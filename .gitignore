@@ -1,0 +1,36 @@
+# AI 作業用の非公開ディレクトリ（公開しない）
+.docs/
+.claude/
+CLAUDE.md
+AGENTS.md
+TASK.md
+TASK-*.md
+
+# ビルド成果物
+/bin/
+/dist/
+/build/
+codexd
+*.exe
+*.test
+*.out
+
+# Go
+vendor/
+*.prof
+
+# ローカル設定・実行時ファイル
+*.local
+*.local.*
+.env
+.env.*
+*.sock
+*.pid
+*.log
+
+# エディタ・OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
