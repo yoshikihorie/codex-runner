@@ -1,6 +1,6 @@
 # AI 作業用ファイル（公開しない）
 # 作業用の .docs/ .claude/ CLAUDE.md はリポジトリの外（親ディレクトリ）に置く
-AGENTS.md
+# AGENTS.md は公開する（リポジトリを触る実装者向けの入口文書）
 CLAUDE.md
 TASK.md
 TASK-*.md
