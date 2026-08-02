@@ -19,8 +19,9 @@ existing `README.md` / `CONTRIBUTING.md` convention.
 - Do not hardcode enum values or thresholds you find written out in design docs; treat any such
   value as a copy of a canonical definition, not the definition itself.
 - Do not change the on-disk task-output format under `/tmp/codex-tasks/<task-id>/` without an
-  explicit instruction — twelve external check scripts read it directly, and it is treated as a
-  frozen contract.
+  explicit instruction — nine external check scripts currently read it directly (see
+  `02-domain/output-contract.md` §5 in the specifications directory for the current count), and it
+  is treated as a frozen contract.
 - Do not write absolute, machine-specific filesystem paths into source code or tests.
 - Verification commands are listed below (`go build`, `go vet`, `go test -race`, `golangci-lint`,
   `shellcheck`). Run them before proposing a change is complete.
@@ -48,7 +49,7 @@ existing `README.md` / `CONTRIBUTING.md` convention.
 | 値の正典（状態・動詞・終了コード分類・エラーコード・閾値・文言） | `10-shared/` 配下（`published-language/`・`message-catalog.md`・`validation-rules.md`） |
 | 状態機械（`Task` 集約の状態遷移・不変条件） | `02-domain/models/task.md` |
 | 永続ファイルの全フィールド定義 | `02-domain/state-files.md` |
-| 出力契約（既存 18 本の検査スクリプトが読む後方互換フォーマット。**変更禁止の凍結仕様**） | `02-domain/output-contract.md` |
+| 出力契約（検査スクリプトが読む後方互換フォーマット。件数の内訳は本表右のファイルの §5 参照。**変更禁止の凍結仕様**） | `02-domain/output-contract.md` |
 | API 契約の正本（ソケットの 5 動詞・CLI サブコマンド・出力契約の 3 つ） | `09-functional-design/FD-*.md`（`03-api/` はここからの転写に過ぎない） |
 | 受入条件 | `09-functional-design/behaviors/FD-*.behavior.md` の Gherkin シナリオ（SCN ID） |
 | ディレクトリ構成・実装マッピング | `01-architecture/directory-map.md` |
@@ -72,7 +73,8 @@ existing `README.md` / `CONTRIBUTING.md` convention.
   思えた場合は、まず Issue で論点を共有すること（`CONTRIBUTING.md` の手順に従う）。
 - **出力契約を変えない。** `/tmp/codex-tasks/<task-id>/` 配下のファイル（`task.json` / `prompt.md` /
   `exit-code` / `last-message.md` / `stdout.log` / `stderr.log` 等）の形式・書き込みタイミングは、
-  既存 18 本の外部検査スクリプトが直接読む後方互換契約であり、明示的な指示なしに変更しない。
+  外部検査スクリプト（異なり 15 種類のうち現存 9 本。内訳は `02-domain/output-contract.md` §5 参照）が
+  直接読む後方互換契約であり、明示的な指示なしに変更しない。
 - **絶対パスを書かない。** ソースコード・テスト・設定に、特定のマシン環境に固有の絶対パス
   （`/Users/...` や `/Volumes/...` など）を書き込まない。
 - **仕様にない機能を追加しない。** スコープを勝手に広げない。
