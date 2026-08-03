@@ -14,7 +14,7 @@ codex-runner is a design-stage project for `codexd`, a local daemon for long-run
 It is intended for developers who run coding agents such as Codex CLI or Claude Code on their own machines.
 The design addresses the loss of a `codex exec` job when its invoking shell terminates.
 It records task state and preserves the existing task-output format for callers.
-The proposed implementation uses a pseudo-terminal, a separate session, file locks, and Codex JSON events.
+The proposed implementation uses a separate session, file locks, and Codex JSON events, with an optional pseudo-terminal fallback that is disabled by default.
 It is designed for a single local user and a Unix domain socket; it is never a network service.
 This repository currently contains design documents only.
 Implementation has not started.
@@ -28,11 +28,11 @@ Feedback on the design is especially welcome.
 
 ## なぜ既存の仕組みで足りないのか
 
-`nohup` と `disown` はセッションやプロセスグループを切り離す手段ではありません。macOS には `setsid` コマンドがなく、起動管理の仕組みはプロセスグループごと終了させる制約もあります。加えて、標準入出力を切り離すと Codex が黙って終了する既知の不具合があり、単純なバックグラウンド実行では安全に解決できません。
+`nohup` と `disown` はセッションやプロセスグループを切り離す手段ではありません。macOS には `setsid` コマンドがなく、起動管理の仕組みはプロセスグループごと終了させる制約もあります。加えて、標準入出力を切り離すと Codex が黙って終了する不具合が報告されており（現行版では未再現。後述）、単純なバックグラウンド実行だけではセッションの分離を保証できません。
 
 ## 設計の要点
 
-- 擬似端末を割り当て、切り離し時に Codex が黙って終了する問題を回避する
+- 擬似端末は既定では割り当てない。切り離し時に Codex が黙って終了する不具合（現行版では未再現）への保険として、設定で有効化できる形で残す
 - 子プロセスを新しいセッションで起動し、管理側の終了信号から分離する
 - タスクごとのファイルロックで、生存と死亡を推定ではなく事実として判定する
 - `codex exec --json` のイベント列で進捗停滞を判定する
@@ -49,7 +49,7 @@ Feedback on the design is especially welcome.
   v
 codexd
   |- 待ち行列・状態管理・ファイルロック
-  |- 擬似端末付きの実行と JSON イベント監視
+  |- 実行と JSON イベント監視（擬似端末は設定で有効化できる保険として残す）
   |- タイムアウト時の回収と互換出力の書き込み
   v
 codex exec --json
