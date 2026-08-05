@@ -11,7 +11,8 @@ This is an unofficial, community-built project. It is not affiliated with, endor
 ## English summary
 
 codex-runner is a design-stage project for `codexd`, a local daemon for long-running, asynchronous OpenAI Codex CLI jobs.
-It is intended for developers who run coding agents such as Codex CLI or Claude Code on their own machines.
+It is primarily intended for orchestrators such as Claude Code that delegate implementation, review, and research work to Codex CLI asynchronously.
+It can also be used by any local orchestrator that invokes Codex CLI as a subprocess.
 The design addresses the loss of a `codex exec` job when its invoking shell terminates.
 It records task state and preserves the existing task-output format for callers.
 The proposed implementation uses a separate session, file locks, and Codex JSON events, with an optional pseudo-terminal fallback that is disabled by default.
@@ -25,6 +26,23 @@ Feedback on the design is especially welcome.
 呼び出し元のシェルが終了すると、同期実行中の `codex exec` も道連れで終了し得ます。このとき終了コードや成果物が残らず、外部からは「まだ実行中」なのか「すでに終了した」のかを区別できなくなります。
 
 `codexd` は実行の親を呼び出し元から切り離し、開始時点の状態、途中経過、終了状態をタスクごとに記録するための常駐プロセスです。
+
+## 想定する利用シーン: オーケストレーターから Codex CLI を使う場合
+
+`codexd` が主に想定するのは、Claude Code のような AI コーディングエージェント（オーケストレーター）が、実装・レビュー・調査などの作業を Codex CLI（`codex exec`）へ委譲して非同期に実行させる利用形態です。
+
+このパターンでは、オーケストレーター側のプロセスが Codex CLI の呼び出し元シェルになります。典型的な流れは次のとおりです。
+
+1. オーケストレーターが「バックグラウンドで実行して」という形で Codex CLI のコマンドを起動する
+2. Codex CLI は数分〜数十分かけて実装やレビューを行う
+3. オーケストレーターが呼び出し元シェルまたはそのプロセスグループを終了させ、Codex CLI の完了を待てないことがある（セッションの終了、接続断、ターミナルの終了など）
+
+このとき Codex CLI が呼び出し元と同じ終了制御下にあると、Codex CLI も終了する可能性があり、途中まで進んでいた作業の終了コードや出力を確実に回収できません。
+
+`codexd` は起動管理下で呼び出し元とは独立して常駐し、Codex CLI を自身の子プロセスとして起動します。そのため Codex CLI は呼び出し元シェルの子孫にならず、呼び出し元が終了しても実行を継続できます。さらに Codex CLI を新しいセッションで起動し、管理側のプロセスグループに対する終了信号から分離します。タスクの状態と成果物は後から確認できます。
+
+- Claude Code に限らず、同一の macOS 上で Codex CLI をサブプロセスとして呼び出すオーケストレーター（他の AI エージェント、ローカルまたはセルフホスト型 CI、カスタムスクリプト等）から利用できる設計です
+- 呼び出し元との通信は Unix domain socket 経由の薄い入口が担い、既存の呼び出し規約（出力ファイルの形式・終了コードの意味）を維持したまま、裏側の実行方式だけを差し替えます
 
 ## なぜ既存の仕組みで足りないのか
 
