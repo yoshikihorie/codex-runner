@@ -85,6 +85,6 @@ const (
 	ReasonAbnormalExit = "abnormal-exit-code"
 )
 
-func isSubmittable(s Subcommand) bool {
+func IsSubmittable(s Subcommand) bool {
 	return s == SubcommandImpl || s == SubcommandReview || s == SubcommandPlan || s == SubcommandResearch || s == SubcommandRead
 }

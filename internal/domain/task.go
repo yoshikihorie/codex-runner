@@ -42,7 +42,7 @@ type Task struct {
 
 // NewTask receives the one-based queue position calculated by the admitting use case.
 func NewTask(id TaskID, subcommand Subcommand, slug Slug, requestedTimeout *int, initialQueuePosition int, requestedAt time.Time) (*Task, []Event, error) {
-	if !isSubmittable(subcommand) {
+	if !IsSubmittable(subcommand) {
 		return nil, nil, fmt.Errorf("subcommand is not submittable")
 	}
 	var requestedCopy *int
