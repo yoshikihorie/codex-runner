@@ -15,7 +15,6 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 )
 
-const protocolVersion = "1"
 const (
 	protocolUnknownVerbCode       = "PROTOCOL_UNKNOWN_VERB"
 	protocolUnknownVerbMessageKey = "error.protocol.unknownVerb"
@@ -169,7 +168,7 @@ func unknownVerbResponse(requestID string, verbs ...string) Response {
 	if len(verbs) > 0 {
 		verb = verbs[0]
 	}
-	return Response{ProtocolVersion: protocolVersion, RequestID: requestID, OK: false, Error: &ErrorBody{Code: protocolUnknownVerbCode, MessageKey: protocolUnknownVerbMessageKey, Detail: map[string]any{"verb": verb}}}
+	return Response{ProtocolVersion: ProtocolVersion, RequestID: requestID, OK: false, Error: &ErrorBody{Code: protocolUnknownVerbCode, MessageKey: protocolUnknownVerbMessageKey, Detail: map[string]any{"verb": verb}}}
 }
 func handleTail(conn net.Conn, _ Request, _ *json.Encoder, tailConns *tailConnRegistry) {
 	tailConns.add(conn)

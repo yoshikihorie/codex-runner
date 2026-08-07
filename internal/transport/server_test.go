@@ -101,7 +101,7 @@ func TestHandleConnJSONLinesAndTail(t *testing.T) {
 	registry := &tailConnRegistry{}
 	go handleConn(server, func(req Request) Response {
 		calls++
-		return Response{ProtocolVersion: protocolVersion, RequestID: req.RequestID, OK: true, Result: json.RawMessage(`{}`)}
+		return Response{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, OK: true, Result: json.RawMessage(`{}`)}
 	}, &wg, registry)
 	if _, err := client.Write([]byte("{\"verb\":\"submit\",\"request_id\":\"one\"}\n{\"verb\":\"tail\",\"request_id\":\"two\"}\n")); err != nil {
 		t.Fatal(err)
@@ -146,7 +146,7 @@ func TestHandleConnWaitsForSplitLine(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go handleConn(server, func(req Request) Response {
-		return Response{ProtocolVersion: protocolVersion, RequestID: req.RequestID, OK: true, Result: json.RawMessage(`{}`)}
+		return Response{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, OK: true, Result: json.RawMessage(`{}`)}
 	}, &wg, &tailConnRegistry{})
 	if _, err := client.Write([]byte("{\"verb\":\"ping\",")); err != nil {
 		t.Fatal(err)
@@ -182,7 +182,7 @@ func TestServeSocketPermissionsAndCancellation(t *testing.T) {
 	done := make(chan error, 1)
 	go func() {
 		done <- Serve(ctx, path, func(req Request) Response {
-			return Response{ProtocolVersion: protocolVersion, RequestID: req.RequestID, OK: true, Result: json.RawMessage(`{}`)}
+			return Response{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, OK: true, Result: json.RawMessage(`{}`)}
 		}, &wg, &tailConnRegistry{})
 	}()
 	var conn net.Conn
@@ -261,7 +261,7 @@ func TestServeRejectsBindFailure(t *testing.T) {
 
 func TestResponseEnvelope(t *testing.T) {
 	resp := unknownVerbResponse("r")
-	if resp.ProtocolVersion != protocolVersion || resp.RequestID != "r" || resp.OK || resp.Error == nil {
+	if resp.ProtocolVersion != ProtocolVersion || resp.RequestID != "r" || resp.OK || resp.Error == nil {
 		t.Fatalf("response=%#v", resp)
 	}
 }
