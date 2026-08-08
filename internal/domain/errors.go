@@ -8,4 +8,5 @@ var (
 	ErrSessionNotResumable    = errors.New("session is not resumable")
 	ErrTaskNotFound           = errors.New("task not found")
 	ErrPathLockConflict       = errors.New("path lock conflict")
+	ErrContractWriteFailed    = errors.New("contract write failed")
 )
