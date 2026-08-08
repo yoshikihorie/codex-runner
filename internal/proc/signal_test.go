@@ -75,7 +75,7 @@ func TestTerminateProcessGroupRejectsNonPositivePID(t *testing.T) {
 
 func startProcessGroup(t *testing.T, name string, args ...string) *exec.Cmd {
 	t.Helper()
-	cmd, err := LaunchNewSession(context.Background(), name, newLockFile(t), args...)
+	cmd, err := LaunchNewSession(context.Background(), name, newLockFile(t), nil, args...)
 	if err != nil {
 		t.Fatal(err)
 	}
