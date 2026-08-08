@@ -7,7 +7,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"time"
+
+	"github.com/yoshikihorie/codex-runner/internal/proc"
 )
+
+var findGitBinary = proc.FindGitBinary
 
 // WorktreeFileStore provides filesystem-backed worktree operations.
 type WorktreeFileStore struct{}
@@ -62,8 +66,14 @@ func (s *WorktreeFileStore) HasGitChanges(path string) (bool, error) {
 }
 
 func runGit(path string, args ...string) ([]byte, error) {
+	gitPath, err := findGitBinary()
+	if err != nil {
+		return nil, err
+	}
 	commandArgs := append([]string{"-C", path}, args...)
-	output, err := exec.Command("git", commandArgs...).Output()
+	cmd := exec.Command(gitPath, commandArgs...)
+	cmd.Env = proc.SafeChildEnv()
+	output, err := cmd.Output()
 	if err != nil {
 		return nil, err
 	}

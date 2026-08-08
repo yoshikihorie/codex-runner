@@ -1,16 +1,18 @@
 package proc
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"testing"
 )
 
 func TestLaunchNewSessionStartsNewSession(t *testing.T) {
 	lockFile := newLockFile(t)
-	cmd, err := LaunchNewSession(context.Background(), "/bin/sleep", lockFile, nil, "10")
+	cmd, err := LaunchNewSession(context.Background(), "/bin/sleep", SafeChildEnv(), lockFile, nil, "10")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -33,7 +35,7 @@ func TestLaunchNewSessionStartsNewSession(t *testing.T) {
 
 func TestLaunchNewSessionPassesLivenessLockFile(t *testing.T) {
 	lockFile := newLockFile(t)
-	cmd, err := LaunchNewSession(context.Background(), "/bin/sh", lockFile, nil, "-c", "test -e /dev/fd/3")
+	cmd, err := LaunchNewSession(context.Background(), "/bin/sh", SafeChildEnv(), lockFile, nil, "-c", "test -e /dev/fd/3")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,19 +47,19 @@ func TestLaunchNewSessionPassesLivenessLockFile(t *testing.T) {
 func TestLaunchNewSessionReturnsErrorForCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := LaunchNewSession(ctx, "/bin/sleep", newLockFile(t), nil, "10"); err == nil {
+	if _, err := LaunchNewSession(ctx, "/bin/sleep", SafeChildEnv(), newLockFile(t), nil, "10"); err == nil {
 		t.Fatal("LaunchNewSession succeeded with a canceled context")
 	}
 }
 
 func TestLaunchNewSessionReturnsErrorForMissingCommand(t *testing.T) {
-	if _, err := LaunchNewSession(context.Background(), "/missing-command", newLockFile(t), nil); err == nil {
+	if _, err := LaunchNewSession(context.Background(), "/missing-command", SafeChildEnv(), newLockFile(t), nil); err == nil {
 		t.Fatal("LaunchNewSession succeeded with a missing command")
 	}
 }
 
 func TestLaunchNewSessionReturnsErrorForNilLivenessLockFile(t *testing.T) {
-	cmd, err := LaunchNewSession(context.Background(), "/bin/sleep", nil, nil, "10")
+	cmd, err := LaunchNewSession(context.Background(), "/bin/sleep", SafeChildEnv(), nil, nil, "10")
 	if err == nil {
 		t.Fatal("LaunchNewSession succeeded with a nil liveness lock file")
 	}
@@ -75,7 +77,7 @@ func TestLaunchNewSessionRedirectsStdout(t *testing.T) {
 		_ = stdout.Close()
 	})
 
-	cmd, err := LaunchNewSession(context.Background(), "/bin/echo", newLockFile(t), stdout, "hello")
+	cmd, err := LaunchNewSession(context.Background(), "/bin/echo", SafeChildEnv(), newLockFile(t), stdout, "hello")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -96,7 +98,7 @@ func TestLaunchNewSessionRedirectsStdout(t *testing.T) {
 
 func TestLaunchNewSessionClosesLivenessLockFileAfterSuccessfulStart(t *testing.T) {
 	lockFile := newLockFile(t)
-	cmd, err := LaunchNewSession(context.Background(), "/bin/echo", lockFile, nil)
+	cmd, err := LaunchNewSession(context.Background(), "/bin/echo", SafeChildEnv(), lockFile, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -110,12 +112,74 @@ func TestLaunchNewSessionClosesLivenessLockFileAfterSuccessfulStart(t *testing.T
 
 func TestLaunchNewSessionClosesLivenessLockFileAfterFailedStart(t *testing.T) {
 	lockFile := newLockFile(t)
-	if _, err := LaunchNewSession(context.Background(), "/missing-command", lockFile, nil); err == nil {
+	if _, err := LaunchNewSession(context.Background(), "/missing-command", SafeChildEnv(), lockFile, nil); err == nil {
 		t.Fatal("LaunchNewSession succeeded with a missing command")
 	}
 	if _, err := lockFile.Stat(); err == nil {
 		t.Fatal("liveness lock file remained open after a failed start")
 	}
+}
+
+func TestLaunchNewSessionUsesOnlySafeEnvironment(t *testing.T) {
+	t.Setenv("FAKE_API_KEY", "secret")
+	var stdout bytes.Buffer
+	cmd, err := LaunchNewSession(context.Background(), "/usr/bin/env", SafeChildEnv(), newLockFile(t), &stdout)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if got, want := envKeys(stdout.String()), envKeys(strings.Join(SafeChildEnv(), "\n")); !equalStringSets(got, want) {
+		t.Fatalf("child environment keys = %v, want %v", got, want)
+	}
+	if strings.Contains(stdout.String(), "FAKE_API_KEY=") {
+		t.Fatalf("child environment leaked FAKE_API_KEY: %q", stdout.String())
+	}
+	if !strings.Contains(stdout.String(), "PATH="+FixedPath()) {
+		t.Fatalf("child environment did not use fixed PATH: %q", stdout.String())
+	}
+}
+
+func TestLaunchNewSessionRejectsUnsafeEnvironmentAndClosesLockFile(t *testing.T) {
+	lockFile := newLockFile(t)
+	if _, err := LaunchNewSession(context.Background(), "/bin/echo", nil, lockFile, nil); err == nil {
+		t.Fatal("LaunchNewSession succeeded with nil environment")
+	}
+	if _, err := lockFile.Stat(); err == nil {
+		t.Fatal("liveness lock file remained open after invalid environment")
+	}
+}
+
+func TestLaunchNewSessionRejectsRelativeCommand(t *testing.T) {
+	for _, name := range []string{"git", "./local-bin"} {
+		if _, err := LaunchNewSession(context.Background(), name, SafeChildEnv(), newLockFile(t), nil); err == nil {
+			t.Errorf("LaunchNewSession(%q) succeeded", name)
+		}
+	}
+}
+
+func envKeys(output string) map[string]bool {
+	keys := make(map[string]bool)
+	for _, line := range strings.Split(strings.TrimSpace(output), "\n") {
+		key, _, found := strings.Cut(line, "=")
+		if found {
+			keys[key] = true
+		}
+	}
+	return keys
+}
+
+func equalStringSets(got, want map[string]bool) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for key := range got {
+		if !want[key] {
+			return false
+		}
+	}
+	return true
 }
 
 func newLockFile(t *testing.T) *os.File {

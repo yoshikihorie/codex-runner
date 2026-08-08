@@ -4,8 +4,11 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
+
+	"github.com/yoshikihorie/codex-runner/internal/proc"
 )
 
 func TestWorktreeFileStoreFilesystemOperations(t *testing.T) {
@@ -41,6 +44,45 @@ func TestWorktreeFileStoreFilesystemOperations(t *testing.T) {
 	}
 	if err := store.Remove(child); err != nil {
 		t.Fatalf("Remove() must be idempotent: %v", err)
+	}
+}
+
+func TestRunGitIgnoresAmbientPathAndUsesSafeEnvironment(t *testing.T) {
+	repo := newGitTestRepository(t, "main")
+	fakeDir := t.TempDir()
+	marker := filepath.Join(fakeDir, "fake-git-ran")
+	fakeGit := filepath.Join(fakeDir, "git")
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\n: > \""+marker+"\"\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeDir+":"+os.Getenv("PATH"))
+	if changed, err := NewWorktreeFileStore().HasGitChanges(repo); err != nil || changed {
+		t.Fatalf("HasGitChanges() = %v, %v", changed, err)
+	}
+	if _, err := os.Stat(marker); !os.IsNotExist(err) {
+		t.Fatalf("fake git was executed: stat error = %v", err)
+	}
+
+	originalFindGitBinary := findGitBinary
+	captureEnv := filepath.Join(t.TempDir(), "capture-env")
+	if err := os.WriteFile(captureEnv, []byte("#!/bin/sh\nenv\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	findGitBinary = func() (string, error) { return captureEnv, nil }
+	t.Cleanup(func() { findGitBinary = originalFindGitBinary })
+	t.Setenv("FAKE_API_KEY", "secret")
+	output, err := runGit(repo, "status", "--porcelain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(output), "FAKE_API_KEY=") {
+		t.Fatalf("runGit environment leaked FAKE_API_KEY: %q", output)
+	}
+	if !strings.Contains(string(output), "PATH="+proc.FixedPath()) {
+		t.Fatalf("runGit environment did not use fixed PATH: %q", output)
+	}
+	if !strings.Contains(string(output), "HOME="+os.Getenv("HOME")) {
+		t.Fatalf("runGit environment did not include HOME: %q", output)
 	}
 }
 
