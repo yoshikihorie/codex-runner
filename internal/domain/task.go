@@ -41,7 +41,7 @@ type Task struct {
 }
 
 // NewTask receives the one-based queue position calculated by the admitting use case.
-func NewTask(id TaskID, subcommand Subcommand, slug Slug, requestedTimeout *int, initialQueuePosition int, requestedAt time.Time) (*Task, []Event, error) {
+func NewTask(id TaskID, subcommand Subcommand, slug Slug, requestedTimeout *int, requestedAt time.Time, initialQueuePosition int) (*Task, []Event, error) {
 	if !IsSubmittable(subcommand) {
 		return nil, nil, fmt.Errorf("subcommand is not submittable")
 	}
@@ -122,7 +122,7 @@ func (t *Task) ConfirmRunning(occurredAt time.Time) error {
 	if t.state == StateStarting || t.state == StateAdopted {
 		// The transition table has no event column for this liveness-confirmation
 		// result, so it is an internal state confirmation rather than a domain
-		// event transition. See /Volumes/project/CodexTools/.docs/specifications/02-domain/models/task.md §2 invariant 9.
+		// event transition. See the Task model specification §2 invariant 9.
 		t.state = StateRunning
 		return nil
 	}

@@ -9,7 +9,7 @@ import (
 func testTask(t *testing.T) *Task {
 	id, _ := NewTaskID("impl-20260806-120000-a1b2-example")
 	slug, _ := NewSlug("example")
-	task, _, err := NewTask(id, SubcommandImpl, slug, nil, 1, time.Now())
+	task, _, err := NewTask(id, SubcommandImpl, slug, nil, time.Now(), 1)
 	if err != nil {
 		t.Fatal(err)
 	}
