@@ -1,0 +1,102 @@
+package usecase
+
+import (
+	"context"
+	"fmt"
+	"sync"
+
+	"github.com/yoshikihorie/codex-runner/internal/domain"
+	"github.com/yoshikihorie/codex-runner/internal/execution"
+)
+
+// AdmitTaskUseCase decides whether a task reserves a slot immediately or waits in FIFO order.
+type AdmitTaskUseCase struct {
+	queue              execution.TaskQueue
+	registry           execution.ActiveTaskRegistry
+	queueMu            *sync.Mutex
+	maxConcurrentTasks int
+	queueMaxDepth      int
+}
+
+func NewAdmitTaskUseCase(queue execution.TaskQueue, registry execution.ActiveTaskRegistry, queueMu *sync.Mutex, maxConcurrentTasks int, queueMaxDepth int) *AdmitTaskUseCase {
+	return &AdmitTaskUseCase{queue: queue, registry: registry, queueMu: queueMu, maxConcurrentTasks: maxConcurrentTasks, queueMaxDepth: queueMaxDepth}
+}
+
+func (u *AdmitTaskUseCase) Execute(_ context.Context, input execution.TaskAdmissionInput) (execution.TaskAdmissionResult, error) {
+	if err := validateAdmissionInput(input); err != nil {
+		return execution.TaskAdmissionResult{}, err
+	}
+	u.queueMu.Lock()
+	defer u.queueMu.Unlock()
+	activeCount := u.registry.Size()
+	if activeCount >= u.maxConcurrentTasks && u.queue.Len() >= u.queueMaxDepth {
+		return execution.TaskAdmissionResult{}, domain.ErrQueueFull
+	}
+	initialQueuePosition := u.queue.Len() + 1
+	task, events, err := domain.NewTask(input.TaskID, input.Subcommand, input.Slug, input.RequestedTimeout, input.RequestedAt, initialQueuePosition)
+	if err != nil {
+		return execution.TaskAdmissionResult{}, err
+	}
+	payload := execution.TaskLaunchPayload{
+		Task: task, Model: input.Model, ReasoningEffort: copyReasoningEffort(input.ReasoningEffort), PromptText: input.PromptText,
+		NormalizedPaths: copyNormalizedPaths(input.NormalizedPaths), ResolvedTimeout: input.ResolvedTimeout,
+		SandboxMode: input.SandboxMode, SourceWorkingDir: input.SourceWorkingDir,
+	}
+	if input.Subcommand != domain.SubcommandImpl {
+		workingDir := input.SourceWorkingDir
+		payload.WorkingDir = &workingDir
+	}
+	if activeCount < u.maxConcurrentTasks {
+		u.registry.Add(task.ID())
+		return execution.TaskAdmissionResult{State: domain.StateQueued, Events: events, LaunchPayload: &payload}, nil
+	}
+	position := u.queue.Enqueue(payload)
+	return execution.TaskAdmissionResult{State: domain.StateQueued, QueuePosition: &position, Events: events}, nil
+}
+
+func copyReasoningEffort(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func copyNormalizedPaths(paths []domain.NormalizedPath) []domain.NormalizedPath {
+	if paths == nil {
+		return nil
+	}
+	cloned := make([]domain.NormalizedPath, len(paths))
+	copy(cloned, paths)
+	return cloned
+}
+
+// Admit adapts the use case to the context-free transport boundary.
+func (u *AdmitTaskUseCase) Admit(input execution.TaskAdmissionInput) (execution.TaskAdmissionResult, error) {
+	return u.Execute(context.Background(), input)
+}
+
+func validateAdmissionInput(input execution.TaskAdmissionInput) error {
+	switch {
+	case input.TaskID.String() == "":
+		return fmt.Errorf("task admission input task ID is required")
+	case input.Subcommand == "":
+		return fmt.Errorf("task admission input subcommand is required")
+	case input.Slug.String() == "":
+		return fmt.Errorf("task admission input slug is required")
+	case input.RequestedAt.IsZero():
+		return fmt.Errorf("task admission input requested at is required")
+	case input.Model == "":
+		return fmt.Errorf("task admission input model is required")
+	case input.PromptText == "":
+		return fmt.Errorf("task admission input prompt text is required")
+	case input.ResolvedTimeout.ResolvedSeconds() == 0:
+		return fmt.Errorf("task admission input resolved timeout is required")
+	case input.SandboxMode == "":
+		return fmt.Errorf("task admission input sandbox mode is required")
+	case input.SourceWorkingDir == "":
+		return fmt.Errorf("task admission input source working directory is required")
+	default:
+		return nil
+	}
+}
