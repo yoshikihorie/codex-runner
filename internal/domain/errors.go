@@ -10,6 +10,7 @@ var (
 	ErrPathLockConflict         = errors.New("path lock conflict")
 	ErrQueueFull                = errors.New("queue full")
 	ErrContractWriteFailed      = errors.New("contract write failed")
+	ErrOutputContractViolation  = errors.New("output contract violation")
 	ErrPTYAllocationFailed      = errors.New("PTY allocation failed")
 	ErrChildProcessLaunchFailed = errors.New("child process launch failed")
 )
