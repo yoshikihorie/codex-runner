@@ -3,10 +3,10 @@ package usecase
 import (
 	"context"
 	"log/slog"
-	"path/filepath"
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
+	"github.com/yoshikihorie/codex-runner/internal/execution"
 	"github.com/yoshikihorie/codex-runner/internal/recovery"
 )
 
@@ -15,20 +15,14 @@ type taskLifecycleRunner interface {
 }
 
 type slotFinalizer struct {
-	advance   *AdvanceQueueUseCase
-	runner    taskLifecycleRunner
-	tasksRoot string
-	baseCtx   context.Context
-	clock     domain.Clock
-	logger    *slog.Logger
+	advance *AdvanceQueueUseCase
+	starter execution.TaskLifecycleStarter
+	logger  *slog.Logger
 }
 
-func NewSlotReleaser(advance *AdvanceQueueUseCase, runner taskLifecycleRunner, tasksRoot string, baseCtx context.Context, clock domain.Clock, loggers ...*slog.Logger) recovery.SlotReleaser {
-	if advance == nil || runner == nil || baseCtx == nil || clock == nil {
+func NewSlotReleaser(advance *AdvanceQueueUseCase, starter execution.TaskLifecycleStarter, loggers ...*slog.Logger) recovery.SlotReleaser {
+	if advance == nil || starter == nil {
 		panic("slot releaser requires non-nil dependencies")
-	}
-	if tasksRoot == "" || !filepath.IsAbs(tasksRoot) {
-		panic("slot releaser tasks root must be an absolute path")
 	}
 	if len(loggers) > 1 {
 		panic("slot releaser accepts at most one logger")
@@ -37,7 +31,7 @@ func NewSlotReleaser(advance *AdvanceQueueUseCase, runner taskLifecycleRunner, t
 	if len(loggers) == 1 && loggers[0] != nil {
 		logger = loggers[0]
 	}
-	return &slotFinalizer{advance: advance, runner: runner, tasksRoot: tasksRoot, baseCtx: baseCtx, clock: clock, logger: logger}
+	return &slotFinalizer{advance: advance, starter: starter, logger: logger}
 }
 
 func (f *slotFinalizer) ReleaseAndAdvance(ctx context.Context, taskID domain.TaskID, now time.Time) {
@@ -49,12 +43,7 @@ func (f *slotFinalizer) ReleaseAndAdvance(ctx context.Context, taskID domain.Tas
 	if !found {
 		return
 	}
-	taskCtx, cancel := context.WithCancel(f.baseCtx)
-	input := TaskLifecycleInput{TaskLaunchPayload: payload, TaskDirPath: filepath.Join(f.tasksRoot, payload.Task.ID().String()), Now: f.clock.Now()}
-	go func() {
-		defer cancel()
-		f.runner.Run(taskCtx, input)
-	}()
+	f.starter.Start(payload)
 }
 
 var _ recovery.SlotReleaser = (*slotFinalizer)(nil)

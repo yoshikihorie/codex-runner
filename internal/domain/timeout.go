@@ -23,6 +23,14 @@ func NewTimeout(requested *int, resolved int) (Timeout, error) {
 	}
 	return Timeout{clone, resolved}, nil
 }
+
+// ResolveTimeout resolves an optional request using the domain default.
+func ResolveTimeout(requested *int) (Timeout, error) {
+	if requested == nil {
+		return NewTimeout(nil, timeoutMinSeconds)
+	}
+	return NewTimeout(requested, *requested)
+}
 func (v Timeout) RequestedSeconds() *int {
 	if v.requestedSeconds == nil {
 		return nil

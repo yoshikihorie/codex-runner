@@ -394,6 +394,39 @@ func IsReasoningEffortAllowed(effort string) bool {
 	return false
 }
 
+// ResolveModel applies request, subcommand, then global defaults.
+func (c Config) ResolveModel(subcommand domain.Subcommand, requested *string) (string, bool) {
+	model := c.model
+	if override, ok := c.modelOverrides[subcommand]; ok {
+		model = override
+	}
+	if requested != nil {
+		model = *requested
+	}
+	return model, IsModelAllowed(model)
+}
+
+// ResolveReasoningEffort applies request, subcommand, then global defaults.
+func (c Config) ResolveReasoningEffort(subcommand domain.Subcommand, requested *string) (*string, bool) {
+	var effort *string
+	if c.reasoningEffort != nil {
+		value := *c.reasoningEffort
+		effort = &value
+	}
+	if override, ok := c.reasoningEffortOverrides[subcommand]; ok {
+		value := override
+		effort = &value
+	}
+	if requested != nil {
+		value := *requested
+		effort = &value
+	}
+	if effort == nil {
+		return nil, true
+	}
+	return effort, IsReasoningEffortAllowed(*effort)
+}
+
 func (c Config) MaxConcurrentTasks() int             { return c.maxConcurrentTasks }
 func (c Config) MaxConcurrentImplTasks() int         { return c.maxConcurrentImplTasks }
 func (c Config) QueueMaxDepth() int                  { return c.queueMaxDepth }

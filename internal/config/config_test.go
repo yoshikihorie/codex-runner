@@ -11,6 +11,37 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 )
 
+func TestResolveSubmitOptions(t *testing.T) {
+	requestedModel := "gpt-5.6-sol"
+	requestedEffort := "high"
+	c := Config{
+		model: "gpt-5.6-terra", modelOverrides: map[domain.Subcommand]string{domain.SubcommandReview: "gpt-5.6-sol"},
+		reasoningEffort: &requestedEffort, reasoningEffortOverrides: map[domain.Subcommand]string{domain.SubcommandReview: "low"},
+	}
+	if model, ok := c.ResolveModel(domain.SubcommandReview, &requestedModel); !ok || model != requestedModel {
+		t.Fatalf("model = %q, %t", model, ok)
+	}
+	if model, ok := c.ResolveModel(domain.SubcommandReview, nil); !ok || model != "gpt-5.6-sol" {
+		t.Fatalf("override model = %q, %t", model, ok)
+	}
+	if effort, ok := c.ResolveReasoningEffort(domain.SubcommandReview, nil); !ok || effort == nil || *effort != "low" {
+		t.Fatalf("override effort = %v, %t", effort, ok)
+	}
+	if effort, ok := c.ResolveReasoningEffort(domain.SubcommandImpl, nil); !ok || effort == nil || *effort != "high" {
+		t.Fatalf("default effort = %v, %t", effort, ok)
+	}
+	if effort, ok := (Config{}).ResolveReasoningEffort(domain.SubcommandImpl, nil); !ok || effort != nil {
+		t.Fatalf("absent effort = %v, %t", effort, ok)
+	}
+	bad := "invalid"
+	if _, ok := c.ResolveModel(domain.SubcommandImpl, &bad); ok {
+		t.Fatal("invalid requested model was accepted")
+	}
+	if _, ok := c.ResolveReasoningEffort(domain.SubcommandImpl, &bad); ok {
+		t.Fatal("invalid requested effort was accepted")
+	}
+}
+
 func TestLoadExplicitDefaultsAndOverrides(t *testing.T) {
 	codex := filepath.Join(t.TempDir(), "codex")
 	if err := os.WriteFile(codex, []byte(""), 0o755); err != nil {
