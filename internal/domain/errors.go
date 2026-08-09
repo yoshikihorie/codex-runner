@@ -8,6 +8,7 @@ var (
 	ErrSessionNotResumable      = errors.New("session is not resumable")
 	ErrTaskNotFound             = errors.New("task not found")
 	ErrPathLockConflict         = errors.New("path lock conflict")
+	ErrPathLockInfraFailure     = errors.New("path lock infrastructure failure")
 	ErrQueueFull                = errors.New("queue full")
 	ErrContractWriteFailed      = errors.New("contract write failed")
 	ErrOutputContractViolation  = errors.New("output contract violation")
