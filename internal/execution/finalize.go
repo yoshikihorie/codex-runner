@@ -40,17 +40,18 @@ type FinalizeTaskOutput struct {
 
 // FinalizeTaskUseCase validates terminal artifacts and records a task's final state.
 type FinalizeTaskUseCase struct {
-	tasks        store.TaskStore
-	contractW    contract.ContractWriter
-	reader       store.ContractReader
-	clock        domain.Clock
-	taskMu       *store.TaskMutex
-	slotReleaser recovery.SlotReleaser
-	logger       *slog.Logger
+	tasks           store.TaskStore
+	contractW       contract.ContractWriter
+	reader          store.ContractReader
+	clock           domain.Clock
+	taskMu          *store.TaskMutex
+	slotReleaser    recovery.SlotReleaser
+	timeoutDisarmer TimeoutDisarmer
+	logger          *slog.Logger
 }
 
-func NewFinalizeTaskUseCase(tasks store.TaskStore, contractWriter contract.ContractWriter, reader store.ContractReader, clock domain.Clock, taskMu *store.TaskMutex, slotReleaser recovery.SlotReleaser, loggers ...*slog.Logger) *FinalizeTaskUseCase {
-	if tasks == nil || contractWriter == nil || reader == nil || clock == nil || taskMu == nil || slotReleaser == nil {
+func NewFinalizeTaskUseCase(tasks store.TaskStore, contractWriter contract.ContractWriter, reader store.ContractReader, clock domain.Clock, taskMu *store.TaskMutex, slotReleaser recovery.SlotReleaser, timeoutDisarmer TimeoutDisarmer, loggers ...*slog.Logger) *FinalizeTaskUseCase {
+	if tasks == nil || contractWriter == nil || reader == nil || clock == nil || taskMu == nil || slotReleaser == nil || timeoutDisarmer == nil {
 		panic("finalize task use case requires non-nil dependencies")
 	}
 	if len(loggers) > 1 {
@@ -60,7 +61,7 @@ func NewFinalizeTaskUseCase(tasks store.TaskStore, contractWriter contract.Contr
 	if len(loggers) == 1 && loggers[0] != nil {
 		logger = loggers[0]
 	}
-	return &FinalizeTaskUseCase{tasks: tasks, contractW: contractWriter, reader: reader, clock: clock, taskMu: taskMu, slotReleaser: slotReleaser, logger: logger}
+	return &FinalizeTaskUseCase{tasks: tasks, contractW: contractWriter, reader: reader, clock: clock, taskMu: taskMu, slotReleaser: slotReleaser, timeoutDisarmer: timeoutDisarmer, logger: logger}
 }
 
 type contractWriteFailure struct {
@@ -87,6 +88,7 @@ func (uc *FinalizeTaskUseCase) Execute(ctx context.Context, in FinalizeTaskInput
 	defer func() {
 		uc.taskMu.Unlock(in.TaskID)
 		if recordExited {
+			uc.timeoutDisarmer.Disarm(in.TaskID)
 			uc.slotReleaser.ReleaseAndAdvance(ctx, in.TaskID, uc.clock.Now())
 		}
 	}()
