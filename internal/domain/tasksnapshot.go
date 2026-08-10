@@ -7,6 +7,20 @@ import (
 
 const taskSnapshotSchemaVersion = 1
 
+// NewInitialTaskSnapshot creates the base metadata for a task before its first persistence.
+func NewInitialTaskSnapshot(route ExecutionRoute, reasoningEffort *string) TaskSnapshot {
+	var reasoningEffortCopy *string
+	if reasoningEffort != nil {
+		value := *reasoningEffort
+		reasoningEffortCopy = &value
+	}
+	return TaskSnapshot{
+		Route:           route,
+		ReasoningEffort: reasoningEffortCopy,
+		SchemaVersion:   taskSnapshotSchemaVersion,
+	}
+}
+
 type TaskSnapshot struct {
 	TaskID                  TaskID          `json:"task_id"`
 	Subcommand              Subcommand      `json:"subcommand"`
