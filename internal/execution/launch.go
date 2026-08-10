@@ -46,9 +46,11 @@ type executionLogOpener interface {
 
 type ProcessRunner interface {
 	Launch(ctx context.Context, params LaunchParams) (*LaunchedProcess, error)
+	Terminate(pid int, grace time.Duration) error
 }
 
 var launchNewSession = proc.LaunchNewSession
+var terminateProcessGroup = proc.TerminateProcessGroup
 var now = time.Now
 
 const (
@@ -107,6 +109,10 @@ func (r *processRunner) Launch(ctx context.Context, p LaunchParams) (*LaunchedPr
 
 	handle := &domain.ProcessHandle{PID: cmd.Process.Pid, ProcessStartedAt: now()}
 	return &LaunchedProcess{Handle: handle, Waiter: &processWaiter{cmd: cmd}}, nil
+}
+
+func (r *processRunner) Terminate(pid int, grace time.Duration) error {
+	return terminateProcessGroup(pid, grace)
 }
 
 type processWaiter struct {
