@@ -13,6 +13,24 @@ func snapshotTime(offset int) time.Time {
 
 func snapshotInt(value int) *int { return &value }
 
+func TestNewInitialTaskSnapshot(t *testing.T) {
+	reasoning := "high"
+	snapshot := NewInitialTaskSnapshot(ExecutionRouteDaemon, &reasoning)
+	if snapshot.Route != ExecutionRouteDaemon || snapshot.ReasoningEffort == nil || *snapshot.ReasoningEffort != reasoning || snapshot.ReasoningEffort == &reasoning || snapshot.SchemaVersion != taskSnapshotSchemaVersion {
+		t.Fatalf("initial snapshot = %#v", snapshot)
+	}
+	reasoning = "low"
+	if *snapshot.ReasoningEffort != "high" {
+		t.Fatalf("initial snapshot reasoning effort was aliased: %q", *snapshot.ReasoningEffort)
+	}
+	if snapshot.TaskID.String() != "" || snapshot.Subcommand != "" || snapshot.PID != nil || snapshot.ProcessStartedAt != nil || snapshot.Model != "" || !snapshot.RequestedAt.IsZero() || snapshot.State != "" || !snapshot.StateUpdatedAt.IsZero() {
+		t.Fatalf("initial snapshot has non-zero task fields: %#v", snapshot)
+	}
+	if NewInitialTaskSnapshot(ExecutionRouteDaemon, nil).ReasoningEffort != nil {
+		t.Fatal("nil reasoning effort was not retained")
+	}
+}
+
 func validRunningSnapshot(t *testing.T) TaskSnapshot {
 	t.Helper()
 	id, err := NewTaskID("impl-20260806-120000-a1b2-example")
