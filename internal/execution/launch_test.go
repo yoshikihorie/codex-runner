@@ -278,3 +278,29 @@ func TestProcessRunnerLaunchPassesPTYArguments(t *testing.T) {
 		t.Fatalf("args = %q, want %q", gotArgs, wantArgs)
 	}
 }
+
+func TestProcessRunnerTerminateDelegatesArgumentsAndError(t *testing.T) {
+	original := terminateProcessGroup
+	t.Cleanup(func() { terminateProcessGroup = original })
+
+	wantErr := errors.New("terminate failed")
+	const wantPID = 12345
+	wantGrace := 7 * time.Second
+	var gotPID int
+	var gotGrace time.Duration
+	callCount := 0
+	terminateProcessGroup = func(pid int, grace time.Duration) error {
+		gotPID = pid
+		gotGrace = grace
+		callCount++
+		return wantErr
+	}
+
+	err := NewProcessRunner(launchTestLogs{}).Terminate(wantPID, wantGrace)
+	if gotPID != wantPID || gotGrace != wantGrace || callCount != 1 {
+		t.Fatalf("pid, grace, calls = %d, %v, %d", gotPID, gotGrace, callCount)
+	}
+	if err != wantErr {
+		t.Fatalf("error = %v, want same error %v", err, wantErr)
+	}
+}

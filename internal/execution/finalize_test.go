@@ -182,6 +182,34 @@ func (f *finalizeSlotFake) snapshot() (int, domain.TaskID, time.Time) {
 
 var _ recovery.SlotReleaser = (*finalizeSlotFake)(nil)
 
+type finalizeTimeoutFake struct {
+	mu     sync.Mutex
+	trace  *finalizeTrace
+	taskMu *store.TaskMutex
+	calls  int
+	id     domain.TaskID
+}
+
+func (f *finalizeTimeoutFake) Disarm(id domain.TaskID) {
+	f.trace.add("disarm")
+	if f.taskMu != nil {
+		f.taskMu.Lock(id)
+		f.taskMu.Unlock(id)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	f.id = id
+}
+
+func (f *finalizeTimeoutFake) snapshot() (int, domain.TaskID) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.calls, f.id
+}
+
+var _ TimeoutDisarmer = (*finalizeTimeoutFake)(nil)
+
 func finalizeID(t *testing.T) domain.TaskID {
 	t.Helper()
 	id, err := domain.NewTaskID("impl-20260809-120000-abcd-finalize")
@@ -197,14 +225,16 @@ func finalizeSnapshot(t *testing.T, state domain.TaskState) domain.TaskSnapshot 
 	pid := 1
 	return domain.TaskSnapshot{TaskID: id, Subcommand: domain.SubcommandImpl, PID: &pid, ProcessStartedAt: &now, ResolvedTimeoutSeconds: 1800, Model: "gpt-5", RequestedAt: now, Route: domain.ExecutionRouteDaemon, State: state, StateUpdatedAt: now, SchemaVersion: 1}
 }
-func finalizeFixtures(t *testing.T, state domain.TaskState, now time.Time) (*finalizeStoreFake, *finalizeReaderFake, *finalizeWriterFake, *finalizeSlotFake, *FinalizeTaskUseCase) {
+func finalizeFixtures(t *testing.T, state domain.TaskState, now time.Time) (*finalizeStoreFake, *finalizeReaderFake, *finalizeWriterFake, *finalizeSlotFake, *finalizeTimeoutFake, *FinalizeTaskUseCase) {
 	t.Helper()
 	trace := &finalizeTrace{}
 	s := &finalizeStoreFake{trace: trace, latest: finalizeSnapshot(t, state)}
 	r := &finalizeReaderFake{trace: trace, present: true}
 	w := &finalizeWriterFake{trace: trace}
 	slot := &finalizeSlotFake{trace: trace}
-	return s, r, w, slot, NewFinalizeTaskUseCase(s, w, r, domain.ClockFunc(func() time.Time { return now }), store.NewTaskMutex(), slot)
+	taskMu := store.NewTaskMutex()
+	timeout := &finalizeTimeoutFake{trace: trace, taskMu: taskMu}
+	return s, r, w, slot, timeout, NewFinalizeTaskUseCase(s, w, r, domain.ClockFunc(func() time.Time { return now }), taskMu, slot, timeout)
 }
 func finalizeInput(id domain.TaskID, at time.Time) FinalizeTaskInput {
 	return FinalizeTaskInput{TaskID: id, RawExitCode: 0, OccurredAt: at}
@@ -242,7 +272,7 @@ func TestFinalizeTaskUseCaseScenarios(t *testing.T) {
 		{"SCN-exec-05-01", 0, true, domain.StateCompleted, ""}, {"SCN-exec-05-02", 0, false, domain.StateFailed, domain.ReasonNoOutput}, {"SCN-exec-05-03", 1, true, domain.StateFailed, domain.ReasonAbnormalExit}, {"SCN-exec-05-07", 0, false, domain.StateFailed, domain.ReasonNoOutput}, {"SCN-exec-05-08", 999, true, domain.StateFailed, domain.ReasonAbnormalExit},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s, r, w, slot, uc := finalizeFixtures(t, domain.StateRunning, now)
+			s, r, w, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
 			r.present = tc.present
 			out, err := uc.Execute(context.Background(), FinalizeTaskInput{TaskID: s.latest.TaskID, RawExitCode: tc.raw, OccurredAt: occurred})
 			if err != nil || out.ResultState != tc.want {
@@ -260,6 +290,14 @@ func TestFinalizeTaskUseCaseScenarios(t *testing.T) {
 			calls, _, slotAt := slot.snapshot()
 			if calls != 1 || !slotAt.Equal(now) {
 				t.Fatalf("slot=%d at=%v", calls, slotAt)
+			}
+			disarms, disarmedID := timeout.snapshot()
+			if disarms != 1 || disarmedID != s.latest.TaskID {
+				t.Fatalf("disarms=%d id=%v", disarms, disarmedID)
+			}
+			callsTrace := w.trace.snapshot()
+			if len(callsTrace) < 2 || callsTrace[len(callsTrace)-2] != "disarm" || callsTrace[len(callsTrace)-1] != "release-slot" {
+				t.Fatalf("post-processing order=%v", callsTrace)
 			}
 			if tc.reason != "" {
 				failed, ok := out.Events[1].(domain.TaskFailed)
@@ -295,7 +333,7 @@ func TestFinalizeTaskUseCaseFailsafePreparationRetainsInitialResult(t *testing.T
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			s, _, w, slot, uc := finalizeFixtures(t, domain.StateRunning, now)
+			s, _, w, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
 			tc.configure(s)
 			w.writeErrs = []error{initialWrite}
 			out, err := uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, now))
@@ -310,6 +348,9 @@ func TestFinalizeTaskUseCaseFailsafePreparationRetainsInitialResult(t *testing.T
 			if calls != 1 {
 				t.Fatalf("slot=%d", calls)
 			}
+			if disarms, _ := timeout.snapshot(); disarms != 1 {
+				t.Fatalf("disarms=%d", disarms)
+			}
 		})
 	}
 }
@@ -317,17 +358,17 @@ func TestFinalizeTaskUseCaseFailsafePreparationRetainsInitialResult(t *testing.T
 func TestFinalizeTaskUseCaseWriteFailuresAndContractRules(t *testing.T) {
 	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
 	t.Run("04a retry write succeeds", func(t *testing.T) {
-		s, _, w, slot, uc := finalizeFixtures(t, domain.StateRunning, now)
+		s, _, w, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
 		w.writeErrs = []error{errors.New("first")}
 		out, err := uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, now))
 		writes, _ := w.snapshot()
 		calls, _, _ := slot.snapshot()
-		if err != nil || len(writes) != 2 || calls != 1 || !errors.Is(out.ContractWriteError, domain.ErrContractWriteFailed) {
+		if disarms, _ := timeout.snapshot(); err != nil || len(writes) != 2 || calls != 1 || disarms != 1 || !errors.Is(out.ContractWriteError, domain.ErrContractWriteFailed) {
 			t.Fatalf("out=%+v err=%v writes=%d", out, err, len(writes))
 		}
 	})
 	t.Run("04b retry save succeeds", func(t *testing.T) {
-		s, _, _, _, uc := finalizeFixtures(t, domain.StateRunning, now)
+		s, _, _, _, _, uc := finalizeFixtures(t, domain.StateRunning, now)
 		s.saveErrs = []error{errors.New("first")}
 		out, err := uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, now))
 		saves, _ := s.counts()
@@ -336,15 +377,15 @@ func TestFinalizeTaskUseCaseWriteFailuresAndContractRules(t *testing.T) {
 		}
 	})
 	t.Run("04c retry failure", func(t *testing.T) {
-		s, _, w, _, uc := finalizeFixtures(t, domain.StateRunning, now)
+		s, _, w, _, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
 		w.writeErrs = []error{errors.New("first"), errors.New("retry")}
 		out, err := uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, now))
-		if err == nil || out.ResultState == "" || len(out.Events) != 2 || !errors.Is(out.ContractWriteError, domain.ErrContractWriteFailed) {
+		if disarms, _ := timeout.snapshot(); err == nil || disarms != 1 || out.ResultState == "" || len(out.Events) != 2 || !errors.Is(out.ContractWriteError, domain.ErrContractWriteFailed) {
 			t.Fatalf("out=%+v err=%v", out, err)
 		}
 	})
 	t.Run("04g same exit code continues", func(t *testing.T) {
-		s, r, w, _, uc := finalizeFixtures(t, domain.StateRunning, now)
+		s, r, w, _, _, uc := finalizeFixtures(t, domain.StateRunning, now)
 		r.exits = []struct {
 			code   int
 			exists bool
@@ -360,7 +401,7 @@ func TestFinalizeTaskUseCaseWriteFailuresAndContractRules(t *testing.T) {
 		}
 	})
 	t.Run("04g mismatch fails closed", func(t *testing.T) {
-		s, r, w, _, uc := finalizeFixtures(t, domain.StateRunning, now)
+		s, r, w, _, _, uc := finalizeFixtures(t, domain.StateRunning, now)
 		r.exits = []struct {
 			code   int
 			exists bool
@@ -374,7 +415,7 @@ func TestFinalizeTaskUseCaseWriteFailuresAndContractRules(t *testing.T) {
 		}
 	})
 	t.Run("04g validation does not retry", func(t *testing.T) {
-		s, _, w, slot, uc := finalizeFixtures(t, domain.StateRunning, now)
+		s, _, w, slot, _, uc := finalizeFixtures(t, domain.StateRunning, now)
 		out, err := uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, time.Time{}))
 		writes, events := w.snapshot()
 		saves, _ := s.counts()
@@ -388,17 +429,18 @@ func TestFinalizeTaskUseCaseWriteFailuresAndContractRules(t *testing.T) {
 func TestFinalizeTaskUseCaseAdditionalScenarios(t *testing.T) {
 	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
 	t.Run("SCN-exec-05-05 terminal is rejected", func(t *testing.T) {
-		s, _, w, slot, uc := finalizeFixtures(t, domain.StateCompleted, now)
+		s, _, w, slot, timeout, uc := finalizeFixtures(t, domain.StateCompleted, now)
 		_, err := uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, now))
 		writes, events := w.snapshot()
 		saves, _ := s.counts()
 		calls, _, _ := slot.snapshot()
-		if !errors.Is(err, domain.ErrInvalidStateTransition) || saves != 0 || len(writes) != 0 || len(events) != 0 || calls != 0 {
+		disarms, _ := timeout.snapshot()
+		if !errors.Is(err, domain.ErrInvalidStateTransition) || saves != 0 || len(writes) != 0 || len(events) != 0 || calls != 0 || disarms != 0 {
 			t.Fatalf("err=%v", err)
 		}
 	})
 	t.Run("SCN-exec-05-06 orphan finalization", func(t *testing.T) {
-		s, _, _, _, uc := finalizeFixtures(t, domain.StateOrphaned, now)
+		s, _, _, _, _, uc := finalizeFixtures(t, domain.StateOrphaned, now)
 		s.latest.AdoptedAfterRestart = true
 		out, err := uc.Execute(context.Background(), FinalizeTaskInput{TaskID: s.latest.TaskID, RawExitCode: 0, Estimated: true, AdoptedAfterRestart: true, OccurredAt: now})
 		exited := out.Events[0].(domain.TaskExited)
@@ -407,18 +449,19 @@ func TestFinalizeTaskUseCaseAdditionalScenarios(t *testing.T) {
 		}
 	})
 	t.Run("SCN-exec-05-09 not found", func(t *testing.T) {
-		s, _, w, slot, uc := finalizeFixtures(t, domain.StateRunning, now)
+		s, _, w, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
 		s.loads = []loadResult{{err: domain.ErrTaskNotFound}}
 		_, err := uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, now))
 		writes, events := w.snapshot()
 		saves, _ := s.counts()
 		calls, _, _ := slot.snapshot()
-		if !errors.Is(err, domain.ErrTaskNotFound) || saves != 0 || len(writes) != 0 || len(events) != 0 || calls != 0 {
+		disarms, _ := timeout.snapshot()
+		if !errors.Is(err, domain.ErrTaskNotFound) || saves != 0 || len(writes) != 0 || len(events) != 0 || calls != 0 || disarms != 0 {
 			t.Fatalf("err=%v", err)
 		}
 	})
 	t.Run("events append is fail soft", func(t *testing.T) {
-		s, _, w, slot, uc := finalizeFixtures(t, domain.StateRunning, now)
+		s, _, w, slot, _, uc := finalizeFixtures(t, domain.StateRunning, now)
 		w.appendErrs = []error{errors.New("append")}
 		out, err := uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, now))
 		_, events := w.snapshot()
@@ -431,7 +474,7 @@ func TestFinalizeTaskUseCaseAdditionalScenarios(t *testing.T) {
 
 func TestFinalizeTaskUseCaseConcurrentDuplicateExecute(t *testing.T) {
 	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
-	s, _, w, slot, uc := finalizeFixtures(t, domain.StateRunning, now)
+	s, _, w, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
 	id := s.latest.TaskID
 	input := finalizeInput(id, now)
 	start := make(chan struct{})
@@ -458,14 +501,42 @@ func TestFinalizeTaskUseCaseConcurrentDuplicateExecute(t *testing.T) {
 	writes, events := w.snapshot()
 	saves, saved := s.counts()
 	calls, _, _ := slot.snapshot()
-	if successful != 1 || rejected != 1 || saves != 1 || len(writes) != 1 || len(events) != 2 || calls != 1 || len(saved) != 1 || saved[0].State != domain.StateCompleted {
+	disarms, _ := timeout.snapshot()
+	if successful != 1 || rejected != 1 || saves != 1 || len(writes) != 1 || len(events) != 2 || calls != 1 || disarms != 1 || len(saved) != 1 || saved[0].State != domain.StateCompleted {
 		t.Fatalf("success=%d rejected=%d saves=%d writes=%d events=%d slots=%d", successful, rejected, saves, len(writes), len(events), calls)
+	}
+}
+
+func TestFinalizeTaskUseCaseUnlocksBeforeDisarm(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
+	s, _, _, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
+	result := make(chan error, 1)
+	go func() {
+		_, err := uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, now))
+		result <- err
+	}()
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("finalize did not unlock task mutex before disarm")
+	}
+	disarms, disarmedID := timeout.snapshot()
+	calls, _, _ := slot.snapshot()
+	if disarms != 1 || disarmedID != s.latest.TaskID || calls != 1 {
+		t.Fatalf("disarms=%d id=%v slots=%d", disarms, disarmedID, calls)
+	}
+	callsTrace := timeout.trace.snapshot()
+	if len(callsTrace) < 2 || callsTrace[len(callsTrace)-2] != "disarm" || callsTrace[len(callsTrace)-1] != "release-slot" {
+		t.Fatalf("post-processing order=%v", callsTrace)
 	}
 }
 
 func TestNewFinalizeTaskUseCaseContract(t *testing.T) {
 	now := time.Now()
-	s, r, w, slot, _ := finalizeFixtures(t, domain.StateRunning, now)
+	s, r, w, slot, timeout, _ := finalizeFixtures(t, domain.StateRunning, now)
 	clock := domain.ClockFunc(func() time.Time { return now })
 	mu := store.NewTaskMutex()
 	mustPanic := func(t *testing.T, f func()) {
@@ -481,18 +552,18 @@ func TestNewFinalizeTaskUseCaseContract(t *testing.T) {
 		name string
 		f    func()
 	}{
-		{"tasks", func() { NewFinalizeTaskUseCase(nil, w, r, clock, mu, slot) }}, {"writer", func() { NewFinalizeTaskUseCase(s, nil, r, clock, mu, slot) }}, {"reader", func() { NewFinalizeTaskUseCase(s, w, nil, clock, mu, slot) }}, {"clock", func() { NewFinalizeTaskUseCase(s, w, r, nil, mu, slot) }}, {"mutex", func() { NewFinalizeTaskUseCase(s, w, r, clock, nil, slot) }}, {"slot", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, nil) }}, {"many loggers", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, slog.Default(), slog.Default()) }},
+		{"tasks", func() { NewFinalizeTaskUseCase(nil, w, r, clock, mu, slot, timeout) }}, {"writer", func() { NewFinalizeTaskUseCase(s, nil, r, clock, mu, slot, timeout) }}, {"reader", func() { NewFinalizeTaskUseCase(s, w, nil, clock, mu, slot, timeout) }}, {"clock", func() { NewFinalizeTaskUseCase(s, w, r, nil, mu, slot, timeout) }}, {"mutex", func() { NewFinalizeTaskUseCase(s, w, r, clock, nil, slot, timeout) }}, {"slot", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, nil, timeout) }}, {"timeout", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, nil) }}, {"many loggers", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, slog.Default(), slog.Default()) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) { mustPanic(t, tc.f) })
 	}
-	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot); got.logger != slog.Default() {
+	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout); got.logger != slog.Default() || got.timeoutDisarmer != timeout {
 		t.Fatal("default logger not used")
 	}
-	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, nil); got.logger != slog.Default() {
+	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, nil); got.logger != slog.Default() {
 		t.Fatal("nil logger not default")
 	}
 	logger := slog.New(slog.NewTextHandler(testingWriter{t}, nil))
-	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, logger); got.logger != logger {
+	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, logger); got.logger != logger {
 		t.Fatal("provided logger not retained")
 	}
 }
@@ -531,7 +602,7 @@ func (h *logCapture) snapshot() []capturedLog {
 
 func TestFinalizeTaskUseCaseStructuredContractWriteLogs(t *testing.T) {
 	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
-	s, _, w, _, uc := finalizeFixtures(t, domain.StateRunning, now)
+	s, _, w, _, _, uc := finalizeFixtures(t, domain.StateRunning, now)
 	initial, retry := errors.New("initial"), errors.New("retry")
 	w.writeErrs = []error{initial, retry}
 	capture := &logCapture{}
