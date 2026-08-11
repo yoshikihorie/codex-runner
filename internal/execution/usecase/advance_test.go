@@ -34,14 +34,20 @@ func (q *advanceQueueFake) Prepend(payload execution.TaskLaunchPayload) {
 }
 func (q *advanceQueueFake) Reindex(time.Time) []domain.Event { q.reindexCalls++; return nil }
 func (q *advanceQueueFake) Len() int                         { return len(q.payloads) }
-func (q *advanceQueueFake) Remove(taskID domain.TaskID, _ time.Time) (bool, []domain.Event) {
+func (q *advanceQueueFake) Remove(taskID domain.TaskID, _ time.Time) (execution.TaskLaunchPayload, int, bool, []domain.Event) {
 	for index, payload := range q.payloads {
 		if payload.Task.ID() == taskID {
 			q.payloads = append(q.payloads[:index], q.payloads[index+1:]...)
-			return true, nil
+			return payload, index, true, nil
 		}
 	}
-	return false, nil
+	return execution.TaskLaunchPayload{}, -1, false, nil
+}
+func (q *advanceQueueFake) Restore(payload execution.TaskLaunchPayload, index int, _ time.Time) []domain.Event {
+	q.payloads = append(q.payloads, execution.TaskLaunchPayload{})
+	copy(q.payloads[index+1:], q.payloads[index:])
+	q.payloads[index] = payload
+	return nil
 }
 
 type advanceRegistryFake struct {

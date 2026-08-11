@@ -14,9 +14,7 @@ import (
 )
 
 // Canonical source: validation-rules.md TIMEOUT_KILL_GRACE_SECONDS.
-const timeoutKillGraceSeconds = 10
-
-var timeoutKillGrace = time.Duration(timeoutKillGraceSeconds) * time.Second
+const TimeoutKillGrace = 10 * time.Second
 
 type TimerFactory interface {
 	AfterFunc(d time.Duration, f func()) CancelFunc
@@ -176,7 +174,7 @@ func (e *TerminationEnsurer) Confirm(ctx context.Context, taskID domain.TaskID) 
 	if err != nil || dead {
 		return dead, err
 	}
-	e.wait(ctx, timeoutKillGrace)
+	e.wait(ctx, TimeoutKillGrace)
 	if err := ctx.Err(); err != nil {
 		return false, err
 	}
@@ -243,7 +241,7 @@ func (uc *EnforceTaskTimeoutUseCase) Execute(ctx context.Context, in EnforceTask
 	}
 
 	operationErr := contractErr
-	if terminateErr := uc.proc.Terminate(*snapshot.PID, timeoutKillGrace); terminateErr != nil {
+	if terminateErr := uc.proc.Terminate(*snapshot.PID, TimeoutKillGrace); terminateErr != nil {
 		slog.Default().Warn("terminate task process group", "task_id", in.TaskID.String(), "error", terminateErr)
 	}
 	dead, confirmErr := uc.termination.Confirm(ctx, in.TaskID)

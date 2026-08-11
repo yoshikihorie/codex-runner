@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -75,6 +76,64 @@ func TestTaskStoreReserveAndRelease(t *testing.T) {
 	}
 	if err := s.Release(id); !os.IsNotExist(err) {
 		t.Fatalf("second Release = %v", err)
+	}
+}
+
+func TestTaskStoreIsReserved_ReturnsTrueForReservedDirectory(t *testing.T) {
+	s, id := newReservedStore(t)
+	reserved, err := s.IsReserved(id)
+	if err != nil || !reserved {
+		t.Fatalf("reserved=%t err=%v", reserved, err)
+	}
+}
+
+func TestTaskStoreIsReserved_ReturnsFalseOnlyForMissingDirectory(t *testing.T) {
+	s, err := NewFileTaskStore(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	reserved, err := s.IsReserved(storeID(t, "missing-reservation"))
+	if err != nil || reserved {
+		t.Fatalf("reserved=%t err=%v", reserved, err)
+	}
+}
+
+func TestTaskStoreIsReserved_RejectsRegularFileAndSymlink(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		make func(*testing.T, string)
+	}{
+		{"regular file", func(t *testing.T, path string) {
+			if err := os.WriteFile(path, []byte("not a directory"), taskFilePerm); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"symlink", func(t *testing.T, path string) {
+			target := filepath.Join(filepath.Dir(path), "target")
+			if err := os.Mkdir(target, taskDirPerm); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, path); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, err := NewFileTaskStore(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := storeID(t, "reserved-"+strings.ReplaceAll(tc.name, " ", "-"))
+			p, err := newTaskPaths(s.root, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.make(t, p.dir())
+			reserved, err := s.IsReserved(id)
+			if err == nil || reserved {
+				t.Fatalf("reserved=%t err=%v", reserved, err)
+			}
+		})
 	}
 }
 func TestTaskStoreReleaseRejectsNonEmptyDirectory(t *testing.T) {

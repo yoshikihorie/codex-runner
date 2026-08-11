@@ -21,6 +21,42 @@ func NewInitialTaskSnapshot(route ExecutionRoute, reasoningEffort *string) TaskS
 	}
 }
 
+// NewTaskSnapshotFromAdmission creates the first persisted snapshot for an admitted task.
+func NewTaskSnapshotFromAdmission(task *Task, resolvedTimeout Timeout, model string, reasoningEffort *string, route ExecutionRoute, stateUpdatedAt time.Time) (TaskSnapshot, error) {
+	if task == nil {
+		return TaskSnapshot{}, fmt.Errorf("task is nil")
+	}
+	var requestedTimeoutCopy *int
+	if requested := task.requestedTimeout; requested != nil {
+		value := *requested
+		requestedTimeoutCopy = &value
+	}
+	var reasoningEffortCopy *string
+	if reasoningEffort != nil {
+		value := *reasoningEffort
+		reasoningEffortCopy = &value
+	}
+	snapshot := TaskSnapshot{
+		TaskID:                  task.ID(),
+		Subcommand:              task.Subcommand(),
+		ResolvedTimeoutSeconds:  resolvedTimeout.ResolvedSeconds(),
+		RequestedTimeoutSeconds: requestedTimeoutCopy,
+		Model:                   model,
+		ReasoningEffort:         reasoningEffortCopy,
+		RequestedAt:             task.requestedAt,
+		Route:                   route,
+		State:                   task.State(),
+		StateUpdatedAt:          stateUpdatedAt,
+		Recovered:               false,
+		AdoptedAfterRestart:     false,
+		SchemaVersion:           taskSnapshotSchemaVersion,
+	}
+	if err := snapshot.Validate(); err != nil {
+		return TaskSnapshot{}, err
+	}
+	return snapshot, nil
+}
+
 type TaskSnapshot struct {
 	TaskID                  TaskID          `json:"task_id"`
 	Subcommand              Subcommand      `json:"subcommand"`

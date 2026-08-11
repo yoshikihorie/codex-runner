@@ -24,6 +24,7 @@ type TaskStore interface {
 	ListByStates([]domain.TaskState) ([]domain.TaskSnapshot, error)
 	Reserve(domain.TaskID) error
 	Release(domain.TaskID) error
+	IsReserved(domain.TaskID) (bool, error)
 }
 
 var _ TaskStore = (*FileTaskStore)(nil)
@@ -96,6 +97,23 @@ func (s *FileTaskStore) Release(id domain.TaskID) error {
 	delete(s.index, id.String())
 	s.mu.Unlock()
 	return nil
+}
+func (s *FileTaskStore) IsReserved(id domain.TaskID) (bool, error) {
+	p, err := newTaskPaths(s.root, id)
+	if err != nil {
+		return false, err
+	}
+	dir, err := openTaskDir(p.dir())
+	if err != nil {
+		return false, err
+	}
+	if dir == nil {
+		return false, nil
+	}
+	if err := dir.Close(); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 func (s *FileTaskStore) Save(id domain.TaskID, v domain.TaskSnapshot) error {
 	if id.String() != v.TaskID.String() {

@@ -77,8 +77,9 @@ func (f *timeoutStoreFake) Save(_ domain.TaskID, s domain.TaskSnapshot) error {
 func (*timeoutStoreFake) ListByStates([]domain.TaskState) ([]domain.TaskSnapshot, error) {
 	return nil, nil
 }
-func (*timeoutStoreFake) Reserve(domain.TaskID) error { return nil }
-func (*timeoutStoreFake) Release(domain.TaskID) error { return nil }
+func (*timeoutStoreFake) Reserve(domain.TaskID) error            { return nil }
+func (*timeoutStoreFake) Release(domain.TaskID) error            { return nil }
+func (*timeoutStoreFake) IsReserved(domain.TaskID) (bool, error) { return true, nil }
 
 type timeoutWriterFake struct {
 	mu        sync.Mutex
@@ -425,8 +426,8 @@ func TestTerminationEnsurerConfirmAndSendOnce(t *testing.T) {
 			if dead != tc.wantDead || (err != nil) != tc.wantErr || waits != tc.waits {
 				t.Fatalf("dead=%v err=%v waits=%d", dead, err, waits)
 			}
-			if waits > 0 && waitedFor != timeoutKillGrace {
-				t.Fatalf("wait duration=%v want=%v", waitedFor, timeoutKillGrace)
+			if waits > 0 && waitedFor != TimeoutKillGrace {
+				t.Fatalf("wait duration=%v want=%v", waitedFor, TimeoutKillGrace)
 			}
 			if tc.name == "dead-second" {
 				sendEnsurer := NewTerminationEnsurer(timeoutLiveness(struct {
@@ -476,15 +477,15 @@ func TestTerminationEnsurerGracePeriodBoundary(t *testing.T) {
 			proc := &timeoutProcessFake{}
 			ensurer := NewTerminationEnsurer(timeoutLiveness(tc.results...), proc, domain.ClockFunc(time.Now), func(_ context.Context, d time.Duration) {
 				waits++
-				if d != timeoutKillGrace {
-					t.Fatalf("wait duration=%v want=%v", d, timeoutKillGrace)
+				if d != TimeoutKillGrace {
+					t.Fatalf("wait duration=%v want=%v", d, TimeoutKillGrace)
 				}
 			})
-			dead, err := ensurer.SendAndConfirm(context.Background(), timeoutID(t, "grace-boundary"), 321, timeoutKillGrace)
+			dead, err := ensurer.SendAndConfirm(context.Background(), timeoutID(t, "grace-boundary"), 321, TimeoutKillGrace)
 			if err != nil || dead != tc.wantDead || waits != tc.wantWaits {
 				t.Fatalf("dead=%v err=%v waits=%d", dead, err, waits)
 			}
-			if proc.calls != 1 || proc.pid != 321 || proc.grace != timeoutKillGrace {
+			if proc.calls != 1 || proc.pid != 321 || proc.grace != TimeoutKillGrace {
 				t.Fatalf("terminate calls=%d pid=%d grace=%v", proc.calls, proc.pid, proc.grace)
 			}
 		})

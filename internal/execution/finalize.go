@@ -157,18 +157,17 @@ func (uc *FinalizeTaskUseCase) executeLocked(_ context.Context, in FinalizeTaskI
 }
 
 func (uc *FinalizeTaskUseCase) writeTerminalState(taskID domain.TaskID, exitCode domain.ExitCode, task *domain.Task, snapshot domain.TaskSnapshot, events []domain.Event, occurredAt time.Time, attempt string) (*contractWriteFailure, error) {
-	existing, exists, err := uc.reader.ReadExitCode(taskID)
-	if err != nil {
-		return nil, fmt.Errorf("read exit-code: %w", err)
-	}
-	if exists && existing != exitCode.Raw() {
-		uc.logExitCodeMismatch(taskID, existing, exitCode.Raw())
-		return nil, domain.ErrContractWriteFailed
-	}
-	if !exists {
-		if err := uc.contractW.WriteExitCode(taskID, exitCode); err != nil {
-			return &contractWriteFailure{stage: "exit-code", attempt: attempt, cause: err}, nil
+	writeErr, fatalErr := writeExitCodeIdempotently(uc.reader, uc.contractW, taskID, exitCode)
+	if fatalErr != nil {
+		if existing, attempted, ok := exitCodeMismatch(fatalErr); ok {
+			uc.logExitCodeMismatch(taskID, existing, attempted)
+			return nil, fatalErr
 		}
+		uc.logger.Error("contract write failed: exit-code validation", "task_id", taskID.String(), "code", machineCodeContractWriteFailed, "stage", "exit-code", "error", fatalErr)
+		return nil, fatalErr
+	}
+	if writeErr != nil {
+		return &contractWriteFailure{stage: "exit-code", attempt: attempt, cause: writeErr}, nil
 	}
 
 	newSnapshot, err := snapshot.WithTask(task, occurredAt)

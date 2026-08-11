@@ -31,6 +31,89 @@ func TestNewInitialTaskSnapshot(t *testing.T) {
 	}
 }
 
+func admissionTask(t *testing.T, requested *int) *Task {
+	t.Helper()
+	id, err := NewTaskID("impl-20260806-120000-a1b2-admission")
+	if err != nil {
+		t.Fatal(err)
+	}
+	slug, err := NewSlug("admission")
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, _, err := NewTask(id, SubcommandImpl, slug, requested, snapshotTime(0), 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return task
+}
+
+func TestNewTaskSnapshotFromAdmission(t *testing.T) {
+	requested, reasoning := timeoutMinSeconds+10, "high"
+	task := admissionTask(t, &requested)
+	timeout, err := NewTimeout(&requested, timeoutMinSeconds+20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", &reasoning, ExecutionRouteDaemon, snapshotTime(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.PID != nil || snapshot.ProcessStartedAt != nil || snapshot.LastEventAt != nil || snapshot.SessionRef != nil || snapshot.ExitCode != nil || snapshot.RecoveryOrigin != nil || snapshot.Recovered || snapshot.AdoptedAfterRestart || snapshot.State != StateQueued || snapshot.Model != "gpt-5" || snapshot.Validate() != nil {
+		t.Fatalf("snapshot=%#v", snapshot)
+	}
+}
+
+func TestNewTaskSnapshotFromAdmission_RejectsInvalidInput(t *testing.T) {
+	requested := timeoutMinSeconds + 10
+	task := admissionTask(t, &requested)
+	timeout, err := NewTimeout(&requested, timeoutMinSeconds+20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name    string
+		task    *Task
+		timeout Timeout
+		model   string
+		route   ExecutionRoute
+		at      time.Time
+	}{
+		{"nil task", nil, timeout, "gpt-5", ExecutionRouteDaemon, snapshotTime(1)},
+		{"empty model", task, timeout, "", ExecutionRouteDaemon, snapshotTime(1)},
+		{"invalid route", task, timeout, "gpt-5", ExecutionRouteLegacy, snapshotTime(1)},
+		{"zero time", task, timeout, "gpt-5", ExecutionRouteDaemon, time.Time{}},
+		{"invalid timeout", task, Timeout{}, "gpt-5", ExecutionRouteDaemon, snapshotTime(1)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			before := *task
+			if _, err := NewTaskSnapshotFromAdmission(tc.task, tc.timeout, tc.model, nil, tc.route, tc.at); err == nil {
+				t.Fatal("invalid input accepted")
+			}
+			if tc.task != nil && !reflect.DeepEqual(*task, before) {
+				t.Fatal("task mutated on validation failure")
+			}
+		})
+	}
+}
+
+func TestNewTaskSnapshotFromAdmission_DefensivelyCopiesPointers(t *testing.T) {
+	requested, reasoning := timeoutMinSeconds+10, "high"
+	task := admissionTask(t, &requested)
+	timeout, err := NewTimeout(&requested, timeoutMinSeconds+20)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", &reasoning, ExecutionRouteDaemon, snapshotTime(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	requested, reasoning = timeoutMinSeconds+30, "low"
+	if *snapshot.RequestedTimeoutSeconds == requested || *snapshot.ReasoningEffort == reasoning {
+		t.Fatalf("snapshot aliases input: %#v", snapshot)
+	}
+}
+
 func validRunningSnapshot(t *testing.T) TaskSnapshot {
 	t.Helper()
 	id, err := NewTaskID("impl-20260806-120000-a1b2-example")

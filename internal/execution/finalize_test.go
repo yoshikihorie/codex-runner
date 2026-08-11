@@ -77,8 +77,9 @@ func (f *finalizeStoreFake) Save(_ domain.TaskID, s domain.TaskSnapshot) error {
 func (f *finalizeStoreFake) ListByStates([]domain.TaskState) ([]domain.TaskSnapshot, error) {
 	return nil, nil
 }
-func (f *finalizeStoreFake) Reserve(domain.TaskID) error { return nil }
-func (f *finalizeStoreFake) Release(domain.TaskID) error { return nil }
+func (f *finalizeStoreFake) Reserve(domain.TaskID) error            { return nil }
+func (f *finalizeStoreFake) Release(domain.TaskID) error            { return nil }
+func (f *finalizeStoreFake) IsReserved(domain.TaskID) (bool, error) { return true, nil }
 func (f *finalizeStoreFake) counts() (int, []domain.TaskSnapshot) {
 	f.mu.Lock()
 	defer f.mu.Unlock()

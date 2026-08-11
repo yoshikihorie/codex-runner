@@ -50,7 +50,8 @@ type TaskQueue interface {
 	Prepend(payload TaskLaunchPayload)
 	Reindex(occurredAt time.Time) []domain.Event
 	Len() int
-	Remove(taskID domain.TaskID, occurredAt time.Time) (removed bool, events []domain.Event)
+	Remove(taskID domain.TaskID, occurredAt time.Time) (payload TaskLaunchPayload, index int, removed bool, events []domain.Event)
+	Restore(payload TaskLaunchPayload, index int, occurredAt time.Time) []domain.Event
 }
 
 // ActiveTaskRegistry tracks task IDs which currently reserve an execution slot.
@@ -95,7 +96,7 @@ func (q *taskQueue) Reindex(occurredAt time.Time) []domain.Event {
 
 func (q *taskQueue) Len() int { return len(q.payloads) }
 
-func (q *taskQueue) Remove(taskID domain.TaskID, occurredAt time.Time) (bool, []domain.Event) {
+func (q *taskQueue) Remove(taskID domain.TaskID, occurredAt time.Time) (TaskLaunchPayload, int, bool, []domain.Event) {
 	q.validateAll()
 	for index, payload := range q.payloads {
 		if payload.Task.ID() != taskID {
@@ -104,9 +105,21 @@ func (q *taskQueue) Remove(taskID domain.TaskID, occurredAt time.Time) (bool, []
 		copy(q.payloads[index:], q.payloads[index+1:])
 		q.payloads[len(q.payloads)-1] = TaskLaunchPayload{}
 		q.payloads = q.payloads[:len(q.payloads)-1]
-		return true, q.reindex(occurredAt)
+		return payload, index, true, q.reindex(occurredAt)
 	}
-	return false, nil
+	return TaskLaunchPayload{}, -1, false, nil
+}
+
+func (q *taskQueue) Restore(payload TaskLaunchPayload, index int, occurredAt time.Time) []domain.Event {
+	q.validateAll()
+	validateQueuedPayload(payload)
+	if index < 0 || index > len(q.payloads) {
+		panic("task queue restore index out of range")
+	}
+	q.payloads = append(q.payloads, TaskLaunchPayload{})
+	copy(q.payloads[index+1:], q.payloads[index:])
+	q.payloads[index] = payload
+	return q.reindex(occurredAt)
 }
 
 func (q *taskQueue) validateAll() {
