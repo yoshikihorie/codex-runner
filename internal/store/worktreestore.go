@@ -2,11 +2,18 @@ package store
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/yoshikihorie/codex-runner/internal/proc"
 )
@@ -16,8 +23,177 @@ var findGitBinary = proc.FindGitBinary
 // WorktreeFileStore provides filesystem-backed worktree operations.
 type WorktreeFileStore struct{}
 
+const renameExclusive = 0x00000004   // Darwin RENAME_EXCL.
+const sysRenameatxNP = 488           // Darwin SYS_RENAMEATX_NP.
+const atFileSystemRoot = ^uintptr(1) // Darwin AT_FDCWD.
+
 // NewWorktreeFileStore constructs a filesystem-backed worktree store.
 func NewWorktreeFileStore() *WorktreeFileStore { return &WorktreeFileStore{} }
+
+// Create copies sourceDir into a temporary sibling and publishes it only when complete.
+func (s *WorktreeFileStore) Create(ctx context.Context, sourceDir string, destinationDir string) (err error) {
+	if sourceDir == "" || destinationDir == "" || !filepath.IsAbs(sourceDir) || !filepath.IsAbs(destinationDir) {
+		return fmt.Errorf("worktree source and destination must be absolute paths")
+	}
+	if info, statErr := os.Lstat(destinationDir); statErr == nil || info != nil {
+		return fmt.Errorf("%w: worktree destination already exists: %s", fs.ErrExist, destinationDir)
+	} else if !os.IsNotExist(statErr) {
+		return statErr
+	}
+	parent := filepath.Dir(destinationDir)
+	if err := rejectWorktreeDestinationWithinSource(sourceDir, parent); err != nil {
+		return err
+	}
+	temporary, err := os.MkdirTemp(parent, ".worktree-copy-")
+	if err != nil {
+		return fmt.Errorf("create worktree temporary directory: %w", err)
+	}
+	defer func() {
+		if err != nil {
+			_ = os.RemoveAll(temporary)
+		}
+	}()
+	directories, err := copyWorktreeTree(ctx, sourceDir, temporary)
+	if err != nil {
+		return err
+	}
+	for index := len(directories) - 1; index >= 0; index-- {
+		if err = ctx.Err(); err != nil {
+			return err
+		}
+		if err = os.Chmod(directories[index].path, directories[index].mode); err != nil {
+			return fmt.Errorf("restore worktree directory permissions: %w", err)
+		}
+	}
+	if err = ctx.Err(); err != nil {
+		return err
+	}
+	if err = renamexNPExclusive(temporary, destinationDir); err != nil {
+		return fmt.Errorf("publish worktree: %w", err)
+	}
+	return nil
+}
+
+type worktreeDirectoryMode struct {
+	path string
+	mode os.FileMode
+}
+
+type contextReader struct {
+	ctx context.Context
+	r   io.Reader
+}
+
+func (r contextReader) Read(p []byte) (int, error) {
+	if err := r.ctx.Err(); err != nil {
+		return 0, err
+	}
+	return r.r.Read(p)
+}
+
+func rejectWorktreeDestinationWithinSource(source, destinationParent string) error {
+	resolvedSource, err := filepath.EvalSymlinks(source)
+	if err != nil {
+		return fmt.Errorf("resolve worktree source: %w", err)
+	}
+	resolvedParent, err := filepath.EvalSymlinks(destinationParent)
+	if err != nil {
+		return fmt.Errorf("resolve worktree destination parent: %w", err)
+	}
+	rel, err := filepath.Rel(resolvedSource, resolvedParent)
+	if err != nil {
+		return fmt.Errorf("compare worktree paths: %w", err)
+	}
+	if rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))) {
+		return fmt.Errorf("worktree destination parent is inside source")
+	}
+	return nil
+}
+
+func copyWorktreeTree(ctx context.Context, source, destination string) ([]worktreeDirectoryMode, error) {
+	directories := make([]worktreeDirectoryMode, 0)
+	err := filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(source, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			info, err := entry.Info()
+			if err != nil {
+				return err
+			}
+			directories = append(directories, worktreeDirectoryMode{destination, info.Mode().Perm()})
+			return nil
+		}
+		target := filepath.Join(destination, rel)
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		mode := info.Mode()
+		switch {
+		case mode&os.ModeSymlink != 0:
+			link, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			return os.Symlink(link, target)
+		case mode.IsDir():
+			directories = append(directories, worktreeDirectoryMode{target, mode.Perm()})
+			return os.Mkdir(target, mode.Perm()|0o700)
+		case mode.IsRegular():
+			from, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			defer from.Close()
+			to, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm())
+			if err != nil {
+				return err
+			}
+			_, copyErr := io.Copy(to, contextReader{ctx: ctx, r: from})
+			closeErr := to.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			return os.Chmod(target, mode.Perm())
+		default:
+			return fmt.Errorf("unsupported worktree file type: %s", path)
+		}
+	})
+	return directories, err
+}
+
+func renamexNPExclusive(source, destination string) error {
+	from, err := syscall.BytePtrFromString(source)
+	if err != nil {
+		return err
+	}
+	to, err := syscall.BytePtrFromString(destination)
+	if err != nil {
+		return err
+	}
+	_, _, errno := syscall.Syscall6(sysRenameatxNP, atFileSystemRoot, uintptr(unsafe.Pointer(from)), atFileSystemRoot, uintptr(unsafe.Pointer(to)), uintptr(renameExclusive), 0)
+	if errno == 0 {
+		return nil
+	}
+	if errors.Is(errno, syscall.EEXIST) {
+		return fs.ErrExist
+	}
+	return errno
+}
 
 // ListTopLevel returns normalized absolute paths for root's direct children only.
 func (s *WorktreeFileStore) ListTopLevel(root string) ([]string, error) {

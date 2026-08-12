@@ -1,15 +1,306 @@
 package store
 
 import (
+	"bytes"
+	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/proc"
 )
+
+func TestWorktreeFileStoreCreateCopiesFilesDirectoriesAndLinks(t *testing.T) {
+	source := t.TempDir()
+	destination := filepath.Join(t.TempDir(), "published")
+	if err := os.Mkdir(filepath.Join(source, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(source, "empty"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(source, "nested"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, "nested", "run"), []byte("content"), 0o751); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, ".git", "config"), []byte("git"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("nested/run", filepath.Join(source, "relative-link")); err != nil {
+		t.Fatal(err)
+	}
+	if err := NewWorktreeFileStore().Create(context.Background(), source, destination); err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(filepath.Join(destination, "nested", "run"))
+	if err != nil || string(contents) != "content" {
+		t.Fatalf("copied contents=%q err=%v", contents, err)
+	}
+	if info, err := os.Stat(filepath.Join(destination, "nested", "run")); err != nil || info.Mode().Perm() != 0o751 {
+		t.Fatalf("copied mode=%v err=%v", info.Mode(), err)
+	}
+	if _, err := os.Stat(filepath.Join(destination, ".git", "config")); err != nil {
+		t.Fatalf("dot directory was not copied: %v", err)
+	}
+	if info, err := os.Stat(filepath.Join(destination, "empty")); err != nil || !info.IsDir() {
+		t.Fatalf("empty directory was not preserved: %v", err)
+	}
+	if link, err := os.Readlink(filepath.Join(destination, "relative-link")); err != nil || link != "nested/run" {
+		t.Fatalf("link=%q err=%v", link, err)
+	}
+}
+
+func TestContextReaderStopsBeforeTheNextReadAfterCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	reader := contextReader{ctx: ctx, r: bytes.NewReader([]byte("content"))}
+	buffer := make([]byte, 3)
+	if _, err := reader.Read(buffer); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if _, err := reader.Read(buffer); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Read() error=%v, want context.Canceled", err)
+	}
+}
+
+type observingWorktreeContext struct {
+	context.Context
+	cancel context.CancelFunc
+	onErr  func()
+}
+
+func (c *observingWorktreeContext) Err() error {
+	if c.Context.Err() == nil && c.onErr != nil {
+		c.onErr()
+	}
+	return c.Context.Err()
+}
+
+func temporaryWorktreeSibling(t *testing.T, parent string) string {
+	t.Helper()
+	entries, err := os.ReadDir(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.IsDir() && strings.HasPrefix(entry.Name(), ".worktree-copy-") {
+			return filepath.Join(parent, entry.Name())
+		}
+	}
+	return ""
+}
+
+func TestWorktreeFileStoreCreateCancelsDuringDirectoryPermissionRestore(t *testing.T) {
+	source := t.TempDir()
+	parent := t.TempDir()
+	destination := filepath.Join(parent, "published")
+	first := filepath.Join(source, "first")
+	second := filepath.Join(first, "second")
+	firstMode := os.FileMode(0o555)
+	if err := os.MkdirAll(second, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(first, firstMode); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(second, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(second, 0o700); err != nil {
+			t.Errorf("restore second directory permissions: %v", err)
+		}
+		if err := os.Chmod(first, 0o700); err != nil {
+			t.Errorf("restore first directory permissions: %v", err)
+		}
+	})
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var observed string
+	ctx := &observingWorktreeContext{Context: base, cancel: cancel, onErr: func() {
+		temporary := temporaryWorktreeSibling(t, parent)
+		if temporary == "" {
+			return
+		}
+		firstInfo, firstErr := os.Stat(filepath.Join(temporary, "first"))
+		secondInfo, secondErr := os.Stat(filepath.Join(temporary, "first", "second"))
+		if firstErr == nil && secondErr == nil && firstInfo.Mode().Perm() == firstMode.Perm()|0o700 && secondInfo.Mode().Perm() == 0o500 {
+			observed = temporary
+			cancel()
+		}
+	}}
+	if err := NewWorktreeFileStore().Create(ctx, source, destination); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Create() error=%v, want context.Canceled", err)
+	}
+	if observed == "" {
+		t.Fatal("did not observe cancellation between directory permission restores")
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("destination was published: %v", err)
+	}
+}
+
+func TestWorktreeFileStoreCreateCancelsImmediatelyBeforeRename(t *testing.T) {
+	source := t.TempDir()
+	parent := t.TempDir()
+	destination := filepath.Join(parent, "published")
+	directory := filepath.Join(source, "copied")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(directory, "file"), []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(directory, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := os.Chmod(directory, 0o700); err != nil {
+			t.Errorf("restore copied directory permissions: %v", err)
+		}
+	})
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var observed string
+	t.Cleanup(func() {
+		if observed == "" {
+			return
+		}
+		if err := filepath.Walk(observed, func(path string, info os.FileInfo, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if info.IsDir() {
+				return os.Chmod(path, 0o700)
+			}
+			return nil
+		}); err != nil && !os.IsNotExist(err) {
+			t.Errorf("restore temporary worktree permissions: %v", err)
+		}
+		if err := os.RemoveAll(observed); err != nil && !os.IsNotExist(err) {
+			t.Errorf("remove temporary worktree: %v", err)
+		}
+	})
+	ctx := &observingWorktreeContext{Context: base, cancel: cancel, onErr: func() {
+		temporary := temporaryWorktreeSibling(t, parent)
+		if temporary == "" {
+			return
+		}
+		info, statErr := os.Stat(filepath.Join(temporary, "copied"))
+		if statErr == nil && info.Mode().Perm() == 0o555 {
+			if _, fileErr := os.Stat(filepath.Join(temporary, "copied", "file")); fileErr == nil {
+				observed = temporary
+				cancel()
+			}
+		}
+	}}
+	if err := NewWorktreeFileStore().Create(ctx, source, destination); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Create() error=%v, want context.Canceled", err)
+	}
+	if observed == "" {
+		t.Fatal("did not observe the pre-rename worktree")
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("destination was published: %v", err)
+	}
+}
+
+func TestWorktreeFileStoreCreateCancelsDuringRegularFileCopy(t *testing.T) {
+	source := t.TempDir()
+	parent := t.TempDir()
+	destination := filepath.Join(parent, "published")
+	contents := bytes.Repeat([]byte("copy"), 128*1024)
+	if err := os.WriteFile(filepath.Join(source, "large-file"), contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	base, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var observedTemporary string
+	var errCalls int
+	ctx := &observingWorktreeContext{Context: base, cancel: cancel, onErr: func() {
+		errCalls++
+		temporary := temporaryWorktreeSibling(t, parent)
+		if temporary == "" || observedTemporary != "" {
+			return
+		}
+		info, err := os.Stat(filepath.Join(temporary, "large-file"))
+		if err == nil && info.Size() > 0 && info.Size() < int64(len(contents)) {
+			observedTemporary = temporary
+			cancel()
+		}
+	}}
+	if err := NewWorktreeFileStore().Create(ctx, source, destination); !errors.Is(err, context.Canceled) {
+		t.Fatalf("Create() error=%v, want context.Canceled", err)
+	}
+	if errCalls < 2 || observedTemporary == "" {
+		t.Fatalf("did not observe cancellation before the next regular-file read: Err calls=%d temporary=%q", errCalls, observedTemporary)
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("destination was published: %v", err)
+	}
+	if _, err := os.Stat(observedTemporary); !os.IsNotExist(err) {
+		t.Fatalf("temporary copy was not removed: %v", err)
+	}
+}
+
+func TestWorktreeFileStoreCreateRestoresRegularFilePermissionsAfterUmask(t *testing.T) {
+	source := t.TempDir()
+	destination := filepath.Join(t.TempDir(), "published")
+	file := filepath.Join(source, "executable")
+	if err := os.WriteFile(file, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(file, 0o751); err != nil {
+		t.Fatal(err)
+	}
+	originalUmask := syscall.Umask(0o077)
+	t.Cleanup(func() { syscall.Umask(originalUmask) })
+	if err := NewWorktreeFileStore().Create(context.Background(), source, destination); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(destination, "executable"))
+	if err != nil {
+		t.Fatalf("stat copied executable: %v", err)
+	}
+	if info.Mode().Perm() != 0o751 {
+		t.Fatalf("copied mode=%v err=%v", info.Mode(), err)
+	}
+}
+
+func TestWorktreeFileStoreCreateRejectsInvalidOrExistingDestination(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store := NewWorktreeFileStore()
+	for _, tc := range []struct{ source, destination string }{
+		{"", filepath.Join(t.TempDir(), "destination")},
+		{source, ""},
+		{"relative", filepath.Join(t.TempDir(), "destination")},
+		{source, "relative"},
+	} {
+		if err := store.Create(context.Background(), tc.source, tc.destination); err == nil {
+			t.Fatalf("Create(%q, %q) accepted invalid paths", tc.source, tc.destination)
+		}
+	}
+	destination := filepath.Join(t.TempDir(), "destination")
+	if err := os.Mkdir(destination, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Create(context.Background(), source, destination); err == nil {
+		t.Fatal("existing destination accepted")
+	}
+	if _, err := os.Stat(destination); err != nil {
+		t.Fatalf("existing destination was replaced: %v", err)
+	}
+}
 
 func TestWorktreeFileStoreFilesystemOperations(t *testing.T) {
 	t.Parallel()

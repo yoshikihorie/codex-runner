@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -22,6 +23,66 @@ const (
 	TriggerExplicit  = "explicit"
 	TriggerAutomatic = "automatic"
 )
+
+const worktreeRootPermission os.FileMode = 0o700
+
+// WorktreeCreator creates one atomic worktree copy.
+type WorktreeCreator interface {
+	Create(ctx context.Context, sourceDir string, destinationDir string) error
+}
+
+type CreateWorktreeInput struct {
+	TaskID           domain.TaskID
+	SourceWorkingDir string
+}
+
+type CreateWorktreeOutput struct{ WorkingDir string }
+
+type CreateWorktreeUseCase struct {
+	creator WorktreeCreator
+	root    string
+}
+
+func NewCreateWorktreeUseCase(creator WorktreeCreator, root string) (*CreateWorktreeUseCase, error) {
+	if creator == nil {
+		return nil, fmt.Errorf("worktree creator must not be nil")
+	}
+	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root {
+		return nil, fmt.Errorf("worktree root must be a normalized absolute path")
+	}
+	return &CreateWorktreeUseCase{creator: creator, root: root}, nil
+}
+
+func (uc *CreateWorktreeUseCase) Execute(ctx context.Context, in CreateWorktreeInput) (CreateWorktreeOutput, error) {
+	if err := ctx.Err(); err != nil {
+		return CreateWorktreeOutput{}, err
+	}
+	if in.TaskID.String() == "" || in.SourceWorkingDir == "" || !filepath.IsAbs(in.SourceWorkingDir) || filepath.Clean(in.SourceWorkingDir) != in.SourceWorkingDir {
+		return CreateWorktreeOutput{}, fmt.Errorf("worktree source and task ID are required")
+	}
+	if err := os.Mkdir(uc.root, worktreeRootPermission); err != nil && !errors.Is(err, fs.ErrExist) {
+		return CreateWorktreeOutput{}, fmt.Errorf("create worktree root: %w", err)
+	}
+	rootInfo, err := os.Lstat(uc.root)
+	if err != nil {
+		return CreateWorktreeOutput{}, err
+	}
+	if rootInfo.Mode()&os.ModeSymlink != 0 || !rootInfo.IsDir() {
+		return CreateWorktreeOutput{}, fmt.Errorf("worktree root must be a directory and not a symlink")
+	}
+	sourceInfo, err := os.Lstat(in.SourceWorkingDir)
+	if err != nil {
+		return CreateWorktreeOutput{}, err
+	}
+	if sourceInfo.Mode()&os.ModeSymlink != 0 || !sourceInfo.IsDir() {
+		return CreateWorktreeOutput{}, fmt.Errorf("worktree source must be a directory and not a symlink")
+	}
+	destination := filepath.Join(uc.root, in.TaskID.String())
+	if err := uc.creator.Create(ctx, in.SourceWorkingDir, destination); err != nil {
+		return CreateWorktreeOutput{}, err
+	}
+	return CreateWorktreeOutput{WorkingDir: destination}, nil
+}
 
 type WorktreeCandidate struct {
 	Path    string

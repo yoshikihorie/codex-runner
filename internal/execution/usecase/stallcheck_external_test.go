@@ -19,7 +19,8 @@ type externalWriter struct{ contract.ContractWriter }
 func TestNewCheckStallUseCaseIsUsableFromExternalPackage(t *testing.T) {
 	mutex := store.NewTaskMutex()
 	liveness := execution.NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), func(domain.TaskID) string { return "lock" })
-	uc := usecase.NewCheckStallUseCase(&externalStore{}, mutex, liveness, &externalWriter{}, domain.ClockFunc(func() time.Time { return time.Time{} }), slog.Default())
+	ownership := execution.NewLifecycleOwnershipRegistry()
+	uc := usecase.NewCheckStallUseCase(&externalStore{}, mutex, liveness, &externalWriter{}, domain.ClockFunc(func() time.Time { return time.Time{} }), ownership, slog.Default())
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	uc.Run(ctx)

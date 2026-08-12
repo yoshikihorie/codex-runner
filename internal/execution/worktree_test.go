@@ -5,12 +5,107 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 )
+
+type createWorktreeRecorder struct {
+	calls       int
+	source      string
+	destination string
+	err         error
+}
+
+func (r *createWorktreeRecorder) Create(_ context.Context, source, destination string) error {
+	r.calls++
+	r.source, r.destination = source, destination
+	return r.err
+}
+
+func TestCreateWorktreeUseCaseValidatesConstructorAndInputs(t *testing.T) {
+	root := t.TempDir()
+	creator := &createWorktreeRecorder{}
+	for _, tc := range []struct {
+		name string
+		root string
+	}{
+		{"nil creator", root},
+		{"empty root", ""},
+		{"relative root", "relative"},
+		{"unnormalized root", root + string(filepath.Separator) + "."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := WorktreeCreator(creator)
+			if tc.name == "nil creator" {
+				candidate = nil
+			}
+			if _, err := NewCreateWorktreeUseCase(candidate, tc.root); err == nil {
+				t.Fatal("constructor accepted invalid input")
+			}
+		})
+	}
+	uc, err := NewCreateWorktreeUseCase(creator, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := domain.NewTaskID("impl-20260812-120000-a1b2-worktree")
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	for _, in := range []CreateWorktreeInput{
+		{TaskID: id, SourceWorkingDir: root},
+		{SourceWorkingDir: root},
+		{TaskID: id},
+		{TaskID: id, SourceWorkingDir: "relative"},
+		{TaskID: id, SourceWorkingDir: root + string(filepath.Separator) + "."},
+	} {
+		ctx := context.Background()
+		if in.TaskID == id && in.SourceWorkingDir == root {
+			ctx = cancelled
+		}
+		if _, err := uc.Execute(ctx, in); err == nil {
+			t.Fatalf("Execute(%+v) accepted invalid input", in)
+		}
+	}
+	if creator.calls != 0 {
+		t.Fatal("invalid input called creator")
+	}
+}
+
+func TestCreateWorktreeUseCaseDerivesDestinationAndRejectsUnsafePaths(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "worktrees")
+	source := t.TempDir()
+	creator := &createWorktreeRecorder{}
+	uc, err := NewCreateWorktreeUseCase(creator, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := domain.NewTaskID("impl-20260812-120000-a1b2-derived")
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := uc.Execute(context.Background(), CreateWorktreeInput{TaskID: id, SourceWorkingDir: source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, id.String())
+	if out.WorkingDir != want || creator.calls != 1 || creator.source != source || creator.destination != want || !filepath.IsAbs(out.WorkingDir) || filepath.Clean(out.WorkingDir) != out.WorkingDir {
+		t.Fatalf("output=%+v recorder=%+v", out, creator)
+	}
+	link := filepath.Join(t.TempDir(), "source-link")
+	if err := os.Symlink(source, link); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := uc.Execute(context.Background(), CreateWorktreeInput{TaskID: id, SourceWorkingDir: link}); err == nil {
+		t.Fatal("symlink source accepted")
+	}
+}
 
 const testWorktreeTaskID = "impl-20260808-120000-abcd-cleanup"
 

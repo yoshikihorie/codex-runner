@@ -35,6 +35,12 @@ func writeExitCodeIdempotently(reader store.ContractReader, writer contract.Cont
 	return nil, nil
 }
 
+// WriteExitCodeIdempotently exposes the frozen-contract implementation to
+// terminal use cases outside the execution package.
+func WriteExitCodeIdempotently(reader store.ContractReader, writer contract.ContractWriter, taskID domain.TaskID, exitCode domain.ExitCode) (writeErr error, fatalErr error) {
+	return writeExitCodeIdempotently(reader, writer, taskID, exitCode)
+}
+
 func exitCodeMismatch(err error) (existing, attempted int, ok bool) {
 	var mismatch *exitCodeMismatchError
 	if !errors.As(err, &mismatch) {

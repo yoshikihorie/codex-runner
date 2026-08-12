@@ -34,21 +34,25 @@ func (realStallTickerFactory) NewTicker(d time.Duration) stallTicker {
 func (t realStallTicker) C() <-chan time.Time { return t.Ticker.C }
 
 type checkStallUseCase struct {
-	tasks    store.TaskStore
-	taskMu   taskLocker
-	liveness *execution.CheckLivenessUseCase
-	contract contract.ContractWriter
-	clock    domain.Clock
-	logger   *slog.Logger
-	interval time.Duration
-	tickers  stallTickerFactory
+	tasks     store.TaskStore
+	taskMu    taskLocker
+	liveness  *execution.CheckLivenessUseCase
+	contract  contract.ContractWriter
+	ownership execution.LifecycleOwnershipRegistry
+	clock     domain.Clock
+	logger    *slog.Logger
+	interval  time.Duration
+	tickers   stallTickerFactory
 }
 
-func NewCheckStallUseCase(tasks store.TaskStore, taskMu taskLocker, liveness *execution.CheckLivenessUseCase, contractWriter contract.ContractWriter, clock domain.Clock, loggers ...*slog.Logger) *checkStallUseCase {
-	return newCheckStallUseCase(tasks, taskMu, liveness, contractWriter, clock, time.Duration(stallScanIntervalSeconds)*time.Second, realStallTickerFactory{}, loggers...)
+func NewCheckStallUseCase(tasks store.TaskStore, taskMu taskLocker, liveness *execution.CheckLivenessUseCase, contractWriter contract.ContractWriter, clock domain.Clock, ownership execution.LifecycleOwnershipRegistry, loggers ...*slog.Logger) *checkStallUseCase {
+	return newCheckStallUseCaseWithOwnership(tasks, taskMu, liveness, contractWriter, clock, time.Duration(stallScanIntervalSeconds)*time.Second, realStallTickerFactory{}, ownership, loggers...)
 }
-func newCheckStallUseCase(tasks store.TaskStore, taskMu taskLocker, liveness *execution.CheckLivenessUseCase, contractWriter contract.ContractWriter, clock domain.Clock, interval time.Duration, tickers stallTickerFactory, loggers ...*slog.Logger) *checkStallUseCase {
-	if isNilValue(tasks) || isNilValue(taskMu) || isNilValue(liveness) || isNilValue(contractWriter) || isNilValue(clock) || isNilValue(tickers) {
+func newCheckStallUseCase(tasks store.TaskStore, taskMu taskLocker, liveness *execution.CheckLivenessUseCase, contractWriter contract.ContractWriter, clock domain.Clock, interval time.Duration, tickers stallTickerFactory, ownership execution.LifecycleOwnershipRegistry, loggers ...*slog.Logger) *checkStallUseCase {
+	return newCheckStallUseCaseWithOwnership(tasks, taskMu, liveness, contractWriter, clock, interval, tickers, ownership, loggers...)
+}
+func newCheckStallUseCaseWithOwnership(tasks store.TaskStore, taskMu taskLocker, liveness *execution.CheckLivenessUseCase, contractWriter contract.ContractWriter, clock domain.Clock, interval time.Duration, tickers stallTickerFactory, ownership execution.LifecycleOwnershipRegistry, loggers ...*slog.Logger) *checkStallUseCase {
+	if isNilValue(tasks) || isNilValue(taskMu) || isNilValue(liveness) || isNilValue(contractWriter) || isNilValue(clock) || isNilValue(tickers) || isNilValue(ownership) {
 		panic("check stall use case requires non-nil dependencies")
 	}
 	if len(loggers) > 1 {
@@ -61,7 +65,7 @@ func newCheckStallUseCase(tasks store.TaskStore, taskMu taskLocker, liveness *ex
 	if interval <= 0 {
 		panic("check stall use case requires positive interval")
 	}
-	return &checkStallUseCase{tasks: tasks, taskMu: taskMu, liveness: liveness, contract: contractWriter, clock: clock, logger: logger, interval: interval, tickers: tickers}
+	return &checkStallUseCase{tasks: tasks, taskMu: taskMu, liveness: liveness, contract: contractWriter, ownership: ownership, clock: clock, logger: logger, interval: interval, tickers: tickers}
 }
 
 func (uc *checkStallUseCase) Run(ctx context.Context) {
@@ -93,8 +97,10 @@ func (uc *checkStallUseCase) scan(ctx context.Context) {
 	}
 }
 func (uc *checkStallUseCase) checkOne(ctx context.Context, taskID domain.TaskID) {
+	ownedBeforeLock := uc.ownership.IsOwned(taskID)
 	uc.taskMu.Lock(taskID)
 	defer uc.taskMu.Unlock(taskID)
+	ownedAfterLock := uc.ownership.IsOwned(taskID)
 	snapshot, err := uc.tasks.Load(taskID)
 	if err != nil {
 		uc.logStateRead(taskID, "load", err)
@@ -109,15 +115,18 @@ func (uc *checkStallUseCase) checkOne(ctx context.Context, taskID domain.TaskID)
 		return
 	}
 	now := uc.clock.Now()
-	dead, err := uc.liveness.Execute(ctx, taskID)
-	if err != nil {
-		uc.logLiveness(taskID, err)
-		return
+	dead := false
+	if !ownedBeforeLock && !ownedAfterLock {
+		var err error
+		dead, err = uc.liveness.Execute(ctx, taskID)
+		if err != nil {
+			uc.logLiveness(taskID, err)
+		}
 	}
 	if ctx.Err() != nil {
 		return
 	}
-	if dead {
+	if dead && !ownedBeforeLock && !ownedAfterLock {
 		uc.orphan(taskID, snapshot, task, now)
 		return
 	}
