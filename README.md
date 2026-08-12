@@ -2,7 +2,7 @@
 
 OpenAI Codex CLI を長時間・非同期で安全に走らせる常駐プロセス `codexd` の設計リポジトリです。
 
-> **Status: 設計フェーズ（実装未着手）です。** 現在、動作する `codexd` や Go の実装はありません。
+> **Status: Stage 1（常駐プロセス基盤）実装中です。** `internal/` 配下に主要コンポーネント（TaskStore・ContractWriter・実行監視の一部等）は実装済みですが、`codexd` 常駐プロセス全体としてはまだ完成していません。
 
 このプロジェクトは有志による非公式のツールです。OpenAI とは関係がなく、OpenAI が提供・保証するものでもありません。Codex は OpenAI の製品名です。
 
@@ -17,8 +17,8 @@ The design addresses the loss of a `codex exec` job when its invoking shell term
 It records task state and preserves the existing task-output format for callers.
 The proposed implementation uses a separate session, file locks, and Codex JSON events, with an optional pseudo-terminal fallback that is disabled by default.
 It is designed for a single local user and a Unix domain socket; it is never a network service.
-This repository currently contains design documents only.
-Implementation has not started.
+This repository currently contains design documents and an in-progress Go implementation (Stage 1: daemon foundation).
+Core components exist under `internal/`, but the `codexd` daemon as a whole is not yet complete.
 Feedback on the design is especially welcome.
 
 ## 何を解決するのか
@@ -83,7 +83,7 @@ codex exec --json
 
 ## 動作環境
 
-設計の調査は macOS、Go、Codex CLI 0.144.5 を前提に確認しています。実装は未着手です。
+設計の調査は macOS、Go、Codex CLI 0.144.5 を前提に確認しています。現在は Stage 1（常駐プロセス基盤）の実装が進行中です。
 
 ## ライセンス
 

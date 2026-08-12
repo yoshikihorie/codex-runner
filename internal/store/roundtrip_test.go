@@ -31,7 +31,6 @@ func TestRoundTripLoadRestoreTransitionSave(t *testing.T) {
 	if err := store.Save(id, snapshot); err != nil {
 		t.Fatal(err)
 	}
-
 	loaded, err := store.Load(id)
 	if err != nil {
 		t.Fatal(err)
@@ -40,6 +39,7 @@ func TestRoundTripLoadRestoreTransitionSave(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	timeout, err := domain.NewTimeout(&requested, 1920)
 	if err != nil {
 		t.Fatal(err)
@@ -58,19 +58,45 @@ func TestRoundTripLoadRestoreTransitionSave(t *testing.T) {
 	if err := store.Save(id, snapshot); err != nil {
 		t.Fatal(err)
 	}
+	loaded, err = store.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err = loaded.Restore()
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	processStartedAt := startingAt.Add(time.Second)
 	if _, err := task.RecordProcessInfo(1234, processStartedAt, processStartedAt); err != nil {
 		t.Fatal(err)
 	}
+	snapshot, err = loaded.WithTask(task, processStartedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.State != domain.StateStarting || snapshot.PID == nil || *snapshot.PID != 1234 || snapshot.ProcessStartedAt == nil {
+		t.Fatalf("started snapshot = %#v", snapshot)
+	}
+	if err := store.Save(id, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = store.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	task, err = loaded.Restore()
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := task.ConfirmRunning(processStartedAt.Add(time.Second)); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := task.ObserveEvent(1, "message", processStartedAt.Add(2*time.Second)); err != nil {
+	if _, err := task.ObserveEvent("message", processStartedAt.Add(2*time.Second)); err != nil {
 		t.Fatal(err)
 	}
 	runningAt := processStartedAt.Add(3 * time.Second)
-	snapshot, err = snapshot.WithTask(task, runningAt)
+	snapshot, err = loaded.WithTask(task, runningAt)
 	if err != nil {
 		t.Fatal(err)
 	}

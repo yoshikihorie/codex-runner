@@ -129,7 +129,7 @@ func (t *Task) ConfirmRunning(occurredAt time.Time) error {
 	return ErrInvalidStateTransition
 }
 
-func (t *Task) ObserveEvent(sequence int, eventType string, observedAt time.Time) ([]Event, error) {
+func (t *Task) ObserveEvent(eventType string, observedAt time.Time) ([]Event, error) {
 	if err := t.transition(eventTaskEventObserved, StateRunning); err != nil {
 		return nil, err
 	}
@@ -141,10 +141,17 @@ func (t *Task) MarkStalled(gapSeconds int, occurredAt time.Time) ([]Event, error
 	if err := t.transition(eventTaskStalled, StateStalled); err != nil {
 		return nil, err
 	}
-	if t.lastEventAt.IsZero() {
-		t.lastEventAt = occurredAt.Add(-time.Duration(gapSeconds) * time.Second)
+	// t.lastEventAt is unobserved (zero value) until the first TaskEventObserved.
+	// Per 02-domain/state-files.md §1.2 and domain-events.md TaskStalled, an
+	// unobserved last_event_at stays null; it is never backfilled with a
+	// synthesized time (09-functional-design/behaviors/FD-exec-03.behavior.md
+	// SCN-exec-03-10).
+	var lastEventAt *time.Time
+	if !t.lastEventAt.IsZero() {
+		value := t.lastEventAt
+		lastEventAt = &value
 	}
-	return []Event{TaskStalled{TaskID: t.id, LastEventAt: t.lastEventAt, GapSeconds: gapSeconds, OccurredAt: occurredAt}}, nil
+	return []Event{TaskStalled{TaskID: t.id, LastEventAt: lastEventAt, GapSeconds: gapSeconds, OccurredAt: occurredAt}}, nil
 }
 
 func (t *Task) RecordExit(exitCode ExitCode, lastMessagePresent, estimated, adoptedAfterRestart bool, occurredAt time.Time) ([]Event, error) {

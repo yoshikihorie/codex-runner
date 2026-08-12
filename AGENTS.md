@@ -9,8 +9,10 @@ existing `README.md` / `CONTRIBUTING.md` convention.
 
 ## English summary
 
-- **Status: design phase. No implementation exists in this repository yet** (no `go.mod`, no `.go`
-  files). Do not assume any package, type, or function mentioned below already exists in code.
+- **Status: Stage 1 implementation in progress.** Core components (e.g. task store, contract
+  writer, execution monitoring) exist under `internal/`, but the `codexd` daemon as a whole is not
+  yet complete. Do not assume every package, type, or function mentioned below is already
+  implemented — check the actual source under `internal/` for current status.
 - The canonical source for values (enums, thresholds, error codes, message text) and for the API
   contract (socket protocol verbs, CLI subcommands, on-disk output format) lives outside this
   repository, in a local specifications directory that is **not part of the public repository**.
@@ -29,9 +31,11 @@ existing `README.md` / `CONTRIBUTING.md` convention.
 ## このリポジトリが何か
 
 `codexd`（OpenAI Codex CLI を長時間・非同期で安全に走らせる常駐プロセス）の**設計リポジトリ**である。
-`README.md` が明記するとおり、現時点は**設計フェーズであり実装は未着手**。このリポジトリには
-`go.mod` も `*.go` ファイルも存在しない。以下で触れる型名・パッケージ名・関数シグネチャは
-「これから実装するときの正典が定める名前」であり、既に動くコードとして存在するわけではない。
+`README.md` が明記するとおり、現時点は**Stage 1（常駐プロセス基盤）の実装が進行中**である。
+`go.mod` と `internal/` 配下に主要コンポーネント（TaskStore・ContractWriter・実行監視の一部等）は
+実装済みだが、`codexd` 常駐プロセス全体としてはまだ完成していない。以下で触れる型名・パッケージ名・
+関数シグネチャは正典が定める名前を基準としており、実装済みかどうかは `internal/` 配下の実ソースで
+都度確認すること。
 
 実装を始める前に、まず `README.md`（何を解決するか）と `docs/roadmap.md`（段階移行の計画）を読むこと。
 

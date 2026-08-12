@@ -1,0 +1,190 @@
+package usecase
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"time"
+
+	"github.com/yoshikihorie/codex-runner/internal/contract"
+	"github.com/yoshikihorie/codex-runner/internal/domain"
+	"github.com/yoshikihorie/codex-runner/internal/execution"
+	"github.com/yoshikihorie/codex-runner/internal/store"
+)
+
+const (
+	// STALL_THRESHOLD_SECONDS and STALL_SCAN_INTERVAL_SECONDS: validation-rules.md.
+	stallThresholdSeconds    = 1200
+	stallScanIntervalSeconds = 60
+)
+
+type stallTicker interface {
+	C() <-chan time.Time
+	Stop()
+}
+type stallTickerFactory interface {
+	NewTicker(time.Duration) stallTicker
+}
+type realStallTickerFactory struct{}
+type realStallTicker struct{ *time.Ticker }
+
+func (realStallTickerFactory) NewTicker(d time.Duration) stallTicker {
+	return realStallTicker{time.NewTicker(d)}
+}
+func (t realStallTicker) C() <-chan time.Time { return t.Ticker.C }
+
+type checkStallUseCase struct {
+	tasks    store.TaskStore
+	taskMu   taskLocker
+	liveness *execution.CheckLivenessUseCase
+	contract contract.ContractWriter
+	clock    domain.Clock
+	logger   *slog.Logger
+	interval time.Duration
+	tickers  stallTickerFactory
+}
+
+func NewCheckStallUseCase(tasks store.TaskStore, taskMu taskLocker, liveness *execution.CheckLivenessUseCase, contractWriter contract.ContractWriter, clock domain.Clock, loggers ...*slog.Logger) *checkStallUseCase {
+	return newCheckStallUseCase(tasks, taskMu, liveness, contractWriter, clock, time.Duration(stallScanIntervalSeconds)*time.Second, realStallTickerFactory{}, loggers...)
+}
+func newCheckStallUseCase(tasks store.TaskStore, taskMu taskLocker, liveness *execution.CheckLivenessUseCase, contractWriter contract.ContractWriter, clock domain.Clock, interval time.Duration, tickers stallTickerFactory, loggers ...*slog.Logger) *checkStallUseCase {
+	if isNilValue(tasks) || isNilValue(taskMu) || isNilValue(liveness) || isNilValue(contractWriter) || isNilValue(clock) || isNilValue(tickers) {
+		panic("check stall use case requires non-nil dependencies")
+	}
+	if len(loggers) > 1 {
+		panic("check stall use case accepts at most one logger")
+	}
+	logger := slog.Default()
+	if len(loggers) == 1 && loggers[0] != nil {
+		logger = loggers[0]
+	}
+	if interval <= 0 {
+		panic("check stall use case requires positive interval")
+	}
+	return &checkStallUseCase{tasks: tasks, taskMu: taskMu, liveness: liveness, contract: contractWriter, clock: clock, logger: logger, interval: interval, tickers: tickers}
+}
+
+func (uc *checkStallUseCase) Run(ctx context.Context) {
+	ticker := uc.tickers.NewTicker(uc.interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C():
+			if ctx.Err() != nil {
+				return
+			}
+			uc.scan(ctx)
+		}
+	}
+}
+func (uc *checkStallUseCase) scan(ctx context.Context) {
+	snapshots, err := uc.tasks.ListByStates([]domain.TaskState{domain.StateRunning, domain.StateStalled})
+	if err != nil {
+		uc.logStateRead(domain.TaskID{}, "list-by-states", err)
+		return
+	}
+	for _, snapshot := range snapshots {
+		if ctx.Err() != nil {
+			return
+		}
+		uc.checkOne(ctx, snapshot.TaskID)
+	}
+}
+func (uc *checkStallUseCase) checkOne(ctx context.Context, taskID domain.TaskID) {
+	uc.taskMu.Lock(taskID)
+	defer uc.taskMu.Unlock(taskID)
+	snapshot, err := uc.tasks.Load(taskID)
+	if err != nil {
+		uc.logStateRead(taskID, "load", err)
+		return
+	}
+	task, err := snapshot.Restore()
+	if err != nil {
+		uc.logStateRead(taskID, "restore", err)
+		return
+	}
+	if task.State() != domain.StateRunning && task.State() != domain.StateStalled {
+		return
+	}
+	now := uc.clock.Now()
+	dead, err := uc.liveness.Execute(ctx, taskID)
+	if err != nil {
+		uc.logLiveness(taskID, err)
+		return
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	if dead {
+		uc.orphan(taskID, snapshot, task, now)
+		return
+	}
+	start := snapshot.LastEventAt
+	if start == nil {
+		start = snapshot.ProcessStartedAt
+	}
+	if start == nil {
+		return
+	}
+	elapsed := now.Sub(*start)
+	threshold := time.Duration(stallThresholdSeconds) * time.Second
+	if elapsed <= threshold {
+		return
+	}
+	gap := int(elapsed / time.Second)
+	if elapsed%time.Second != 0 {
+		gap++
+	}
+	uc.stall(taskID, snapshot, task, gap, now)
+}
+func (uc *checkStallUseCase) orphan(taskID domain.TaskID, snapshot domain.TaskSnapshot, task *domain.Task, now time.Time) {
+	events, err := task.DetectOrphan("running", now)
+	if err != nil {
+		if errors.Is(err, domain.ErrInvalidStateTransition) {
+			logInvalidTransition(uc.logger, taskID, "detect-orphan", task.State(), err)
+		}
+		return
+	}
+	uc.persist(taskID, snapshot, task, events, now, "detect-orphan")
+}
+func (uc *checkStallUseCase) stall(taskID domain.TaskID, snapshot domain.TaskSnapshot, task *domain.Task, gap int, now time.Time) {
+	events, err := task.MarkStalled(gap, now)
+	if err != nil {
+		if errors.Is(err, domain.ErrInvalidStateTransition) {
+			logInvalidTransition(uc.logger, taskID, "mark-stalled", task.State(), err)
+		}
+		return
+	}
+	uc.persist(taskID, snapshot, task, events, now, "mark-stalled")
+}
+func (uc *checkStallUseCase) persist(taskID domain.TaskID, snapshot domain.TaskSnapshot, task *domain.Task, events []domain.Event, now time.Time, transition string) {
+	updated, err := snapshot.WithTask(task, now)
+	if err != nil {
+		uc.logger.Warn("snapshot validation failed after task update", "task_id", taskID.String(), "operation", "with-task", "error", err.Error())
+		return
+	}
+	if err := uc.tasks.Save(taskID, updated); err != nil {
+		uc.logger.Warn("contract write failed", "code", contractWriteFailedCode, "task_id", taskID.String(), "operation", "save-task", "transition", transition, "error", err)
+		return
+	}
+	for _, event := range events {
+		if err := uc.contract.AppendEvent(taskID, event); err != nil {
+			uc.logger.Warn("contract write failed", "code", contractWriteFailedCode, "task_id", taskID.String(), "operation", "append-event", "event_type", event.Type(), "error", err)
+		}
+	}
+}
+func (uc *checkStallUseCase) logStateRead(taskID domain.TaskID, operation string, err error) {
+	uc.logger.Warn("task state read failed", "code", taskStateReadFailedCode, "task_id", taskID.String(), "operation", operation, "error", err)
+}
+func (uc *checkStallUseCase) logLiveness(taskID domain.TaskID, err error) {
+	// error-codes.md: only task.lock open/flock failures are I/O classification.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	if !errors.Is(err, domain.ErrTaskNotFound) {
+		uc.logger.Warn("liveness lock I/O error", "code", "LIVENESS_LOCK_IO_ERROR", "task_id", taskID.String(), "error", err)
+	}
+	uc.logger.Warn("stall liveness check returned an error", "task_id", taskID.String(), "error", err)
+}

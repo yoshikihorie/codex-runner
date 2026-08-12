@@ -40,10 +40,10 @@ func (TaskEventObserved) Type() string { return "TaskEventObserved" }
 func (TaskEventObserved) event()       {}
 
 type TaskStalled struct {
-	TaskID      TaskID    `json:"task_id"`
-	LastEventAt time.Time `json:"last_event_at"`
-	GapSeconds  int       `json:"gap_seconds"`
-	OccurredAt  time.Time `json:"occurred_at"`
+	TaskID      TaskID     `json:"task_id"`
+	LastEventAt *time.Time `json:"last_event_at"`
+	GapSeconds  int        `json:"gap_seconds"`
+	OccurredAt  time.Time  `json:"occurred_at"`
 }
 
 func (TaskStalled) Type() string { return "TaskStalled" }
