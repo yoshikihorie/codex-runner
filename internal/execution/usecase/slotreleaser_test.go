@@ -25,7 +25,8 @@ func (f *lifecycleRunnerFake) Run(ctx context.Context, input TaskLifecycleInput)
 
 func TestSlotFinalizerStartsLifecycleWithBaseContextChild(t *testing.T) {
 	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
-	admit := NewAdmitTaskUseCase(queue, registry, mutex, 1, 1)
+	launching := execution.NewLaunchingTaskRegistry()
+	admit := NewAdmitTaskUseCase(queue, registry, launching, mutex, 1, 1)
 	active := testAdmissionInput(t, domain.SubcommandImpl, "active-slot")
 	if _, err := admit.Execute(context.Background(), active); err != nil {
 		t.Fatal(err)
@@ -39,7 +40,7 @@ func TestSlotFinalizerStartsLifecycleWithBaseContextChild(t *testing.T) {
 	runner := &lifecycleRunnerFake{called: make(chan struct{})}
 	now := time.Now()
 	starter := newLifecycleStarterForTest(t, runner, baseCtx, domain.ClockFunc(func() time.Time { return now }))
-	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(queue, registry, mutex, 1), starter)
+	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(queue, registry, launching, mutex, 1), starter)
 	releaser.ReleaseAndAdvance(context.Background(), active.TaskID, now)
 	select {
 	case <-runner.called:
@@ -58,7 +59,7 @@ func TestSlotFinalizerStartsLifecycleWithBaseContextChild(t *testing.T) {
 
 func TestSlotFinalizerDoesNotStartLifecycleWhenQueueIsEmpty(t *testing.T) {
 	runner := &lifecycleRunnerFake{called: make(chan struct{})}
-	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}, 1), newLifecycleStarterForTest(t, runner, context.Background(), domain.ClockFunc(time.Now)))
+	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1), newLifecycleStarterForTest(t, runner, context.Background(), domain.ClockFunc(time.Now)))
 	releaser.ReleaseAndAdvance(context.Background(), domain.TaskID{}, time.Now())
 	select {
 	case <-runner.called:
@@ -72,7 +73,7 @@ func TestSlotFinalizerLogsAdvanceErrorAndDoesNotStartLifecycle(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	runner := &lifecycleRunnerFake{called: make(chan struct{})}
-	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(invalidQueue, &advanceRegistryFake{ids: map[domain.TaskID]struct{}{}}, &sync.Mutex{}, 1), newLifecycleStarterForTest(t, runner, context.Background(), domain.ClockFunc(time.Now)), logger)
+	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(invalidQueue, &advanceRegistryFake{ids: map[domain.TaskID]struct{}{}}, execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1), newLifecycleStarterForTest(t, runner, context.Background(), domain.ClockFunc(time.Now)), logger)
 	taskID := testAdmissionInput(t, domain.SubcommandImpl, "finalizer-release").TaskID
 	releaser.ReleaseAndAdvance(context.Background(), taskID, time.Now())
 	if !bytes.Contains(logs.Bytes(), []byte("WARN")) || !bytes.Contains(logs.Bytes(), []byte(taskID.String())) || !bytes.Contains(logs.Bytes(), []byte(domain.ErrInvalidStateTransition.Error())) {
@@ -90,7 +91,8 @@ func TestSlotFinalizerRunnerReceivesOnlyBaseContextValues(t *testing.T) {
 	baseCtx := context.WithValue(context.Background(), key("base"), "base-value")
 	callCtx := context.WithValue(context.Background(), key("call"), "call-value")
 	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
-	admit := NewAdmitTaskUseCase(queue, registry, mutex, 1, 1)
+	launching := execution.NewLaunchingTaskRegistry()
+	admit := NewAdmitTaskUseCase(queue, registry, launching, mutex, 1, 1)
 	active := testAdmissionInput(t, domain.SubcommandImpl, "context-active")
 	if _, err := admit.Execute(context.Background(), active); err != nil {
 		t.Fatal(err)
@@ -99,7 +101,7 @@ func TestSlotFinalizerRunnerReceivesOnlyBaseContextValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := &lifecycleRunnerFake{called: make(chan struct{})}
-	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(queue, registry, mutex, 1), newLifecycleStarterForTest(t, runner, baseCtx, domain.ClockFunc(time.Now)))
+	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(queue, registry, launching, mutex, 1), newLifecycleStarterForTest(t, runner, baseCtx, domain.ClockFunc(time.Now)))
 	releaser.ReleaseAndAdvance(callCtx, active.TaskID, time.Now())
 	select {
 	case <-runner.called:

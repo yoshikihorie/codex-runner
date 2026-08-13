@@ -65,6 +65,7 @@ func NewTask(id TaskID, subcommand Subcommand, slug Slug, requestedTimeout *int,
 func (t *Task) ID() TaskID             { return t.id }
 func (t *Task) Subcommand() Subcommand { return t.subcommand }
 func (t *Task) State() TaskState       { return t.state }
+func (t *Task) RequestedAt() time.Time { return t.requestedAt }
 
 // transition is the only state-writing operation.  The event names are the
 // canonical domain event type names from the state-transition table.

@@ -13,13 +13,17 @@ import (
 type AdmitTaskUseCase struct {
 	queue              execution.TaskQueue
 	registry           execution.ActiveTaskRegistry
+	launching          execution.LaunchingTaskRegistry
 	queueMu            *sync.Mutex
 	maxConcurrentTasks int
 	queueMaxDepth      int
 }
 
-func NewAdmitTaskUseCase(queue execution.TaskQueue, registry execution.ActiveTaskRegistry, queueMu *sync.Mutex, maxConcurrentTasks int, queueMaxDepth int) *AdmitTaskUseCase {
-	return &AdmitTaskUseCase{queue: queue, registry: registry, queueMu: queueMu, maxConcurrentTasks: maxConcurrentTasks, queueMaxDepth: queueMaxDepth}
+func NewAdmitTaskUseCase(queue execution.TaskQueue, registry execution.ActiveTaskRegistry, launching execution.LaunchingTaskRegistry, queueMu *sync.Mutex, maxConcurrentTasks int, queueMaxDepth int) *AdmitTaskUseCase {
+	if queue == nil || registry == nil || launching == nil || queueMu == nil {
+		panic("admit task use case requires non-nil dependencies")
+	}
+	return &AdmitTaskUseCase{queue: queue, registry: registry, launching: launching, queueMu: queueMu, maxConcurrentTasks: maxConcurrentTasks, queueMaxDepth: queueMaxDepth}
 }
 
 func (u *AdmitTaskUseCase) Execute(_ context.Context, input execution.TaskAdmissionInput) (execution.TaskAdmissionResult, error) {
@@ -47,7 +51,12 @@ func (u *AdmitTaskUseCase) Execute(_ context.Context, input execution.TaskAdmiss
 		payload.WorkingDir = &workingDir
 	}
 	if activeCount < u.maxConcurrentTasks {
+		snapshot, snapshotErr := domain.NewTaskSnapshotFromAdmission(task, input.ResolvedTimeout, input.Model, input.ReasoningEffort, domain.ExecutionRouteDaemon, task.RequestedAt())
+		if snapshotErr != nil {
+			return execution.TaskAdmissionResult{}, snapshotErr
+		}
 		u.registry.Add(task.ID())
+		u.launching.Register(task.ID(), snapshot)
 		return execution.TaskAdmissionResult{State: domain.StateQueued, Events: events, LaunchPayload: &payload}, nil
 	}
 	position := u.queue.Enqueue(payload)

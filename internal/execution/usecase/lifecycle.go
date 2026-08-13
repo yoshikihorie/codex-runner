@@ -74,6 +74,7 @@ type TaskLifecycleDependencies struct {
 	Terminator    processTerminator
 	Pending       recovery.PendingRegistrar
 	Ownership     execution.LifecycleOwnershipRegistry
+	Launching     execution.LaunchingTaskRegistry
 	OpenStdout    stdoutFileOpener
 	Clock         domain.Clock
 }
@@ -95,7 +96,7 @@ func NewTaskLifecycleOrchestrator(deps TaskLifecycleDependencies, config TaskLif
 	if config.CodexBinaryPath == "" || !filepath.IsAbs(config.CodexBinaryPath) {
 		return nil, fmt.Errorf("task lifecycle codex binary path must be absolute")
 	}
-	if deps.AcquireForChild == nil || isNilValue(deps.RecordStarting) || isNilValue(deps.Launch) || isNilValue(deps.RecordProcess) || isNilValue(deps.FailLaunch) || isNilValue(deps.ConfirmRunning) || isNilValue(deps.CheckLiveness) || isNilValue(deps.TimeoutArmer) || isNilValue(deps.Monitor) || isNilValue(deps.Finalize) || isNilValue(deps.ConfirmKilled) || isNilValue(deps.Tasks) || isNilValue(deps.TaskMu) || isNilValue(deps.Termination) || isNilValue(deps.Terminator) || isNilValue(deps.Pending) || isNilValue(deps.Ownership) || isNilValue(deps.OpenStdout) || isNilValue(deps.Clock) {
+	if deps.AcquireForChild == nil || isNilValue(deps.RecordStarting) || isNilValue(deps.Launch) || isNilValue(deps.RecordProcess) || isNilValue(deps.FailLaunch) || isNilValue(deps.ConfirmRunning) || isNilValue(deps.CheckLiveness) || isNilValue(deps.TimeoutArmer) || isNilValue(deps.Monitor) || isNilValue(deps.Finalize) || isNilValue(deps.ConfirmKilled) || isNilValue(deps.Tasks) || isNilValue(deps.TaskMu) || isNilValue(deps.Termination) || isNilValue(deps.Terminator) || isNilValue(deps.Pending) || isNilValue(deps.Ownership) || isNilValue(deps.Launching) || isNilValue(deps.OpenStdout) || isNilValue(deps.Clock) {
 		return nil, fmt.Errorf("task lifecycle orchestrator requires non-nil dependencies")
 	}
 	logger := slog.Default()
@@ -117,6 +118,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		return
 	}
 	defer release()
+	defer o.deps.Launching.Unregister(taskID)
 
 	lock, err := o.deps.AcquireForChild(input.TaskDirPath)
 	if err != nil {

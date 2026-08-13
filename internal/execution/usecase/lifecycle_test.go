@@ -359,6 +359,23 @@ type lifecycleRecordingOwnership struct {
 	trace        *[]string
 }
 
+type lifecycleRecordingLaunching struct {
+	registerCalls   int
+	unregisterCalls int
+	trace           *[]string
+}
+
+func (f *lifecycleRecordingLaunching) Register(domain.TaskID, domain.TaskSnapshot) {
+	f.registerCalls++
+}
+func (f *lifecycleRecordingLaunching) Unregister(domain.TaskID) {
+	f.unregisterCalls++
+	appendLifecycleTrace(f.trace, "launching-unregister")
+}
+func (f *lifecycleRecordingLaunching) Lookup(domain.TaskID) (domain.TaskSnapshot, bool) {
+	return domain.TaskSnapshot{}, false
+}
+
 func (f *lifecycleRecordingOwnership) Acquire(domain.TaskID) (func(), bool) {
 	f.acquireCalls++
 	appendLifecycleTrace(f.trace, "ownership-acquire")
@@ -623,6 +640,7 @@ type lifecycleFixture struct {
 	termination  *lifecycleRecordingTerminationEnsurer
 	pending      *lifecycleRecordingPendingRegistrar
 	ownership    *lifecycleRecordingOwnership
+	launching    *lifecycleRecordingLaunching
 	clock        *lifecycleRecordingClock
 	orchestrator *TaskLifecycleOrchestrator
 }
@@ -670,8 +688,9 @@ func newLifecycleFixture(t *testing.T) *lifecycleFixture {
 	f.termination = &lifecycleRecordingTerminationEnsurer{}
 	f.pending = &lifecycleRecordingPendingRegistrar{trace: &f.trace}
 	f.ownership = &lifecycleRecordingOwnership{acquired: true, trace: &f.trace}
+	f.launching = &lifecycleRecordingLaunching{trace: &f.trace}
 	f.clock = &lifecycleRecordingClock{now: testLifecycleTime.Add(2 * time.Hour), trace: &f.trace}
-	deps := TaskLifecycleDependencies{AcquireForChild: f.acquire.Acquire, RecordStarting: f.starting, CreateWorktree: f.worktree, Launch: f.launch, RecordProcess: f.process, FailLaunch: fail, ConfirmRunning: confirm, CheckLiveness: execution.NewCheckLivenessUseCase(f.recordLock, func(domain.TaskID) string { return "/private/tmp/task.lock" }), TimeoutArmer: f.timeout, Monitor: f.monitor, Finalize: f.finalizer, ConfirmKilled: f.killed, Tasks: f.tasks, TaskMu: f.taskMu, Terminator: f.terminator, Termination: f.termination, Pending: f.pending, Ownership: f.ownership, OpenStdout: f.opener, Clock: f.clock}
+	deps := TaskLifecycleDependencies{AcquireForChild: f.acquire.Acquire, RecordStarting: f.starting, CreateWorktree: f.worktree, Launch: f.launch, RecordProcess: f.process, FailLaunch: fail, ConfirmRunning: confirm, CheckLiveness: execution.NewCheckLivenessUseCase(f.recordLock, func(domain.TaskID) string { return "/private/tmp/task.lock" }), TimeoutArmer: f.timeout, Monitor: f.monitor, Finalize: f.finalizer, ConfirmKilled: f.killed, Tasks: f.tasks, TaskMu: f.taskMu, Terminator: f.terminator, Termination: f.termination, Pending: f.pending, Ownership: f.ownership, Launching: f.launching, OpenStdout: f.opener, Clock: f.clock}
 	f.orchestrator, err = NewTaskLifecycleOrchestrator(deps, TaskLifecycleLaunchConfig{CodexBinaryPath: "/private/tmp/codex", PTYEnabled: true})
 	if err != nil {
 		t.Fatal(err)
@@ -692,6 +711,15 @@ func TestTaskLifecycleOrchestratorRejectsMissingOrRelativeBinaryPathBeforeDepend
 		}
 	}
 }
+
+func TestTaskLifecycleOrchestratorRejectsNilLaunchingRegistry(t *testing.T) {
+	f := newLifecycleFixture(t)
+	deps := f.orchestrator.deps
+	deps.Launching = nil
+	if _, err := NewTaskLifecycleOrchestrator(deps, f.orchestrator.launchConfig); err == nil {
+		t.Fatal("nil launching registry was accepted")
+	}
+}
 func TestTaskLifecycleInputCarriesTaskScopedFields(t *testing.T) {
 	input := TaskLifecycleInput{TaskDirPath: "/private/tmp/task", Now: testLifecycleTime}
 	if input.TaskDirPath != "/private/tmp/task" || input.Now != testLifecycleTime {
@@ -702,11 +730,11 @@ func TestTaskLifecycleInputCarriesTaskScopedFields(t *testing.T) {
 func TestTaskLifecycleRunImplSuccessOrdersLaunchAndFinalization(t *testing.T) {
 	f := newLifecycleFixture(t)
 	f.run()
-	want := []string{"acquire-for-child", "record-starting", "create-worktree", "task-lock", "load-final", "task-unlock", "launch", "task-lock", "load-final", "record-process", "task-unlock", "confirm-running", "timeout-arm", "open-stdout", "monitor", "wait", "load-final", "clock-now", "finalize"}
+	want := []string{"acquire-for-child", "record-starting", "create-worktree", "task-lock", "load-final", "task-unlock", "launch", "task-lock", "load-final", "record-process", "task-unlock", "confirm-running", "timeout-arm", "open-stdout", "monitor", "wait", "load-final", "clock-now", "finalize", "launching-unregister"}
 	if !reflect.DeepEqual(f.trace[1:len(f.trace)-1], want) {
 		t.Fatalf("trace=%v", f.trace)
 	}
-	if f.ownership.acquireCalls != 1 || f.ownership.releaseCalls != 1 || f.acquire.calls != 1 || f.starting.calls != 1 || f.worktree.calls != 1 || f.launch.calls != 1 || f.process.calls != 1 || f.confirmLock.calls != 1 || f.timeout.calls != 1 || f.monitor.calls != 1 || f.waiter.calls != 1 || len(f.finalizer.calls) != 1 || len(f.killed.calls) != 0 || f.pending.calls != 0 || f.terminator.calls != 0 || f.termination.confirmCalls != 0 || f.termination.sendCalls != 0 {
+	if f.ownership.acquireCalls != 1 || f.ownership.releaseCalls != 1 || f.launching.unregisterCalls != 1 || f.acquire.calls != 1 || f.starting.calls != 1 || f.worktree.calls != 1 || f.launch.calls != 1 || f.process.calls != 1 || f.confirmLock.calls != 1 || f.timeout.calls != 1 || f.monitor.calls != 1 || f.waiter.calls != 1 || len(f.finalizer.calls) != 1 || len(f.killed.calls) != 0 || f.pending.calls != 0 || f.terminator.calls != 0 || f.termination.confirmCalls != 0 || f.termination.sendCalls != 0 {
 		t.Fatalf("unexpected call counts: %+v", f.trace)
 	}
 	p := f.launch.params[0]
@@ -721,7 +749,7 @@ func TestTaskLifecycleRunRejectsDuplicateOwnershipBeforeLaunch(t *testing.T) {
 	f := newLifecycleFixture(t)
 	f.ownership.acquired = false
 	f.run()
-	if f.ownership.acquireCalls != 1 || f.ownership.releaseCalls != 0 || f.acquire.calls != 0 || f.waiter.calls != 0 || f.failStore.saveCalls != 0 || len(f.finalizer.calls) != 0 || len(f.killed.calls) != 0 || f.pending.calls != 0 {
+	if f.ownership.acquireCalls != 1 || f.ownership.releaseCalls != 0 || f.launching.unregisterCalls != 0 || f.acquire.calls != 0 || f.waiter.calls != 0 || f.failStore.saveCalls != 0 || len(f.finalizer.calls) != 0 || len(f.killed.calls) != 0 || f.pending.calls != 0 {
 		t.Fatalf("unexpected duplicate ownership side effects")
 	}
 }
@@ -741,7 +769,7 @@ func TestTaskLifecycleRunLaunchPreparationFailuresFailAndStop(t *testing.T) {
 			f := newLifecycleFixture(t)
 			tc.configure(f)
 			f.run()
-			if f.process.calls != 0 || f.confirmLock.calls != 0 || f.timeout.calls != 0 || f.monitor.calls != 0 || f.waiter.calls != 0 || len(f.finalizer.calls) != 0 || len(f.killed.calls) != 0 || f.failStore.saveCalls != 1 || f.failStore.saved[0].State != domain.StateFailed || f.failSlots.calls != 1 || f.ownership.releaseCalls != 1 {
+			if f.process.calls != 0 || f.confirmLock.calls != 0 || f.timeout.calls != 0 || f.monitor.calls != 0 || f.waiter.calls != 0 || len(f.finalizer.calls) != 0 || len(f.killed.calls) != 0 || f.failStore.saveCalls != 1 || f.failStore.saved[0].State != domain.StateFailed || f.failSlots.calls != 1 || f.launching.unregisterCalls != 1 || f.ownership.releaseCalls != 1 {
 				t.Fatalf("failure handling mismatch: %+v", f.trace)
 			}
 		})

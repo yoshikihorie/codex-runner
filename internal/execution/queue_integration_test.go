@@ -56,6 +56,7 @@ type queueIntegrationFixture struct {
 	tasksRoot string
 	queue     execution.TaskQueue
 	registry  execution.ActiveTaskRegistry
+	launching execution.LaunchingTaskRegistry
 	admitter  *recordingAdmitter
 	starter   *queueIntegrationStarter
 	submit    *transportusecase.SubmitTaskUseCase
@@ -70,7 +71,8 @@ func newQueueIntegrationFixture(t *testing.T, maxConcurrent int, options queueIn
 	}
 	queue, registry := execution.NewTaskQueue(), execution.NewActiveTaskRegistry()
 	const queueMaxDepth = 10
-	admit := executionusecase.NewAdmitTaskUseCase(queue, registry, &sync.Mutex{}, maxConcurrent, queueMaxDepth)
+	launching := execution.NewLaunchingTaskRegistry()
+	admit := executionusecase.NewAdmitTaskUseCase(queue, registry, launching, &sync.Mutex{}, maxConcurrent, queueMaxDepth)
 	recording := &recordingAdmitter{inner: admit}
 	starter := &queueIntegrationStarter{}
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
@@ -78,7 +80,7 @@ func newQueueIntegrationFixture(t *testing.T, maxConcurrent int, options queueIn
 		tasks, nil, nil, recording, queueMaxDepth, starter, options,
 		domain.ClockFunc(func() time.Time { return now }), slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	)
-	return queueIntegrationFixture{tasksRoot: tasksRoot, queue: queue, registry: registry, admitter: recording, starter: starter, submit: submit}
+	return queueIntegrationFixture{tasksRoot: tasksRoot, queue: queue, registry: registry, launching: launching, admitter: recording, starter: starter, submit: submit}
 }
 
 func queueIntegrationInput(t *testing.T, slug string) transportusecase.SubmitTaskInput {
@@ -162,6 +164,9 @@ func TestSubmitQueueIntegrationStartsQueuedTaskImmediatelyWhenSlotIsAvailable(t 
 	if payload.Task.ID() != out.TaskID || payload.Task.State() != domain.StateQueued || fixture.queue.Len() != 0 || fixture.registry.Size() != 1 {
 		t.Fatal("immediate admission did not preserve queued task state")
 	}
+	if snapshot, found := fixture.launching.Lookup(out.TaskID); !found || snapshot.TaskID != out.TaskID || snapshot.State != domain.StateQueued {
+		t.Fatalf("launching snapshot=%#v found=%t", snapshot, found)
+	}
 	requireReservedTaskDir(t, fixture.tasksRoot, out.TaskID)
 	requireQueuedOnly(t, out.Events)
 	record := fixture.admitter.records[0]
@@ -192,6 +197,9 @@ func TestSubmitQueueIntegrationEnqueuesWhenSlotsAreFull(t *testing.T) {
 	}
 	if fixture.registry.Size() != 1 {
 		t.Fatal("queued task was incorrectly registered as active")
+	}
+	if _, found := fixture.launching.Lookup(out.TaskID); found {
+		t.Fatal("queued task was incorrectly registered as launching")
 	}
 }
 
