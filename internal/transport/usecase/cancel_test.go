@@ -136,6 +136,19 @@ func (f *cancelSlotFake) ReleaseAndAdvance(context.Context, domain.TaskID, time.
 
 var _ recovery.SlotReleaser = (*cancelSlotFake)(nil)
 
+type cancelReenteringSlotFake struct {
+	queueMu *sync.Mutex
+	reached chan struct{}
+}
+
+func (f *cancelReenteringSlotFake) ReleaseAndAdvance(context.Context, domain.TaskID, time.Time) {
+	f.reached <- struct{}{}
+	f.queueMu.Lock()
+	f.queueMu.Unlock()
+}
+
+var _ recovery.SlotReleaser = (*cancelReenteringSlotFake)(nil)
+
 type cancelPathsFake struct{}
 
 func (*cancelPathsFake) List() ([]execution.PathLockSnapshot, error)       { return nil, nil }
@@ -169,15 +182,19 @@ func cancelQueuedPayload(t *testing.T) execution.TaskLaunchPayload {
 }
 func cancelFixture(t *testing.T, payload execution.TaskLaunchPayload, removed bool) (*cancelStoreFake, *cancelQueueFake, *cancelEventsFake, *cancelTerminatorFake, *cancelDisarmerFake, *CancelTaskUseCase) {
 	t.Helper()
+	return cancelFixtureWithQueueMutexAndSlots(t, payload, removed, &sync.Mutex{}, &cancelSlotFake{})
+}
+
+func cancelFixtureWithQueueMutexAndSlots(t *testing.T, payload execution.TaskLaunchPayload, removed bool, queueMu *sync.Mutex, slots recovery.SlotReleaser) (*cancelStoreFake, *cancelQueueFake, *cancelEventsFake, *cancelTerminatorFake, *cancelDisarmerFake, *CancelTaskUseCase) {
+	t.Helper()
 	tasks := &cancelStoreFake{reserved: true}
 	queue := &cancelQueueFake{payload: payload, index: 1, removed: removed}
 	events := &cancelEventsFake{}
 	terminator := &cancelTerminatorFake{}
 	disarmer := &cancelDisarmerFake{}
-	slots := &cancelSlotFake{}
 	writer := &cancelWriterFake{}
 	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, writer, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), slots, domain.ClockFunc(time.Now))
-	uc := NewCancelTaskUseCase(tasks, queue, &sync.Mutex{}, store.NewTaskMutex(), events, terminator, disarmer, confirmer, domain.ClockFunc(func() time.Time { return time.Date(2026, 8, 11, 12, 1, 0, 0, time.UTC) }))
+	uc := NewCancelTaskUseCase(tasks, queue, queueMu, store.NewTaskMutex(), events, terminator, disarmer, confirmer, domain.ClockFunc(func() time.Time { return time.Date(2026, 8, 11, 12, 1, 0, 0, time.UTC) }))
 	return tasks, queue, events, terminator, disarmer, uc
 }
 
@@ -218,6 +235,35 @@ func TestCancelTaskExecute_QueuedReturnsOneTaskCancelRequestedEvent(t *testing.T
 	event, ok := out.Events[0].(domain.TaskCancelRequested)
 	if !ok || !event.Force || event.RequestedVia != domain.ProtocolVerbCancel || !event.OccurredAt.Equal(at) {
 		t.Fatalf("event=%#v", out.Events[0])
+	}
+}
+
+func TestCancelTaskExecute_QueuedUnlocksQueueMutexBeforeConfirm(t *testing.T) {
+	payload := cancelQueuedPayload(t)
+	queueMu := &sync.Mutex{}
+	slots := &cancelReenteringSlotFake{queueMu: queueMu, reached: make(chan struct{}, 1)}
+	tasks, _, _, _, _, uc := cancelFixtureWithQueueMutexAndSlots(t, payload, true, queueMu, slots)
+	type result struct {
+		out CancelTaskOutput
+		err error
+	}
+	completed := make(chan result, 1)
+	go func() {
+		out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+		completed <- result{out: out, err: err}
+	}()
+	select {
+	case <-slots.reached:
+	case <-time.After(time.Second):
+		t.Fatal("confirmer did not reach slot release")
+	}
+	select {
+	case result := <-completed:
+		if result.err != nil || result.out.State != domain.StateCancelling || tasks.snapshot.State != domain.StateKilled {
+			t.Fatalf("result=%#v snapshot=%#v", result, tasks.snapshot)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("queued cancel did not complete after confirmer reentered queue mutex")
 	}
 }
 

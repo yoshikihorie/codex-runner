@@ -88,6 +88,8 @@ func (uc *CancelTaskUseCase) Execute(ctx context.Context, in CancelTaskInput) (C
 		if err != nil {
 			return CancelTaskOutput{}, err
 		}
+		uc.queueMu.Unlock()
+		queueLocked = false
 		_, err = uc.confirmer.Execute(ctx, execution.ConfirmTaskKilledInput{TaskID: in.TaskID, RawExitCode: 130, Estimated: true, OccurredAt: in.OccurredAt})
 		return out, err
 	}
