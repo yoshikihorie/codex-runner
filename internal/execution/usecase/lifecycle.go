@@ -229,6 +229,8 @@ func (o *TaskLifecycleOrchestrator) confirmUnlaunchedCancellation(ctx context.Co
 	}
 	if result.Confirmed {
 		o.deps.ConfirmKilled.ReleaseAfterConfirmation(ctx, result, taskID)
+	} else if registerErr := o.deps.Pending.Register(taskID, false); registerErr != nil {
+		o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
 	}
 	return true
 }
@@ -251,8 +253,16 @@ func (o *TaskLifecycleOrchestrator) handleStartingCancellation(ctx context.Conte
 		o.waitLaunched(taskID, launched)
 		return
 	}
-	if confirmErr := o.deps.ConfirmKilled.ConfirmKilled(ctx, taskID, 130, true, o.deps.Clock.Now()); confirmErr != nil {
+	o.deps.TaskMu.Lock(taskID)
+	result, confirmErr := o.deps.ConfirmKilled.ExecuteLocked(ctx, execution.ConfirmTaskKilledInput{TaskID: taskID, RawExitCode: 130, Estimated: true, OccurredAt: o.deps.Clock.Now()})
+	o.deps.TaskMu.Unlock(taskID)
+	if confirmErr != nil {
 		o.logger.Warn("confirm killed starting cancellation", "task_id", taskID.String(), "error", confirmErr)
+	}
+	if result.Confirmed {
+		o.deps.ConfirmKilled.ReleaseAfterConfirmation(ctx, result, taskID)
+	} else if registerErr := o.deps.Pending.Register(taskID, true); registerErr != nil {
+		o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
 	}
 	o.waitLaunched(taskID, launched)
 }
@@ -281,6 +291,8 @@ func (o *TaskLifecycleOrchestrator) fail(ctx context.Context, input TaskLifecycl
 		}
 		if result.Confirmed {
 			o.deps.ConfirmKilled.ReleaseAfterConfirmation(ctx, result, taskID)
+		} else if registerErr := o.deps.Pending.Register(taskID, false); registerErr != nil {
+			o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
 		}
 		return
 	}
@@ -335,7 +347,18 @@ func (o *TaskLifecycleOrchestrator) confirmTerminal(ctx context.Context, taskID 
 		return
 	}
 	if snapshot.State == domain.StateCancelling {
-		err = o.deps.ConfirmKilled.ConfirmKilled(ctx, taskID, raw, estimated, o.deps.Clock.Now())
+		o.deps.TaskMu.Lock(taskID)
+		result, confirmErr := o.deps.ConfirmKilled.ExecuteLocked(ctx, execution.ConfirmTaskKilledInput{TaskID: taskID, RawExitCode: raw, Estimated: estimated, OccurredAt: o.deps.Clock.Now()})
+		o.deps.TaskMu.Unlock(taskID)
+		if confirmErr != nil {
+			o.logger.Warn("terminal lifecycle confirmation", "task_id", taskID.String(), "error", confirmErr)
+		}
+		if result.Confirmed {
+			o.deps.ConfirmKilled.ReleaseAfterConfirmation(ctx, result, taskID)
+		} else if registerErr := o.deps.Pending.Register(taskID, true); registerErr != nil {
+			o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
+		}
+		return
 	} else {
 		err = o.deps.Finalize.Finalize(taskID, raw, estimated, false, o.deps.Clock.Now())
 	}

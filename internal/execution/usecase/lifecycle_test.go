@@ -151,9 +151,13 @@ type lifecycleConfirmKilledCall struct {
 }
 type lifecycleRecordingKillConfirmer struct {
 	calls              []lifecycleConfirmKilledCall
+	wrapperCalls       int
+	lockedCalls        int
 	err                error
 	lockedErr          error
 	lockedResult       execution.LockedKillResult
+	lockedResults      []execution.LockedKillResult
+	lockedErrors       []error
 	releaseCalls       int
 	releaseWhileLocked func() bool
 	releaseHook        func()
@@ -161,13 +165,22 @@ type lifecycleRecordingKillConfirmer struct {
 }
 
 func (f *lifecycleRecordingKillConfirmer) ConfirmKilled(_ context.Context, id domain.TaskID, raw int, estimated bool, now time.Time) error {
+	f.wrapperCalls++
 	f.calls = append(f.calls, lifecycleConfirmKilledCall{id, raw, estimated, now})
 	appendLifecycleTrace(f.trace, "confirm-killed")
 	return f.err
 }
 func (f *lifecycleRecordingKillConfirmer) ExecuteLocked(_ context.Context, in execution.ConfirmTaskKilledInput) (execution.LockedKillResult, error) {
+	f.lockedCalls++
 	f.calls = append(f.calls, lifecycleConfirmKilledCall{in.TaskID, in.RawExitCode, in.Estimated, in.OccurredAt})
 	appendLifecycleTrace(f.trace, "confirm-killed-locked")
+	if f.lockedCalls <= len(f.lockedResults) {
+		var err error
+		if f.lockedCalls <= len(f.lockedErrors) {
+			err = f.lockedErrors[f.lockedCalls-1]
+		}
+		return f.lockedResults[f.lockedCalls-1], err
+	}
 	return f.lockedResult, f.lockedErr
 }
 func (f *lifecycleRecordingKillConfirmer) ReleaseAfterConfirmation(_ context.Context, _ execution.LockedKillResult, _ domain.TaskID) {
@@ -341,12 +354,14 @@ func (f *lifecycleRecordingTerminator) Terminate(pid int, grace time.Duration) e
 
 type lifecycleRecordingPendingRegistrar struct {
 	calls      int
+	taskIDs    []domain.TaskID
 	signalSent []bool
 	trace      *[]string
 }
 
-func (f *lifecycleRecordingPendingRegistrar) Register(_ domain.TaskID, sent bool) error {
+func (f *lifecycleRecordingPendingRegistrar) Register(id domain.TaskID, sent bool) error {
 	f.calls++
+	f.taskIDs = append(f.taskIDs, id)
 	f.signalSent = append(f.signalSent, sent)
 	appendLifecycleTrace(f.trace, "pending-register")
 	return nil
@@ -870,7 +885,7 @@ func TestTaskLifecycleStartingCancellationUsesEstimatedCancelledExitCode(t *test
 	f := newLifecycleFixture(t)
 	f.termination.dead = true
 	f.orchestrator.handleStartingCancellation(context.Background(), f.input.Task.ID(), f.launch.launched, true)
-	if f.termination.sendCalls != 1 || f.termination.confirmCalls != 0 || f.waiter.calls != 1 || len(f.killed.calls) != 1 {
+	if f.termination.sendCalls != 1 || f.termination.confirmCalls != 0 || f.waiter.calls != 1 || f.killed.lockedCalls != 1 || f.killed.wrapperCalls != 0 {
 		t.Fatalf("unexpected cancellation handling: trace=%v", f.trace)
 	}
 	call := f.killed.calls[0]
@@ -879,6 +894,136 @@ func TestTaskLifecycleStartingCancellationUsesEstimatedCancelledExitCode(t *test
 	}
 	if f.termination.sendCalls != 1 || f.termination.confirmCalls != 0 {
 		t.Fatalf("termination calls send=%d confirm=%d", f.termination.sendCalls, f.termination.confirmCalls)
+	}
+}
+
+func TestTaskLifecycleCancellationConfirmationRegistersUnconfirmed(t *testing.T) {
+	for _, confirmErr := range []error{nil, errors.New("confirm")} {
+		for _, tc := range []struct {
+			name       string
+			signalSent bool
+			invoke     func(*lifecycleFixture)
+		}{
+			{
+				name:       "unlaunched",
+				signalSent: false,
+				invoke: func(f *lifecycleFixture) {
+					f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
+					if !f.orchestrator.confirmUnlaunchedCancellation(context.Background(), f.input.Task.ID()) {
+						t.Fatal("cancellation was not detected")
+					}
+				},
+			},
+			{
+				name:       "launch-failure",
+				signalSent: false,
+				invoke: func(f *lifecycleFixture) {
+					f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
+					f.orchestrator.fail(context.Background(), f.input)
+				},
+			},
+			{
+				name:       "starting",
+				signalSent: true,
+				invoke: func(f *lifecycleFixture) {
+					f.termination.dead = true
+					f.orchestrator.handleStartingCancellation(context.Background(), f.input.Task.ID(), f.launch.launched, true)
+				},
+			},
+			{
+				name:       "terminal",
+				signalSent: true,
+				invoke: func(f *lifecycleFixture) {
+					f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
+					f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
+				},
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				f := newLifecycleFixture(t)
+				f.killed.lockedResult = execution.LockedKillResult{}
+				f.killed.lockedErr = confirmErr
+				tc.invoke(f)
+				if f.killed.lockedCalls != 1 || f.killed.releaseCalls != 0 || f.pending.calls != 1 || f.pending.taskIDs[0] != f.input.Task.ID() || f.pending.signalSent[0] != tc.signalSent {
+					t.Fatalf("locked=%d release=%d pending=%+v", f.killed.lockedCalls, f.killed.releaseCalls, f.pending)
+				}
+				if !lifecycleTraceSubsequence(f.trace, "confirm-killed-locked", "task-unlock", "pending-register") {
+					t.Fatalf("pending registration did not follow unlock: %v", f.trace)
+				}
+				if tc.name == "starting" && (f.killed.wrapperCalls != 0 || f.waiter.calls != 1) {
+					t.Fatalf("wrapper=%d wait=%d", f.killed.wrapperCalls, f.waiter.calls)
+				}
+			})
+		}
+	}
+}
+
+func TestTaskLifecycleCancellationConfirmationReleasesConfirmedDespiteError(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		invoke func(*lifecycleFixture)
+	}{
+		{
+			name: "unlaunched",
+			invoke: func(f *lifecycleFixture) {
+				f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
+				f.orchestrator.confirmUnlaunchedCancellation(context.Background(), f.input.Task.ID())
+			},
+		},
+		{
+			name: "launch-failure",
+			invoke: func(f *lifecycleFixture) {
+				f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
+				f.orchestrator.fail(context.Background(), f.input)
+			},
+		},
+		{
+			name: "starting",
+			invoke: func(f *lifecycleFixture) {
+				f.termination.dead = true
+				f.orchestrator.handleStartingCancellation(context.Background(), f.input.Task.ID(), f.launch.launched, true)
+			},
+		},
+		{
+			name: "terminal",
+			invoke: func(f *lifecycleFixture) {
+				f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
+				f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newLifecycleFixture(t)
+			f.killed.lockedResult = execution.LockedKillResult{Confirmed: true}
+			f.killed.lockedErr = errors.New("persistence")
+			tc.invoke(f)
+			if f.killed.lockedCalls != 1 || f.killed.releaseCalls != 1 || f.pending.calls != 0 {
+				t.Fatalf("locked=%d release=%d pending=%d", f.killed.lockedCalls, f.killed.releaseCalls, f.pending.calls)
+			}
+			if !lifecycleTraceSubsequence(f.trace, "confirm-killed-locked", "task-unlock", "release-after-confirmation") {
+				t.Fatalf("release did not follow unlock: %v", f.trace)
+			}
+			if (tc.name == "starting" || tc.name == "terminal") && f.killed.wrapperCalls != 0 {
+				t.Fatalf("wrapper calls=%d", f.killed.wrapperCalls)
+			}
+		})
+	}
+}
+
+func TestTaskLifecycleCancellationConfirmationDoesNotRereleaseAfterConfirmedPersistenceError(t *testing.T) {
+	f := newLifecycleFixture(t)
+	cancelling := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)
+	f.tasks.loads = []lifecycleLoadResult{{snapshot: cancelling}, {snapshot: cancelling}}
+	f.killed.lockedResults = []execution.LockedKillResult{{Confirmed: true}, {}}
+	f.killed.lockedErrors = []error{errors.New("persistence"), errors.New("reevaluation")}
+
+	f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
+	if f.killed.releaseCalls != 1 || f.pending.calls != 0 {
+		t.Fatalf("first confirmation release=%d pending=%d", f.killed.releaseCalls, f.pending.calls)
+	}
+	f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
+	if f.killed.lockedCalls != 2 || f.killed.releaseCalls != 1 || f.pending.calls != 1 || f.pending.signalSent[0] != true {
+		t.Fatalf("locked=%d release=%d pending=%+v", f.killed.lockedCalls, f.killed.releaseCalls, f.pending)
 	}
 }
 
@@ -900,8 +1045,8 @@ func TestTaskLifecycleFailDoesNotReleaseUnconfirmedCancellation(t *testing.T) {
 		f.killed.lockedResult = execution.LockedKillResult{}
 		f.killed.lockedErr = err
 		f.orchestrator.fail(context.Background(), f.input)
-		if f.killed.releaseCalls != 0 {
-			t.Fatalf("unconfirmed cancellation released with error %v", err)
+		if f.killed.releaseCalls != 0 || f.pending.calls != 1 || f.pending.signalSent[0] {
+			t.Fatalf("unconfirmed cancellation release=%d pending=%+v error=%v", f.killed.releaseCalls, f.pending, err)
 		}
 	}
 }
@@ -1053,11 +1198,11 @@ func TestTaskLifecycleConfirmTerminalDoesNotFallbackAfterSelectedBranchError(t *
 		t.Run(tc.name, func(t *testing.T) {
 			f := newLifecycleFixture(t)
 			f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), tc.state)}}
-			f.finalizer.err, f.killed.err = tc.err, tc.err
+			f.finalizer.err, f.killed.lockedErr = tc.err, tc.err
 			f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
 			if tc.state == domain.StateCancelling {
-				if len(f.killed.calls) != 1 || len(f.finalizer.calls) != 0 {
-					t.Fatalf("kill=%d finalize=%d", len(f.killed.calls), len(f.finalizer.calls))
+				if f.killed.lockedCalls != 1 || f.killed.wrapperCalls != 0 || len(f.finalizer.calls) != 0 {
+					t.Fatalf("locked=%d wrapper=%d finalize=%d", f.killed.lockedCalls, f.killed.wrapperCalls, len(f.finalizer.calls))
 				}
 			} else if len(f.finalizer.calls) != 1 || len(f.killed.calls) != 0 {
 				t.Fatalf("finalize=%d kill=%d", len(f.finalizer.calls), len(f.killed.calls))
