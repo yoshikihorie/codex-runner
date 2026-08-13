@@ -54,6 +54,14 @@ type TaskQueue interface {
 	Restore(payload TaskLaunchPayload, index int, occurredAt time.Time) []domain.Event
 }
 
+// TaskQueueReader is the status-read extension of TaskQueue. It is deliberately
+// separate from TaskQueue so lifecycle callers do not depend on status queries.
+type TaskQueueReader interface {
+	TaskQueue
+	Lookup(taskID domain.TaskID) (payload TaskLaunchPayload, index int, found bool)
+	QueuePosition(taskID domain.TaskID) (position int, found bool, err error)
+}
+
 // ActiveTaskRegistry tracks task IDs which currently reserve an execution slot.
 type ActiveTaskRegistry interface {
 	Size() int
@@ -66,7 +74,9 @@ type taskQueue struct {
 	payloads []TaskLaunchPayload
 }
 
-func NewTaskQueue() TaskQueue { return &taskQueue{} }
+var _ TaskQueueReader = (*taskQueue)(nil)
+
+func NewTaskQueue() TaskQueueReader { return &taskQueue{} }
 
 func (q *taskQueue) Enqueue(payload TaskLaunchPayload) int {
 	validateQueuedPayload(payload)
@@ -95,6 +105,24 @@ func (q *taskQueue) Reindex(occurredAt time.Time) []domain.Event {
 }
 
 func (q *taskQueue) Len() int { return len(q.payloads) }
+
+// QueuePosition reports a task's one-based FIFO position without changing the queue.
+func (q *taskQueue) QueuePosition(taskID domain.TaskID) (position int, found bool, err error) {
+	_, index, found := q.Lookup(taskID)
+	if !found {
+		return 0, false, nil
+	}
+	return index + 1, true, nil
+}
+
+func (q *taskQueue) Lookup(taskID domain.TaskID) (TaskLaunchPayload, int, bool) {
+	for index, payload := range q.payloads {
+		if payload.Task != nil && payload.Task.ID() == taskID {
+			return payload, index, true
+		}
+	}
+	return TaskLaunchPayload{}, -1, false
+}
 
 func (q *taskQueue) Remove(taskID domain.TaskID, occurredAt time.Time) (TaskLaunchPayload, int, bool, []domain.Event) {
 	q.validateAll()

@@ -45,6 +45,43 @@ func TestTaskQueueFIFOAndReindex(t *testing.T) {
 	}
 }
 
+func TestTaskQueueQueuePositionIsOneBasedAndNonDestructive(t *testing.T) {
+	queue := NewTaskQueue().(*taskQueue)
+	payloads := []TaskLaunchPayload{queueTestPayload(t, "position-first"), queueTestPayload(t, "position-middle"), queueTestPayload(t, "position-last")}
+	for _, payload := range payloads {
+		queue.Enqueue(payload)
+	}
+	before := append([]TaskLaunchPayload(nil), queue.payloads...)
+	for index, payload := range payloads {
+		position, found, err := queue.QueuePosition(payload.Task.ID())
+		if err != nil || !found || position != index+1 {
+			t.Fatalf("position=%d found=%t err=%v", position, found, err)
+		}
+	}
+	missing := queueTestPayload(t, "position-missing")
+	if position, found, err := queue.QueuePosition(missing.Task.ID()); err != nil || found || position != 0 {
+		t.Fatalf("position=%d found=%t err=%v", position, found, err)
+	}
+	if !reflect.DeepEqual(queue.payloads, before) {
+		t.Fatalf("queue changed: got=%#v want=%#v", queue.payloads, before)
+	}
+}
+
+func TestTaskQueueReaderReturnsPayloadAndZeroBasedIndexWithoutExpandingTaskQueue(t *testing.T) {
+	queue := NewTaskQueue().(*taskQueue)
+	payloads := []TaskLaunchPayload{queueTestPayload(t, "lookup-first"), queueTestPayload(t, "lookup-second")}
+	for _, payload := range payloads {
+		queue.Enqueue(payload)
+	}
+	got, index, found := queue.Lookup(payloads[1].Task.ID())
+	if !found || index != 1 || !reflect.DeepEqual(got, payloads[1]) {
+		t.Fatalf("payload=%#v index=%d found=%t", got, index, found)
+	}
+	if _, found := reflect.TypeOf((*TaskQueue)(nil)).Elem().MethodByName("QueuePosition"); found {
+		t.Fatal("TaskQueue must not expose QueuePosition")
+	}
+}
+
 func TestTaskQueuePrependAndRemove(t *testing.T) {
 	queue := NewTaskQueue()
 	first, second := queueTestPayload(t, "first"), queueTestPayload(t, "second")
