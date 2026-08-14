@@ -40,6 +40,20 @@ func AcquireForChild(taskDirPath string) (*os.File, error) {
 	return f, nil
 }
 
+// AcquireExistingForChild reopens and exclusively locks an existing liveness lock for child inheritance.
+func AcquireExistingForChild(taskDirPath string) (*os.File, error) {
+	lockPath := filepath.Join(taskDirPath, "task.lock")
+	f, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	if err != nil {
+		return nil, err
+	}
+	if err := flockFunc(f, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("acquire existing liveness lock for child: %w", err)
+	}
+	return f, nil
+}
+
 // CheckLivenessUseCase checks whether a task liveness lock is currently unheld.
 type CheckLivenessUseCase struct {
 	lock            domain.LivenessLock

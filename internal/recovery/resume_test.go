@@ -1,0 +1,464 @@
+package recovery
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/yoshikihorie/codex-runner/internal/domain"
+	"github.com/yoshikihorie/codex-runner/internal/metrics"
+)
+
+type resumeLauncherFake struct {
+	params ResumeLaunchParams
+	err    error
+	calls  int
+}
+
+func (f *resumeLauncherFake) LaunchAndWait(_ context.Context, params ResumeLaunchParams) error {
+	f.calls++
+	f.params = params
+	return f.err
+}
+
+type resumeReaderFake struct {
+	present bool
+	err     error
+	calls   int
+}
+
+func (f *resumeReaderFake) ReadLastMessage(domain.TaskID) (bool, error) {
+	f.calls++
+	return f.present, f.err
+}
+func (*resumeReaderFake) ReadStderrLog(domain.TaskID) ([]byte, error) { return nil, nil }
+
+func TestRecoveryAttemptAttemptsResumeAndChecksLastMessage(t *testing.T) {
+	id, err := domain.NewTaskID("impl-20260813-120000-abcd-resume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := domain.NewSessionRef("123e4567-e89b-12d3-a456-426614174000", time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	launcher := &resumeLauncherFake{}
+	reader := &resumeReaderFake{present: true}
+	attempt := RecoveryAttempt{TaskID: id, SessionRef: session, CodexBinaryPath: "/usr/local/bin/codex"}
+	out, err := attempt.Attempt(context.Background(), launcher, reader)
+	if err != nil || !out.Succeeded || out.ExitCode.Raw() != 0 || out.PartialOutputSaved {
+		t.Fatalf("result = (%+v, %v)", out, err)
+	}
+	if launcher.calls != 1 || reader.calls != 1 {
+		t.Fatalf("calls = launcher:%d reader:%d", launcher.calls, reader.calls)
+	}
+	if launcher.params.SessionID != session.SessionID() || launcher.params.TaskID != id {
+		t.Fatalf("params = %#v", launcher.params)
+	}
+}
+
+func TestRecoveryAttemptDoesNotReadOutputAfterLaunchFailure(t *testing.T) {
+	id, _ := domain.NewTaskID("impl-20260813-120001-abcd-resume")
+	session, _ := domain.NewSessionRef("123e4567-e89b-12d3-a456-426614174000", time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC), false)
+	launcher := &resumeLauncherFake{err: context.DeadlineExceeded}
+	reader := &resumeReaderFake{present: true}
+	_, err := (&RecoveryAttempt{TaskID: id, SessionRef: session, CodexBinaryPath: "/usr/local/bin/codex"}).Attempt(context.Background(), launcher, reader)
+	if err == nil || reader.calls != 0 {
+		t.Fatalf("err=%v reader calls=%d", err, reader.calls)
+	}
+}
+
+func TestRecoveryAttemptAppliesResumeRecoveryTimeout(t *testing.T) {
+	id := recoveryTestTaskID(t)
+	session := recoveryTestSession(t)
+	launcher := &resumeLauncherFake{}
+	launcherWithDeadline := resumeLauncherFunc(func(ctx context.Context, _ ResumeLaunchParams) error {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("resume context has no deadline")
+		}
+		remaining := time.Until(deadline)
+		if remaining > resumeRecoveryTimeout || remaining < resumeRecoveryTimeout-time.Second {
+			t.Fatalf("resume timeout remaining = %s", remaining)
+		}
+		launcher.calls++
+		return nil
+	})
+	result, err := (&RecoveryAttempt{TaskID: id, SessionRef: session, CodexBinaryPath: "/usr/local/bin/codex"}).Attempt(context.Background(), launcherWithDeadline, &resumeReaderFake{present: true})
+	if err != nil || !result.Succeeded || launcher.calls != 1 {
+		t.Fatalf("result = (%+v, %v), calls = %d", result, err, launcher.calls)
+	}
+}
+
+func TestResumeRecovererAllowsNilSessionRef(t *testing.T) {
+	launcher := &resumeLauncherFake{}
+	recoverer := NewResumeRecoverer(launcher, &resumeReaderFake{}, "/usr/local/bin/codex", domain.ClockFunc(time.Now))
+	result, err := recoverer.Resume(context.Background(), recoveryTestTaskID(t), nil, domain.RecoveryOriginTimeout)
+	if err != nil || result != (RecoveryResult{}) || launcher.calls != 0 {
+		t.Fatalf("result=(%+v, %v), launches=%d", result, err, launcher.calls)
+	}
+}
+
+func recoveryEvent[T domain.Event](t *testing.T, events []domain.Event) T {
+	t.Helper()
+	for _, event := range events {
+		if typed, ok := event.(T); ok {
+			return typed
+		}
+	}
+	var zero T
+	t.Fatalf("event %T not found in %#v", zero, events)
+	return zero
+}
+
+type resumeLauncherFunc func(context.Context, ResumeLaunchParams) error
+
+func (f resumeLauncherFunc) LaunchAndWait(ctx context.Context, params ResumeLaunchParams) error {
+	return f(ctx, params)
+}
+
+type recovererFake struct {
+	result RecoveryResult
+	err    error
+	calls  int
+	origin domain.RecoveryOrigin
+	mutex  *recoveryMutexFake
+}
+
+func (f *recovererFake) Resume(_ context.Context, _ domain.TaskID, _ *domain.SessionRef, origin domain.RecoveryOrigin) (RecoveryResult, error) {
+	if f.mutex != nil && f.mutex.held {
+		panic("recoverer called while task mutex is held")
+	}
+	f.calls++
+	f.origin = origin
+	return f.result, f.err
+}
+
+type recoveryStoreFake struct {
+	snapshot domain.TaskSnapshot
+	loads    int
+	saves    int
+	saveErr  error
+}
+
+func (f *recoveryStoreFake) Load(domain.TaskID) (domain.TaskSnapshot, error) {
+	f.loads++
+	return f.snapshot, nil
+}
+
+func (f *recoveryStoreFake) Save(_ domain.TaskID, snapshot domain.TaskSnapshot) error {
+	f.saves++
+	f.snapshot = snapshot
+	return f.saveErr
+}
+
+type recoveryWriterFake struct {
+	events        []domain.Event
+	markerCalls   int
+	partialCalls  int
+	lastPresent   bool
+	stderr        []byte
+	appendErr     error
+	markerErr     error
+	partialErr    error
+	exitCodeErr   error
+	exitCodeCalls int
+	exitCode      domain.ExitCode
+}
+
+func (f *recoveryWriterFake) ReadLastMessage(domain.TaskID) (bool, error) { return f.lastPresent, nil }
+func (f *recoveryWriterFake) ReadStderrLog(domain.TaskID) ([]byte, error) { return f.stderr, nil }
+func (f *recoveryWriterFake) WritePartialOutput(domain.TaskID, string) error {
+	f.partialCalls++
+	return f.partialErr
+}
+func (f *recoveryWriterFake) WriteRecoveredMarker(domain.TaskID, time.Time) error {
+	f.markerCalls++
+	return f.markerErr
+}
+func (f *recoveryWriterFake) WriteExitCode(_ domain.TaskID, exitCode domain.ExitCode) error {
+	f.exitCodeCalls++
+	f.exitCode = exitCode
+	return f.exitCodeErr
+}
+func (f *recoveryWriterFake) AppendEvent(_ domain.TaskID, event domain.Event) error {
+	f.events = append(f.events, event)
+	return f.appendErr
+}
+
+type recoveryMetricsFake struct {
+	inputs []metrics.RecordTaskMetricsInput
+}
+
+func (f *recoveryMetricsFake) Execute(_ context.Context, in metrics.RecordTaskMetricsInput) metrics.RecordTaskMetricsOutput {
+	f.inputs = append(f.inputs, in)
+	return metrics.RecordTaskMetricsOutput{Recorded: true}
+}
+
+type recoverySlotFake struct {
+	calls int
+	at    time.Time
+}
+
+func (f *recoverySlotFake) ReleaseAndAdvance(_ context.Context, _ domain.TaskID, at time.Time) {
+	f.calls++
+	f.at = at
+}
+
+type recoveryMutexFake struct {
+	locks, unlocks int
+	held           bool
+}
+
+func (f *recoveryMutexFake) Lock(domain.TaskID) {
+	if f.held {
+		panic("task mutex double lock")
+	}
+	f.locks++
+	f.held = true
+}
+func (f *recoveryMutexFake) Unlock(domain.TaskID) {
+	if !f.held {
+		panic("task mutex unlock without lock")
+	}
+	f.unlocks++
+	f.held = false
+}
+
+type recoveryClockFake struct{ values []time.Time }
+
+func (f *recoveryClockFake) Now() time.Time {
+	if len(f.values) == 0 {
+		panic("clock exhausted")
+	}
+	value := f.values[0]
+	f.values = f.values[1:]
+	return value
+}
+
+func recoveryTestTaskID(t *testing.T) domain.TaskID {
+	t.Helper()
+	id, err := domain.NewTaskID("impl-20260813-120002-abcd-resume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func recoveryTestSession(t *testing.T) domain.SessionRef {
+	t.Helper()
+	session, err := domain.NewSessionRef("123e4567-e89b-12d3-a456-426614174000", time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return session
+}
+
+func recoverySnapshot(t *testing.T, state domain.TaskState, session *domain.SessionRef) domain.TaskSnapshot {
+	t.Helper()
+	id := recoveryTestTaskID(t)
+	slug, err := domain.NewSlug("resume")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestedAt := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
+	task, _, err := domain.NewTask(id, domain.SubcommandImpl, slug, nil, requestedAt, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	timeout, err := domain.NewTimeout(nil, 1800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := task.Start(timeout, "gpt-5", requestedAt); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := domain.NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", nil, domain.ExecutionRouteDaemon, requestedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := task.RecordProcessInfo(123, requestedAt, requestedAt); err != nil {
+		t.Fatal(err)
+	}
+	if err := task.ConfirmRunning(requestedAt); err != nil {
+		t.Fatal(err)
+	}
+	switch state {
+	case domain.StateTimeout:
+		if _, err := task.MarkTimedOut(session, requestedAt); err != nil {
+			t.Fatal(err)
+		}
+	case domain.StateOrphaned:
+		if _, err := task.DetectOrphan("running", requestedAt); err != nil {
+			t.Fatal(err)
+		}
+	case domain.StateRunning:
+	default:
+		t.Fatalf("unsupported recovery fixture state %q", state)
+	}
+	snapshot, err = snapshot.WithTask(task, requestedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snapshot
+}
+
+func newRecoveryUseCaseFixture(t *testing.T, state domain.TaskState, session *domain.SessionRef, result RecoveryResult) (*RecoverViaResumeUseCase, *recoveryStoreFake, *recoveryWriterFake, *recovererFake, *recoveryMetricsFake, *recoverySlotFake, *recoveryMutexFake) {
+	t.Helper()
+	store := &recoveryStoreFake{snapshot: recoverySnapshot(t, state, session)}
+	writer := &recoveryWriterFake{}
+	mutex := &recoveryMutexFake{}
+	recoverer := &recovererFake{result: result, mutex: mutex}
+	metricsRecorder := &recoveryMetricsFake{}
+	slots := &recoverySlotFake{}
+	clock := &recoveryClockFake{values: []time.Time{
+		time.Date(2026, 8, 13, 12, 1, 0, 0, time.UTC),
+		time.Date(2026, 8, 13, 12, 2, 0, 0, time.UTC),
+	}}
+	partial := NewSavePartialOutputUseCase(writer, writer)
+	uc := NewRecoverViaResumeUseCase(store, writer, recoverer, partial, slots, metricsRecorder, mutex, clock)
+	return uc, store, writer, recoverer, metricsRecorder, slots, mutex
+}
+
+func TestRecoverViaResumeUseCaseTimeoutSuccess(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, store, writer, recoverer, recorded, slots, mutex := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Date(2026, 8, 13, 12, 0, 30, 0, time.UTC)})
+	if err != nil || !out.Succeeded || out.FinalState != domain.StateRecovered {
+		t.Fatalf("result = (%+v, %v)", out, err)
+	}
+	if recoverer.calls != 1 || recoverer.origin != domain.RecoveryOriginTimeout || writer.markerCalls != 1 || writer.exitCodeCalls != 1 || writer.exitCode.Raw() != 0 || store.loads != 2 || store.saves != 2 {
+		t.Fatalf("calls = recoverer:%d marker:%d exit:%d loads:%d saves:%d", recoverer.calls, writer.markerCalls, writer.exitCodeCalls, store.loads, store.saves)
+	}
+	if len(recorded.inputs) != 1 || !recorded.inputs[0].Estimated || recorded.inputs[0].FinalState != domain.StateRecovered || slots.calls != 1 || mutex.locks != 2 || mutex.unlocks != 2 {
+		t.Fatalf("metrics=%+v slots=%d locks=%d unlocks=%d", recorded.inputs, slots.calls, mutex.locks, mutex.unlocks)
+	}
+	if len(writer.events) != 2 || writer.events[0].Type() != "RecoveryAttempted" || writer.events[1].Type() != "RecoverySucceeded" {
+		t.Fatalf("events = %#v", writer.events)
+	}
+}
+
+func TestRecoverViaResumeUseCaseOrphanSuccess(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, _, writer, recoverer, recorded, slots, _ := newRecoveryUseCaseFixture(t, domain.StateOrphaned, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginOrphan, OccurredAt: time.Now()})
+	if err != nil || out.FinalState != domain.StateRecovered || recoverer.origin != domain.RecoveryOriginOrphan || writer.markerCalls != 1 || slots.calls != 1 || len(recorded.inputs) != 1 || !recorded.inputs[0].Estimated {
+		t.Fatalf("result=(%+v, %v), origin=%q marker=%d slots=%d metrics=%+v", out, err, recoverer.origin, writer.markerCalls, slots.calls, recorded.inputs)
+	}
+	if attempted := recoveryEvent[domain.RecoveryAttempted](t, writer.events); attempted.Origin != domain.RecoveryOriginOrphan {
+		t.Fatalf("attempted origin=%q", attempted.Origin)
+	}
+}
+
+func TestRecoverViaResumeUseCaseFailureUsesDomainOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		state           domain.TaskState
+		inputOrigin     domain.RecoveryOrigin
+		wantState       domain.TaskState
+		wantPartialCall int
+	}{
+		{name: "timeout", state: domain.StateTimeout, inputOrigin: domain.RecoveryOriginTimeout, wantState: domain.StateTimeoutLost, wantPartialCall: 1},
+		{name: "orphan", state: domain.StateOrphaned, inputOrigin: domain.RecoveryOriginOrphan, wantState: domain.StateLost, wantPartialCall: 0},
+		{name: "derived origin overrides input", state: domain.StateTimeout, inputOrigin: domain.RecoveryOriginOrphan, wantState: domain.StateTimeoutLost, wantPartialCall: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := recoveryTestSession(t)
+			uc, _, writer, recoverer, recorded, slots, _ := newRecoveryUseCaseFixture(t, tc.state, &session, RecoveryResult{ExitCode: domain.NewExitCode(1)})
+			writer.stderr = []byte("incomplete output")
+			out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: tc.inputOrigin, OccurredAt: time.Now()})
+			if err != nil || out.Succeeded || out.FinalState != tc.wantState || writer.partialCalls != tc.wantPartialCall || slots.calls != 1 {
+				t.Fatalf("result=(%+v, %v), partial=%d slots=%d", out, err, writer.partialCalls, slots.calls)
+			}
+			if recoverer.origin != map[domain.TaskState]domain.RecoveryOrigin{domain.StateTimeout: domain.RecoveryOriginTimeout, domain.StateOrphaned: domain.RecoveryOriginOrphan}[tc.state] || len(recorded.inputs) != 1 || recorded.inputs[0].FinalState != tc.wantState {
+				t.Fatalf("origin=%q metrics=%+v", recoverer.origin, recorded.inputs)
+			}
+			failed := recoveryEvent[domain.RecoveryFailed](t, writer.events)
+			if failed.Origin != recoverer.origin || failed.PartialOutputSaved != (tc.wantPartialCall == 1) {
+				t.Fatalf("failed event=%#v", failed)
+			}
+		})
+	}
+}
+
+func TestRecoverViaResumeUseCaseNilSessionTransitionsToTimeoutLostWithoutResume(t *testing.T) {
+	uc, store, writer, recoverer, recorded, slots, mutex := newRecoveryUseCaseFixture(t, domain.StateTimeout, nil, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
+	if err != nil || out.Succeeded || out.FinalState != domain.StateTimeoutLost || recoverer.calls != 0 || slots.calls != 1 || mutex.locks != 2 || mutex.unlocks != 2 {
+		t.Fatalf("result=(%+v, %v), resume=%d slots=%d locks=%d unlocks=%d", out, err, recoverer.calls, slots.calls, mutex.locks, mutex.unlocks)
+	}
+	if store.snapshot.SessionRef != nil || len(writer.events) != 2 || len(recorded.inputs) != 1 {
+		t.Fatalf("session=%v events=%d metrics=%d", store.snapshot.SessionRef, len(writer.events), len(recorded.inputs))
+	}
+	attempted := recoveryEvent[domain.RecoveryAttempted](t, writer.events)
+	failed := recoveryEvent[domain.RecoveryFailed](t, writer.events)
+	if attempted.SessionRef != nil || failed.Origin != domain.RecoveryOriginTimeout {
+		t.Fatalf("attempted=%#v failed=%#v", attempted, failed)
+	}
+}
+
+func TestRecoverViaResumeUseCaseRejectsInvalidStateWithoutSideEffects(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, store, writer, recoverer, recorded, slots, mutex := newRecoveryUseCaseFixture(t, domain.StateRunning, &session, RecoveryResult{})
+	_, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
+	if !errors.Is(err, domain.ErrInvalidStateTransition) {
+		t.Fatalf("error = %v", err)
+	}
+	if store.saves != 0 || len(writer.events) != 0 || recoverer.calls != 0 || len(recorded.inputs) != 0 || slots.calls != 0 || mutex.locks != 1 || mutex.unlocks != 1 {
+		t.Fatalf("unexpected side effects: saves=%d events=%d resume=%d metrics=%d slots=%d locks=%d unlocks=%d", store.saves, len(writer.events), recoverer.calls, len(recorded.inputs), slots.calls, mutex.locks, mutex.unlocks)
+	}
+}
+
+func TestRecoverViaResumeUseCaseCompletionTimeIsTakenAfterResume(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, _, _, _, recorded, slots, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	_, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Date(2026, 8, 13, 11, 0, 0, 0, time.UTC)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, 8, 13, 12, 1, 0, 0, time.UTC)
+	if len(recorded.inputs) != 1 || !recorded.inputs[0].OccurredAt.Equal(want) || !slots.at.Equal(time.Date(2026, 8, 13, 12, 2, 0, 0, time.UTC)) {
+		t.Fatalf("metrics=%+v slot at=%s", recorded.inputs, slots.at)
+	}
+}
+
+func TestRecoverViaResumeUseCaseTimeoutDuringResumeFailsTerminally(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, _, writer, recoverer, recorded, slots, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	recoverer.err = context.DeadlineExceeded
+	writer.stderr = []byte("incomplete output")
+	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
+	if err != nil || out.Succeeded || out.FinalState != domain.StateTimeoutLost || writer.partialCalls != 1 || slots.calls != 1 || len(recorded.inputs) != 1 {
+		t.Fatalf("result=(%+v, %v), partial=%d slots=%d metrics=%+v", out, err, writer.partialCalls, slots.calls, recorded.inputs)
+	}
+	if failed := recoveryEvent[domain.RecoveryFailed](t, writer.events); !failed.PartialOutputSaved {
+		t.Fatalf("failed event=%#v", failed)
+	}
+	if writer.exitCodeCalls != 1 || writer.exitCode.Raw() != 1 {
+		t.Fatalf("exit code writes=%d code=%d", writer.exitCodeCalls, writer.exitCode.Raw())
+	}
+}
+
+func TestRecoverViaResumeUseCaseWriterFailuresDoNotSkipMetricsOrSlotRelease(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, _, writer, _, recorded, slots, mutex := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	writer.markerErr = errors.New("marker write failed")
+	writer.appendErr = errors.New("event append failed")
+	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
+	if err != nil || !out.Succeeded || out.FinalState != domain.StateRecovered || len(recorded.inputs) != 1 || slots.calls != 1 || mutex.locks != 2 || mutex.unlocks != 2 {
+		t.Fatalf("result=(%+v, %v), metrics=%+v slots=%d locks=%d unlocks=%d", out, err, recorded.inputs, slots.calls, mutex.locks, mutex.unlocks)
+	}
+}
+
+func TestRecoverViaResumeUseCaseRejectsInvalidOriginBeforeLocking(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, store, writer, recoverer, recorded, slots, mutex := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{})
+	_, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOrigin("running"), OccurredAt: time.Now()})
+	if err == nil {
+		t.Fatal("invalid origin was accepted")
+	}
+	if store.loads != 0 || store.saves != 0 || len(writer.events) != 0 || recoverer.calls != 0 || len(recorded.inputs) != 0 || slots.calls != 0 || mutex.locks != 0 || mutex.unlocks != 0 {
+		t.Fatalf("unexpected side effects: loads=%d saves=%d events=%d resume=%d metrics=%d slots=%d locks=%d unlocks=%d", store.loads, store.saves, len(writer.events), recoverer.calls, len(recorded.inputs), slots.calls, mutex.locks, mutex.unlocks)
+	}
+}

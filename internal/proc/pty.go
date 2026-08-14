@@ -10,8 +10,8 @@ import (
 	"syscall"
 )
 
-// LaunchNewSession starts a child in a new session, redirects stdout, and closes the transferred liveness lock file.
-func LaunchNewSession(ctx context.Context, name string, env []string, livenessLockFile *os.File, stdout io.Writer, args ...string) (*exec.Cmd, error) {
+// LaunchNewSession starts a child in a new session, redirects standard streams, and closes the transferred liveness lock file.
+func LaunchNewSession(ctx context.Context, name string, env []string, livenessLockFile *os.File, stdout io.Writer, stderr io.Writer, args ...string) (*exec.Cmd, error) {
 	if livenessLockFile == nil {
 		return nil, fmt.Errorf("livenessLockFile is required")
 	}
@@ -29,6 +29,9 @@ func LaunchNewSession(ctx context.Context, name string, env []string, livenessLo
 	cmd.Env = env
 	if stdout != nil {
 		cmd.Stdout = stdout
+	}
+	if stderr != nil {
+		cmd.Stderr = stderr
 	}
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("launch %s: %w", name, err)

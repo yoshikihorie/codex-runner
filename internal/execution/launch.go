@@ -1,17 +1,22 @@
 package execution
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"strings"
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/contract"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/proc"
+	"github.com/yoshikihorie/codex-runner/internal/recovery"
 )
 
 type LaunchParams struct {
@@ -56,6 +61,8 @@ var now = time.Now
 const (
 	scriptBinaryPath = "/usr/bin/script"
 	stdbufBinaryPath = "/usr/bin/stdbuf"
+	// Canonical source: validation-rules.md RESUME_STDERR_BUFFER_MAX_BYTES.
+	resumeStderrBufferMaxBytes = 4096
 )
 
 func buildLaunchArgs(p LaunchParams) (headProcess string, args []string) {
@@ -75,6 +82,125 @@ func buildLaunchArgs(p LaunchParams) (headProcess string, args []string) {
 
 type processRunner struct {
 	logs executionLogOpener
+}
+
+type resumeLauncher struct {
+	runner ProcessRunner
+	logger *slog.Logger
+}
+
+type resumeWaitOutcome struct {
+	exitCode int
+	err      error
+}
+
+// NewResumeLauncher constructs the recovery boundary without exposing execution process types.
+func NewResumeLauncher(runner ProcessRunner, loggers ...*slog.Logger) recovery.ResumeLauncher {
+	if runner == nil {
+		panic("resume launcher requires a process runner")
+	}
+	logger := slog.Default()
+	if len(loggers) > 0 && loggers[0] != nil {
+		logger = loggers[0]
+	}
+	return &resumeLauncher{runner: runner, logger: logger}
+}
+
+func buildResumeArgs(params recovery.ResumeLaunchParams) []string {
+	return []string{"exec", "resume", params.SessionID, "--output-last-message", params.OutputLastMessagePath}
+}
+
+func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.ResumeLaunchParams) error {
+	if !filepath.IsAbs(params.CodexBinaryPath) || !filepath.IsAbs(params.OutputLastMessagePath) {
+		return fmt.Errorf("resume launch paths must be absolute")
+	}
+	taskDirPath := filepath.Join(taskPlacementRoot, params.TaskID.String())
+	lock, err := AcquireExistingForChild(taskDirPath)
+	if err != nil {
+		return fmt.Errorf("acquire resume liveness lock: %w", err)
+	}
+	defer lock.Close()
+	var stderr limitedWriter
+	stderr.limit = resumeStderrBufferMaxBytes
+	cmd, err := launchNewSession(context.Background(), params.CodexBinaryPath, proc.SafeChildEnv(), lock, nil, &stderr, buildResumeArgs(params)...)
+	if err != nil {
+		l.logStderr(params, err, &stderr)
+		return err
+	}
+	waiter := &processWaiter{cmd: cmd}
+	waitResult := make(chan resumeWaitOutcome, 1)
+	go func() {
+		exitCode, waitErr := waiter.Wait()
+		waitResult <- resumeWaitOutcome{exitCode: exitCode, err: waitErr}
+	}()
+	select {
+	case outcome := <-waitResult:
+		if outcome.err != nil {
+			l.logStderr(params, outcome.err, &stderr)
+			return outcome.err
+		}
+		if outcome.exitCode != 0 {
+			l.logStderr(params, fmt.Errorf("resume process exited with code %d", outcome.exitCode), &stderr)
+		}
+		return nil
+	case <-ctx.Done():
+		terminateErr := l.runner.Terminate(cmd.Process.Pid, TimeoutKillGrace)
+		timer := time.NewTimer(TimeoutKillGrace)
+		defer timer.Stop()
+		select {
+		case outcome := <-waitResult:
+			err := errors.Join(ctx.Err(), terminateErr, outcome.err)
+			l.logStderr(params, err, &stderr)
+			return err
+		case <-timer.C:
+			err := errors.Join(ctx.Err(), terminateErr, fmt.Errorf("resume process did not exit after termination"))
+			l.logStderr(params, err, &stderr)
+			return err
+		}
+	}
+}
+
+// ansiEscapePattern follows the canonical ANSI_ESCAPE_PATTERN. It is kept in
+// this package because recovery's equivalent is intentionally unexported.
+var resumeANSISequencePattern = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
+
+func sanitizeResumeStderr(raw []byte) string {
+	text := resumeANSISequencePattern.ReplaceAllString(string(raw), "")
+	text = strings.Map(func(r rune) rune {
+		if r < 0x20 && r != '\n' && r != '\t' {
+			return -1
+		}
+		return r
+	}, text)
+	const maxSummaryBytes = 500
+	if len(text) > maxSummaryBytes {
+		return text[:maxSummaryBytes] + "...(truncated)"
+	}
+	return text
+}
+
+func (l *resumeLauncher) logStderr(params recovery.ResumeLaunchParams, err error, stderr *limitedWriter) {
+	summary := sanitizeResumeStderr(stderr.buffer.Bytes())
+	if summary == "" {
+		return
+	}
+	l.logger.Warn("resume process failed", "task_id", params.TaskID.String(), "error", err, "stderr_summary", summary)
+}
+
+type limitedWriter struct {
+	buffer bytes.Buffer
+	limit  int
+}
+
+func (w *limitedWriter) Write(p []byte) (int, error) {
+	if remaining := w.limit - w.buffer.Len(); remaining > 0 {
+		if len(p) > remaining {
+			_, _ = w.buffer.Write(p[:remaining])
+		} else {
+			_, _ = w.buffer.Write(p)
+		}
+	}
+	return len(p), nil
 }
 
 func NewProcessRunner(logs executionLogOpener) ProcessRunner {
@@ -99,7 +225,7 @@ func (r *processRunner) Launch(ctx context.Context, p LaunchParams) (*LaunchedPr
 	}
 	defer logs.Close()
 
-	cmd, err := launchNewSession(ctx, head, proc.SafeChildEnv(), p.LivenessLockFile, logs.Stdout, args...)
+	cmd, err := launchNewSession(ctx, head, proc.SafeChildEnv(), p.LivenessLockFile, logs.Stdout, logs.Stderr, args...)
 	if err != nil {
 		if p.PTYEnabled {
 			return nil, fmt.Errorf("%w: %v", domain.ErrPTYAllocationFailed, err)

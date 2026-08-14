@@ -136,6 +136,55 @@ func TestAcquireForChildClosesFileWhenFlockFails(t *testing.T) {
 	}
 }
 
+func TestAcquireExistingForChildLocksOnlyExistingFile(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "task.lock")
+	if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	f, err := AcquireExistingForChild(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	other, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if err := syscall.Flock(int(other.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+		t.Fatalf("second lock error = %v, want EWOULDBLOCK", err)
+	}
+}
+
+func TestAcquireExistingForChildDoesNotCreateLock(t *testing.T) {
+	dir := t.TempDir()
+	if _, err := AcquireExistingForChild(dir); err == nil {
+		t.Fatal("AcquireExistingForChild unexpectedly created a lock")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "task.lock")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("lock stat error = %v, want not exist", err)
+	}
+}
+
+func TestAcquireExistingForChildClosesFileWhenFlockFails(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "task.lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	original := flockFunc
+	t.Cleanup(func() { flockFunc = original })
+	var captured *os.File
+	flockFunc = func(f *os.File, _ int) error { captured = f; return syscall.EWOULDBLOCK }
+	f, err := AcquireExistingForChild(dir)
+	if f != nil || !errors.Is(err, syscall.EWOULDBLOCK) || captured == nil {
+		t.Fatalf("result = (%v, %v), captured = %v", f, err, captured)
+	}
+	if _, err := captured.Stat(); err == nil {
+		t.Fatal("file remained open after flock error")
+	}
+}
+
 func TestAcquireForChildPropagatesMissingDirectoryAndRejectsSecondCall(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing")
 	if _, err := AcquireForChild(missing); err == nil {

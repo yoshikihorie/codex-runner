@@ -1,9 +1,11 @@
 package execution
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +18,7 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/contract"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/proc"
+	"github.com/yoshikihorie/codex-runner/internal/recovery"
 )
 
 type launchTestLogs struct {
@@ -100,7 +103,7 @@ func TestBuildLaunchArgs(t *testing.T) {
 func TestProcessRunnerLaunchMapsErrorsAndClosesLock(t *testing.T) {
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })
-	launchNewSession = func(_ context.Context, _ string, _ []string, lock *os.File, _ io.Writer, _ ...string) (*exec.Cmd, error) {
+	launchNewSession = func(_ context.Context, _ string, _ []string, lock *os.File, _ io.Writer, _ io.Writer, _ ...string) (*exec.Cmd, error) {
 		_ = lock.Close()
 		return nil, errors.New("start failed")
 	}
@@ -130,7 +133,7 @@ func TestProcessRunnerLaunchRejectsMissingTaskDirectoryBeforeDependencies(t *tes
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })
 	called := false
-	launchNewSession = func(ctx context.Context, name string, env []string, lock *os.File, stdout io.Writer, args ...string) (*exec.Cmd, error) {
+	launchNewSession = func(ctx context.Context, name string, env []string, lock *os.File, stdout io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
 		called = true
 		return nil, nil
 	}
@@ -149,7 +152,7 @@ func TestProcessRunnerLaunchRejectsFileAsTaskDirectory(t *testing.T) {
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })
 	called := false
-	launchNewSession = func(ctx context.Context, name string, env []string, lock *os.File, stdout io.Writer, args ...string) (*exec.Cmd, error) {
+	launchNewSession = func(ctx context.Context, name string, env []string, lock *os.File, stdout io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
 		called = true
 		return nil, nil
 	}
@@ -172,7 +175,7 @@ func TestProcessRunnerLaunchReturnsContractErrorWithoutStarting(t *testing.T) {
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })
 	called := false
-	launchNewSession = func(ctx context.Context, name string, env []string, lock *os.File, stdout io.Writer, args ...string) (*exec.Cmd, error) {
+	launchNewSession = func(ctx context.Context, name string, env []string, lock *os.File, stdout io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
 		called = true
 		return nil, nil
 	}
@@ -205,7 +208,7 @@ func TestProcessRunnerCapturesTimestampAndDomainHandle(t *testing.T) {
 	var gotName string
 	var gotEnv []string
 	var gotArgs []string
-	launchNewSession = func(ctx context.Context, name string, env []string, lock *os.File, stdout io.Writer, args ...string) (*exec.Cmd, error) {
+	launchNewSession = func(ctx context.Context, name string, env []string, lock *os.File, stdout io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
 		gotName, gotEnv, gotArgs = name, env, args
 		cmd := exec.Command("/bin/echo")
 		cmd.Stdout = stdout
@@ -251,7 +254,7 @@ func TestProcessRunnerLaunchPassesPTYArguments(t *testing.T) {
 	t.Cleanup(func() { launchNewSession = original })
 	var gotName string
 	var gotArgs []string
-	launchNewSession = func(ctx context.Context, name string, env []string, lock *os.File, stdout io.Writer, args ...string) (*exec.Cmd, error) {
+	launchNewSession = func(ctx context.Context, name string, env []string, lock *os.File, stdout io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
 		gotName, gotArgs = name, args
 		cmd := exec.Command("/bin/echo")
 		cmd.Stdout = stdout
@@ -302,5 +305,72 @@ func TestProcessRunnerTerminateDelegatesArgumentsAndError(t *testing.T) {
 	}
 	if err != wantErr {
 		t.Fatalf("error = %v, want same error %v", err, wantErr)
+	}
+}
+
+func TestResumeLaunchArgs(t *testing.T) {
+	id := launchTestID(t)
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", OutputLastMessagePath: "/tmp/codex-tasks/last-message.md"}
+	if got, want := buildResumeArgs(params), []string{"exec", "resume", "session-id", "--output-last-message", "/tmp/codex-tasks/last-message.md"}; !slices.Equal(got, want) {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
+func TestSanitizeResumeStderr(t *testing.T) {
+	if got := sanitizeResumeStderr([]byte("\x1b[31merror\x1b[0m\x01\n")); got != "error\n" {
+		t.Fatalf("sanitized=%q", got)
+	}
+	if got := sanitizeResumeStderr(bytes.Repeat([]byte("x"), 501)); got != strings.Repeat("x", 500)+"...(truncated)" {
+		t.Fatalf("truncated=%q", got)
+	}
+	if got := sanitizeResumeStderr(nil); got != "" {
+		t.Fatalf("empty=%q", got)
+	}
+}
+
+func TestResumeLauncherLogsSanitizedStderrOnLaunchFailure(t *testing.T) {
+	original := launchNewSession
+	t.Cleanup(func() { launchNewSession = original })
+	var logOutput bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
+	launchNewSession = func(_ context.Context, _ string, _ []string, _ *os.File, _ io.Writer, stderr io.Writer, _ ...string) (*exec.Cmd, error) {
+		_, _ = stderr.Write([]byte("\x1b[31mresume failure\x1b[0m"))
+		return nil, errors.New("launch failed")
+	}
+	id := launchTestID(t)
+	taskDir := filepath.Join(taskPlacementRoot, id.String())
+	if err := os.MkdirAll(taskDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lock, err := os.Create(filepath.Join(taskDir, "task.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
+	if err := NewResumeLauncher(&timeoutProcessFake{}, logger).LaunchAndWait(context.Background(), params); err == nil {
+		t.Fatal("launch failure was accepted")
+	}
+	log := logOutput.String()
+	if !strings.Contains(log, "task_id="+id.String()) || !strings.Contains(log, "stderr_summary=\"resume failure\"") || strings.Contains(log, "\\x1b") {
+		t.Fatalf("log=%q", log)
+	}
+}
+
+func TestResumeLauncherLogsSanitizedStderrForNonZeroExit(t *testing.T) {
+	var logOutput bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
+	launcher := &resumeLauncher{logger: logger}
+	params := recovery.ResumeLaunchParams{TaskID: launchTestID(t)}
+	stderr := &limitedWriter{limit: resumeStderrBufferMaxBytes}
+	if _, err := stderr.Write([]byte("\x1b[31mnon-zero resume output\x1b[0m")); err != nil {
+		t.Fatal(err)
+	}
+	launcher.logStderr(params, errors.New("resume process exited with code 1"), stderr)
+	log := logOutput.String()
+	if !strings.Contains(log, "task_id="+params.TaskID.String()) || !strings.Contains(log, "stderr_summary=\"non-zero resume output\"") || strings.Contains(log, "\\x1b") {
+		t.Fatalf("log=%q", log)
 	}
 }
