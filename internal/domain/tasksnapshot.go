@@ -122,7 +122,7 @@ func (s TaskSnapshot) Validate() error {
 		return bad("unknown recovery origin")
 	}
 	requires := map[TaskState]bool{StateRunning: true, StateStalled: true, StateTimeout: true, StateRecovering: true, StateRecovered: true, StateTimeoutLost: true, StateLost: true, StateCompleted: true}
-	if requires[s.State] && s.PID == nil {
+	if requires[s.State] && s.PID == nil && !s.AdoptedAfterRestart {
 		return bad("state requires process info")
 	}
 	if s.ExitCode != nil && !s.State.terminal() {

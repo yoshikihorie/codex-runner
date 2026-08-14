@@ -146,6 +146,28 @@ func TestTaskSnapshotValidateAllowsFailedWithoutPID(t *testing.T) {
 	}
 }
 
+func TestTaskSnapshotValidateRunningWithoutPIDAfterAdoption(t *testing.T) {
+	for _, tc := range []struct {
+		name                string
+		adoptedAfterRestart bool
+		wantErr             bool
+	}{
+		{"adopted after restart", true, false},
+		{"not adopted after restart", false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := validRunningSnapshot(t)
+			snapshot.PID, snapshot.ProcessStartedAt = nil, nil
+			snapshot.AdoptedAfterRestart = tc.adoptedAfterRestart
+
+			err := snapshot.Validate()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %v", err, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestTaskSnapshotValidateRejectsInvalidFields(t *testing.T) {
 	valid := validRunningSnapshot(t)
 	recoveryOrigin := RecoveryOriginTimeout
