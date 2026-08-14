@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/execution"
@@ -16,11 +17,20 @@ import (
 
 var errTailFromSeqInvalid = errors.New("tail from_seq is invalid")
 
+const (
+	tailIdleTimeout        = 1500 * time.Second
+	tailTerminalDrainRetry = 250 * time.Millisecond
+)
+
+type tailTimerFactory func(time.Duration) (<-chan time.Time, func())
+
 // TailTaskUseCase replays task progress and establishes the live-follow subscription point.
 type TailTaskUseCase struct {
 	provider transport.TaskSnapshotProvider
 	events   store.EventReader
 	notifier execution.TaskChangeNotifier
+
+	timerFactory tailTimerFactory
 }
 
 // NewTailTaskUseCase creates a tail use case with its required dependencies.
@@ -28,7 +38,12 @@ func NewTailTaskUseCase(provider transport.TaskSnapshotProvider, events store.Ev
 	if isNilStatusUseCaseDependency(provider) || isNilStatusUseCaseDependency(events) || isNilStatusUseCaseDependency(notifier) {
 		panic("tail task use case requires non-nil dependencies")
 	}
-	return &TailTaskUseCase{provider: provider, events: events, notifier: notifier}
+	return &TailTaskUseCase{
+		provider:     provider,
+		events:       events,
+		notifier:     notifier,
+		timerFactory: newTailTimer,
+	}
 }
 
 // Handle validates wire input and writes protocol responses to out.
@@ -51,8 +66,8 @@ func (uc *TailTaskUseCase) Handle(ctx context.Context, req transport.Request, ou
 	return err
 }
 
-// Execute replays saved progress and establishes a subscription for non-terminal tasks.
-func (uc *TailTaskUseCase) Execute(_ context.Context, in schema.TailTaskInput, out schema.ProgressWriter) error {
+// Execute replays saved progress and follows changes for non-terminal tasks.
+func (uc *TailTaskUseCase) Execute(ctx context.Context, in schema.TailTaskInput, out schema.ProgressWriter) error {
 	snapshot, err := uc.provider.Snapshot(in.TaskID)
 	if err != nil {
 		return err
@@ -64,7 +79,7 @@ func (uc *TailTaskUseCase) Execute(_ context.Context, in schema.TailTaskInput, o
 		nextSeq:   in.FromSeq,
 	}
 	if session.taskState.IsTerminal() {
-		if err := replayTailHistory(uc.events, session, out); err != nil {
+		if err := replayTailHistory(ctx, uc.events, session, out); err != nil {
 			return err
 		}
 		return out.WriteComplete(schema.CompleteLine{
@@ -78,7 +93,55 @@ func (uc *TailTaskUseCase) Execute(_ context.Context, in schema.TailTaskInput, o
 	changes, unsubscribe := uc.notifier.Subscribe(in.TaskID)
 	session.changes = changes
 	defer unsubscribe()
-	return replayTailHistory(uc.events, session, out)
+	defer session.stopTimers()
+
+	snapshot, err = uc.provider.Snapshot(in.TaskID)
+	if err != nil {
+		return err
+	}
+	session.taskState = snapshot.State
+	if session.taskState.IsTerminal() {
+		if _, err := uc.replayUntilEmpty(ctx, session, out, nil); err != nil {
+			return err
+		}
+		uc.enterTerminalDrain(session)
+	} else {
+		if _, err := replayTailHistoryWithCallback(ctx, uc.events, session, out, nil); err != nil {
+			return err
+		}
+		session.startIdle(uc.timerFactory)
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-session.changes:
+			done, err := uc.followChange(ctx, session, out, false)
+			if err != nil {
+				return err
+			}
+			if done {
+				return nil
+			}
+		case <-session.idleTimer:
+			done, err := uc.followChange(ctx, session, out, true)
+			if err != nil {
+				return err
+			}
+			if done {
+				return nil
+			}
+		case <-session.drainTimer:
+			done, err := uc.followTerminalDrain(ctx, session, out)
+			if err != nil {
+				return err
+			}
+			if done {
+				return nil
+			}
+		}
+	}
 }
 
 type tailSession struct {
@@ -87,14 +150,29 @@ type tailSession struct {
 	nextSeq          int
 	lastDeliveredSeq int
 	changes          <-chan struct{}
+
+	idleTimer       <-chan time.Time
+	stopIdleTimer   func()
+	drainTimer      <-chan time.Time
+	stopDrainTimer  func()
+	terminalPending bool
 }
 
-func replayTailHistory(events store.EventReader, session *tailSession, out schema.ProgressWriter) error {
+func replayTailHistory(ctx context.Context, events store.EventReader, session *tailSession, out schema.ProgressWriter) error {
+	_, err := replayTailHistoryWithCallback(ctx, events, session, out, nil)
+	return err
+}
+
+func replayTailHistoryWithCallback(ctx context.Context, events store.EventReader, session *tailSession, out schema.ProgressWriter, afterProgress func()) (int, error) {
 	records, err := events.ReadFrom(session.taskID, session.nextSeq)
 	if err != nil {
-		return err
+		return 0, err
 	}
+	delivered := 0
 	for _, record := range records {
+		if err := ctx.Err(); err != nil {
+			return delivered, err
+		}
 		if err := out.WriteProgress(schema.ProgressLine{
 			LineType:   schema.LineTypeProgress,
 			Seq:        record.Seq,
@@ -103,12 +181,145 @@ func replayTailHistory(events store.EventReader, session *tailSession, out schem
 			Raw:        record.Raw,
 			TaskState:  session.taskState,
 		}); err != nil {
-			return err
+			return delivered, err
 		}
 		session.nextSeq = record.Seq + 1
 		session.lastDeliveredSeq = record.Seq
+		delivered++
+		if afterProgress != nil {
+			afterProgress()
+		}
 	}
-	return nil
+	return delivered, nil
+}
+
+func newTailTimer(duration time.Duration) (<-chan time.Time, func()) {
+	timer := time.NewTimer(duration)
+	return timer.C, func() { timer.Stop() }
+}
+
+func (session *tailSession) startIdle(factory tailTimerFactory) {
+	session.stopIdle()
+	session.idleTimer, session.stopIdleTimer = factory(tailIdleTimeout)
+}
+
+func (session *tailSession) stopIdle() {
+	if session.stopIdleTimer != nil {
+		session.stopIdleTimer()
+	}
+	session.idleTimer = nil
+	session.stopIdleTimer = nil
+}
+
+func (session *tailSession) startDrain(factory tailTimerFactory) {
+	session.stopDrain()
+	session.drainTimer, session.stopDrainTimer = factory(tailTerminalDrainRetry)
+}
+
+func (session *tailSession) stopDrain() {
+	if session.stopDrainTimer != nil {
+		session.stopDrainTimer()
+	}
+	session.drainTimer = nil
+	session.stopDrainTimer = nil
+}
+
+func (session *tailSession) stopTimers() {
+	session.stopIdle()
+	session.stopDrain()
+}
+
+func (uc *TailTaskUseCase) replayUntilEmpty(ctx context.Context, session *tailSession, out schema.ProgressWriter, afterProgress func()) (int, error) {
+	total := 0
+	for {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		delivered, err := replayTailHistoryWithCallback(ctx, uc.events, session, out, afterProgress)
+		if err != nil {
+			return total, err
+		}
+		total += delivered
+		if delivered == 0 {
+			return total, nil
+		}
+	}
+}
+
+func (uc *TailTaskUseCase) enterTerminalDrain(session *tailSession) {
+	session.terminalPending = true
+	session.stopIdle()
+	session.startDrain(uc.timerFactory)
+}
+
+func (uc *TailTaskUseCase) followChange(ctx context.Context, session *tailSession, out schema.ProgressWriter, fromIdle bool) (bool, error) {
+	snapshot, err := uc.provider.Snapshot(session.taskID)
+	if err != nil {
+		return false, err
+	}
+	session.taskState = snapshot.State
+
+	if session.terminalPending {
+		_, err := uc.replayUntilEmpty(ctx, session, out, nil)
+		if err != nil {
+			return false, err
+		}
+		if !session.taskState.IsTerminal() {
+			session.terminalPending = false
+			session.stopDrain()
+			session.startIdle(uc.timerFactory)
+			return false, nil
+		}
+		// A notification establishes a fresh, complete terminal drain grace period.
+		session.startDrain(uc.timerFactory)
+		return false, nil
+	}
+
+	delivered, err := uc.replayUntilEmpty(ctx, session, out, func() { session.startIdle(uc.timerFactory) })
+	if err != nil {
+		return false, err
+	}
+	if session.taskState.IsTerminal() {
+		uc.enterTerminalDrain(session)
+		return false, nil
+	}
+	if fromIdle && delivered == 0 {
+		return true, out.WriteComplete(schema.CompleteLine{
+			LineType:  schema.LineTypeComplete,
+			Reason:    schema.CompleteReasonIdleTimeout,
+			TaskState: session.taskState,
+			LastSeq:   session.lastDeliveredSeq,
+		})
+	}
+	return false, nil
+}
+
+func (uc *TailTaskUseCase) followTerminalDrain(ctx context.Context, session *tailSession, out schema.ProgressWriter) (bool, error) {
+	snapshot, err := uc.provider.Snapshot(session.taskID)
+	if err != nil {
+		return false, err
+	}
+	session.taskState = snapshot.State
+	delivered, err := uc.replayUntilEmpty(ctx, session, out, nil)
+	if err != nil {
+		return false, err
+	}
+	if !session.taskState.IsTerminal() {
+		session.terminalPending = false
+		session.stopDrain()
+		session.startIdle(uc.timerFactory)
+		return false, nil
+	}
+	if delivered > 0 {
+		session.startDrain(uc.timerFactory)
+		return false, nil
+	}
+	return true, out.WriteComplete(schema.CompleteLine{
+		LineType:  schema.LineTypeComplete,
+		Reason:    schema.CompleteReasonTaskTerminal,
+		TaskState: session.taskState,
+		LastSeq:   session.lastDeliveredSeq,
+	})
 }
 
 func tailFromSeq(params json.RawMessage) (int, any, error) {
