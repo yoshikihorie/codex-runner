@@ -8,10 +8,12 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/store"
@@ -185,6 +187,164 @@ func TestAcquireExistingForChildClosesFileWhenFlockFails(t *testing.T) {
 	}
 }
 
+func TestAcquireExistingForChildRetriesAfterTransientLockContention(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "task.lock")
+	if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	holderReady := make(chan struct{})
+	releaseHolder := make(chan struct{})
+	holderClosed := make(chan struct{})
+	go func() {
+		holder, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+		if err != nil {
+			t.Errorf("open holder: %v", err)
+			return
+		}
+		if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+			t.Errorf("lock holder: %v", err)
+			_ = holder.Close()
+			return
+		}
+		close(holderReady)
+		<-releaseHolder
+		_ = holder.Close()
+		close(holderClosed)
+	}()
+	<-holderReady
+
+	var waits []time.Duration
+	f, err := acquireExistingForChild(dir, func(d time.Duration) {
+		waits = append(waits, d)
+		close(releaseHolder)
+		<-holderClosed
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	if len(waits) != 1 || waits[0] != existingLivenessLockRetryFirstWait {
+		t.Fatalf("waits = %v, want [%v]", waits, existingLivenessLockRetryFirstWait)
+	}
+
+	other, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if err := syscall.Flock(int(other.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+		t.Fatalf("second lock error = %v, want EWOULDBLOCK", err)
+	}
+}
+
+func TestAcquireExistingForChildReturnsWrappedWouldBlockAfterRetries(t *testing.T) {
+	dir := t.TempDir()
+	lockPath := filepath.Join(dir, "task.lock")
+	if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	holderReady := make(chan struct{})
+	releaseHolder := make(chan struct{})
+	holderClosed := make(chan struct{})
+	go func() {
+		holder, openErr := os.OpenFile(lockPath, os.O_RDWR, 0)
+		if openErr != nil {
+			t.Errorf("open holder: %v", openErr)
+			return
+		}
+		if lockErr := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); lockErr != nil {
+			t.Errorf("lock holder: %v", lockErr)
+			_ = holder.Close()
+			return
+		}
+		close(holderReady)
+		<-releaseHolder
+		_ = holder.Close()
+		close(holderClosed)
+	}()
+	<-holderReady
+	t.Cleanup(func() {
+		close(releaseHolder)
+		<-holderClosed
+	})
+
+	original := flockFunc
+	t.Cleanup(func() { flockFunc = original })
+	var captured *os.File
+	callCount := 0
+	flockFunc = func(f *os.File, how int) error {
+		captured = f
+		callCount++
+		return original(f, how)
+	}
+	var waits []time.Duration
+	f, err := acquireExistingForChild(dir, func(d time.Duration) { waits = append(waits, d) })
+	if f != nil || !errors.Is(err, syscall.EWOULDBLOCK) {
+		t.Fatalf("result = (%v, %v), want (nil, wrapped EWOULDBLOCK)", f, err)
+	}
+	if callCount != 4 {
+		t.Fatalf("flock calls = %d, want 4", callCount)
+	}
+	wantWaits := []time.Duration{existingLivenessLockRetryFirstWait, existingLivenessLockRetrySecondWait, existingLivenessLockRetryThirdWait}
+	if !slices.Equal(waits, wantWaits) {
+		t.Fatalf("waits = %v, want %v", waits, wantWaits)
+	}
+	if captured == nil {
+		t.Fatal("flock did not receive the opened file")
+	}
+	if _, statErr := captured.Stat(); statErr == nil {
+		t.Fatal("file remained open after retry exhaustion")
+	}
+}
+
+func TestAcquireExistingForChildDoesNotRetryOtherFlockErrors(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "task.lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	original := flockFunc
+	t.Cleanup(func() { flockFunc = original })
+	var captured *os.File
+	flockFunc = func(f *os.File, _ int) error {
+		captured = f
+		return syscall.EIO
+	}
+	waitCount := 0
+	f, err := acquireExistingForChild(dir, func(time.Duration) { waitCount++ })
+	if f != nil || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("result = (%v, %v), want (nil, wrapped EIO)", f, err)
+	}
+	if waitCount != 0 {
+		t.Fatalf("wait calls = %d, want 0", waitCount)
+	}
+	if captured == nil {
+		t.Fatal("flock did not receive the opened file")
+	}
+	if _, statErr := captured.Stat(); statErr == nil {
+		t.Fatal("file remained open after non-retryable flock error")
+	}
+}
+
+func TestAcquireExistingForChildRejectsSymbolicLink(t *testing.T) {
+	dir := t.TempDir()
+	target := filepath.Join(dir, "target.lock")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "task.lock")); err != nil {
+		t.Fatal(err)
+	}
+	if f, err := AcquireExistingForChild(dir); err == nil || f != nil {
+		if f != nil {
+			_ = f.Close()
+		}
+		t.Fatalf("result = (%v, %v), want fail-closed error", f, err)
+	}
+}
+
 func TestAcquireForChildPropagatesMissingDirectoryAndRejectsSecondCall(t *testing.T) {
 	missing := filepath.Join(t.TempDir(), "missing")
 	if _, err := AcquireForChild(missing); err == nil {
@@ -355,6 +515,99 @@ func TestAcquireForChildAndCheckLiveness(t *testing.T) {
 	}
 	if dead, err := useCase.Execute(context.Background(), id); !dead || err != nil {
 		t.Fatalf("released result = (%t, %v)", dead, err)
+	}
+}
+
+func TestAcquireDeathLease(t *testing.T) {
+	id := testTaskID(t)
+	root := t.TempDir()
+	dir := makeTaskDirectory(t, root, id)
+	lockPath := filepath.Join(dir, "task.lock")
+	if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	uc := NewCheckLivenessUseCase(nil, testResolver(root))
+	lease, dead, err := uc.AcquireDeathLease(id)
+	if err != nil || !dead || lease == nil {
+		t.Fatalf("result = (%v, %t, %v), want lease", lease, dead, err)
+	}
+	other, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if err := syscall.Flock(int(other.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); !errors.Is(err, syscall.EWOULDBLOCK) {
+		t.Fatalf("competing lock error = %v, want EWOULDBLOCK", err)
+	}
+	if err := lease.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	holder, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer holder.Close()
+	if err := syscall.Flock(int(holder.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	lease, dead, err = uc.AcquireDeathLease(id)
+	if lease != nil || dead || err != nil {
+		t.Fatalf("held result = (%v, %t, %v), want (nil, false, nil)", lease, dead, err)
+	}
+	if err := holder.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatal(err)
+	}
+	if lease, dead, err := uc.AcquireDeathLease(id); lease != nil || dead || !errors.Is(err, domain.ErrTaskNotFound) {
+		t.Fatalf("missing result = (%v, %t, %v), want ErrTaskNotFound", lease, dead, err)
+	}
+}
+
+func TestAcquireDeathLeaseRejectsSymbolicLink(t *testing.T) {
+	id := testTaskID(t)
+	root := t.TempDir()
+	dir := makeTaskDirectory(t, root, id)
+	target := filepath.Join(dir, "target.lock")
+	if err := os.WriteFile(target, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, filepath.Join(dir, "task.lock")); err != nil {
+		t.Fatal(err)
+	}
+	lease, dead, err := NewCheckLivenessUseCase(nil, testResolver(root)).AcquireDeathLease(id)
+	if lease != nil || dead || err == nil {
+		t.Fatalf("result = (%v, %t, %v), want fail-closed error", lease, dead, err)
+	}
+}
+
+func TestAcquireDeathLeaseClosesFileAfterFlockIOError(t *testing.T) {
+	id := testTaskID(t)
+	root := t.TempDir()
+	dir := makeTaskDirectory(t, root, id)
+	if err := os.WriteFile(filepath.Join(dir, "task.lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	original := flockFunc
+	t.Cleanup(func() { flockFunc = original })
+	var opened *os.File
+	flockFunc = func(f *os.File, _ int) error {
+		opened = f
+		return syscall.EIO
+	}
+
+	lease, dead, err := NewCheckLivenessUseCase(nil, testResolver(root)).AcquireDeathLease(id)
+	if lease != nil || dead || !errors.Is(err, syscall.EIO) {
+		t.Fatalf("result = (%v, %t, %v), want wrapped EIO", lease, dead, err)
+	}
+	if opened == nil {
+		t.Fatal("flock did not receive the opened file")
+	}
+	if _, statErr := opened.Stat(); statErr == nil {
+		t.Fatal("death lease file remained open after flock I/O error")
 	}
 }
 

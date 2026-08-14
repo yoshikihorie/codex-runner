@@ -8,11 +8,18 @@ import (
 	"os"
 	"path/filepath"
 	"syscall"
+	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 )
 
 const taskPlacementRoot = "/tmp/codex-tasks"
+
+const (
+	existingLivenessLockRetryFirstWait  = 10 * time.Millisecond
+	existingLivenessLockRetrySecondWait = 30 * time.Millisecond
+	existingLivenessLockRetryThirdWait  = 60 * time.Millisecond
+)
 
 var flockFunc = func(f *os.File, how int) error {
 	return syscall.Flock(int(f.Fd()), how)
@@ -42,16 +49,34 @@ func AcquireForChild(taskDirPath string) (*os.File, error) {
 
 // AcquireExistingForChild reopens and exclusively locks an existing liveness lock for child inheritance.
 func AcquireExistingForChild(taskDirPath string) (*os.File, error) {
+	return acquireExistingForChild(taskDirPath, time.Sleep)
+}
+
+func acquireExistingForChild(taskDirPath string, wait func(time.Duration)) (*os.File, error) {
 	lockPath := filepath.Join(taskDirPath, "task.lock")
-	f, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	f, err := os.OpenFile(lockPath, os.O_RDWR|syscall.O_NOFOLLOW, 0)
 	if err != nil {
 		return nil, err
 	}
-	if err := flockFunc(f, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		_ = f.Close()
-		return nil, fmt.Errorf("acquire existing liveness lock for child: %w", err)
+
+	retryWaits := [...]time.Duration{
+		existingLivenessLockRetryFirstWait,
+		existingLivenessLockRetrySecondWait,
+		existingLivenessLockRetryThirdWait,
 	}
-	return f, nil
+	for attempt := range len(retryWaits) + 1 {
+		err := flockFunc(f, syscall.LOCK_EX|syscall.LOCK_NB)
+		if err == nil {
+			return f, nil
+		}
+		if !errors.Is(err, syscall.EWOULDBLOCK) || attempt == len(retryWaits) {
+			_ = f.Close()
+			return nil, fmt.Errorf("acquire existing liveness lock for child: %w", err)
+		}
+		wait(retryWaits[attempt])
+	}
+
+	panic("unreachable")
 }
 
 // CheckLivenessUseCase checks whether a task liveness lock is currently unheld.
@@ -76,4 +101,25 @@ func (u *CheckLivenessUseCase) Execute(_ context.Context, taskID domain.TaskID) 
 	default:
 		return false, fmt.Errorf("check task liveness: %w", err)
 	}
+}
+
+// AcquireDeathLease exclusively locks taskID's existing liveness lock until the
+// caller closes the returned file. A held lock means the task may still resume.
+func (u *CheckLivenessUseCase) AcquireDeathLease(taskID domain.TaskID) (lease *os.File, dead bool, err error) {
+	lockPath := u.resolveLockPath(taskID)
+	lease, err = os.OpenFile(lockPath, os.O_RDWR|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, false, domain.ErrTaskNotFound
+		}
+		return nil, false, fmt.Errorf("open death lease %q: %w", lockPath, err)
+	}
+	if err := flockFunc(lease, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		_ = lease.Close()
+		if errors.Is(err, syscall.EWOULDBLOCK) {
+			return nil, false, nil
+		}
+		return nil, false, fmt.Errorf("acquire death lease %q: %w", lockPath, err)
+	}
+	return lease, true, nil
 }

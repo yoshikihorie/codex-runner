@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"os/exec"
@@ -118,6 +119,22 @@ func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.Resu
 	lock, err := AcquireExistingForChild(taskDirPath)
 	if err != nil {
 		return fmt.Errorf("acquire resume liveness lock: %w", err)
+	}
+	markerPath := worktreeEvictionMarkerPath(params.TaskID)
+	if _, markerErr := os.Lstat(markerPath); markerErr == nil {
+		evictionErr := fmt.Errorf("%w: %s", ErrWorktreeEvicted, markerPath)
+		_ = lock.Close()
+		l.logger.Error("reject resume after worktree eviction", "task_id", params.TaskID.String(), "marker_path", markerPath, "error", evictionErr)
+		return evictionErr
+	} else if !errors.Is(markerErr, fs.ErrNotExist) {
+		err := fmt.Errorf("inspect worktree eviction marker %q: %w", markerPath, markerErr)
+		_ = lock.Close()
+		l.logger.Error("inspect worktree eviction marker", "task_id", params.TaskID.String(), "marker_path", markerPath, "error", err)
+		return err
+	}
+	if err := ctx.Err(); err != nil {
+		_ = lock.Close()
+		return err
 	}
 	defer lock.Close()
 	var stderr limitedWriter

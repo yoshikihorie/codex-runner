@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -313,6 +314,168 @@ func TestResumeLaunchArgs(t *testing.T) {
 	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", OutputLastMessagePath: "/tmp/codex-tasks/last-message.md"}
 	if got, want := buildResumeArgs(params), []string{"exec", "resume", "session-id", "--output-last-message", "/tmp/codex-tasks/last-message.md"}; !slices.Equal(got, want) {
 		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
+func TestResumeLauncherDoesNotLaunchWhenContextCanceledAfterLockAcquisition(t *testing.T) {
+	originalFlock := flockFunc
+	t.Cleanup(func() { flockFunc = originalFlock })
+	originalLaunch := launchNewSession
+	t.Cleanup(func() { launchNewSession = originalLaunch })
+
+	id, err := domain.NewTaskID("impl-20260814-120000-a1b2-cancel")
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskDir := filepath.Join(taskPlacementRoot, id.String())
+	if err := os.MkdirAll(taskDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(taskDir, "task.lock")
+	lock, err := os.Create(lockPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lock.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var acquired *os.File
+	flockFunc = func(f *os.File, _ int) error {
+		acquired = f
+		cancel()
+		return nil
+	}
+	launchCalls := 0
+	launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+		launchCalls++
+		return nil, nil
+	}
+
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
+	err = NewResumeLauncher(&timeoutProcessFake{}).LaunchAndWait(ctx, params)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if launchCalls != 0 {
+		t.Fatalf("launch calls = %d, want 0", launchCalls)
+	}
+	if acquired == nil {
+		t.Fatal("flock did not receive the acquired lock")
+	}
+	if _, statErr := acquired.Stat(); statErr == nil {
+		t.Fatal("acquired lock remained open after cancellation")
+	}
+}
+
+func TestResumeLauncherRejectsEvictedWorktreeBeforeContextCancellation(t *testing.T) {
+	originalLaunch := launchNewSession
+	t.Cleanup(func() { launchNewSession = originalLaunch })
+	id, err := domain.NewTaskID("impl-20260814-120002-a1b2-evicted")
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskDir := filepath.Join(taskPlacementRoot, id.String())
+	if err := os.MkdirAll(taskDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(taskDir) })
+	if err := os.WriteFile(filepath.Join(taskDir, "task.lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(worktreeEvictionMarkerPath(id), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	launchCalls := 0
+	launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+		launchCalls++
+		return nil, nil
+	}
+	var logOutput bytes.Buffer
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
+	err = NewResumeLauncher(&timeoutProcessFake{}, slog.New(slog.NewTextHandler(&logOutput, nil))).LaunchAndWait(ctx, params)
+	if !errors.Is(err, ErrWorktreeEvicted) || errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want eviction error only", err)
+	}
+	if launchCalls != 0 {
+		t.Fatalf("launch calls = %d, want 0", launchCalls)
+	}
+	other, openErr := os.OpenFile(filepath.Join(taskDir, "task.lock"), os.O_RDWR, 0)
+	if openErr != nil {
+		t.Fatal(openErr)
+	}
+	defer other.Close()
+	if lockErr := syscall.Flock(int(other.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); lockErr != nil {
+		t.Fatalf("resume lock remained held after eviction rejection: %v", lockErr)
+	}
+	if !strings.Contains(logOutput.String(), "task_id="+id.String()) || !strings.Contains(logOutput.String(), worktreeEvictionMarkerPath(id)) || !strings.Contains(logOutput.String(), ErrWorktreeEvicted.Error()) {
+		t.Fatalf("eviction rejection log = %q", logOutput.String())
+	}
+}
+
+func TestResumeLauncherRejectsMarkerInspectionPermissionFailure(t *testing.T) {
+	if os.Getuid() == 0 {
+		t.Skip("permission checks are not reliable for root")
+	}
+	originalLaunch := launchNewSession
+	originalFlock := flockFunc
+	t.Cleanup(func() {
+		launchNewSession = originalLaunch
+		flockFunc = originalFlock
+	})
+	id, err := domain.NewTaskID("impl-20260814-120006-a1b2-markereacces")
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskDir := filepath.Join(taskPlacementRoot, id.String())
+	if err := os.MkdirAll(taskDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(taskDir, 0o700)
+		_ = os.RemoveAll(taskDir)
+	})
+	lockPath := filepath.Join(taskDir, "task.lock")
+	if err := os.WriteFile(lockPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	flockFunc = func(f *os.File, how int) error {
+		if err := originalFlock(f, how); err != nil {
+			return err
+		}
+		return os.Chmod(taskDir, 0o000)
+	}
+	launchCalls := 0
+	launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+		launchCalls++
+		return nil, nil
+	}
+	var logOutput bytes.Buffer
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
+	err = NewResumeLauncher(&timeoutProcessFake{}, slog.New(slog.NewTextHandler(&logOutput, nil))).LaunchAndWait(context.Background(), params)
+	if !errors.Is(err, syscall.EACCES) {
+		t.Fatalf("error = %v, want EACCES", err)
+	}
+	if launchCalls != 0 {
+		t.Fatalf("launch calls = %d, want 0", launchCalls)
+	}
+	if err := os.Chmod(taskDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	other, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	if err := syscall.Flock(int(other.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatalf("resume lock remained held after marker inspection failure: %v", err)
+	}
+	if !strings.Contains(logOutput.String(), "task_id="+id.String()) || !strings.Contains(logOutput.String(), worktreeEvictionMarkerPath(id)) || !strings.Contains(logOutput.String(), "permission denied") {
+		t.Fatalf("marker inspection log = %q", logOutput.String())
 	}
 }
 

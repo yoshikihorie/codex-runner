@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
+	storepkg "github.com/yoshikihorie/codex-runner/internal/store"
 )
 
 const (
@@ -25,6 +26,16 @@ const (
 )
 
 const worktreeRootPermission os.FileMode = 0o700
+
+const worktreeEvictionMarkerName = ".eviction-marker"
+
+var ErrWorktreeEvicted = errors.New("worktree was evicted")
+
+var writeAtomic = storepkg.WriteAtomic
+
+func worktreeEvictionMarkerPath(taskID domain.TaskID) string {
+	return filepath.Join(taskPlacementRoot, taskID.String(), worktreeEvictionMarkerName)
+}
 
 // WorktreeCreator creates one atomic worktree copy.
 type WorktreeCreator interface {
@@ -331,12 +342,13 @@ func (uc *EvictWorkDirUseCase) Execute(ctx context.Context, in EvictWorkDirInput
 			continue
 		}
 		out.Candidates = append(out.Candidates, *candidate)
-		if err := uc.store.Remove(candidate.Path); err != nil {
-			uc.logger.Error("remove worktree", "path", candidate.Path, "error", err)
-			out.Skipped = append(out.Skipped, WorktreeSkipped{Path: candidate.Path, Reason: WorktreeSkipRemoveFailed})
-			continue
+		deleted, skip := uc.deleteWithDeathLease(*candidate)
+		if skip != nil {
+			out.Skipped = append(out.Skipped, *skip)
 		}
-		out.Deleted = append(out.Deleted, candidate.Path)
+		if deleted {
+			out.Deleted = append(out.Deleted, candidate.Path)
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return out, err
@@ -349,15 +361,72 @@ func (uc *EvictWorkDirUseCase) deleteAll(ctx context.Context, candidates []Workt
 		if err := ctx.Err(); err != nil {
 			return deleted, skipped, err
 		}
-		if err := uc.store.Remove(candidate.Path); err != nil {
-			uc.logger.Error("remove worktree", "path", candidate.Path, "error", err)
-			skipped = append(skipped, WorktreeSkipped{Path: candidate.Path, Reason: WorktreeSkipRemoveFailed})
-			continue
+		wasDeleted, skip := uc.deleteWithDeathLease(candidate)
+		if skip != nil {
+			skipped = append(skipped, *skip)
 		}
-		deleted = append(deleted, candidate.Path)
+		if wasDeleted {
+			deleted = append(deleted, candidate.Path)
+		}
 	}
 	if err := ctx.Err(); err != nil {
 		return deleted, skipped, err
 	}
 	return deleted, skipped, nil
+}
+
+// deleteWithDeathLease rechecks liveness immediately before destructive work.
+func (uc *EvictWorkDirUseCase) deleteWithDeathLease(candidate WorktreeCandidate) (bool, *WorktreeSkipped) {
+	lease, dead, err := uc.locks.AcquireDeathLease(candidate.TaskID)
+	if err == nil && !dead {
+		return false, &WorktreeSkipped{Path: candidate.Path, Reason: WorktreeSkipStillAlive}
+	}
+
+	writeMarker := false
+	if errors.Is(err, domain.ErrTaskNotFound) {
+		taskDirPath := filepath.Join(taskPlacementRoot, candidate.TaskID.String())
+		info, lstatErr := os.Lstat(taskDirPath)
+		switch {
+		case errors.Is(lstatErr, fs.ErrNotExist):
+			return uc.removeCandidate(candidate)
+		case lstatErr != nil:
+			uc.logger.Error("inspect task directory before worktree eviction", "task_id", candidate.TaskID.String(), "path", candidate.Path, "error", lstatErr)
+			return false, nil
+		case info.Mode()&os.ModeSymlink != 0:
+			uc.logger.Error("reject task directory symlink before worktree eviction", "task_id", candidate.TaskID.String(), "path", candidate.Path, "error", fmt.Errorf("task directory is a symbolic link"))
+			return false, nil
+		case !info.IsDir():
+			uc.logger.Error("reject task directory before worktree eviction", "task_id", candidate.TaskID.String(), "path", candidate.Path, "error", fmt.Errorf("task directory is not a directory"))
+			return false, nil
+		default:
+			writeMarker = true
+		}
+	} else if err != nil {
+		uc.logger.Error("acquire worktree death lease", "task_id", candidate.TaskID.String(), "path", candidate.Path, "error", err)
+		return false, nil
+	} else {
+		defer func() {
+			if closeErr := lease.Close(); closeErr != nil {
+				uc.logger.Error("close worktree death lease", "task_id", candidate.TaskID.String(), "lock_path", uc.locks.resolveLockPath(candidate.TaskID), "error", closeErr)
+			}
+		}()
+		writeMarker = true
+	}
+
+	if writeMarker {
+		markerPath := worktreeEvictionMarkerPath(candidate.TaskID)
+		if writeErr := writeAtomic(markerPath, nil, 0o600); writeErr != nil {
+			uc.logger.Error("write worktree eviction marker", "task_id", candidate.TaskID.String(), "marker_path", markerPath, "error", writeErr)
+			return false, nil
+		}
+	}
+	return uc.removeCandidate(candidate)
+}
+
+func (uc *EvictWorkDirUseCase) removeCandidate(candidate WorktreeCandidate) (bool, *WorktreeSkipped) {
+	if err := uc.store.Remove(candidate.Path); err != nil {
+		uc.logger.Error("remove worktree", "path", candidate.Path, "error", err)
+		return false, &WorktreeSkipped{Path: candidate.Path, Reason: WorktreeSkipRemoveFailed}
+	}
+	return true, nil
 }
