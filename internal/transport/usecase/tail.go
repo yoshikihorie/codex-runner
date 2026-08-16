@@ -18,8 +18,11 @@ import (
 var errTailFromSeqInvalid = errors.New("tail from_seq is invalid")
 
 const (
-	tailIdleTimeout        = 1500 * time.Second
-	tailTerminalDrainRetry = 250 * time.Millisecond
+	tailIdleTimeout = 1500 * time.Second
+	// TAIL_TERMINAL_DRAIN_RETRY_INTERVAL_MS
+	tailTerminalDrainRetryInterval = 250 * time.Millisecond
+	// TAIL_TERMINAL_DRAIN_MAX_WAIT_MS
+	tailTerminalDrainMaxWait = 2000 * time.Millisecond
 )
 
 type tailTimerFactory func(time.Duration) (<-chan time.Time, func())
@@ -78,34 +81,19 @@ func (uc *TailTaskUseCase) Execute(ctx context.Context, in schema.TailTaskInput,
 		taskState: snapshot.State,
 		nextSeq:   in.FromSeq,
 	}
-	if session.taskState.IsTerminal() {
-		if err := replayTailHistory(ctx, uc.events, session, out); err != nil {
-			return err
-		}
-		return out.WriteComplete(schema.CompleteLine{
-			LineType:  schema.LineTypeComplete,
-			Reason:    schema.CompleteReasonTaskTerminal,
-			TaskState: session.taskState,
-			LastSeq:   session.lastDeliveredSeq,
-		})
-	}
-
-	changes, unsubscribe := uc.notifier.Subscribe(in.TaskID)
-	session.changes = changes
-	defer unsubscribe()
 	defer session.stopTimers()
 
-	snapshot, err = uc.provider.Snapshot(in.TaskID)
-	if err != nil {
-		return err
-	}
-	session.taskState = snapshot.State
 	if session.taskState.IsTerminal() {
+		uc.enterTerminalDrain(session)
 		if _, err := uc.replayUntilEmpty(ctx, session, out, nil); err != nil {
 			return err
 		}
-		uc.enterTerminalDrain(session)
+		session.startDrainRetry(uc.timerFactory)
 	} else {
+		changes, unsubscribe := uc.notifier.Subscribe(in.TaskID)
+		session.changes = changes
+		defer unsubscribe()
+
 		if _, err := replayTailHistoryWithCallback(ctx, uc.events, session, out, nil); err != nil {
 			return err
 		}
@@ -132,8 +120,16 @@ func (uc *TailTaskUseCase) Execute(ctx context.Context, in schema.TailTaskInput,
 			if done {
 				return nil
 			}
-		case <-session.drainTimer:
+		case <-session.drainRetryTimer:
 			done, err := uc.followTerminalDrain(ctx, session, out)
+			if err != nil {
+				return err
+			}
+			if done {
+				return nil
+			}
+		case <-session.drainMaximumTimer:
+			done, err := uc.finishTerminalDrain(ctx, session, out)
 			if err != nil {
 				return err
 			}
@@ -151,11 +147,13 @@ type tailSession struct {
 	lastDeliveredSeq int
 	changes          <-chan struct{}
 
-	idleTimer       <-chan time.Time
-	stopIdleTimer   func()
-	drainTimer      <-chan time.Time
-	stopDrainTimer  func()
-	terminalPending bool
+	idleTimer             <-chan time.Time
+	stopIdleTimer         func()
+	drainRetryTimer       <-chan time.Time
+	stopDrainRetryTimer   func()
+	drainMaximumTimer     <-chan time.Time
+	stopDrainMaximumTimer func()
+	terminalPending       bool
 }
 
 func replayTailHistory(ctx context.Context, events store.EventReader, session *tailSession, out schema.ProgressWriter) error {
@@ -211,22 +209,38 @@ func (session *tailSession) stopIdle() {
 	session.stopIdleTimer = nil
 }
 
-func (session *tailSession) startDrain(factory tailTimerFactory) {
-	session.stopDrain()
-	session.drainTimer, session.stopDrainTimer = factory(tailTerminalDrainRetry)
+func (session *tailSession) startDrainRetry(factory tailTimerFactory) {
+	session.stopDrainRetry()
+	session.drainRetryTimer, session.stopDrainRetryTimer = factory(tailTerminalDrainRetryInterval)
 }
 
-func (session *tailSession) stopDrain() {
-	if session.stopDrainTimer != nil {
-		session.stopDrainTimer()
+func (session *tailSession) stopDrainRetry() {
+	if session.stopDrainRetryTimer != nil {
+		session.stopDrainRetryTimer()
 	}
-	session.drainTimer = nil
-	session.stopDrainTimer = nil
+	session.drainRetryTimer = nil
+	session.stopDrainRetryTimer = nil
+}
+
+func (session *tailSession) startDrainMaximum(factory tailTimerFactory) {
+	if session.drainMaximumTimer != nil {
+		return
+	}
+	session.drainMaximumTimer, session.stopDrainMaximumTimer = factory(tailTerminalDrainMaxWait)
+}
+
+func (session *tailSession) stopDrainMaximum() {
+	if session.stopDrainMaximumTimer != nil {
+		session.stopDrainMaximumTimer()
+	}
+	session.drainMaximumTimer = nil
+	session.stopDrainMaximumTimer = nil
 }
 
 func (session *tailSession) stopTimers() {
 	session.stopIdle()
-	session.stopDrain()
+	session.stopDrainRetry()
+	session.stopDrainMaximum()
 }
 
 func (uc *TailTaskUseCase) replayUntilEmpty(ctx context.Context, session *tailSession, out schema.ProgressWriter, afterProgress func()) (int, error) {
@@ -249,29 +263,31 @@ func (uc *TailTaskUseCase) replayUntilEmpty(ctx context.Context, session *tailSe
 func (uc *TailTaskUseCase) enterTerminalDrain(session *tailSession) {
 	session.terminalPending = true
 	session.stopIdle()
-	session.startDrain(uc.timerFactory)
+	session.startDrainMaximum(uc.timerFactory)
 }
 
 func (uc *TailTaskUseCase) followChange(ctx context.Context, session *tailSession, out schema.ProgressWriter, fromIdle bool) (bool, error) {
-	snapshot, err := uc.provider.Snapshot(session.taskID)
-	if err != nil {
-		return false, err
-	}
-	session.taskState = snapshot.State
-
 	if session.terminalPending {
-		_, err := uc.replayUntilEmpty(ctx, session, out, nil)
+		snapshot, err := uc.provider.Snapshot(session.taskID)
+		if err != nil {
+			return false, err
+		}
+		session.taskState = snapshot.State
+		delivered, err := uc.replayUntilEmpty(ctx, session, out, nil)
 		if err != nil {
 			return false, err
 		}
 		if !session.taskState.IsTerminal() {
 			session.terminalPending = false
-			session.stopDrain()
+			session.stopDrainRetry()
+			session.stopDrainMaximum()
 			session.startIdle(uc.timerFactory)
 			return false, nil
 		}
-		// A notification establishes a fresh, complete terminal drain grace period.
-		session.startDrain(uc.timerFactory)
+		if delivered == 0 {
+			return true, uc.writeTerminalComplete(ctx, session, out)
+		}
+		session.startDrainRetry(uc.timerFactory)
 		return false, nil
 	}
 
@@ -279,8 +295,14 @@ func (uc *TailTaskUseCase) followChange(ctx context.Context, session *tailSessio
 	if err != nil {
 		return false, err
 	}
+	snapshot, err := uc.provider.Snapshot(session.taskID)
+	if err != nil {
+		return false, err
+	}
+	session.taskState = snapshot.State
 	if session.taskState.IsTerminal() {
 		uc.enterTerminalDrain(session)
+		session.startDrainRetry(uc.timerFactory)
 		return false, nil
 	}
 	if fromIdle && delivered == 0 {
@@ -306,15 +328,30 @@ func (uc *TailTaskUseCase) followTerminalDrain(ctx context.Context, session *tai
 	}
 	if !session.taskState.IsTerminal() {
 		session.terminalPending = false
-		session.stopDrain()
+		session.stopDrainRetry()
+		session.stopDrainMaximum()
 		session.startIdle(uc.timerFactory)
 		return false, nil
 	}
 	if delivered > 0 {
-		session.startDrain(uc.timerFactory)
+		session.startDrainRetry(uc.timerFactory)
 		return false, nil
 	}
-	return true, out.WriteComplete(schema.CompleteLine{
+	return true, uc.writeTerminalComplete(ctx, session, out)
+}
+
+func (uc *TailTaskUseCase) finishTerminalDrain(ctx context.Context, session *tailSession, out schema.ProgressWriter) (bool, error) {
+	if _, err := uc.replayUntilEmpty(ctx, session, out, nil); err != nil {
+		return false, err
+	}
+	return true, uc.writeTerminalComplete(ctx, session, out)
+}
+
+func (uc *TailTaskUseCase) writeTerminalComplete(ctx context.Context, session *tailSession, out schema.ProgressWriter) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return out.WriteComplete(schema.CompleteLine{
 		LineType:  schema.LineTypeComplete,
 		Reason:    schema.CompleteReasonTaskTerminal,
 		TaskState: session.taskState,

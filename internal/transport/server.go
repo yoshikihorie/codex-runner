@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 )
@@ -46,6 +47,10 @@ type Response struct {
 	Result          json.RawMessage `json:"result,omitempty"`
 	Error           *ErrorBody      `json:"error,omitempty"`
 }
+
+// TailHandler writes tail responses for a validated tail request.
+type TailHandler func(context.Context, Request, io.Writer) error
+
 type envelopeResult int
 
 const (
@@ -55,31 +60,59 @@ const (
 )
 
 type tailConnRegistry struct {
-	mu    sync.Mutex
-	conns map[net.Conn]struct{}
+	mu       sync.Mutex
+	conns    map[net.Conn]context.CancelFunc
+	shutting bool
 }
 
 // NewTailConnRegistry creates the registry shared by Serve and shutdown handling.
 func NewTailConnRegistry() *tailConnRegistry {
-	return &tailConnRegistry{conns: make(map[net.Conn]struct{})}
+	return &tailConnRegistry{conns: make(map[net.Conn]context.CancelFunc)}
 }
 
-func (r *tailConnRegistry) add(conn net.Conn) {
+func (r *tailConnRegistry) add(conn net.Conn, cancel context.CancelFunc) bool {
 	r.mu.Lock()
-	defer r.mu.Unlock()
-	if r.conns == nil {
-		r.conns = make(map[net.Conn]struct{})
+	if r.shutting {
+		r.mu.Unlock()
+		cancel()
+		_ = conn.Close()
+		return false
 	}
-	r.conns[conn] = struct{}{}
+	if r.conns == nil {
+		r.conns = make(map[net.Conn]context.CancelFunc)
+	}
+	r.conns[conn] = cancel
+	r.mu.Unlock()
+	return true
 }
+
 func (r *tailConnRegistry) remove(conn net.Conn) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	delete(r.conns, conn)
 }
 
+func (r *tailConnRegistry) closeAll() {
+	r.mu.Lock()
+	r.shutting = true
+	targets := make(map[net.Conn]context.CancelFunc, len(r.conns))
+	for conn, cancel := range r.conns {
+		targets[conn] = cancel
+	}
+	clear(r.conns)
+	r.mu.Unlock()
+
+	for _, cancel := range targets {
+		cancel()
+	}
+	for conn := range targets {
+		_ = conn.Close()
+	}
+}
+
 // Serve starts a Unix-domain socket listener and stops accepting connections when ctx is cancelled.
-func Serve(ctx context.Context, socketPath string, dispatch func(Request) Response, wg *sync.WaitGroup, tailConns *tailConnRegistry) error {
+func Serve(ctx context.Context, socketPath string, dispatch func(Request) Response, tailHandler TailHandler, wg *sync.WaitGroup, tailConns *tailConnRegistry, acceptLoopDone chan<- struct{}) error {
+	defer close(acceptLoopDone)
 	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
 		return fmt.Errorf("remove existing socket: %w", err)
 	}
@@ -103,10 +136,10 @@ func Serve(ctx context.Context, socketPath string, dispatch func(Request) Respon
 			continue
 		}
 		wg.Add(1)
-		go handleConn(conn, dispatch, wg, tailConns)
+		go handleConn(ctx, conn, dispatch, tailHandler, wg, tailConns)
 	}
 }
-func handleConn(conn net.Conn, dispatch func(Request) Response, wg *sync.WaitGroup, tailConns *tailConnRegistry) {
+func handleConn(ctx context.Context, conn net.Conn, dispatch func(Request) Response, tailHandler TailHandler, wg *sync.WaitGroup, tailConns *tailConnRegistry) {
 	defer wg.Done()
 	defer conn.Close()
 	defer func() {
@@ -114,14 +147,22 @@ func handleConn(conn net.Conn, dispatch func(Request) Response, wg *sync.WaitGro
 			slog.Error("connection handler panicked", "panic", recovered)
 		}
 	}()
+	stop := context.AfterFunc(ctx, func() { _ = conn.SetReadDeadline(time.Now()) })
+	defer stop()
 	reader := bufio.NewReader(conn)
 	encoder := json.NewEncoder(conn)
 	for {
+		if ctx.Err() != nil {
+			return
+		}
 		line, err := reader.ReadBytes('\n')
 		if err != nil {
 			if err == io.EOF && len(line) == 0 {
 				return
 			}
+			return
+		}
+		if ctx.Err() != nil {
 			return
 		}
 		var req Request
@@ -138,7 +179,9 @@ func handleConn(conn net.Conn, dispatch func(Request) Response, wg *sync.WaitGro
 			continue
 		}
 		if req.Verb == string(domain.ProtocolVerbTail) {
-			handleTail(conn, req, encoder, tailConns)
+			if err := handleTail(ctx, conn, req, tailHandler, tailConns); err != nil {
+				return
+			}
 			continue
 		}
 		if encoder.Encode(dispatch(req)) != nil {
@@ -170,7 +213,12 @@ func unknownVerbResponse(requestID string, verbs ...string) Response {
 	}
 	return Response{ProtocolVersion: ProtocolVersion, RequestID: requestID, OK: false, Error: &ErrorBody{Code: protocolUnknownVerbCode, MessageKey: protocolUnknownVerbMessageKey, Detail: map[string]any{"verb": verb}}}
 }
-func handleTail(conn net.Conn, _ Request, _ *json.Encoder, tailConns *tailConnRegistry) {
-	tailConns.add(conn)
+func handleTail(parentCtx context.Context, conn net.Conn, req Request, tailHandler TailHandler, tailConns *tailConnRegistry) error {
+	tailCtx, cancel := context.WithCancel(context.WithoutCancel(parentCtx))
+	if !tailConns.add(conn, cancel) {
+		return nil
+	}
+	defer cancel()
 	defer tailConns.remove(conn)
+	return tailHandler(tailCtx, req, conn)
 }

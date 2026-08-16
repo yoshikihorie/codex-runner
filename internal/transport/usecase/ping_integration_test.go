@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -50,9 +51,10 @@ func TestServePingConcurrentConnections(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
+	acceptLoopDone := make(chan struct{})
 	serveDone := make(chan error, 1)
 	go func() {
-		serveDone <- transport.Serve(ctx, socketPath, dispatcher.Dispatch, &wg, transport.NewTailConnRegistry())
+		serveDone <- transport.Serve(ctx, socketPath, dispatcher.Dispatch, func(context.Context, transport.Request, io.Writer) error { return nil }, &wg, transport.NewTailConnRegistry(), acceptLoopDone)
 	}()
 	t.Cleanup(func() {
 		cancel()
