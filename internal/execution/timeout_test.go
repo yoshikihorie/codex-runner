@@ -15,9 +15,25 @@ import (
 
 	"github.com/yoshikihorie/codex-runner/internal/contract"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
+	"github.com/yoshikihorie/codex-runner/internal/metrics"
 	"github.com/yoshikihorie/codex-runner/internal/recovery"
 	"github.com/yoshikihorie/codex-runner/internal/store"
 )
+
+type timeoutStalledTrackerFake struct {
+	calls []struct {
+		id domain.TaskID
+		at time.Time
+	}
+}
+
+func (f *timeoutStalledTrackerFake) LeaveStalled(id domain.TaskID, at time.Time) int {
+	f.calls = append(f.calls, struct {
+		id domain.TaskID
+		at time.Time
+	}{id: id, at: at})
+	return 0
+}
 
 type timeoutTimerFake struct {
 	mu        sync.Mutex
@@ -245,7 +261,7 @@ func timeoutUseCase(t *testing.T, snapshot domain.TaskSnapshot, liveness ...stru
 	pending := &timeoutPendingFake{}
 	paths := &timeoutPathStoreFake{}
 	ensurer := NewTerminationEnsurer(timeoutLiveness(liveness...), proc, domain.ClockFunc(time.Now), func(context.Context, time.Duration) {})
-	return NewEnforceTaskTimeoutUseCase(tasks, writer, proc, recoverer, ensurer, pending, NewReleasePathLockUseCase(paths), store.NewTaskMutex(), domain.ClockFunc(time.Now)), tasks, writer, proc, recoverer, pending, paths
+	return NewEnforceTaskTimeoutUseCase(tasks, writer, proc, recoverer, ensurer, pending, NewReleasePathLockUseCase(paths), store.NewTaskMutex(), domain.ClockFunc(time.Now), &timeoutStalledTrackerFake{}), tasks, writer, proc, recoverer, pending, paths
 }
 
 func TestTimeoutWatcherArmDisarmAndClose(t *testing.T) {
@@ -560,6 +576,7 @@ func TestEnforceTaskTimeoutPendingUsesReconciliationSet(t *testing.T) {
 		NewReleasePathLockUseCase(&timeoutPathStoreFake{}),
 		store.NewTaskMutex(),
 		domain.ClockFunc(time.Now),
+		&timeoutStalledTrackerFake{},
 	)
 	out, err := uc.Execute(context.Background(), EnforceTaskTimeoutInput{TaskID: snapshot.TaskID, OccurredAt: time.Now()})
 	if err != nil || out.Outcome != "timed-out" {
@@ -597,7 +614,7 @@ func TestEnforceTaskTimeoutAppendEventFailureContinuesTerminationAndRecovery(t *
 	uc := NewEnforceTaskTimeoutUseCase(tasks, writer, proc, recoverer, NewTerminationEnsurer(timeoutLivenessWithCalls(&confirmCalls, struct {
 		dead bool
 		err  error
-	}{dead: true}), proc, domain.ClockFunc(time.Now), func(context.Context, time.Duration) {}), pending, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), store.NewTaskMutex(), domain.ClockFunc(time.Now))
+	}{dead: true}), proc, domain.ClockFunc(time.Now), func(context.Context, time.Duration) {}), pending, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), store.NewTaskMutex(), domain.ClockFunc(time.Now), &timeoutStalledTrackerFake{})
 	appendErr := fmt.Errorf("%w: append event", domain.ErrContractWriteFailed)
 	writer.appendErr = appendErr
 
@@ -678,7 +695,7 @@ func TestEnforceTaskTimeoutPendingSkipsReleaseAndRecovery(t *testing.T) {
 			recoverer := &timeoutRecoveryFake{}
 			pending := &recovery.PendingReconciliationSet{}
 			ensurer := NewTerminationEnsurer(timeoutLiveness(tc.results...), proc, domain.ClockFunc(time.Now), func(context.Context, time.Duration) {})
-			uc := NewEnforceTaskTimeoutUseCase(tasks, &timeoutWriterFake{}, proc, recoverer, ensurer, pending, NewReleasePathLockUseCase(paths), store.NewTaskMutex(), domain.ClockFunc(time.Now))
+			uc := NewEnforceTaskTimeoutUseCase(tasks, &timeoutWriterFake{}, proc, recoverer, ensurer, pending, NewReleasePathLockUseCase(paths), store.NewTaskMutex(), domain.ClockFunc(time.Now), &timeoutStalledTrackerFake{})
 			_, _ = uc.Execute(context.Background(), EnforceTaskTimeoutInput{TaskID: snapshot.TaskID, OccurredAt: time.Now()})
 			if len(pending.List()) != 1 || recoverer.calls != 0 || len(paths.deleted) != 0 {
 				t.Fatalf("pending=%d recovery=%d paths=%d", len(pending.List()), recoverer.calls, len(paths.deleted))
@@ -704,7 +721,7 @@ func TestEnforceTaskTimeoutReleasesPathLockFileBeforeRecovery(t *testing.T) {
 			dead bool
 			err  error
 		}{dead: true}), proc, domain.ClockFunc(time.Now), func(context.Context, time.Duration) {}),
-		&timeoutPendingFake{}, NewReleasePathLockUseCase(pathStore), store.NewTaskMutex(), domain.ClockFunc(time.Now),
+		&timeoutPendingFake{}, NewReleasePathLockUseCase(pathStore), store.NewTaskMutex(), domain.ClockFunc(time.Now), &timeoutStalledTrackerFake{},
 	)
 	if _, err := uc.Execute(context.Background(), EnforceTaskTimeoutInput{TaskID: snapshot.TaskID, OccurredAt: time.Now()}); err != nil {
 		t.Fatal(err)
@@ -752,7 +769,7 @@ func TestEnforceTaskTimeoutNotFoundAndPendingSet(t *testing.T) {
 		dead bool
 		err  error
 	}{}), proc, domain.ClockFunc(time.Now), func(context.Context, time.Duration) {})
-	uc = NewEnforceTaskTimeoutUseCase(tasks, &timeoutWriterFake{}, proc, &timeoutRecoveryFake{}, ensurer, pending, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), store.NewTaskMutex(), domain.ClockFunc(time.Now))
+	uc = NewEnforceTaskTimeoutUseCase(tasks, &timeoutWriterFake{}, proc, &timeoutRecoveryFake{}, ensurer, pending, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), store.NewTaskMutex(), domain.ClockFunc(time.Now), &timeoutStalledTrackerFake{})
 	if _, err := uc.Execute(context.Background(), EnforceTaskTimeoutInput{TaskID: snapshot.TaskID, OccurredAt: time.Now()}); err != nil {
 		t.Fatal(err)
 	}
@@ -773,7 +790,7 @@ func TestEnforceTaskTimeoutConstructorRejectsNilPathLockReleaser(t *testing.T) {
 	NewEnforceTaskTimeoutUseCase(&timeoutStoreFake{}, &timeoutWriterFake{}, &timeoutProcessFake{}, &timeoutRecoveryFake{}, timeoutEnsurer(struct {
 		dead bool
 		err  error
-	}{dead: true}), &timeoutPendingFake{}, nil, store.NewTaskMutex(), domain.ClockFunc(time.Now))
+	}{dead: true}), &timeoutPendingFake{}, nil, store.NewTaskMutex(), domain.ClockFunc(time.Now), &timeoutStalledTrackerFake{})
 }
 
 func TestTerminationEnsurerConstructorRejectsNilDependencies(t *testing.T) {
@@ -809,3 +826,122 @@ var _ store.TaskStore = (*timeoutStoreFake)(nil)
 var _ ProcessRunner = (*timeoutProcessFake)(nil)
 var _ RecoveryInvoker = (*timeoutRecoveryFake)(nil)
 var _ recovery.PendingRegistrar = (*timeoutPendingFake)(nil)
+
+// RED: Batch 4B wires the tracker at the same persistence boundary as timeout.
+func TestEnforceTaskTimeoutStalledTrackerTransitions(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		state     domain.TaskState
+		saveErr   error
+		appendErr error
+		wantCalls int
+	}{
+		{"stalled-save-success", domain.StateStalled, nil, nil, 1},
+		{"running-save-success", domain.StateRunning, nil, nil, 0},
+		{"stalled-save-failure", domain.StateStalled, errors.New("save"), nil, 0},
+		{"stalled-append-event-failure", domain.StateStalled, nil, errors.New("append"), 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := timeoutSnapshot(t, tc.state, domain.SubcommandReview, nil)
+			tasks := &timeoutStoreFake{snapshot: snapshot, saveErr: tc.saveErr}
+			writer := &timeoutWriterFake{appendErr: tc.appendErr}
+			tracker := &timeoutStalledTrackerFake{}
+			proc := &timeoutProcessFake{}
+			uc := NewEnforceTaskTimeoutUseCase(tasks, writer, proc, &timeoutRecoveryFake{}, timeoutEnsurer(struct {
+				dead bool
+				err  error
+			}{dead: true}), &timeoutPendingFake{}, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), store.NewTaskMutex(), domain.ClockFunc(time.Now), tracker)
+			at := time.Date(2026, time.August, 10, 12, 1, 0, 0, time.UTC)
+			_, _ = uc.Execute(context.Background(), EnforceTaskTimeoutInput{TaskID: snapshot.TaskID, OccurredAt: at})
+			if len(tracker.calls) != tc.wantCalls {
+				t.Fatalf("LeaveStalled calls=%d, want %d", len(tracker.calls), tc.wantCalls)
+			}
+			if tc.wantCalls == 1 && (tracker.calls[0].id != snapshot.TaskID || !tracker.calls[0].at.Equal(at)) {
+				t.Fatalf("LeaveStalled=%+v", tracker.calls[0])
+			}
+		})
+	}
+	t.Run("non-running-or-stalled-early-return", func(t *testing.T) {
+		for _, state := range []domain.TaskState{
+			domain.StateQueued, domain.StateStarting, domain.StateCompleted, domain.StateFailed,
+			domain.StateTimeout, domain.StateRecovering, domain.StateRecovered, domain.StateTimeoutLost,
+			domain.StateCancelling, domain.StateKilled, domain.StateAdopted, domain.StateOrphaned, domain.StateLost,
+		} {
+			t.Run(string(state), func(t *testing.T) {
+				snapshot := timeoutSnapshot(t, state, domain.SubcommandReview, nil)
+				tracker := &timeoutStalledTrackerFake{}
+				proc := &timeoutProcessFake{}
+				uc := NewEnforceTaskTimeoutUseCase(&timeoutStoreFake{snapshot: snapshot}, &timeoutWriterFake{}, proc, &timeoutRecoveryFake{}, timeoutEnsurer(struct {
+					dead bool
+					err  error
+				}{dead: true}), &timeoutPendingFake{}, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), store.NewTaskMutex(), domain.ClockFunc(time.Now), tracker)
+				_, _ = uc.Execute(context.Background(), EnforceTaskTimeoutInput{TaskID: snapshot.TaskID, OccurredAt: time.Now()})
+				if len(tracker.calls) != 0 {
+					t.Fatalf("state=%s LeaveStalled calls=%d", state, len(tracker.calls))
+				}
+			})
+		}
+	})
+}
+
+func TestEnforceTaskTimeoutConstructorRejectsNilStalledTimeTracker(t *testing.T) {
+	for _, tracker := range []stalledTimeTracker{nil, (*metrics.StalledTimeTracker)(nil)} {
+		t.Run("nil", func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			NewEnforceTaskTimeoutUseCase(&timeoutStoreFake{}, &timeoutWriterFake{}, &timeoutProcessFake{}, &timeoutRecoveryFake{}, timeoutEnsurer(struct {
+				dead bool
+				err  error
+			}{dead: true}), &timeoutPendingFake{}, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), store.NewTaskMutex(), domain.ClockFunc(time.Now), tracker)
+		})
+	}
+}
+
+func TestEnforceTaskTimeoutStalledTrackerPreSaveFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		snapshot domain.TaskSnapshot
+		loadErr  error
+	}{
+		{"load-error", domain.TaskSnapshot{}, errors.New("load")},
+		{"restore-error", domain.TaskSnapshot{TaskID: timeoutID(t, "restore-error"), State: domain.StateStalled}, nil},
+		{"with-task-error", domain.TaskSnapshot{TaskID: timeoutID(t, "with-task-error"), State: domain.StateStalled}, nil},
+		{"mark-timed-out-rejection-is-unreachable-after-state-guard", timeoutSnapshot(t, domain.StateCompleted, domain.SubcommandReview, nil), nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := tc.snapshot
+			if snapshot.TaskID.String() == "" {
+				snapshot = timeoutSnapshot(t, domain.StateStalled, domain.SubcommandReview, nil)
+			}
+			tasks := &timeoutStoreFake{snapshot: snapshot, loadErr: tc.loadErr}
+			tracker := &timeoutStalledTrackerFake{}
+			proc := &timeoutProcessFake{}
+			uc := NewEnforceTaskTimeoutUseCase(tasks, &timeoutWriterFake{}, proc, &timeoutRecoveryFake{}, timeoutEnsurer(struct {
+				dead bool
+				err  error
+			}{dead: true}), &timeoutPendingFake{}, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), store.NewTaskMutex(), domain.ClockFunc(time.Now), tracker)
+			_, _ = uc.Execute(context.Background(), EnforceTaskTimeoutInput{TaskID: snapshot.TaskID, OccurredAt: time.Now()})
+			if len(tracker.calls) != 0 {
+				t.Fatalf("LeaveStalled calls=%d", len(tracker.calls))
+			}
+		})
+	}
+}
+
+func TestEnforceTaskTimeoutStalledTrackerNeverEntersOrTakes(t *testing.T) {
+	var _ stalledTimeTracker = (*timeoutStalledTrackerFake)(nil)
+	snapshot := timeoutSnapshot(t, domain.StateStalled, domain.SubcommandReview, nil)
+	tracker := &timeoutStalledTrackerFake{}
+	proc := &timeoutProcessFake{}
+	uc := NewEnforceTaskTimeoutUseCase(&timeoutStoreFake{snapshot: snapshot}, &timeoutWriterFake{}, proc, &timeoutRecoveryFake{}, timeoutEnsurer(struct {
+		dead bool
+		err  error
+	}{dead: true}), &timeoutPendingFake{}, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), store.NewTaskMutex(), domain.ClockFunc(time.Now), tracker)
+	_, _ = uc.Execute(context.Background(), EnforceTaskTimeoutInput{TaskID: snapshot.TaskID, OccurredAt: time.Now()})
+	if len(tracker.calls) != 1 {
+		t.Fatalf("LeaveStalled calls=%d, want 1", len(tracker.calls))
+	}
+}

@@ -14,6 +14,7 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/contract"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/execution"
+	"github.com/yoshikihorie/codex-runner/internal/metrics"
 	"github.com/yoshikihorie/codex-runner/internal/recovery"
 	"github.com/yoshikihorie/codex-runner/internal/store"
 	"github.com/yoshikihorie/codex-runner/internal/transport"
@@ -77,6 +78,21 @@ type cancelEventsFake struct {
 	err    error
 }
 
+type cancelStalledTrackerFake struct {
+	calls []struct {
+		id domain.TaskID
+		at time.Time
+	}
+}
+
+func (f *cancelStalledTrackerFake) LeaveStalled(id domain.TaskID, at time.Time) int {
+	f.calls = append(f.calls, struct {
+		id domain.TaskID
+		at time.Time
+	}{id: id, at: at})
+	return 0
+}
+
 func (f *cancelEventsFake) AppendEvent(_ domain.TaskID, event domain.Event) error {
 	f.events = append(f.events, event)
 	return f.err
@@ -131,7 +147,7 @@ func (*cancelReaderFake) ReadLastMessageContent(domain.TaskID) ([]byte, error) {
 func (*cancelReaderFake) ReadPartialOutputContent(domain.TaskID) ([]byte, error) {
 	return nil, nil
 }
-func (*cancelReaderFake) ReadExitCode(domain.TaskID) (int, bool, error)        { return 0, false, nil }
+func (*cancelReaderFake) ReadExitCode(domain.TaskID) (int, bool, error) { return 0, false, nil }
 
 type cancelSlotFake struct{ calls int }
 
@@ -197,7 +213,7 @@ func cancelFixtureWithQueueMutexAndSlots(t *testing.T, payload execution.TaskLau
 	disarmer := &cancelDisarmerFake{}
 	writer := &cancelWriterFake{}
 	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, writer, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), slots, domain.ClockFunc(time.Now))
-	uc := NewCancelTaskUseCase(tasks, queue, queueMu, store.NewTaskMutex(), events, terminator, disarmer, confirmer, domain.ClockFunc(func() time.Time { return time.Date(2026, 8, 11, 12, 1, 0, 0, time.UTC) }))
+	uc := NewCancelTaskUseCase(tasks, queue, queueMu, store.NewTaskMutex(), events, terminator, disarmer, confirmer, &cancelStalledTrackerFake{}, domain.ClockFunc(func() time.Time { return time.Date(2026, 8, 11, 12, 1, 0, 0, time.UTC) }))
 	return tasks, queue, events, terminator, disarmer, uc
 }
 
@@ -450,6 +466,152 @@ func TestCancelTaskHandle_ContractWriteFailuresAreSanitized(t *testing.T) {
 			detail, err := json.Marshal(response.Error.Detail)
 			if err != nil || strings.Contains(string(detail), "/private/contract") || strings.Contains(string(detail), "task.json") || !strings.Contains(string(detail), payload.Task.ID().String()) {
 				t.Fatalf("detail=%s err=%v", detail, err)
+			}
+		})
+	}
+}
+
+// RED: only a persisted stalled task closes the in-memory stalled interval.
+func TestCancelTaskStalledTrackerPersistedTransitions(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		state     domain.TaskState
+		saveErr   error
+		wantCalls int
+	}{
+		{"stalled-save-success", domain.StateStalled, nil, 1},
+		{"running-save-success", domain.StateRunning, nil, 0},
+		{"starting-save-success", domain.StateStarting, nil, 0},
+		{"adopted-save-success", domain.StateAdopted, nil, 0},
+		{"orphaned-save-success", domain.StateOrphaned, nil, 0},
+		{"cancelling-self-loop", domain.StateCancelling, nil, 0},
+		{"stalled-save-failure", domain.StateStalled, errors.New("save"), 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := cancelQueuedPayload(t)
+			tasks := &cancelStoreFake{reserved: true, snapshot: cancelPersistedSnapshot(t, tc.state, true), saveErr: tc.saveErr}
+			queue, events := &cancelQueueFake{}, &cancelEventsFake{}
+			tracker := &cancelStalledTrackerFake{}
+			disarmer := &cancelDisarmerFake{}
+			confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now))
+			uc := NewCancelTaskUseCase(tasks, queue, &sync.Mutex{}, store.NewTaskMutex(), events, &cancelTerminatorFake{}, disarmer, confirmer, tracker, domain.ClockFunc(time.Now))
+			at := time.Date(2026, time.August, 11, 12, 2, 0, 0, time.UTC)
+			_, _ = uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: at})
+			if len(tracker.calls) != tc.wantCalls {
+				t.Fatalf("LeaveStalled calls=%d, want %d", len(tracker.calls), tc.wantCalls)
+			}
+		})
+	}
+}
+
+func TestCancelTaskQueuedSaveDoesNotUpdateStalledTracker(t *testing.T) {
+	payload := cancelQueuedPayload(t)
+	tasks, queue, events := &cancelStoreFake{reserved: true}, &cancelQueueFake{payload: payload, removed: true}, &cancelEventsFake{}
+	tracker, disarmer := &cancelStalledTrackerFake{}, &cancelDisarmerFake{}
+	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now))
+	uc := NewCancelTaskUseCase(tasks, queue, &sync.Mutex{}, store.NewTaskMutex(), events, &cancelTerminatorFake{}, disarmer, confirmer, tracker, domain.ClockFunc(time.Now))
+	_, _ = uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+	if len(tracker.calls) != 0 {
+		t.Fatalf("queued cancel called LeaveStalled: %+v", tracker.calls)
+	}
+}
+
+func TestNewCancelTaskUseCaseRejectsNilStalledTimeTracker(t *testing.T) {
+	for _, tracker := range []stalledTimeTracker{nil, (*metrics.StalledTimeTracker)(nil)} {
+		t.Run("nil", func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			payload := cancelQueuedPayload(t)
+			tasks, queue, events, terminator, disarmer, _ := cancelFixture(t, payload, false)
+			confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now))
+			NewCancelTaskUseCase(tasks, queue, &sync.Mutex{}, store.NewTaskMutex(), events, terminator, disarmer, confirmer, tracker, domain.ClockFunc(time.Now))
+		})
+	}
+}
+
+func TestCancelTaskStalledTrackerPreSaveFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		loadErr  error
+		reserved bool
+		state    domain.TaskState
+	}{
+		{"load-error", errors.New("load"), true, domain.StateStalled},
+		{"cancel-state-changed", domain.ErrTaskNotFound, true, domain.StateStalled},
+		{"request-cancel-rejected", nil, true, domain.StateCompleted},
+		{"with-task-error", nil, true, domain.StateStalled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := cancelQueuedPayload(t)
+			snapshot := cancelPersistedSnapshot(t, tc.state, true)
+			if tc.name == "with-task-error" {
+				snapshot = domain.TaskSnapshot{TaskID: payload.Task.ID(), State: domain.StateStalled}
+			}
+			tasks := &cancelStoreFake{reserved: tc.reserved, snapshot: snapshot, loadErr: tc.loadErr}
+			tracker, disarmer := &cancelStalledTrackerFake{}, &cancelDisarmerFake{}
+			confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now))
+			uc := NewCancelTaskUseCase(tasks, &cancelQueueFake{}, &sync.Mutex{}, store.NewTaskMutex(), &cancelEventsFake{}, &cancelTerminatorFake{}, disarmer, confirmer, tracker, domain.ClockFunc(time.Now))
+			_, _ = uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+			if len(tracker.calls) != 0 {
+				t.Fatalf("LeaveStalled calls=%d", len(tracker.calls))
+			}
+		})
+	}
+}
+
+func TestCancelTaskStalledTrackerNeverEntersOrTakes(t *testing.T) {
+	var _ stalledTimeTracker = (*cancelStalledTrackerFake)(nil)
+	payload := cancelQueuedPayload(t)
+	tasks := &cancelStoreFake{reserved: true, snapshot: cancelPersistedSnapshot(t, domain.StateStalled, true)}
+	tracker, disarmer := &cancelStalledTrackerFake{}, &cancelDisarmerFake{}
+	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now))
+	uc := NewCancelTaskUseCase(tasks, &cancelQueueFake{}, &sync.Mutex{}, store.NewTaskMutex(), &cancelEventsFake{}, &cancelTerminatorFake{}, disarmer, confirmer, tracker, domain.ClockFunc(time.Now))
+	_, _ = uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+	if len(tracker.calls) != 1 {
+		t.Fatalf("LeaveStalled calls=%d, want 1", len(tracker.calls))
+	}
+}
+
+func TestCancelTaskHandleResponsesRemainStableWithStalledTracker(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		setup    func(*cancelStoreFake)
+		wantOK   bool
+		wantCode string
+		wantKey  string
+	}{
+		{"success", func(tasks *cancelStoreFake) { tasks.snapshot = cancelPersistedSnapshot(t, domain.StateStalled, true) }, true, "", ""},
+		{"TASK_NOT_FOUND", func(tasks *cancelStoreFake) { tasks.reserved = false }, false, "TASK_NOT_FOUND", "error.task.notFound"},
+		{"TASK_ALREADY_TERMINAL", func(tasks *cancelStoreFake) { tasks.snapshot = cancelPersistedSnapshot(t, domain.StateCompleted, true) }, false, "TASK_ALREADY_TERMINAL", "error.task.alreadyTerminal"},
+		{"TASK_INVALID_TRANSITION", func(tasks *cancelStoreFake) { tasks.snapshot = cancelPersistedSnapshot(t, domain.StateTimeout, true) }, false, "TASK_INVALID_TRANSITION", "error.task.invalidTransition"},
+		{"CANCEL_STATE_CHANGED", func(tasks *cancelStoreFake) { tasks.loadErr = domain.ErrTaskNotFound }, false, "CANCEL_STATE_CHANGED", "error.cancel.stateChanged"},
+		{"CONTRACT_WRITE_FAILED", func(tasks *cancelStoreFake) {
+			tasks.snapshot = cancelPersistedSnapshot(t, domain.StateStalled, true)
+			tasks.saveErr = errors.New("save")
+		}, false, "CONTRACT_WRITE_FAILED", "error.contract.writeFailed"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := cancelQueuedPayload(t)
+			tasks, _, _, _, _, uc := cancelFixture(t, payload, false)
+			tc.setup(tasks)
+			response := uc.Handle(transport.Request{RequestID: tc.name, TaskID: payload.Task.ID().String(), Params: json.RawMessage(`{}`)})
+			if response.OK != tc.wantOK {
+				t.Fatalf("response=%#v", response)
+			}
+			if tc.wantOK {
+				var body struct {
+					State domain.TaskState `json:"state"`
+				}
+				if err := json.Unmarshal(response.Result, &body); err != nil || body.State != domain.StateCancelling {
+					t.Fatalf("body=%s err=%v", response.Result, err)
+				}
+				return
+			}
+			if response.Error == nil || response.Error.Code != tc.wantCode || response.Error.MessageKey != tc.wantKey {
+				t.Fatalf("response=%#v", response)
 			}
 		})
 	}

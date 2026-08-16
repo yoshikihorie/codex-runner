@@ -196,6 +196,17 @@ type TimeoutDisarmer interface {
 	Disarm(taskID domain.TaskID)
 }
 
+type stalledTimeTracker interface {
+	LeaveStalled(domain.TaskID, time.Time) int
+}
+
+type taskLocker interface {
+	Lock(domain.TaskID)
+	Unlock(domain.TaskID)
+}
+
+var _ taskLocker = (*store.TaskMutex)(nil)
+
 type EnforceTaskTimeoutInput struct {
 	TaskID                 domain.TaskID
 	ResolvedTimeoutSeconds int
@@ -215,15 +226,16 @@ type EnforceTaskTimeoutUseCase struct {
 	termination      *TerminationEnsurer
 	pendingRegistrar recovery.PendingRegistrar
 	pathLockReleaser *ReleasePathLockUseCase
-	taskMu           *store.TaskMutex
+	taskMu           taskLocker
 	clock            domain.Clock
+	stalledTracker   stalledTimeTracker
 }
 
-func NewEnforceTaskTimeoutUseCase(tasks store.TaskStore, contractWriter contract.ContractWriter, proc ProcessRunner, recoveryInvoker RecoveryInvoker, termination *TerminationEnsurer, pendingRegistrar recovery.PendingRegistrar, pathLockReleaser *ReleasePathLockUseCase, taskMu *store.TaskMutex, clock domain.Clock) *EnforceTaskTimeoutUseCase {
-	if tasks == nil || contractWriter == nil || proc == nil || recoveryInvoker == nil || termination == nil || pendingRegistrar == nil || pathLockReleaser == nil || taskMu == nil || clock == nil {
+func NewEnforceTaskTimeoutUseCase(tasks store.TaskStore, contractWriter contract.ContractWriter, proc ProcessRunner, recoveryInvoker RecoveryInvoker, termination *TerminationEnsurer, pendingRegistrar recovery.PendingRegistrar, pathLockReleaser *ReleasePathLockUseCase, taskMu taskLocker, clock domain.Clock, stalledTracker stalledTimeTracker) *EnforceTaskTimeoutUseCase {
+	if isNilStatusDependency(tasks) || isNilStatusDependency(contractWriter) || isNilStatusDependency(proc) || isNilStatusDependency(recoveryInvoker) || isNilStatusDependency(termination) || isNilStatusDependency(pendingRegistrar) || isNilStatusDependency(pathLockReleaser) || isNilStatusDependency(taskMu) || isNilStatusDependency(clock) || isNilStatusDependency(stalledTracker) {
 		panic("enforce task timeout use case requires non-nil dependencies")
 	}
-	return &EnforceTaskTimeoutUseCase{tasks: tasks, contract: contractWriter, proc: proc, recovery: recoveryInvoker, termination: termination, pendingRegistrar: pendingRegistrar, pathLockReleaser: pathLockReleaser, taskMu: taskMu, clock: clock}
+	return &EnforceTaskTimeoutUseCase{tasks: tasks, contract: contractWriter, proc: proc, recovery: recoveryInvoker, termination: termination, pendingRegistrar: pendingRegistrar, pathLockReleaser: pathLockReleaser, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker}
 }
 
 func (uc *EnforceTaskTimeoutUseCase) Execute(ctx context.Context, in EnforceTaskTimeoutInput) (EnforceTaskTimeoutOutput, error) {
@@ -288,6 +300,9 @@ func (uc *EnforceTaskTimeoutUseCase) executeLocked(_ context.Context, in Enforce
 	}
 	if err := uc.tasks.Save(in.TaskID, updated); err != nil {
 		return domain.TaskSnapshot{}, nil, false, nil, err
+	}
+	if snapshot.State == domain.StateStalled {
+		uc.stalledTracker.LeaveStalled(in.TaskID, in.OccurredAt)
 	}
 	var contractErr error
 	for _, event := range events {
