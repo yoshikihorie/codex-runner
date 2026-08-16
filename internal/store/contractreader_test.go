@@ -128,6 +128,39 @@ func TestReadPromptContentAndExitCode(t *testing.T) {
 		t.Fatalf("malformed exit=(%t,%v)", ok, err)
 	}
 }
+func TestReadPartialOutputContent(t *testing.T) {
+	root, id := readerDir(t)
+	r := NewFileContractReader(root)
+	p, err := PartialOutputMDPath(root, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []byte{0, 'x', '\n', 0xff}
+	if err := os.WriteFile(p, want, taskFilePerm); err != nil {
+		t.Fatal(err)
+	}
+	got, err := r.ReadPartialOutputContent(id)
+	if err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("content=%v err=%v", got, err)
+	}
+	if err := os.Remove(p); err != nil {
+		t.Fatal(err)
+	}
+	got, err = r.ReadPartialOutputContent(id)
+	if err != nil || got != nil {
+		t.Fatalf("missing=%v err=%v", got, err)
+	}
+	if err := os.WriteFile(p, nil, taskFilePerm); err != nil {
+		t.Fatal(err)
+	}
+	got, err = r.ReadPartialOutputContent(id)
+	if err != nil || got == nil || len(got) != 0 {
+		t.Fatalf("empty=%v err=%v", got, err)
+	}
+	if _, err := r.ReadPartialOutputContent(domain.TaskID{}); err == nil {
+		t.Fatal("zero task ID was accepted")
+	}
+}
 func TestContractReaderRejectsSymlinkedContractPaths(t *testing.T) {
 	root, id := readerDir(t)
 	r := NewFileContractReader(root)
@@ -138,7 +171,7 @@ func TestContractReaderRejectsSymlinkedContractPaths(t *testing.T) {
 	for name, path := range map[string]func(string, domain.TaskID) (string, error){"prompt": PromptMDPath, "last": func(root string, id domain.TaskID) (string, error) {
 		p, e := newTaskPaths(root, id)
 		return p.lastMessageMD(), e
-	}, "exit": ExitCodePath} {
+	}, "partial": PartialOutputMDPath, "exit": ExitCodePath} {
 		p, err := path(root, id)
 		if err != nil {
 			t.Fatal(err)
@@ -151,6 +184,8 @@ func TestContractReaderRejectsSymlinkedContractPaths(t *testing.T) {
 			_, err = r.ReadPromptContent(id)
 		case "last":
 			_, err = r.ReadLastMessageContent(id)
+		case "partial":
+			_, err = r.ReadPartialOutputContent(id)
 		case "exit":
 			_, _, err = r.ReadExitCode(id)
 		}

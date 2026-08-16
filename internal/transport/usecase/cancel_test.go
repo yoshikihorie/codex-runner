@@ -128,6 +128,9 @@ func (*cancelReaderFake) ReadStderrLog(domain.TaskID) ([]byte, error)          {
 func (*cancelReaderFake) ReadLastMessage(domain.TaskID) (bool, error)          { return false, nil }
 func (*cancelReaderFake) ReadPromptContent(domain.TaskID) ([]byte, error)      { return nil, nil }
 func (*cancelReaderFake) ReadLastMessageContent(domain.TaskID) ([]byte, error) { return nil, nil }
+func (*cancelReaderFake) ReadPartialOutputContent(domain.TaskID) ([]byte, error) {
+	return nil, nil
+}
 func (*cancelReaderFake) ReadExitCode(domain.TaskID) (int, bool, error)        { return 0, false, nil }
 
 type cancelSlotFake struct{ calls int }

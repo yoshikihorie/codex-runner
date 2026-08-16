@@ -47,6 +47,9 @@ func (*killedReaderFake) ReadStderrLog(domain.TaskID) ([]byte, error)          {
 func (*killedReaderFake) ReadLastMessage(domain.TaskID) (bool, error)          { return false, nil }
 func (*killedReaderFake) ReadPromptContent(domain.TaskID) ([]byte, error)      { return nil, nil }
 func (*killedReaderFake) ReadLastMessageContent(domain.TaskID) ([]byte, error) { return nil, nil }
+func (*killedReaderFake) ReadPartialOutputContent(domain.TaskID) ([]byte, error) {
+	return nil, nil
+}
 func (f *killedReaderFake) ReadExitCode(domain.TaskID) (int, bool, error) {
 	return f.code, f.exists, f.err
 }

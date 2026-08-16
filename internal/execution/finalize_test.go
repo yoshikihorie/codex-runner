@@ -108,6 +108,9 @@ func (f *finalizeReaderFake) ReadLastMessage(domain.TaskID) (bool, error) {
 }
 func (f *finalizeReaderFake) ReadPromptContent(domain.TaskID) ([]byte, error)      { return nil, nil }
 func (f *finalizeReaderFake) ReadLastMessageContent(domain.TaskID) ([]byte, error) { return nil, nil }
+func (f *finalizeReaderFake) ReadPartialOutputContent(domain.TaskID) ([]byte, error) {
+	return nil, nil
+}
 func (f *finalizeReaderFake) ReadExitCode(domain.TaskID) (int, bool, error) {
 	f.trace.add("read-exit-code")
 	f.mu.Lock()

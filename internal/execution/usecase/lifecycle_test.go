@@ -262,6 +262,9 @@ func (lifecycleRecordingContractReader) ReadPromptContent(domain.TaskID) ([]byte
 func (lifecycleRecordingContractReader) ReadLastMessageContent(domain.TaskID) ([]byte, error) {
 	return nil, nil
 }
+func (lifecycleRecordingContractReader) ReadPartialOutputContent(domain.TaskID) ([]byte, error) {
+	return nil, nil
+}
 func (lifecycleRecordingContractReader) ReadExitCode(domain.TaskID) (int, bool, error) {
 	return 0, false, nil
 }

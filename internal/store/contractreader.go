@@ -16,6 +16,7 @@ type ContractReader interface {
 	ReadLastMessage(domain.TaskID) (bool, error)
 	ReadPromptContent(domain.TaskID) ([]byte, error)
 	ReadLastMessageContent(domain.TaskID) ([]byte, error)
+	ReadPartialOutputContent(domain.TaskID) ([]byte, error)
 	ReadExitCode(domain.TaskID) (int, bool, error)
 }
 
@@ -53,6 +54,9 @@ func (r *FileContractReader) ReadPromptContent(id domain.TaskID) ([]byte, error)
 }
 func (r *FileContractReader) ReadLastMessageContent(id domain.TaskID) ([]byte, error) {
 	return r.read(id, taskPaths.lastMessageMD)
+}
+func (r *FileContractReader) ReadPartialOutputContent(id domain.TaskID) ([]byte, error) {
+	return r.read(id, taskPaths.partialOutputMD)
 }
 func (r *FileContractReader) ReadLastMessage(id domain.TaskID) (bool, error) {
 	b, e := r.ReadLastMessageContent(id)
