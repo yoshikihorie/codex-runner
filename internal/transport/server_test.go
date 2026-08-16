@@ -310,12 +310,6 @@ func TestHandleConnTailHandlerWritesLinesAndConnectionRemainsReusable(t *testing
 			t.Fatalf("tail response %d = %#v, result = %#v", index, response, result)
 		}
 	}
-	registry.mu.Lock()
-	remaining := len(registry.conns)
-	registry.mu.Unlock()
-	if remaining != 0 {
-		t.Fatalf("tail connection registry entries = %d", remaining)
-	}
 	if _, err := client.Write([]byte(`{"protocol_version":"` + ProtocolVersion + `","verb":"ping","request_id":"ping-2"}` + "\n")); err != nil {
 		t.Fatal(err)
 	}
@@ -325,6 +319,12 @@ func TestHandleConnTailHandlerWritesLinesAndConnectionRemainsReusable(t *testing
 	}
 	if !ping.OK || ping.RequestID != "ping-2" {
 		t.Fatalf("ping response = %#v", ping)
+	}
+	registry.mu.Lock()
+	remaining := len(registry.conns)
+	registry.mu.Unlock()
+	if remaining != 0 {
+		t.Fatalf("tail connection registry entries = %d", remaining)
 	}
 	_ = client.Close()
 	wg.Wait()
@@ -532,11 +532,27 @@ func TestHandleConnKeepsConcurrentTailConnectionsIndependent(t *testing.T) {
 	responsesB := make(chan tailResponse, 4)
 	readerDoneA := make(chan struct{})
 	readerDoneB := make(chan struct{})
+	waitRegistryEntries := func(want int, message string) {
+		deadline := time.After(time.Second)
+		for {
+			registry.mu.Lock()
+			remaining := len(registry.conns)
+			registry.mu.Unlock()
+			if remaining == want {
+				return
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("%s; remaining=%d", message, remaining)
+			default:
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}
 	readResponses := func(conn net.Conn, responses chan<- tailResponse, done chan<- struct{}) {
 		defer close(done)
 		decoder := json.NewDecoder(conn)
 		for {
-			_ = conn.SetReadDeadline(time.Now().Add(time.Second))
 			var response Response
 			if err := decoder.Decode(&response); err != nil {
 				return
@@ -660,21 +676,7 @@ func TestHandleConnKeepsConcurrentTailConnectionsIndependent(t *testing.T) {
 
 	_ = clientA.Close()
 	controlA <- tailWrite{seq: 2}
-	deadline := time.After(time.Second)
-	for {
-		registry.mu.Lock()
-		remaining := len(registry.conns)
-		registry.mu.Unlock()
-		if remaining == 1 {
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("A was not removed from registry; remaining=%d", remaining)
-		default:
-			time.Sleep(time.Millisecond)
-		}
-	}
+	waitRegistryEntries(1, "A was not removed from registry")
 
 	controlB <- tailWrite{seq: 4}
 	select {
@@ -694,12 +696,7 @@ func TestHandleConnKeepsConcurrentTailConnectionsIndependent(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("B did not receive completion")
 	}
-	registry.mu.Lock()
-	remaining := len(registry.conns)
-	registry.mu.Unlock()
-	if remaining != 0 {
-		t.Fatalf("registry entries after B completion=%d", remaining)
-	}
+	waitRegistryEntries(0, "registry entries after B completion")
 	_ = clientB.Close()
 	select {
 	case <-handleConnsDone:

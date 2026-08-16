@@ -64,8 +64,18 @@ func (f *reconcileLivenessFake) Execute(ctx context.Context, _ domain.TaskID) (b
 	select {
 	case <-f.release:
 		return f.dead, f.err
+	default:
+	}
+	select {
+	case <-f.release:
+		return f.dead, f.err
 	case <-ctx.Done():
-		return false, ctx.Err()
+		select {
+		case <-f.release:
+			return f.dead, f.err
+		default:
+			return false, ctx.Err()
+		}
 	}
 }
 
@@ -504,8 +514,8 @@ func TestReconcilePendingStopsWhenContextIsCancelled(t *testing.T) {
 	uc, pending, _, liveness, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateRecovering, false, false)
 	id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
 	pending.Add(id, true)
-	finish := runReconciliation(t, uc, liveness)
-	finish()
+	run := startReconciliation(t, uc, liveness)
+	run.stop()
 }
 
 var _ ContractReader = (*reconcileReaderFake)(nil)
