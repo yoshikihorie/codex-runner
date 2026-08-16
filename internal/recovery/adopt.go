@@ -57,6 +57,20 @@ type stalledTimeTracker interface {
 	LeaveStalled(domain.TaskID, time.Time) int
 }
 
+type orphanResumeDispatcher interface {
+	dispatch(func())
+}
+
+type asynchronousOrphanResumeDispatcher struct{}
+
+func (asynchronousOrphanResumeDispatcher) dispatch(f func()) {
+	go f()
+}
+
+type orphanResumeDispatcherOption struct {
+	dispatcher orphanResumeDispatcher
+}
+
 type AdoptRunningTasksOutput struct {
 	Outcomes      []AdoptionOutcome
 	ElapsedMillis int64
@@ -85,6 +99,7 @@ type AdoptRunningTasksUseCase struct {
 	taskMu         TaskMutex
 	clock          domain.Clock
 	stalledTracker stalledTimeTracker
+	resumeDispatch orphanResumeDispatcher
 	grace          time.Duration
 	logger         *slog.Logger
 }
@@ -95,6 +110,7 @@ func NewAdoptRunningTasksUseCase(tasks AdoptionTaskStore, liveness LivenessCheck
 	}
 	logger := slog.Default()
 	grace := defaultRecoveryTerminationGrace
+	resumeDispatch := orphanResumeDispatcher(asynchronousOrphanResumeDispatcher{})
 	for _, option := range options {
 		switch value := option.(type) {
 		case time.Duration:
@@ -106,11 +122,16 @@ func NewAdoptRunningTasksUseCase(tasks AdoptionTaskStore, liveness LivenessCheck
 			if value != nil {
 				logger = value
 			}
+		case orphanResumeDispatcherOption:
+			if isNilAdoptionDependency(value.dispatcher) {
+				panic("adopt running tasks use case requires a non-nil orphan resume dispatcher")
+			}
+			resumeDispatch = value.dispatcher
 		default:
 			panic("adopt running tasks use case received unsupported option")
 		}
 	}
-	return &AdoptRunningTasksUseCase{tasks: tasks, liveness: liveness, reader: reader, contract: writer, finalizer: finalizer, resume: resume, slots: slots, resetter: resetter, termination: termination, killed: killed, pathLocks: pathLocks, pending: pending, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker, grace: grace, logger: logger}
+	return &AdoptRunningTasksUseCase{tasks: tasks, liveness: liveness, reader: reader, contract: writer, finalizer: finalizer, resume: resume, slots: slots, resetter: resetter, termination: termination, killed: killed, pathLocks: pathLocks, pending: pending, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker, resumeDispatch: resumeDispatch, grace: grace, logger: logger}
 }
 
 func (uc *AdoptRunningTasksUseCase) Execute(ctx context.Context) (AdoptRunningTasksOutput, error) {
@@ -398,21 +419,24 @@ func (uc *AdoptRunningTasksUseCase) confirmCancellationTermination(ctx context.C
 
 func (uc *AdoptRunningTasksUseCase) recoverOrphan(ctx context.Context, taskID domain.TaskID, sessionRef *domain.SessionRef, occurredAt time.Time) string {
 	present, err := uc.reader.ReadLastMessage(taskID)
-	if err == nil && present {
+	if err != nil {
+		uc.logFailure("read last message for adopted orphan failed", taskID, err)
+		return adoptionOutcomeError
+	}
+	if present {
 		if err := uc.finalizer.Finalize(taskID, 0, true, true, occurredAt); err != nil {
 			uc.logFailure("finalize adopted orphan failed", taskID, err)
 			return adoptionOutcomeError
 		}
 		return adoptionOutcomeOrphanRecovered
 	}
-	if err != nil {
-		uc.logFailure("read last message for adopted orphan failed", taskID, err)
-	}
 	if uc.resume == nil {
 		uc.logFailure("resume recovery for adopted orphan is unavailable", taskID, nil)
 		return adoptionOutcomeError
 	}
-	go uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: sessionRef, Origin: domain.RecoveryOriginOrphan, OccurredAt: occurredAt})
+	uc.resumeDispatch.dispatch(func() {
+		uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: sessionRef, Origin: domain.RecoveryOriginOrphan, OccurredAt: occurredAt})
+	})
 	return adoptionOutcomeOrphanRecoveryStarted
 }
 

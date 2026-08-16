@@ -1,10 +1,12 @@
 package usecase
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"time"
@@ -215,14 +217,25 @@ func (uc *CancelTaskUseCase) Handle(req transport.Request) transport.Response {
 	if err != nil {
 		return cancelErrorResponse(req.RequestID, "TASK_ID_INVALID_FORMAT", "error.task.idInvalidFormat", nil)
 	}
-	var object map[string]json.RawMessage
-	if err := json.Unmarshal(req.Params, &object); err != nil || object == nil {
-		return cancelErrorResponse(req.RequestID, "CANCEL_PARAMS_MALFORMED", "error.cancel.paramsMalformed", nil)
-	}
 	force := false
-	if raw, ok := object["force"]; ok {
-		if string(raw) == "null" || json.Unmarshal(raw, &force) != nil {
+	if len(req.Params) != 0 {
+		decoder := json.NewDecoder(bytes.NewReader(req.Params))
+		var raw map[string]json.RawMessage
+		if err := decoder.Decode(&raw); err != nil || raw == nil {
 			return cancelErrorResponse(req.RequestID, "CANCEL_PARAMS_MALFORMED", "error.cancel.paramsMalformed", nil)
+		}
+		if decoder.Decode(&struct{}{}) != io.EOF {
+			return cancelErrorResponse(req.RequestID, "CANCEL_PARAMS_MALFORMED", "error.cancel.paramsMalformed", nil)
+		}
+		for key := range raw {
+			if key != "force" {
+				return cancelErrorResponse(req.RequestID, "CANCEL_PARAMS_MALFORMED", "error.cancel.paramsMalformed", nil)
+			}
+		}
+		if forceRaw, ok := raw["force"]; ok {
+			if bytes.Equal(bytes.TrimSpace(forceRaw), []byte("null")) || json.Unmarshal(forceRaw, &force) != nil {
+				return cancelErrorResponse(req.RequestID, "CANCEL_PARAMS_MALFORMED", "error.cancel.paramsMalformed", nil)
+			}
 		}
 	}
 	out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: id, Force: force, OccurredAt: uc.clock.Now()})

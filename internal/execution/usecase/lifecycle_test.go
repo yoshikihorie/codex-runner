@@ -132,15 +132,36 @@ type lifecycleFinalizeCall struct {
 	now                 time.Time
 }
 type lifecycleRecordingFinalizer struct {
-	calls []lifecycleFinalizeCall
-	err   error
-	trace *[]string
+	calls          []lifecycleFinalizeCall
+	err            error
+	prepareErr     error
+	prepareCalls   int
+	trace          *[]string
+	releaseCalls   int
+	prepared       lifecycleFinalizeCall
+	prepareBlocked chan struct{}
+	allowPrepare   chan struct{}
 }
 
-func (f *lifecycleRecordingFinalizer) Finalize(id domain.TaskID, raw int, estimated bool, adopted bool, now time.Time) error {
-	f.calls = append(f.calls, lifecycleFinalizeCall{id, raw, estimated, adopted, now})
+func (f *lifecycleRecordingFinalizer) Prepare(in execution.FinalizeTaskInput) (execution.PreparedFinalizeTask, error) {
+	f.prepareCalls++
+	f.prepared = lifecycleFinalizeCall{in.TaskID, in.RawExitCode, in.Estimated, in.AdoptedAfterRestart, in.OccurredAt}
+	if f.prepareBlocked != nil {
+		f.prepareBlocked <- struct{}{}
+		<-f.allowPrepare
+	}
+	return execution.PreparedFinalizeTask{}, f.prepareErr
+}
+
+func (f *lifecycleRecordingFinalizer) ExecuteLocked(_ context.Context, _ execution.PreparedFinalizeTask) (execution.LockedFinalizeResult, error) {
+	f.calls = append(f.calls, f.prepared)
 	appendLifecycleTrace(f.trace, "finalize")
-	return f.err
+	return execution.LockedFinalizeResult{RecordExited: true}, f.err
+}
+
+func (f *lifecycleRecordingFinalizer) ReleaseAfterFinalization(_ context.Context, _ execution.LockedFinalizeResult, _ domain.TaskID) {
+	f.releaseCalls++
+	appendLifecycleTrace(f.trace, "release-after-finalization")
 }
 
 type lifecycleConfirmKilledCall struct {
@@ -421,13 +442,16 @@ func (f *lifecycleRecordingStdoutOpener) Open(path string) (*os.File, error) {
 type lifecycleRecordingClock struct {
 	calls int
 	now   time.Time
+	step  time.Duration
 	trace *[]string
 }
 
 func (f *lifecycleRecordingClock) Now() time.Time {
 	f.calls++
 	appendLifecycleTrace(f.trace, "clock-now")
-	return f.now
+	t := f.now
+	f.now = f.now.Add(f.step)
+	return t
 }
 
 type lifecycleRecordingWaiter struct {
@@ -449,6 +473,11 @@ type lifecycleSynchronizedTaskStore struct {
 	store.TaskStore
 	mu             sync.Mutex
 	snapshot       domain.TaskSnapshot
+	loadSnapshots  []domain.TaskSnapshot
+	loadCount      int
+	blockLoad      int
+	loadBlocked    chan struct{}
+	allowLoad      chan struct{}
 	loadEntered    chan struct{}
 	saveStarted    chan struct{}
 	allowFirstSave chan struct{}
@@ -473,8 +502,19 @@ func (s *lifecycleSynchronizedTaskStore) Load(domain.TaskID) (domain.TaskSnapsho
 	default:
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.snapshot, nil
+	s.loadCount++
+	loadCount := s.loadCount
+	snapshot := s.snapshot
+	if s.loadCount <= len(s.loadSnapshots) {
+		snapshot = s.loadSnapshots[s.loadCount-1]
+	}
+	block := s.blockLoad == loadCount
+	s.mu.Unlock()
+	if block {
+		s.loadBlocked <- struct{}{}
+		<-s.allowLoad
+	}
+	return snapshot, nil
 }
 func (s *lifecycleSynchronizedTaskStore) Save(_ domain.TaskID, snapshot domain.TaskSnapshot) error {
 	s.mu.Lock()
@@ -748,7 +788,7 @@ func TestTaskLifecycleInputCarriesTaskScopedFields(t *testing.T) {
 func TestTaskLifecycleRunImplSuccessOrdersLaunchAndFinalization(t *testing.T) {
 	f := newLifecycleFixture(t)
 	f.run()
-	want := []string{"acquire-for-child", "record-starting", "create-worktree", "task-lock", "load-final", "task-unlock", "launch", "task-lock", "load-final", "record-process", "task-unlock", "confirm-running", "timeout-arm", "open-stdout", "monitor", "wait", "load-final", "clock-now", "finalize", "launching-unregister"}
+	want := []string{"acquire-for-child", "record-starting", "create-worktree", "task-lock", "load-final", "task-unlock", "launch", "task-lock", "load-final", "record-process", "task-unlock", "confirm-running", "timeout-arm", "open-stdout", "monitor", "wait", "clock-now", "load-final", "task-lock", "load-final", "finalize", "task-unlock", "release-after-finalization", "launching-unregister"}
 	if !reflect.DeepEqual(f.trace[1:len(f.trace)-1], want) {
 		t.Fatalf("trace=%v", f.trace)
 	}
@@ -937,7 +977,8 @@ func TestTaskLifecycleCancellationConfirmationRegistersUnconfirmed(t *testing.T)
 				name:       "terminal",
 				signalSent: true,
 				invoke: func(f *lifecycleFixture) {
-					f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
+					cancelling := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)
+					f.tasks.loads = []lifecycleLoadResult{{snapshot: cancelling}, {snapshot: cancelling}}
 					f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
 				},
 			},
@@ -990,7 +1031,8 @@ func TestTaskLifecycleCancellationConfirmationReleasesConfirmedDespiteError(t *t
 		{
 			name: "terminal",
 			invoke: func(f *lifecycleFixture) {
-				f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
+				cancelling := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)
+				f.tasks.loads = []lifecycleLoadResult{{snapshot: cancelling}, {snapshot: cancelling}}
 				f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
 			},
 		},
@@ -1016,7 +1058,7 @@ func TestTaskLifecycleCancellationConfirmationReleasesConfirmedDespiteError(t *t
 func TestTaskLifecycleCancellationConfirmationDoesNotRereleaseAfterConfirmedPersistenceError(t *testing.T) {
 	f := newLifecycleFixture(t)
 	cancelling := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)
-	f.tasks.loads = []lifecycleLoadResult{{snapshot: cancelling}, {snapshot: cancelling}}
+	f.tasks.loads = []lifecycleLoadResult{{snapshot: cancelling}, {snapshot: cancelling}, {snapshot: cancelling}, {snapshot: cancelling}}
 	f.killed.lockedResults = []execution.LockedKillResult{{Confirmed: true}, {}}
 	f.killed.lockedErrors = []error{errors.New("persistence"), errors.New("reevaluation")}
 
@@ -1154,13 +1196,14 @@ func TestTaskLifecycleConfirmRunningErrorWaitsAndConfirmsExactlyOneTerminalBranc
 			f := newLifecycleFixture(t)
 			f.confirmLock.err = errors.New("liveness")
 			// Run loads the lifecycle snapshot before launch, at the process
-			// recording boundary, and again when choosing the terminal branch.
-			// Keep cancellation until the third load so this test exercises the
+			// recording boundary, and twice when choosing the terminal branch.
+			// Keep cancellation until the third and fourth loads so this test exercises the
 			// ConfirmRunning error path rather than launch-time cancellation.
 			startingSnapshot := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateStarting)
 			f.tasks.loads = []lifecycleLoadResult{
 				{snapshot: startingSnapshot},
 				{snapshot: startingSnapshot},
+				{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), state)},
 				{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), state)},
 			}
 			f.run()
@@ -1187,6 +1230,171 @@ func TestTaskLifecycleConfirmRunningDeadWaitsWithoutTerminalConfirmation(t *test
 	}
 }
 
+// RED-05: cancellation committed after the terminal reader observed running
+// must choose ConfirmKilled from the state reloaded while taskMu is held.
+func TestTaskLifecycleRunTerminalRaceCancelWinsRoutesOnlyConfirmKilled(t *testing.T) {
+	f := newLifecycleFixture(t)
+	running := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateRunning)
+	tasks := &lifecycleSynchronizedTaskStore{
+		snapshot:       running,
+		loadEntered:    make(chan struct{}, 2),
+		saveStarted:    make(chan struct{}, 1),
+		allowFirstSave: make(chan struct{}),
+	}
+	close(tasks.allowFirstSave)
+	shared := store.NewTaskMutex()
+	f.orchestrator.deps.Tasks = tasks
+	f.orchestrator.deps.TaskMu = shared
+	f.finalizer.prepareBlocked = make(chan struct{}, 1)
+	f.finalizer.allowPrepare = make(chan struct{})
+
+	confirmed := make(chan struct{})
+	go func() {
+		f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
+		close(confirmed)
+	}()
+	<-f.finalizer.prepareBlocked
+	shared.Lock(f.input.Task.ID())
+	snapshot, err := tasks.Load(f.input.Task.ID())
+	if err != nil {
+		shared.Unlock(f.input.Task.ID())
+		t.Fatal(err)
+	}
+	task, err := snapshot.Restore()
+	if err != nil {
+		shared.Unlock(f.input.Task.ID())
+		t.Fatal(err)
+	}
+	if _, err = task.RequestCancel(false, testLifecycleTime); err != nil {
+		shared.Unlock(f.input.Task.ID())
+		t.Fatal(err)
+	}
+	updated, err := snapshot.WithTask(task, testLifecycleTime)
+	if err != nil {
+		shared.Unlock(f.input.Task.ID())
+		t.Fatal(err)
+	}
+	if err = tasks.Save(f.input.Task.ID(), updated); err != nil {
+		shared.Unlock(f.input.Task.ID())
+		t.Fatal(err)
+	}
+	shared.Unlock(f.input.Task.ID())
+	close(f.finalizer.allowPrepare)
+	<-confirmed
+
+	if f.killed.lockedCalls != 1 || len(f.finalizer.calls) != 0 {
+		t.Fatalf("ConfirmKilled=%d Finalize=%d", f.killed.lockedCalls, len(f.finalizer.calls))
+	}
+}
+
+func TestTaskLifecycleConfirmTerminalCancellingSkipsPrepare(t *testing.T) {
+	f := newLifecycleFixture(t)
+	cancelling := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)
+	f.tasks.loads = []lifecycleLoadResult{{snapshot: cancelling}, {snapshot: cancelling}}
+
+	f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
+
+	if f.finalizer.prepareCalls != 0 || f.killed.lockedCalls != 1 || len(f.finalizer.calls) != 0 {
+		t.Fatalf("Prepare=%d ConfirmKilled=%d Finalize=%d", f.finalizer.prepareCalls, f.killed.lockedCalls, len(f.finalizer.calls))
+	}
+	if f.taskMu.lockCalls != f.taskMu.unlockCalls {
+		t.Fatalf("task mutex lock=%d unlock=%d", f.taskMu.lockCalls, f.taskMu.unlockCalls)
+	}
+}
+
+func TestTaskLifecycleConfirmTerminalNonCancellingPreparesOnce(t *testing.T) {
+	f := newLifecycleFixture(t)
+	running := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateRunning)
+	f.tasks.loads = []lifecycleLoadResult{{snapshot: running}, {snapshot: running}}
+
+	f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
+
+	if f.finalizer.prepareCalls != 1 || len(f.finalizer.calls) != 1 || f.killed.lockedCalls != 0 {
+		t.Fatalf("Prepare=%d Finalize=%d ConfirmKilled=%d", f.finalizer.prepareCalls, len(f.finalizer.calls), f.killed.lockedCalls)
+	}
+	if f.taskMu.lockCalls != f.taskMu.unlockCalls {
+		t.Fatalf("task mutex lock=%d unlock=%d", f.taskMu.lockCalls, f.taskMu.unlockCalls)
+	}
+}
+
+func TestTaskLifecycleConfirmTerminalPrepareRaceRoutesOnlyConfirmKilled(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.tasks.loads = []lifecycleLoadResult{
+		{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateRunning)},
+		{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)},
+	}
+
+	f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
+
+	if f.finalizer.prepareCalls != 1 || f.killed.lockedCalls != 1 || len(f.finalizer.calls) != 0 {
+		t.Fatalf("Prepare=%d ConfirmKilled=%d Finalize=%d", f.finalizer.prepareCalls, f.killed.lockedCalls, len(f.finalizer.calls))
+	}
+	if f.taskMu.lockCalls != f.taskMu.unlockCalls {
+		t.Fatalf("task mutex lock=%d unlock=%d", f.taskMu.lockCalls, f.taskMu.unlockCalls)
+	}
+}
+
+func TestTaskLifecycleConfirmTerminalCancellingUsesClockReacquiredUnderLock(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.clock.step = time.Second
+	base := f.clock.now
+	f.tasks.loads = []lifecycleLoadResult{
+		{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateRunning)},
+		{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)},
+	}
+
+	f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
+
+	if f.finalizer.prepareCalls != 1 || f.killed.lockedCalls != 1 || len(f.finalizer.calls) != 0 {
+		t.Fatalf("Prepare=%d ConfirmKilled=%d Finalize=%d", f.finalizer.prepareCalls, f.killed.lockedCalls, len(f.finalizer.calls))
+	}
+	if f.finalizer.prepared.now != base {
+		t.Fatalf("Prepare occurredAt=%v want %v", f.finalizer.prepared.now, base)
+	}
+	if got := f.killed.calls[0].now; got != base.Add(time.Second) {
+		t.Fatalf("ConfirmKilled occurredAt=%v want %v (must be re-acquired under lock)", got, base.Add(time.Second))
+	}
+	if f.taskMu.lockCalls != f.taskMu.unlockCalls {
+		t.Fatalf("task mutex lock=%d unlock=%d", f.taskMu.lockCalls, f.taskMu.unlockCalls)
+	}
+}
+
+func TestTaskLifecycleConfirmTerminalCancellingPreReadTerminalAuthoritativeLoadReturnsWithoutFinalization(t *testing.T) {
+	f := newLifecycleFixture(t)
+	task := lifecycleTask(t, domain.SubcommandImpl)
+	timeout := lifecycleTimeout(t)
+	if _, err := task.Start(timeout, "gpt-5", testLifecycleTime); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := task.RecordProcessInfo(42, testLifecycleTime, testLifecycleTime); err != nil {
+		t.Fatal(err)
+	}
+	if err := task.ConfirmRunning(testLifecycleTime); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := task.RequestCancel(false, testLifecycleTime); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := task.ConfirmKilled(domain.NewExitCode(130), true, testLifecycleTime); err != nil {
+		t.Fatal(err)
+	}
+	terminal, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil).WithTask(task, testLifecycleTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelling := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)
+	f.tasks.loads = []lifecycleLoadResult{{snapshot: cancelling}, {snapshot: terminal}}
+
+	f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
+
+	if f.finalizer.prepareCalls != 0 || f.killed.lockedCalls != 0 || len(f.finalizer.calls) != 0 || f.finalizer.releaseCalls != 0 || f.pending.calls != 0 {
+		t.Fatalf("Prepare=%d ConfirmKilled=%d Finalize=%d release=%d pending=%d", f.finalizer.prepareCalls, f.killed.lockedCalls, len(f.finalizer.calls), f.finalizer.releaseCalls, f.pending.calls)
+	}
+	if f.taskMu.lockCalls != f.taskMu.unlockCalls {
+		t.Fatalf("task mutex lock=%d unlock=%d", f.taskMu.lockCalls, f.taskMu.unlockCalls)
+	}
+}
+
 func TestTaskLifecycleConfirmTerminalDoesNotFallbackAfterSelectedBranchError(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
@@ -1200,7 +1408,8 @@ func TestTaskLifecycleConfirmTerminalDoesNotFallbackAfterSelectedBranchError(t *
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newLifecycleFixture(t)
-			f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), tc.state)}}
+			snapshot := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), tc.state)
+			f.tasks.loads = []lifecycleLoadResult{{snapshot: snapshot}, {snapshot: snapshot}}
 			f.finalizer.err, f.killed.lockedErr = tc.err, tc.err
 			f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
 			if tc.state == domain.StateCancelling {
@@ -1210,7 +1419,78 @@ func TestTaskLifecycleConfirmTerminalDoesNotFallbackAfterSelectedBranchError(t *
 			} else if len(f.finalizer.calls) != 1 || len(f.killed.calls) != 0 {
 				t.Fatalf("finalize=%d kill=%d", len(f.finalizer.calls), len(f.killed.calls))
 			}
+			if f.taskMu.lockCalls != f.taskMu.unlockCalls {
+				t.Fatalf("task mutex lock=%d unlock=%d", f.taskMu.lockCalls, f.taskMu.unlockCalls)
+			}
 		})
+	}
+}
+
+func TestTaskLifecycleConfirmTerminalPrepareErrorInRaceStillConfirmsCancelling(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		result         execution.LockedKillResult
+		raw            int
+		waitErr        error
+		wantRaw        int
+		wantEstimated  bool
+		wantRelease    int
+		wantPending    int
+		traceAfterLock string
+	}{
+		{name: "confirmed", result: execution.LockedKillResult{Confirmed: true}, raw: 23, wantRaw: 23, wantRelease: 1, traceAfterLock: "release-after-confirmation"},
+		{name: "unconfirmed-estimated", result: execution.LockedKillResult{}, raw: 99, waitErr: errors.New("wait"), wantRaw: 1, wantEstimated: true, wantPending: 1, traceAfterLock: "pending-register"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newLifecycleFixture(t)
+			f.finalizer.prepareErr = errors.New("prepare")
+			f.tasks.loads = []lifecycleLoadResult{
+				{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateRunning)},
+				{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)},
+			}
+			f.killed.lockedResult = tc.result
+
+			f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), tc.raw, tc.waitErr)
+
+			if f.killed.lockedCalls != 1 || len(f.finalizer.calls) != 0 {
+				t.Fatalf("locked=%d finalize=%d", f.killed.lockedCalls, len(f.finalizer.calls))
+			}
+			if f.finalizer.prepareCalls != 1 {
+				t.Fatalf("Prepare() calls=%d", f.finalizer.prepareCalls)
+			}
+			got := f.killed.calls[0]
+			if got.taskID != f.input.Task.ID() || got.rawExitCode != tc.wantRaw || got.estimated != tc.wantEstimated || got.now != f.clock.now {
+				t.Fatalf("kill confirmation=%+v", got)
+			}
+			if f.killed.releaseCalls != tc.wantRelease || f.pending.calls != tc.wantPending {
+				t.Fatalf("release=%d pending=%d", f.killed.releaseCalls, f.pending.calls)
+			}
+			if tc.wantPending == 1 && !f.pending.signalSent[0] {
+				t.Fatal("pending registration did not mark the signal as sent")
+			}
+			if !lifecycleTraceSubsequence(f.trace, "confirm-killed-locked", "task-unlock", tc.traceAfterLock) {
+				t.Fatalf("post-unlock handling trace=%v", f.trace)
+			}
+			if f.taskMu.lockCalls != f.taskMu.unlockCalls {
+				t.Fatalf("task mutex lock=%d unlock=%d", f.taskMu.lockCalls, f.taskMu.unlockCalls)
+			}
+		})
+	}
+}
+
+func TestTaskLifecycleConfirmTerminalPrepareErrorUnlocksNonCancelling(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.finalizer.prepareErr = errors.New("prepare")
+	running := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateRunning)
+	f.tasks.loads = []lifecycleLoadResult{{snapshot: running}, {snapshot: running}}
+
+	f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
+
+	if f.finalizer.prepareCalls != 1 || len(f.finalizer.calls) != 0 || f.killed.lockedCalls != 0 {
+		t.Fatalf("Prepare=%d finalize=%d kill=%d", f.finalizer.prepareCalls, len(f.finalizer.calls), f.killed.lockedCalls)
+	}
+	if f.taskMu.lockCalls != f.taskMu.unlockCalls {
+		t.Fatalf("task mutex lock=%d unlock=%d", f.taskMu.lockCalls, f.taskMu.unlockCalls)
 	}
 }
 

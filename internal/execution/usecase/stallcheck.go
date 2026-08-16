@@ -122,6 +122,7 @@ func (uc *checkStallUseCase) checkOne(ctx context.Context, taskID domain.TaskID)
 		dead, err = uc.liveness.Execute(ctx, taskID)
 		if err != nil {
 			uc.logLiveness(taskID, err)
+			return
 		}
 	}
 	if ctx.Err() != nil {

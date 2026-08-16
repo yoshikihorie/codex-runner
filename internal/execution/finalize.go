@@ -38,6 +38,18 @@ type FinalizeTaskOutput struct {
 	ContractWriteError error
 }
 
+// PreparedFinalizeTask contains the terminal observation read before taskMu is acquired.
+type PreparedFinalizeTask struct {
+	in                 FinalizeTaskInput
+	lastMessagePresent bool
+}
+
+// LockedFinalizeResult contains the terminal result and whether post-lock release is required.
+type LockedFinalizeResult struct {
+	Output       FinalizeTaskOutput
+	RecordExited bool
+}
+
 // FinalizeTaskUseCase validates terminal artifacts and records a task's final state.
 type FinalizeTaskUseCase struct {
 	tasks           store.TaskStore
@@ -76,29 +88,42 @@ func (f *contractWriteFailure) Error() string {
 
 func (f *contractWriteFailure) Unwrap() error { return domain.ErrContractWriteFailed }
 
+// Prepare reads terminal artifacts before taskMu is acquired.
+func (uc *FinalizeTaskUseCase) Prepare(in FinalizeTaskInput) (PreparedFinalizeTask, error) {
+	present, err := uc.reader.ReadLastMessage(in.TaskID)
+	if err != nil {
+		return PreparedFinalizeTask{}, err
+	}
+	return PreparedFinalizeTask{in: in, lastMessagePresent: present}, nil
+}
+
 // Execute owns taskMu and releases the execution slot only after unlocking it.
 func (uc *FinalizeTaskUseCase) Execute(ctx context.Context, in FinalizeTaskInput) (FinalizeTaskOutput, error) {
-	present, err := uc.reader.ReadLastMessage(in.TaskID)
+	prepared, err := uc.Prepare(in)
 	if err != nil {
 		return FinalizeTaskOutput{}, err
 	}
-
-	uc.taskMu.Lock(in.TaskID)
-	var recordExited bool
-	defer func() {
-		uc.taskMu.Unlock(in.TaskID)
-		if recordExited {
-			uc.timeoutDisarmer.Disarm(in.TaskID)
-			uc.slotReleaser.ReleaseAndAdvance(ctx, in.TaskID, uc.clock.Now())
-		}
+	result, err := func() (LockedFinalizeResult, error) {
+		uc.taskMu.Lock(in.TaskID)
+		defer uc.taskMu.Unlock(in.TaskID)
+		return uc.ExecuteLocked(ctx, prepared)
 	}()
+	if result.RecordExited {
+		uc.ReleaseAfterFinalization(ctx, result, in.TaskID)
+	}
+	return result.Output, err
+}
 
-	output, recordExited, err := uc.executeLocked(ctx, in, present)
-	return output, err
+// ExecuteLocked performs terminal persistence while the caller holds taskMu.
+func (uc *FinalizeTaskUseCase) ExecuteLocked(_ context.Context, prepared PreparedFinalizeTask) (result LockedFinalizeResult, err error) {
+	in := prepared.in
+	present := prepared.lastMessagePresent
+	output, recordExited, err := uc.executeLocked(in, present)
+	return LockedFinalizeResult{Output: output, RecordExited: recordExited}, err
 }
 
 // executeLocked performs terminal persistence while the caller holds taskMu.
-func (uc *FinalizeTaskUseCase) executeLocked(_ context.Context, in FinalizeTaskInput, present bool) (output FinalizeTaskOutput, recordExited bool, err error) {
+func (uc *FinalizeTaskUseCase) executeLocked(in FinalizeTaskInput, present bool) (output FinalizeTaskOutput, recordExited bool, err error) {
 	snapshot, err := uc.tasks.Load(in.TaskID)
 	if err != nil {
 		if errors.Is(err, domain.ErrTaskNotFound) {
@@ -154,6 +179,15 @@ func (uc *FinalizeTaskUseCase) executeLocked(_ context.Context, in FinalizeTaskI
 		return FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}, true, retryWriteFail
 	}
 	return FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}, true, nil
+}
+
+// ReleaseAfterFinalization releases resources after taskMu has been unlocked.
+func (uc *FinalizeTaskUseCase) ReleaseAfterFinalization(ctx context.Context, result LockedFinalizeResult, taskID domain.TaskID) {
+	if !result.RecordExited {
+		return
+	}
+	uc.timeoutDisarmer.Disarm(taskID)
+	uc.slotReleaser.ReleaseAndAdvance(ctx, taskID, uc.clock.Now())
 }
 
 func (uc *FinalizeTaskUseCase) writeTerminalState(taskID domain.TaskID, exitCode domain.ExitCode, task *domain.Task, snapshot domain.TaskSnapshot, events []domain.Event, occurredAt time.Time, attempt string) (*contractWriteFailure, error) {

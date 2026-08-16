@@ -444,6 +444,62 @@ func TestCancelTaskHandle_Validation(t *testing.T) {
 	}
 }
 
+// RED-08: the transport contract permits missing params, but rejects every
+// non-object or unknown-field variant before invoking CancelTaskUseCase.Execute.
+func TestCancelTaskHandleParamsContract(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		params      json.RawMessage
+		wantExecute int
+		wantForce   bool
+	}{
+		{"params-missing", nil, 1, false},
+		{"empty-object", json.RawMessage(`{}`), 1, false},
+		{"force-missing-object", json.RawMessage(` { } `), 1, false},
+		{"force-true", json.RawMessage(`{"force":true}`), 1, true},
+		{"force-false", json.RawMessage(`{"force":false}`), 1, false},
+		{"case-insensitive-upper", json.RawMessage(`{"FORCE":true}`), 0, false},
+		{"case-insensitive-title", json.RawMessage(`{"Force":true}`), 0, false},
+		{"unknown-field", json.RawMessage(`{"unknown":true}`), 0, false},
+		{"params-null", json.RawMessage(`null`), 0, false},
+		{"params-array", json.RawMessage(`[]`), 0, false},
+		{"malformed-json", json.RawMessage(`{`), 0, false},
+		{"force-null", json.RawMessage(`{"force":null}`), 0, false},
+		{"force-wrong-type", json.RawMessage(`{"force":"true"}`), 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := cancelQueuedPayload(t)
+			tasks, queue, events, _, _, uc := cancelFixture(t, payload, false)
+			tasks.snapshot = cancelPersistedSnapshot(t, domain.StateStarting, false)
+			response := uc.Handle(transport.Request{RequestID: tc.name, TaskID: payload.Task.ID().String(), Params: tc.params})
+			if tc.wantExecute == 0 {
+				if response.OK || response.Error == nil || response.Error.Code != "CANCEL_PARAMS_MALFORMED" || response.Error.MessageKey != "error.cancel.paramsMalformed" || response.Error.Detail != nil || queue.removes != 0 {
+					t.Fatalf("response=%#v removes=%d", response, queue.removes)
+				}
+				return
+			}
+			if !response.OK || queue.removes != tc.wantExecute {
+				t.Fatalf("response=%#v removes=%d", response, queue.removes)
+			}
+			var body struct {
+				TaskID     string           `json:"task_id"`
+				State      domain.TaskState `json:"state"`
+				MessageKey string           `json:"message_key"`
+			}
+			if err := json.Unmarshal(response.Result, &body); err != nil || body.TaskID != payload.Task.ID().String() || body.State != domain.StateCancelling || body.MessageKey != "status.task.cancelling" {
+				t.Fatalf("body=%s err=%v", response.Result, err)
+			}
+			if len(events.events) != 1 {
+				t.Fatalf("events=%#v", events.events)
+			}
+			event, ok := events.events[0].(domain.TaskCancelRequested)
+			if !ok || event.Force != tc.wantForce {
+				t.Fatalf("event=%#v", events.events[0])
+			}
+		})
+	}
+}
+
 func TestCancelTaskHandle_ContractWriteFailuresAreSanitized(t *testing.T) {
 	for _, tc := range []struct {
 		name  string

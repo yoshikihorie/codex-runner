@@ -91,6 +91,7 @@ type finalizeReaderFake struct {
 	trace      *finalizeTrace
 	present    bool
 	presentErr error
+	lastCalls  int
 	exits      []struct {
 		code   int
 		exists bool
@@ -104,6 +105,7 @@ func (f *finalizeReaderFake) ReadLastMessage(domain.TaskID) (bool, error) {
 	f.trace.add("last-message")
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastCalls++
 	return f.present, f.presentErr
 }
 func (f *finalizeReaderFake) ReadPromptContent(domain.TaskID) ([]byte, error)      { return nil, nil }
@@ -261,6 +263,136 @@ func requireEvents(t *testing.T, events []domain.Event, state domain.TaskState, 
 		}
 	} else if failed, ok := events[1].(domain.TaskFailed); !ok || failed.Reason == "" {
 		t.Fatalf("second=%#v", events[1])
+	}
+}
+
+func TestFinalizeTaskUseCasePrepareReadsLastMessageOutsideTaskMutexExactlyOnce(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{
+		{"last-message-present", nil},
+		{"last-message-absent", nil},
+		{"read-error", errors.New("read")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, r, _, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
+			r.presentErr = tc.err
+			_, err := uc.Prepare(finalizeInput(s.latest.TaskID, now))
+			if !errors.Is(err, tc.err) || r.lastCalls != 1 {
+				t.Fatalf("err=%v reads=%d", err, r.lastCalls)
+			}
+			if saves, _ := s.counts(); saves != 0 {
+				t.Fatalf("saves=%d", saves)
+			}
+			if calls, _ := timeout.snapshot(); calls != 0 {
+				t.Fatalf("disarms=%d", calls)
+			}
+			if calls, _, _ := slot.snapshot(); calls != 0 {
+				t.Fatalf("releases=%d", calls)
+			}
+		})
+	}
+}
+
+func TestFinalizeTaskUseCaseExecuteLockedUsesPreparedResultWithoutSecondRead(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name    string
+		present bool
+		want    domain.TaskState
+	}{
+		{"prepared-present-completes", true, domain.StateCompleted},
+		{"prepared-absent-fails-no-output", false, domain.StateFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, r, _, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
+			r.present = tc.present
+			prepared, err := uc.Prepare(finalizeInput(s.latest.TaskID, now))
+			if err != nil {
+				t.Fatal(err)
+			}
+			uc.taskMu.Lock(s.latest.TaskID)
+			result, err := uc.ExecuteLocked(context.Background(), prepared)
+			uc.taskMu.Unlock(s.latest.TaskID)
+			if err != nil || result.Output.ResultState != tc.want || r.lastCalls != 1 {
+				t.Fatalf("result=%+v err=%v reads=%d", result, err, r.lastCalls)
+			}
+			if calls, _ := timeout.snapshot(); calls != 0 {
+				t.Fatalf("disarms=%d", calls)
+			}
+			if calls, _, _ := slot.snapshot(); calls != 0 {
+				t.Fatalf("releases=%d", calls)
+			}
+		})
+	}
+}
+
+func TestFinalizeTaskUseCaseRecordExitedReleaseContractAfterTwoPhaseAPI(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name      string
+		configure func(*finalizeStoreFake)
+		wantExit  bool
+	}{
+		{"initial-save-success", func(*finalizeStoreFake) {}, true},
+		{"initial-save-fails-retry-save-succeeds", func(s *finalizeStoreFake) { s.saveErrs = []error{errors.New("initial")} }, true},
+		{"initial-and-retry-save-fail", func(s *finalizeStoreFake) { s.saveErrs = []error{errors.New("initial"), errors.New("retry")} }, true},
+		{"load-fails-before-record-exit", func(s *finalizeStoreFake) { s.loads = []loadResult{{err: errors.New("load")}} }, false},
+		{"record-exit-rejected", func(s *finalizeStoreFake) { s.latest.State = domain.StateCompleted }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
+			tc.configure(s)
+			prepared, err := uc.Prepare(finalizeInput(s.latest.TaskID, now))
+			if err != nil {
+				t.Fatal(err)
+			}
+			uc.taskMu.Lock(s.latest.TaskID)
+			result, _ := uc.ExecuteLocked(context.Background(), prepared)
+			uc.taskMu.Unlock(s.latest.TaskID)
+			if result.RecordExited != tc.wantExit {
+				t.Fatalf("recordExited=%t", result.RecordExited)
+			}
+			if result.RecordExited {
+				uc.ReleaseAfterFinalization(context.Background(), result, s.latest.TaskID)
+			}
+			want := 0
+			if tc.wantExit {
+				want = 1
+			}
+			if calls, _ := timeout.snapshot(); calls != want {
+				t.Fatalf("disarms=%d", calls)
+			}
+			if calls, _, _ := slot.snapshot(); calls != want {
+				t.Fatalf("releases=%d", calls)
+			}
+		})
+	}
+}
+
+func TestFinalizeTaskUseCasePublicEntryPointsUsePreparedLockedReleasePath(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
+	for _, tc := range []struct{ name string }{{"Execute"}, {"Finalize-adapter"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, r, _, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
+			var err error
+			if tc.name == "Execute" {
+				_, err = uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, now))
+			} else {
+				err = uc.Finalize(s.latest.TaskID, 0, true, true, now)
+			}
+			if err != nil || r.lastCalls != 1 {
+				t.Fatalf("err=%v reads=%d", err, r.lastCalls)
+			}
+			if calls, _ := timeout.snapshot(); calls != 1 {
+				t.Fatalf("disarms=%d", calls)
+			}
+			if calls, _, _ := slot.snapshot(); calls != 1 {
+				t.Fatalf("releases=%d", calls)
+			}
+		})
 	}
 }
 

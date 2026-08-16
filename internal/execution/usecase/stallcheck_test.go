@@ -34,6 +34,22 @@ func stallUC(t *testing.T, id domain.TaskID, s *testStore, dead bool, liveErr er
 	return newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, id, dead, liveErr), &testWriter{r: r}, &testClock{at: now, r: r, id: id}, testTracker(r), time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry(), logger)
 }
 
+type stallOwnershipSequence struct {
+	values []bool
+	calls  int
+}
+
+func (s *stallOwnershipSequence) Acquire(domain.TaskID) (func(), bool) { return func() {}, false }
+
+func (s *stallOwnershipSequence) IsOwned(domain.TaskID) bool {
+	if s.calls >= len(s.values) {
+		return s.values[len(s.values)-1]
+	}
+	value := s.values[s.calls]
+	s.calls++
+	return value
+}
+
 func TestCheckStallThresholdAndNilLastEvent(t *testing.T) {
 	start := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
 	for _, tc := range []struct {
@@ -167,6 +183,112 @@ func TestCheckStallReadAndLivenessErrorClassification(t *testing.T) {
 			}
 			if len(s.saved) != 0 || len(w.events) != 0 || strings.Contains(fmt.Sprint(r.ops), "save:") || strings.Contains(fmt.Sprint(r.ops), "append-event:") {
 				t.Fatalf("liveness error changed task: saved=%v events=%v ops=%v", s.saved, w.events, r.ops)
+			}
+		})
+	}
+}
+
+func TestCheckStallLivenessErrorOverThresholdIsFailClosedAndContinues(t *testing.T) {
+	r := &testRecorder{}
+	start := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	now := start.Add(1201 * time.Second)
+	one, two := testID(t, "liveness-error-one"), testID(t, "liveness-error-two")
+	secondLast := now.Add(-time.Second)
+	first := testSnapshot(t, one, domain.StateRunning, start, &start)
+	second := testSnapshot(t, two, domain.StateRunning, start, &secondLast)
+	store := &testStore{r: r, loads: map[string]domain.TaskSnapshot{one.String(): first, two.String(): second}, lists: [][]domain.TaskSnapshot{{first, second}}}
+	writer := &testWriter{r: r}
+	tracker := testTracker(r)
+	livenessCalls := 0
+	liveness := execution.NewCheckLivenessUseCase(domain.LivenessLockFunc(func(path string) (bool, error) {
+		r.add("liveness:" + path)
+		livenessCalls++
+		if livenessCalls == 1 {
+			return false, errors.New("liveness I/O failure")
+		}
+		return false, nil
+	}), func(id domain.TaskID) string { return id.String() })
+	uc := newCheckStallUseCase(store, &testLocker{r: r}, liveness, writer, &testClock{at: now, r: r, id: one}, tracker, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry())
+
+	uc.scan(context.Background())
+
+	if len(store.saved) != 0 || len(writer.events) != 0 || len(tracker.calls) != 0 || tracker.takeCalls != 0 {
+		t.Fatalf("liveness error changed task: saved=%v events=%v tracker=%v take=%d", store.saved, writer.events, tracker.calls, tracker.takeCalls)
+	}
+	if livenessCalls != 2 {
+		t.Fatalf("liveness calls=%d ops=%v", livenessCalls, r.ops)
+	}
+	ops := fmt.Sprint(r.ops)
+	for _, operation := range []string{"load:" + two.String(), "liveness:" + two.String()} {
+		if strings.Count(ops, operation) != 1 {
+			t.Fatalf("operation %q count=%d ops=%v", operation, strings.Count(ops, operation), r.ops)
+		}
+	}
+	for _, id := range []domain.TaskID{one, two} {
+		if strings.Count(ops, "unlock:"+id.String()) != 1 {
+			t.Fatalf("unlock count for %s=%d ops=%v", id, strings.Count(ops, "unlock:"+id.String()), r.ops)
+		}
+	}
+	assertOrderedSubsequence(t, r.ops, []string{"liveness:" + one.String(), "unlock:" + one.String(), "lock:" + two.String(), "load:" + two.String(), "liveness:" + two.String(), "unlock:" + two.String()})
+}
+
+func TestCheckStallLivenessErrorDoesNotReachStateTransitionPaths(t *testing.T) {
+	start := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name     string
+		idSuffix string
+		state    domain.TaskState
+		now      time.Time
+	}{
+		{name: "running-under-threshold", idSuffix: "liveness-error-run", state: domain.StateRunning, now: start.Add(1199 * time.Second)},
+		{name: "stalled-over-threshold-orphan-eligible", idSuffix: "liveness-error-stalled", state: domain.StateStalled, now: start.Add(1201 * time.Second)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &testRecorder{}
+			id := testID(t, tc.idSuffix)
+			last := start
+			snapshot := testSnapshot(t, id, tc.state, start, &last)
+			store := &testStore{r: r, loads: map[string]domain.TaskSnapshot{id.String(): snapshot}}
+			writer := &testWriter{r: r}
+			tracker := testTracker(r)
+			uc := newCheckStallUseCase(store, &testLocker{r: r}, testLive(r, id, false, errors.New("liveness I/O failure")), writer, &testClock{at: tc.now, r: r, id: id}, tracker, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry())
+
+			uc.checkOne(context.Background(), id)
+
+			if len(store.saved) != 0 || len(writer.events) != 0 || len(tracker.calls) != 0 || tracker.takeCalls != 0 {
+				t.Fatalf("liveness error changed task: saved=%v events=%v tracker=%v take=%d", store.saved, writer.events, tracker.calls, tracker.takeCalls)
+			}
+		})
+	}
+}
+
+func TestCheckStallOwnedBeforeOrAfterLockSkipsLivenessAndPreservesStallEvaluation(t *testing.T) {
+	start := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name  string
+		owned []bool
+	}{
+		{name: "owned-before-lock", owned: []bool{true, true}},
+		{name: "owned-after-lock", owned: []bool{false, true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &testRecorder{}
+			id := testID(t, "owned-"+tc.name)
+			last := start
+			snapshot := testSnapshot(t, id, domain.StateRunning, start, &last)
+			store := &testStore{r: r, loads: map[string]domain.TaskSnapshot{id.String(): snapshot}}
+			writer := &testWriter{r: r}
+			tracker := testTracker(r)
+			ownership := &stallOwnershipSequence{values: tc.owned}
+			uc := newCheckStallUseCaseWithOwnership(store, &testLocker{r: r}, testLive(r, id, false, nil), writer, &testClock{at: start.Add(1201 * time.Second), r: r, id: id}, tracker, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, ownership)
+
+			uc.checkOne(context.Background(), id)
+
+			if strings.Contains(fmt.Sprint(r.ops), "liveness:"+id.String()) {
+				t.Fatalf("owned task checked liveness: ops=%v", r.ops)
+			}
+			if len(store.saved) != 1 || len(writer.events) != 1 || writer.events[0] != "TaskStalled" || len(tracker.calls) != 1 || tracker.calls[0].kind != "enter" || tracker.takeCalls != 0 {
+				t.Fatalf("owned task did not preserve stall evaluation: saved=%v events=%v tracker=%v take=%d", store.saved, writer.events, tracker.calls, tracker.takeCalls)
 			}
 		})
 	}

@@ -38,7 +38,9 @@ type lifecycleRecordProcess interface {
 	Execute(context.Context, *domain.Task, *domain.ProcessHandle, time.Time) error
 }
 type lifecycleFinalizer interface {
-	Finalize(domain.TaskID, int, bool, bool, time.Time) error
+	Prepare(execution.FinalizeTaskInput) (execution.PreparedFinalizeTask, error)
+	ExecuteLocked(context.Context, execution.PreparedFinalizeTask) (execution.LockedFinalizeResult, error)
+	ReleaseAfterFinalization(context.Context, execution.LockedFinalizeResult, domain.TaskID)
 }
 type lifecycleKillConfirmer interface {
 	ConfirmKilled(context.Context, domain.TaskID, int, bool, time.Time) error
@@ -341,29 +343,55 @@ func (o *TaskLifecycleOrchestrator) confirmTerminal(ctx context.Context, taskID 
 	if estimated {
 		raw = 1
 	}
-	snapshot, err := o.deps.Tasks.Load(taskID)
-	if err != nil {
-		o.logger.Error("reload task before terminal confirmation", "task_id", taskID.String(), "error", err)
+	occurredAt := o.deps.Clock.Now()
+	skipPrepare := false
+	if preSnapshot, preErr := o.deps.Tasks.Load(taskID); preErr == nil && preSnapshot.State == domain.StateCancelling {
+		skipPrepare = true
+	}
+	var prepared execution.PreparedFinalizeTask
+	var err error
+	if !skipPrepare {
+		prepared, err = o.deps.Finalize.Prepare(execution.FinalizeTaskInput{TaskID: taskID, RawExitCode: raw, Estimated: estimated, OccurredAt: occurredAt})
+	}
+
+	o.deps.TaskMu.Lock(taskID)
+	snapshot, loadErr := o.deps.Tasks.Load(taskID)
+	if loadErr != nil {
+		o.deps.TaskMu.Unlock(taskID)
+		o.logger.Error("reload task before terminal confirmation", "task_id", taskID.String(), "error", loadErr)
 		return
 	}
 	if snapshot.State == domain.StateCancelling {
-		o.deps.TaskMu.Lock(taskID)
-		result, confirmErr := o.deps.ConfirmKilled.ExecuteLocked(ctx, execution.ConfirmTaskKilledInput{TaskID: taskID, RawExitCode: raw, Estimated: estimated, OccurredAt: o.deps.Clock.Now()})
+		killOccurredAt := o.deps.Clock.Now()
+		killResult, confirmErr := o.deps.ConfirmKilled.ExecuteLocked(ctx, execution.ConfirmTaskKilledInput{TaskID: taskID, RawExitCode: raw, Estimated: estimated, OccurredAt: killOccurredAt})
 		o.deps.TaskMu.Unlock(taskID)
 		if confirmErr != nil {
 			o.logger.Warn("terminal lifecycle confirmation", "task_id", taskID.String(), "error", confirmErr)
 		}
-		if result.Confirmed {
-			o.deps.ConfirmKilled.ReleaseAfterConfirmation(ctx, result, taskID)
+		if killResult.Confirmed {
+			o.deps.ConfirmKilled.ReleaseAfterConfirmation(ctx, killResult, taskID)
 		} else if registerErr := o.deps.Pending.Register(taskID, true); registerErr != nil {
 			o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
 		}
 		return
-	} else {
-		err = o.deps.Finalize.Finalize(taskID, raw, estimated, false, o.deps.Clock.Now())
+	}
+	if skipPrepare {
+		o.deps.TaskMu.Unlock(taskID)
+		o.logger.Warn("task left cancelling before terminal confirmation", "task_id", taskID.String())
+		return
 	}
 	if err != nil {
-		o.logger.Warn("terminal lifecycle confirmation", "task_id", taskID.String(), "error", err)
+		o.deps.TaskMu.Unlock(taskID)
+		o.logger.Error("prepare task terminal confirmation", "task_id", taskID.String(), "error", err)
+		return
+	}
+	finalizeResult, finalizeErr := o.deps.Finalize.ExecuteLocked(ctx, prepared)
+	o.deps.TaskMu.Unlock(taskID)
+	if finalizeErr != nil {
+		o.logger.Warn("terminal lifecycle confirmation", "task_id", taskID.String(), "error", finalizeErr)
+	}
+	if finalizeResult.RecordExited {
+		o.deps.Finalize.ReleaseAfterFinalization(ctx, finalizeResult, taskID)
 	}
 }
 
