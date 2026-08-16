@@ -3,8 +3,11 @@ package execution
 import (
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/contract"
@@ -16,6 +19,32 @@ import (
 // Canonical source: validation-rules.md TIMEOUT_KILL_GRACE_SECONDS.
 const TimeoutKillGrace = 10 * time.Second
 
+// Canonical source: validation-rules.md TIMEOUT_ENFORCEMENT_RETRY_INTERVAL_SECONDS.
+const timeoutEnforcementRetryInterval = 10 * time.Second
+
+// Canonical source: validation-rules.md TIMEOUT_ENFORCEMENT_RETRY_MAX_ATTEMPTS.
+const timeoutEnforcementRetryMaxAttempts = 6
+
+type TimeoutEnforcementStage string
+
+const (
+	TimeoutEnforcementStageLoad    TimeoutEnforcementStage = "load"
+	TimeoutEnforcementStageRestore TimeoutEnforcementStage = "restore"
+	TimeoutEnforcementStageSave    TimeoutEnforcementStage = "save"
+)
+
+type TimeoutEnforcementError struct {
+	Stage     TimeoutEnforcementStage
+	Retryable bool
+	Cause     error
+}
+
+func (e *TimeoutEnforcementError) Error() string {
+	return fmt.Sprintf("timeout enforcement %s: %v", e.Stage, e.Cause)
+}
+
+func (e *TimeoutEnforcementError) Unwrap() error { return e.Cause }
+
 type TimerFactory interface {
 	AfterFunc(d time.Duration, f func()) CancelFunc
 }
@@ -24,8 +53,11 @@ type CancelFunc func() bool
 
 type armedTimer struct {
 	cancel                 CancelFunc
+	deadline               time.Time
 	resolvedTimeoutSeconds int
 	generation             uint64
+	retryAttempts          int
+	executing              bool
 }
 
 type TimeoutWatcher struct {
@@ -89,7 +121,12 @@ func (w *TimeoutWatcher) Arm(taskID domain.TaskID, deadline time.Time, resolvedT
 			w.mu.Unlock()
 			return
 		}
-		delete(w.timers, taskID)
+		if armed.executing || w.closed {
+			w.mu.Unlock()
+			return
+		}
+		armed.executing = true
+		w.timers[taskID] = armed
 		w.mu.Unlock()
 
 		_, err := w.enforce.Execute(w.baseCtx, EnforceTaskTimeoutInput{
@@ -97,6 +134,7 @@ func (w *TimeoutWatcher) Arm(taskID domain.TaskID, deadline time.Time, resolvedT
 			ResolvedTimeoutSeconds: armed.resolvedTimeoutSeconds,
 			OccurredAt:             w.clock.Now(),
 		})
+		w.finishExecution(taskID, generation, err)
 		if err != nil {
 			w.logger.Error("enforce task timeout", "task_id", taskID.String(), "error", err)
 		}
@@ -108,7 +146,59 @@ func (w *TimeoutWatcher) Arm(taskID domain.TaskID, deadline time.Time, resolvedT
 		}
 		return stopped
 	}
-	w.timers[taskID] = armedTimer{cancel: cancel, resolvedTimeoutSeconds: resolvedTimeoutSeconds, generation: generation}
+	w.timers[taskID] = armedTimer{cancel: cancel, deadline: deadline, resolvedTimeoutSeconds: resolvedTimeoutSeconds, generation: generation}
+	close(ready)
+}
+
+func (w *TimeoutWatcher) finishExecution(taskID domain.TaskID, generation uint64, err error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	current, ok := w.timers[taskID]
+	if !ok || current.generation != generation {
+		return
+	}
+	var timeoutErr *TimeoutEnforcementError
+	if w.closed || err == nil || !errors.As(err, &timeoutErr) || !timeoutErr.Retryable {
+		delete(w.timers, taskID)
+		return
+	}
+	if current.retryAttempts >= timeoutEnforcementRetryMaxAttempts {
+		delete(w.timers, taskID)
+		w.logger.Error("timeout enforcement retries exhausted", "task_id", taskID.String(), "stage", timeoutErr.Stage, "attempts", current.retryAttempts)
+		return
+	}
+	current.retryAttempts++
+	current.executing = false
+	ready := make(chan struct{})
+	w.wg.Add(1)
+	var done sync.Once
+	finish := func() { done.Do(w.wg.Done) }
+	timerCancel := w.timerFactory.AfterFunc(timeoutEnforcementRetryInterval, func() {
+		defer finish()
+		<-ready
+		w.mu.Lock()
+		entry, found := w.timers[taskID]
+		if !found || w.closed || entry.generation != generation || entry.executing {
+			w.mu.Unlock()
+			return
+		}
+		entry.executing = true
+		w.timers[taskID] = entry
+		w.mu.Unlock()
+		_, retryErr := w.enforce.Execute(w.baseCtx, EnforceTaskTimeoutInput{TaskID: taskID, ResolvedTimeoutSeconds: entry.resolvedTimeoutSeconds, OccurredAt: w.clock.Now()})
+		w.finishExecution(taskID, generation, retryErr)
+		if retryErr != nil {
+			w.logger.Error("enforce task timeout", "task_id", taskID.String(), "error", retryErr)
+		}
+	})
+	current.cancel = func() bool {
+		stopped := timerCancel()
+		if stopped {
+			finish()
+		}
+		return stopped
+	}
+	w.timers[taskID] = current
 	close(ready)
 }
 
@@ -253,12 +343,22 @@ func (uc *EnforceTaskTimeoutUseCase) Execute(ctx context.Context, in EnforceTask
 	}
 
 	operationErr := contractErr
-	if terminateErr := uc.proc.Terminate(*snapshot.PID, TimeoutKillGrace); terminateErr != nil {
-		slog.Default().Warn("terminate task process group", "task_id", in.TaskID.String(), "error", terminateErr)
+	disposition := recovery.PendingSendConfirmOnly
+	var authority *recovery.ProcessSignalAuthority
+	if snapshot.PID != nil && snapshot.ProcessStartedAt != nil {
+		candidate := recovery.ProcessSignalAuthority{TaskID: snapshot.TaskID, PID: *snapshot.PID, ProcessStartedAt: *snapshot.ProcessStartedAt}
+		authority = &candidate
+		if terminateErr := uc.proc.Terminate(*snapshot.PID, TimeoutKillGrace); terminateErr != nil {
+			slog.Default().Warn("terminate task process group", "task_id", in.TaskID.String(), "error", terminateErr)
+			disposition = recovery.PendingSendUnsent
+		} else {
+			disposition = recovery.PendingSendSent
+			authority = nil
+		}
 	}
 	dead, confirmErr := uc.termination.Confirm(ctx, in.TaskID)
 	if confirmErr != nil || !dead {
-		if registerErr := uc.pendingRegistrar.Register(in.TaskID, true); registerErr != nil {
+		if registerErr := uc.pendingRegistrar.Register(in.TaskID, disposition, authority); registerErr != nil {
 			operationErr = errors.Join(operationErr, registerErr)
 		}
 		if !dead {
@@ -269,10 +369,13 @@ func (uc *EnforceTaskTimeoutUseCase) Execute(ctx context.Context, in EnforceTask
 	if snapshot.Subcommand == domain.SubcommandImpl {
 		if releaseErr := uc.pathLockReleaser.Execute(ctx, ReleasePathLockInput{TaskID: in.TaskID}); releaseErr != nil {
 			operationErr = errors.Join(operationErr, releaseErr)
+			uc.reconcileAfterConfirmedDeath(in.TaskID, &operationErr)
+			return EnforceTaskTimeoutOutput{Outcome: "timed-out", Events: events}, operationErr
 		}
 	}
 	if _, recoveryErr := uc.recovery.Execute(ctx, recovery.RecoverViaResumeInput{TaskID: in.TaskID, SessionRef: snapshot.SessionRef, Origin: domain.RecoveryOriginTimeout, OccurredAt: in.OccurredAt}); recoveryErr != nil {
 		operationErr = errors.Join(operationErr, recoveryErr)
+		uc.reconcileAfterConfirmedDeath(in.TaskID, &operationErr)
 	}
 	return EnforceTaskTimeoutOutput{Outcome: "timed-out", Events: events}, operationErr
 }
@@ -281,25 +384,25 @@ func (uc *EnforceTaskTimeoutUseCase) Execute(ctx context.Context, in EnforceTask
 func (uc *EnforceTaskTimeoutUseCase) executeLocked(_ context.Context, in EnforceTaskTimeoutInput) (domain.TaskSnapshot, []domain.Event, bool, error, error) {
 	snapshot, err := uc.tasks.Load(in.TaskID)
 	if err != nil {
-		return domain.TaskSnapshot{}, nil, false, nil, err
+		return domain.TaskSnapshot{}, nil, false, nil, timeoutEnforcementError(TimeoutEnforcementStageLoad, err)
 	}
 	task, err := snapshot.Restore()
 	if err != nil {
-		return domain.TaskSnapshot{}, nil, false, nil, err
+		return domain.TaskSnapshot{}, nil, false, nil, timeoutEnforcementError(TimeoutEnforcementStageRestore, err)
 	}
 	if task.State() != domain.StateRunning && task.State() != domain.StateStalled {
 		return domain.TaskSnapshot{}, nil, true, nil, nil
 	}
 	events, err := task.MarkTimedOut(snapshot.SessionRef, in.OccurredAt)
 	if err != nil {
-		return domain.TaskSnapshot{}, nil, false, nil, err
+		return domain.TaskSnapshot{}, nil, false, nil, timeoutEnforcementError(TimeoutEnforcementStageRestore, err)
 	}
 	updated, err := snapshot.WithTask(task, in.OccurredAt)
 	if err != nil {
-		return domain.TaskSnapshot{}, nil, false, nil, err
+		return domain.TaskSnapshot{}, nil, false, nil, timeoutEnforcementError(TimeoutEnforcementStageRestore, err)
 	}
 	if err := uc.tasks.Save(in.TaskID, updated); err != nil {
-		return domain.TaskSnapshot{}, nil, false, nil, err
+		return domain.TaskSnapshot{}, nil, false, nil, timeoutEnforcementError(TimeoutEnforcementStageSave, err)
 	}
 	if snapshot.State == domain.StateStalled {
 		uc.stalledTracker.LeaveStalled(in.TaskID, in.OccurredAt)
@@ -311,6 +414,54 @@ func (uc *EnforceTaskTimeoutUseCase) executeLocked(_ context.Context, in Enforce
 		}
 	}
 	return snapshot, events, false, contractErr, nil
+}
+
+func timeoutEnforcementError(stage TimeoutEnforcementStage, cause error) error {
+	return &TimeoutEnforcementError{Stage: stage, Retryable: isTimeoutRetryable(cause), Cause: cause}
+}
+
+func isTimeoutRetryable(err error) bool {
+	if errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return false
+	}
+	switch errno {
+	case syscall.EINTR, syscall.EAGAIN, syscall.EBUSY, syscall.EMFILE, syscall.ENFILE, syscall.ENOSPC:
+		return true
+	default:
+		return false
+	}
+}
+
+func (uc *EnforceTaskTimeoutUseCase) reconcileAfterConfirmedDeath(taskID domain.TaskID, operationErr *error) {
+	uc.taskMu.Lock(taskID)
+	snapshot, loadErr := uc.tasks.Load(taskID)
+	uc.taskMu.Unlock(taskID)
+	if loadErr != nil {
+		*operationErr = errors.Join(*operationErr, loadErr)
+		return
+	}
+	if isTimeoutTerminalState(snapshot.State) {
+		return
+	}
+	if snapshot.State != domain.StateTimeout && snapshot.State != domain.StateCancelling && snapshot.State != domain.StateRecovering && snapshot.State != domain.StateOrphaned {
+		return
+	}
+	if err := uc.pendingRegistrar.Register(taskID, recovery.PendingSendConfirmOnly, nil); err != nil {
+		*operationErr = errors.Join(*operationErr, err)
+	}
+}
+
+func isTimeoutTerminalState(state domain.TaskState) bool {
+	switch state {
+	case domain.StateCompleted, domain.StateFailed, domain.StateRecovered, domain.StateTimeoutLost, domain.StateKilled, domain.StateLost:
+		return true
+	default:
+		return false
+	}
 }
 
 var _ TimeoutDisarmer = (*TimeoutWatcher)(nil)

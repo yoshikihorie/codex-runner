@@ -175,18 +175,42 @@ func (f *timeoutRecoveryFake) Execute(ctx context.Context, in recovery.RecoverVi
 }
 
 type timeoutPendingFake struct {
-	mu         sync.Mutex
-	calls      int
-	signalSent bool
-	err        error
+	mu          sync.Mutex
+	calls       int
+	taskID      domain.TaskID
+	disposition recovery.PendingSendDisposition
+	authority   *recovery.ProcessSignalAuthority
+	err         error
+	set         recovery.PendingReconciliationSet
 }
 
-func (f *timeoutPendingFake) Register(_ domain.TaskID, signalSent bool) error {
+func (f *timeoutPendingFake) Register(taskID domain.TaskID, disposition recovery.PendingSendDisposition, authority *recovery.ProcessSignalAuthority) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls++
-	f.signalSent = signalSent
-	return f.err
+	f.taskID, f.disposition = taskID, disposition
+	f.authority = nil
+	if authority != nil {
+		copy := *authority
+		f.authority = &copy
+	}
+	if f.err != nil {
+		return f.err
+	}
+	return f.set.Register(taskID, disposition, authority)
+}
+
+func (f *timeoutPendingFake) ClaimForSend(taskID domain.TaskID, authority recovery.ProcessSignalAuthority) (recovery.SendClaim, bool) {
+	return f.set.ClaimForSend(taskID, authority)
+}
+func (f *timeoutPendingFake) CompleteSend(claim recovery.SendClaim) bool {
+	return f.set.CompleteSend(claim)
+}
+func (f *timeoutPendingFake) ReleaseSend(claim recovery.SendClaim) bool {
+	return f.set.ReleaseSend(claim)
+}
+func (f *timeoutPendingFake) InvalidateSend(claim recovery.SendClaim) bool {
+	return f.set.InvalidateSend(claim)
 }
 
 type timeoutPathStoreFake struct {
@@ -339,7 +363,7 @@ func TestTimeoutWatcherDisarmNoopAndDoesNotInterruptRunningCallback(t *testing.T
 	select {
 	case <-recoverer.started:
 	case <-time.After(time.Second):
-		t.Fatal("callback did not begin recovery")
+		t.Fatal("timeout callback did not start recovery")
 	}
 	watcher.Disarm(snapshot.TaskID)
 	select {
@@ -351,7 +375,7 @@ func TestTimeoutWatcherDisarmNoopAndDoesNotInterruptRunningCallback(t *testing.T
 	select {
 	case <-finished:
 	case <-time.After(time.Second):
-		t.Fatal("callback did not finish")
+		t.Fatal("timeout callback did not finish after recovery release")
 	}
 }
 
@@ -548,7 +572,7 @@ func TestEnforceTaskTimeoutScenarios(t *testing.T) {
 				if recoverer.calls != 1 || len(paths.deleted) != 1 || pending.calls != 0 {
 					t.Fatalf("recover=%d paths=%d pending=%d", recoverer.calls, len(paths.deleted), pending.calls)
 				}
-			} else if pending.calls != 1 || !pending.signalSent || recoverer.calls != 0 || len(paths.deleted) != 0 {
+			} else if pending.calls != 1 || pending.disposition != recovery.PendingSendSent || recoverer.calls != 0 || len(paths.deleted) != 0 {
 				t.Fatalf("pending=%d recovery=%d paths=%d", pending.calls, recoverer.calls, len(paths.deleted))
 			}
 		})
@@ -585,8 +609,106 @@ func TestEnforceTaskTimeoutPendingUsesReconciliationSet(t *testing.T) {
 	if len(pending.List()) != 1 {
 		t.Fatalf("pending entries=%d", len(pending.List()))
 	}
-	if claimed, found := pending.ClaimForSend(snapshot.TaskID); claimed || !found {
-		t.Fatalf("pending signalSent state claimed=%v found=%v", claimed, found)
+	authority := recovery.ProcessSignalAuthority{TaskID: snapshot.TaskID, PID: *snapshot.PID, ProcessStartedAt: *snapshot.ProcessStartedAt}
+	if claim, found := pending.ClaimForSend(snapshot.TaskID, authority); claim.Token != 0 || !found {
+		t.Fatalf("pending sent state claim=%+v found=%v", claim, found)
+	}
+}
+
+func TestEnforceTaskTimeoutAdoptedWithoutPIDRegistersConfirmOnly(t *testing.T) {
+	snapshot := timeoutSnapshot(t, domain.StateRunning, domain.SubcommandImpl, nil)
+	snapshot.PID, snapshot.ProcessStartedAt = nil, nil
+	snapshot.AdoptedAfterRestart = true
+	tasks := &timeoutStoreFake{snapshot: snapshot}
+	proc := &timeoutProcessFake{}
+	pending := &timeoutPendingFake{}
+	uc := NewEnforceTaskTimeoutUseCase(tasks, &timeoutWriterFake{}, proc, &timeoutRecoveryFake{}, NewTerminationEnsurer(timeoutLiveness(struct {
+		dead bool
+		err  error
+	}{}), proc, domain.ClockFunc(time.Now), func(context.Context, time.Duration) {}), pending, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), store.NewTaskMutex(), domain.ClockFunc(time.Now), &timeoutStalledTrackerFake{})
+	if _, err := uc.Execute(context.Background(), EnforceTaskTimeoutInput{TaskID: snapshot.TaskID, OccurredAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if tasks.saves != 1 || proc.calls != 0 || pending.calls != 1 || pending.disposition != recovery.PendingSendConfirmOnly || pending.authority != nil {
+		t.Fatalf("save=%d terminate=%d pending=%d disposition=%v authority=%+v", tasks.saves, proc.calls, pending.calls, pending.disposition, pending.authority)
+	}
+}
+
+func TestEnforceTaskTimeoutTerminateErrorRegistersUnsent(t *testing.T) {
+	snapshot := timeoutSnapshot(t, domain.StateRunning, domain.SubcommandReview, nil)
+	uc, _, _, proc, _, pending, _ := timeoutUseCase(t, snapshot, struct {
+		dead bool
+		err  error
+	}{})
+	proc.err = errors.New("terminate")
+	if _, err := uc.Execute(context.Background(), EnforceTaskTimeoutInput{TaskID: snapshot.TaskID, OccurredAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if pending.disposition != recovery.PendingSendUnsent || pending.authority == nil || pending.authority.TaskID != snapshot.TaskID || pending.authority.PID != *snapshot.PID || !pending.authority.ProcessStartedAt.Equal(*snapshot.ProcessStartedAt) {
+		t.Fatalf("disposition=%v authority=%+v", pending.disposition, pending.authority)
+	}
+	claim, found := pending.ClaimForSend(snapshot.TaskID, *pending.authority)
+	second, secondFound := pending.ClaimForSend(snapshot.TaskID, *pending.authority)
+	if !found || claim.Token == 0 || !secondFound || second.Token != 0 || !pending.ReleaseSend(claim) {
+		t.Fatalf("claim=%+v found=%v", claim, found)
+	}
+	if next, found := pending.ClaimForSend(snapshot.TaskID, *pending.authority); !found || next.Token == 0 {
+		t.Fatalf("next=%+v found=%v", next, found)
+	}
+}
+
+func TestEnforceTaskTimeoutConfirmedDeathFailureRegistersConfirmOnly(t *testing.T) {
+	releaseErr := errors.New("release path lock")
+	recoveryErr := errors.New("resume recovery")
+	for _, tc := range []struct {
+		name              string
+		subcommand        domain.Subcommand
+		configure         func(*timeoutRecoveryFake, *timeoutPathStoreFake)
+		wantRecoveryCalls int
+		wantError         error
+	}{
+		{
+			name:       "path lock release",
+			subcommand: domain.SubcommandImpl,
+			configure: func(_ *timeoutRecoveryFake, paths *timeoutPathStoreFake) {
+				paths.err = releaseErr
+			},
+			wantError: releaseErr,
+		},
+		{
+			name:       "recovery",
+			subcommand: domain.SubcommandReview,
+			configure: func(recoverer *timeoutRecoveryFake, _ *timeoutPathStoreFake) {
+				recoverer.err = recoveryErr
+			},
+			wantRecoveryCalls: 1,
+			wantError:         recoveryErr,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := timeoutSnapshot(t, domain.StateRunning, tc.subcommand, nil)
+			uc, _, _, proc, recoverer, pending, paths := timeoutUseCase(t, snapshot, struct {
+				dead bool
+				err  error
+			}{dead: true})
+			proc.err = errors.New("terminate")
+			tc.configure(recoverer, paths)
+
+			out, err := uc.Execute(context.Background(), EnforceTaskTimeoutInput{TaskID: snapshot.TaskID, OccurredAt: time.Now()})
+			if out.Outcome != "timed-out" || !errors.Is(err, tc.wantError) {
+				t.Fatalf("out=%+v err=%v", out, err)
+			}
+			if pending.calls != 1 || pending.disposition != recovery.PendingSendConfirmOnly || pending.authority != nil {
+				t.Fatalf("pending calls=%d disposition=%v authority=%+v", pending.calls, pending.disposition, pending.authority)
+			}
+			authority := recovery.ProcessSignalAuthority{TaskID: snapshot.TaskID, PID: *snapshot.PID, ProcessStartedAt: *snapshot.ProcessStartedAt}
+			if claim, _ := pending.ClaimForSend(snapshot.TaskID, authority); claim.Token != 0 {
+				t.Fatalf("confirm-only pending entry returned send token=%+v", claim)
+			}
+			if recoverer.calls != tc.wantRecoveryCalls {
+				t.Fatalf("recovery calls=%d, want %d", recoverer.calls, tc.wantRecoveryCalls)
+			}
+		})
 	}
 }
 
@@ -776,8 +898,9 @@ func TestEnforceTaskTimeoutNotFoundAndPendingSet(t *testing.T) {
 	if len(pending.List()) != 1 {
 		t.Fatalf("pending entries=%d", len(pending.List()))
 	}
-	if claimed, found := pending.ClaimForSend(snapshot.TaskID); claimed || !found {
-		t.Fatalf("pending signalSent state claimed=%v found=%v", claimed, found)
+	authority := recovery.ProcessSignalAuthority{TaskID: snapshot.TaskID, PID: *snapshot.PID, ProcessStartedAt: *snapshot.ProcessStartedAt}
+	if claim, found := pending.ClaimForSend(snapshot.TaskID, authority); claim.Token != 0 || !found {
+		t.Fatalf("pending sent state claim=%+v found=%v", claim, found)
 	}
 }
 

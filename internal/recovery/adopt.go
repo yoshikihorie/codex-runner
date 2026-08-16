@@ -149,6 +149,9 @@ func (uc *AdoptRunningTasksUseCase) Execute(ctx context.Context) (AdoptRunningTa
 
 	out := AdoptRunningTasksOutput{Outcomes: make([]AdoptionOutcome, 0, len(taskIDs))}
 	for _, taskID := range taskIDs {
+		if ctx.Err() != nil {
+			break
+		}
 		out.Outcomes = append(out.Outcomes, AdoptionOutcome{TaskID: taskID, Outcome: uc.adoptOne(ctx, taskID)})
 	}
 	out.ElapsedMillis = uc.clock.Now().Sub(startedAt).Milliseconds()
@@ -244,25 +247,25 @@ func (uc *AdoptRunningTasksUseCase) adoptRecovering(ctx context.Context, taskID 
 	if err != nil {
 		uc.taskMu.Unlock(taskID)
 		uc.logFailure("check recovering task liveness for adoption failed", taskID, err)
-		uc.pending.Add(taskID, false)
+		uc.registerPending(taskID, snapshot)
 		return adoptionOutcomeError
 	}
 	if !dead {
 		uc.taskMu.Unlock(taskID)
-		uc.pending.Add(taskID, true)
+		uc.registerPending(taskID, snapshot)
 		return adoptionOutcomeDeferred
 	}
 	present, err := uc.reader.ReadLastMessage(taskID)
 	if err != nil {
 		uc.taskMu.Unlock(taskID)
 		uc.logFailure("read last message for recovering task failed", taskID, err)
-		uc.pending.Add(taskID, false)
+		uc.registerPending(taskID, snapshot)
 		return adoptionOutcomeError
 	}
 	if err := resolveRecoveringLocked(uc.tasks, uc.contract, uc.logger, taskID, snapshot, present, occurredAt); err != nil {
 		uc.taskMu.Unlock(taskID)
 		uc.logFailure("resolve recovering task failed", taskID, err)
-		uc.pending.Add(taskID, false)
+		uc.reconcilePendingAfterConfirmedDeath(taskID)
 		return adoptionOutcomeError
 	}
 	uc.taskMu.Unlock(taskID)
@@ -324,54 +327,94 @@ func resolveRecoveringLocked(tasks AdoptionTaskStore, writer contract.ContractWr
 }
 
 func (uc *AdoptRunningTasksUseCase) adoptTimeout(ctx context.Context, taskID domain.TaskID, snapshot domain.TaskSnapshot) string {
-	occurredAt := uc.clock.Now()
+	adoptionObservedAt := uc.clock.Now()
+	// Timeout tasks have already been adopted; retain this independent liveness
+	// observation timestamp while recovery obtains its own dispatch timestamp.
+	_ = adoptionObservedAt
 	dead, err := uc.liveness.Execute(ctx, taskID)
 	if err != nil {
 		uc.taskMu.Unlock(taskID)
 		uc.logFailure("check timeout task liveness for adoption failed", taskID, err)
-		uc.pending.Add(taskID, false)
+		uc.registerPending(taskID, snapshot)
 		return adoptionOutcomeError
 	}
 	if dead {
 		uc.taskMu.Unlock(taskID)
-		if err := uc.startTimeoutRecovery(ctx, taskID, snapshot, occurredAt); err != nil {
+		if err := uc.startTimeoutRecovery(ctx, taskID, snapshot); err != nil {
+			uc.reconcilePendingAfterConfirmedDeath(taskID)
 			return adoptionOutcomeError
 		}
 		return adoptionOutcomeOrphanRecoveryStarted
 	}
 	if snapshot.PID == nil {
 		uc.taskMu.Unlock(taskID)
-		uc.pending.Add(taskID, true)
+		uc.registerPending(taskID, snapshot)
 		return adoptionOutcomeDeferred
 	}
 	pid := *snapshot.PID
 	uc.taskMu.Unlock(taskID)
-	go uc.confirmTimeoutTermination(context.WithoutCancel(ctx), taskID, snapshot, pid, occurredAt)
+	if !uc.registerPending(taskID, snapshot) {
+		return adoptionOutcomeError
+	}
+	go uc.confirmTimeoutTermination(context.WithoutCancel(ctx), taskID, snapshot, pid)
 	return adoptionOutcomeDeferred
 }
 
-func (uc *AdoptRunningTasksUseCase) confirmTimeoutTermination(ctx context.Context, taskID domain.TaskID, snapshot domain.TaskSnapshot, pid int, occurredAt time.Time) {
+func (uc *AdoptRunningTasksUseCase) confirmTimeoutTermination(ctx context.Context, taskID domain.TaskID, snapshot domain.TaskSnapshot, pid int) {
+	authority, ok := processSignalAuthority(snapshot)
+	if !ok {
+		uc.registerPending(taskID, snapshot)
+		return
+	}
+	claim, found := uc.pending.ClaimForSend(taskID, authority)
+	if !found || claim.Token == 0 {
+		return
+	}
 	dead, err := uc.termination.SendAndConfirm(ctx, taskID, pid, uc.grace)
 	if err != nil {
 		uc.logFailure("confirm timeout task termination failed", taskID, err)
+		uc.pending.ReleaseSend(claim)
 	}
 	if err != nil || !dead {
-		uc.pending.Add(taskID, true)
+		if err == nil {
+			uc.pending.ReleaseSend(claim)
+		}
 		return
 	}
-	if err := uc.startTimeoutRecovery(ctx, taskID, snapshot, occurredAt); err != nil {
-		uc.logFailure("start timeout recovery after termination failed", taskID, err)
+	latest, valid := currentClaimAuthority(uc.tasks, uc.taskMu, claim)
+	if !valid {
+		uc.pending.InvalidateSend(claim)
+		return
 	}
+	uc.pending.CompleteSend(claim)
+	terminationConfirmedAt := uc.clock.Now()
+	if err := uc.releaseTimeoutPathLock(ctx, taskID, latest); err != nil {
+		uc.logFailure("start timeout recovery after termination failed", taskID, err)
+		uc.reconcilePendingAfterConfirmedDeath(taskID)
+		return
+	}
+	recoveryDispatchAt := uc.clock.Now()
+	uc.pending.Remove(taskID)
+	go uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: latest.SessionRef, Origin: domain.RecoveryOriginTimeout, OccurredAt: recoveryDispatchAt})
+	_ = terminationConfirmedAt
 }
 
-func (uc *AdoptRunningTasksUseCase) startTimeoutRecovery(ctx context.Context, taskID domain.TaskID, snapshot domain.TaskSnapshot, occurredAt time.Time) error {
+func (uc *AdoptRunningTasksUseCase) startTimeoutRecovery(ctx context.Context, taskID domain.TaskID, snapshot domain.TaskSnapshot) error {
+	if err := uc.releaseTimeoutPathLock(ctx, taskID, snapshot); err != nil {
+		return err
+	}
+	recoveryDispatchAt := uc.clock.Now()
+	go uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: snapshot.SessionRef, Origin: domain.RecoveryOriginTimeout, OccurredAt: recoveryDispatchAt})
+	return nil
+}
+
+func (uc *AdoptRunningTasksUseCase) releaseTimeoutPathLock(ctx context.Context, taskID domain.TaskID, snapshot domain.TaskSnapshot) error {
 	if snapshot.Subcommand == domain.SubcommandImpl {
 		if err := uc.pathLocks.Release(ctx, taskID); err != nil {
 			uc.logFailure("release path lock before timeout recovery failed", taskID, err)
 			return err
 		}
 	}
-	go uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: snapshot.SessionRef, Origin: domain.RecoveryOriginTimeout, OccurredAt: occurredAt})
 	return nil
 }
 
@@ -382,6 +425,7 @@ func (uc *AdoptRunningTasksUseCase) adoptCancelling(ctx context.Context, taskID 
 		uc.taskMu.Unlock(taskID)
 		if err := uc.killed.ConfirmKilled(ctx, taskID, cancelledExitCode, true, occurredAt); err != nil {
 			uc.logFailure("confirm cancelling task killed failed", taskID, err)
+			uc.reconcilePendingAfterConfirmedDeath(taskID)
 			return adoptionOutcomeError
 		}
 		return adoptionOutcomeReconciled
@@ -389,43 +433,70 @@ func (uc *AdoptRunningTasksUseCase) adoptCancelling(ctx context.Context, taskID 
 	if err != nil {
 		uc.taskMu.Unlock(taskID)
 		uc.logFailure("check cancelling task liveness for adoption failed", taskID, err)
-		uc.pending.Add(taskID, false)
+		uc.registerPending(taskID, snapshot)
 		return adoptionOutcomeError
 	}
 	if snapshot.PID == nil {
 		uc.taskMu.Unlock(taskID)
-		uc.pending.Add(taskID, true)
+		uc.registerPending(taskID, snapshot)
 		return adoptionOutcomeDeferred
 	}
 	pid := *snapshot.PID
 	uc.taskMu.Unlock(taskID)
-	go uc.confirmCancellationTermination(context.WithoutCancel(ctx), taskID, pid, occurredAt)
+	if !uc.registerPending(taskID, snapshot) {
+		return adoptionOutcomeError
+	}
+	go uc.confirmCancellationTermination(context.WithoutCancel(ctx), taskID, snapshot, pid)
 	return adoptionOutcomeDeferred
 }
 
-func (uc *AdoptRunningTasksUseCase) confirmCancellationTermination(ctx context.Context, taskID domain.TaskID, pid int, occurredAt time.Time) {
+func (uc *AdoptRunningTasksUseCase) confirmCancellationTermination(ctx context.Context, taskID domain.TaskID, snapshot domain.TaskSnapshot, pid int) {
+	authority, ok := processSignalAuthority(snapshot)
+	if !ok {
+		uc.registerPending(taskID, snapshot)
+		return
+	}
+	claim, found := uc.pending.ClaimForSend(taskID, authority)
+	if !found || claim.Token == 0 {
+		return
+	}
 	dead, err := uc.termination.SendAndConfirm(ctx, taskID, pid, uc.grace)
 	if err != nil {
 		uc.logFailure("confirm cancelling task termination failed", taskID, err)
+		uc.pending.ReleaseSend(claim)
 	}
 	if err != nil || !dead {
-		uc.pending.Add(taskID, true)
+		if err == nil {
+			uc.pending.ReleaseSend(claim)
+		}
 		return
 	}
-	if err := uc.killed.ConfirmKilled(ctx, taskID, cancelledExitCode, true, occurredAt); err != nil {
-		uc.logFailure("confirm cancelling task killed after termination failed", taskID, err)
+	_, valid := currentClaimAuthority(uc.tasks, uc.taskMu, claim)
+	if !valid {
+		uc.pending.InvalidateSend(claim)
+		return
 	}
+	uc.pending.CompleteSend(claim)
+	terminationConfirmedAt := uc.clock.Now()
+	if err := uc.killed.ConfirmKilled(ctx, taskID, cancelledExitCode, true, terminationConfirmedAt); err != nil {
+		uc.logFailure("confirm cancelling task killed after termination failed", taskID, err)
+		uc.reconcilePendingAfterConfirmedDeath(taskID)
+		return
+	}
+	uc.pending.Remove(taskID)
 }
 
 func (uc *AdoptRunningTasksUseCase) recoverOrphan(ctx context.Context, taskID domain.TaskID, sessionRef *domain.SessionRef, occurredAt time.Time) string {
 	present, err := uc.reader.ReadLastMessage(taskID)
 	if err != nil {
 		uc.logFailure("read last message for adopted orphan failed", taskID, err)
+		uc.registerPendingConfirmOnly(taskID)
 		return adoptionOutcomeError
 	}
 	if present {
 		if err := uc.finalizer.Finalize(taskID, 0, true, true, occurredAt); err != nil {
 			uc.logFailure("finalize adopted orphan failed", taskID, err)
+			uc.reconcilePendingAfterConfirmedDeath(taskID)
 			return adoptionOutcomeError
 		}
 		return adoptionOutcomeOrphanRecovered
@@ -434,8 +505,9 @@ func (uc *AdoptRunningTasksUseCase) recoverOrphan(ctx context.Context, taskID do
 		uc.logFailure("resume recovery for adopted orphan is unavailable", taskID, nil)
 		return adoptionOutcomeError
 	}
+	recoveryDispatchAt := uc.clock.Now()
 	uc.resumeDispatch.dispatch(func() {
-		uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: sessionRef, Origin: domain.RecoveryOriginOrphan, OccurredAt: occurredAt})
+		uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: sessionRef, Origin: domain.RecoveryOriginOrphan, OccurredAt: recoveryDispatchAt})
 	})
 	return adoptionOutcomeOrphanRecoveryStarted
 }
@@ -443,7 +515,58 @@ func (uc *AdoptRunningTasksUseCase) recoverOrphan(ctx context.Context, taskID do
 func (uc *AdoptRunningTasksUseCase) resumeRecovery(ctx context.Context, in RecoverViaResumeInput) {
 	if _, err := uc.resume.Execute(ctx, in); err != nil {
 		uc.logFailure("resume recovery for adopted task failed", in.TaskID, err)
+		uc.reconcilePendingAfterConfirmedDeath(in.TaskID)
 	}
+}
+
+func processSignalAuthority(snapshot domain.TaskSnapshot) (ProcessSignalAuthority, bool) {
+	if snapshot.PID == nil || snapshot.ProcessStartedAt == nil {
+		return ProcessSignalAuthority{}, false
+	}
+	return ProcessSignalAuthority{TaskID: snapshot.TaskID, PID: *snapshot.PID, ProcessStartedAt: *snapshot.ProcessStartedAt}, true
+}
+
+func pendingRegistration(snapshot domain.TaskSnapshot) (PendingSendDisposition, *ProcessSignalAuthority) {
+	if snapshot.State == domain.StateTimeout || snapshot.State == domain.StateCancelling {
+		if authority, ok := processSignalAuthority(snapshot); ok {
+			return PendingSendUnsent, &authority
+		}
+	}
+	return PendingSendConfirmOnly, nil
+}
+
+func currentClaimAuthority(tasks AdoptionTaskStore, taskMu TaskMutex, claim SendClaim) (domain.TaskSnapshot, bool) {
+	taskMu.Lock(claim.TaskID)
+	snapshot, err := tasks.Load(claim.TaskID)
+	taskMu.Unlock(claim.TaskID)
+	if err != nil {
+		return domain.TaskSnapshot{}, false
+	}
+	authority, ok := processSignalAuthority(snapshot)
+	return snapshot, ok && pendingAuthorityEqual(authority, claim.Authority)
+}
+
+func (uc *AdoptRunningTasksUseCase) registerPending(taskID domain.TaskID, snapshot domain.TaskSnapshot) bool {
+	disposition, authority := pendingRegistration(snapshot)
+	if err := uc.pending.Register(taskID, disposition, authority); err != nil {
+		uc.logFailure("register pending reconciliation failed", taskID, err)
+		return false
+	}
+	return true
+}
+
+func (uc *AdoptRunningTasksUseCase) registerPendingConfirmOnly(taskID domain.TaskID) {
+	if err := uc.pending.Register(taskID, PendingSendConfirmOnly, nil); err != nil {
+		uc.logFailure("register pending reconciliation failed", taskID, err)
+	}
+}
+
+func (uc *AdoptRunningTasksUseCase) reconcilePendingAfterSnapshotFailure(taskID domain.TaskID) {
+	reconcilePendingAfterFailure(uc.tasks, uc.pending, uc.taskMu, uc.logger, taskID, pendingFailureFromSnapshot)
+}
+
+func (uc *AdoptRunningTasksUseCase) reconcilePendingAfterConfirmedDeath(taskID domain.TaskID) {
+	reconcilePendingAfterFailure(uc.tasks, uc.pending, uc.taskMu, uc.logger, taskID, pendingFailureAfterConfirmedDeath)
 }
 
 func (uc *AdoptRunningTasksUseCase) appendAdoptionEvents(taskID domain.TaskID, events []domain.Event) {

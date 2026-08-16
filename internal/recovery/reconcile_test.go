@@ -5,8 +5,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"log/slog"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -79,10 +84,36 @@ func (f *reconcileLivenessFake) Execute(ctx context.Context, _ domain.TaskID) (b
 	}
 }
 
-type reconcileReaderFake struct{ present bool }
+type reconcileReaderResult struct {
+	present bool
+	err     error
+}
 
-func (f *reconcileReaderFake) ReadLastMessage(domain.TaskID) (bool, error) { return f.present, nil }
-func (*reconcileReaderFake) ReadStderrLog(domain.TaskID) ([]byte, error)   { return nil, nil }
+type reconcileReaderFake struct {
+	present   bool
+	err       error
+	results   []reconcileReaderResult
+	calls     int
+	afterRead func()
+}
+
+func (f *reconcileReaderFake) ReadLastMessage(domain.TaskID) (bool, error) {
+	f.calls++
+	if len(f.results) == 0 {
+		present, err := f.present, f.err
+		if err == nil && f.afterRead != nil {
+			f.afterRead()
+		}
+		return present, err
+	}
+	result := f.results[0]
+	f.results = f.results[1:]
+	if result.err == nil && f.afterRead != nil {
+		f.afterRead()
+	}
+	return result.present, result.err
+}
+func (*reconcileReaderFake) ReadStderrLog(domain.TaskID) ([]byte, error) { return nil, nil }
 
 type reconcileWriterFake struct {
 	order            *[]string
@@ -220,13 +251,28 @@ func newReconcileFixture(t *testing.T, state domain.TaskState, dead bool, presen
 	pathLocks := &reconcilePathLocksFake{order: &order}
 	slots := &reconcileSlotsFake{order: &order}
 	mutex := &reconcileMutexFake{order: &order}
-	uc := NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{present: present}, writer, termination, killed, pathLocks, newAdoptionResumeUseCase(t), slots, mutex, domain.ClockFunc(time.Now), time.Nanosecond, 17*time.Second, slog.Default())
+	uc := NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{present: present}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, newAdoptionResumeUseCase(t), slots, mutex, domain.ClockFunc(time.Now), time.Nanosecond, 17*time.Second, slog.Default())
 	return uc, pending, tasks, liveness, writer, termination, killed, pathLocks, slots, mutex, &order
 }
 
 type reconciliationRun struct {
 	releaseLiveness func()
 	stop            func()
+}
+
+func registerReconcilePending(t *testing.T, pending *PendingReconciliationSet, snapshot domain.TaskSnapshot, disposition PendingSendDisposition) {
+	t.Helper()
+	var authority *ProcessSignalAuthority
+	if disposition == PendingSendUnsent {
+		value, ok := processSignalAuthority(snapshot)
+		if !ok {
+			t.Fatal("unsent pending test entry requires authority")
+		}
+		authority = &value
+	}
+	if err := pending.Register(snapshot.TaskID, disposition, authority); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func startReconciliation(t *testing.T, uc *ReconcilePendingUseCase, liveness *reconcileLivenessFake) reconciliationRun {
@@ -258,17 +304,35 @@ func startReconciliation(t *testing.T, uc *ReconcilePendingUseCase, liveness *re
 }
 
 func runReconciliation(t *testing.T, uc *ReconcilePendingUseCase, liveness *reconcileLivenessFake) func() {
-	run := startReconciliation(t, uc, liveness)
+	t.Helper()
+	entries := uc.pending.List()
+	if len(entries) != 1 {
+		t.Fatalf("pending entries=%+v, want one", entries)
+	}
+	done := make(chan struct{})
+	go func() {
+		uc.reconcileOne(context.Background(), entries[0].taskID)
+		close(done)
+	}()
+	select {
+	case <-liveness.called:
+	case <-time.After(time.Second):
+		t.Fatal("reconciliation did not begin")
+	}
 	return func() {
-		run.releaseLiveness()
-		run.stop()
+		liveness.release <- struct{}{}
+		select {
+		case <-done:
+		case <-time.After(time.Second):
+			t.Fatal("reconciliation did not finish")
+		}
 	}
 }
 
 func TestReconcilePendingRetainsLiveRecoveringTask(t *testing.T) {
-	uc, pending, _, liveness, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateRecovering, false, false)
+	uc, pending, tasks, liveness, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateRecovering, false, false)
 	id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
-	pending.Add(id, true)
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
 	finish := runReconciliation(t, uc, liveness)
 	finish()
 	if entries := pending.List(); len(entries) != 1 || entries[0].taskID != id {
@@ -279,7 +343,7 @@ func TestReconcilePendingRetainsLiveRecoveringTask(t *testing.T) {
 func TestReconcilePendingCompletesDeadRecoveringTaskBeforeReleasingSlot(t *testing.T) {
 	uc, pending, tasks, liveness, writer, _, _, _, slots, mutex, order := newReconcileFixture(t, domain.StateRecovering, true, true)
 	id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
-	pending.Add(id, true)
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
 	finish := runReconciliation(t, uc, liveness)
 	finish()
 	if got := tasks.entries[id].State; got != domain.StateRecovered {
@@ -288,7 +352,7 @@ func TestReconcilePendingCompletesDeadRecoveringTaskBeforeReleasingSlot(t *testi
 	if mutex.held || writer.events == 0 || slots.calls != 1 || len(pending.List()) != 0 {
 		t.Fatalf("held=%v events=%d slots=%d pending=%+v", mutex.held, writer.events, slots.calls, pending.List())
 	}
-	want := []string{"load", "lock", "load", "adopted-marker", "recovered-marker", "exit-code", "save", "event", "unlock", "slot"}
+	want := []string{"lock", "load", "unlock", "lock", "load", "adopted-marker", "recovered-marker", "exit-code", "save", "event", "unlock", "slot"}
 	if len(*order) < len(want) {
 		t.Fatalf("order=%v, want prefix %v", *order, want)
 	}
@@ -302,7 +366,7 @@ func TestReconcilePendingCompletesDeadRecoveringTaskBeforeReleasingSlot(t *testi
 func TestReconcilePendingFailsDeadRecoveringTaskWithoutOutput(t *testing.T) {
 	uc, pending, tasks, liveness, writer, _, _, _, slots, mutex, _ := newReconcileFixture(t, domain.StateRecovering, true, false)
 	id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
-	pending.Add(id, true)
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
 	finish := runReconciliation(t, uc, liveness)
 	finish()
 	if got := tasks.entries[id].State; got != domain.StateTimeoutLost {
@@ -313,6 +377,29 @@ func TestReconcilePendingFailsDeadRecoveringTaskWithoutOutput(t *testing.T) {
 	}
 	if writer.adoptedMarkers != 1 || writer.recoveredMarkers != 0 || writer.exitCodes != 1 || writer.exitCode == nil || writer.exitCode.Raw() != 1 || writer.exitCode.Class() != domain.ExitCodeClassFailure || !tasks.entries[id].AdoptedAfterRestart {
 		t.Fatalf("writer=%+v snapshot=%+v", writer, tasks.entries[id])
+	}
+}
+
+func TestReconcilePendingOrphanReadErrorRetriesFromReadLastMessage(t *testing.T) {
+	id := adoptionID(t, "reconcile-orphan-read-retry")
+	snapshot := adoptionSnapshot(t, id, domain.StateOrphaned)
+	order := []string{}
+	pending := &PendingReconciliationSet{}
+	registerReconcilePending(t, pending, snapshot, PendingSendConfirmOnly)
+	tasks := &reconcileStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}, order: &order}
+	reader := &reconcileReaderFake{results: []reconcileReaderResult{{err: errors.New("read")}, {present: true}}}
+	finalizer := &adoptionFinalizerFake{}
+	uc := NewReconcilePendingUseCase(pending, tasks, &reconcileLivenessFake{called: make(chan struct{}), release: make(chan struct{})}, reader, &reconcileWriterFake{order: &order}, finalizer, &reconcileTerminationFake{called: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{})}, &reconcileKilledFake{}, &reconcilePathLocksFake{order: &order}, newAdoptionResumeUseCase(t), &reconcileSlotsFake{order: &order}, &reconcileMutexFake{order: &order}, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+
+	uc.reconcileOne(context.Background(), id)
+	entries := pending.List()
+	if reader.calls != 1 || finalizer.calls != 0 || len(entries) != 1 || pendingDisposition(entries[0]) != PendingSendConfirmOnly {
+		t.Fatalf("reader=%d finalizer=%d pending=%+v", reader.calls, finalizer.calls, entries)
+	}
+
+	uc.reconcileOne(context.Background(), id)
+	if reader.calls != 2 || finalizer.calls != 1 || len(pending.List()) != 0 {
+		t.Fatalf("reader=%d finalizer=%d pending=%+v", reader.calls, finalizer.calls, pending.List())
 	}
 }
 
@@ -337,7 +424,7 @@ func TestReconcilePendingRecoveringWriteFailuresAreFailSoft(t *testing.T) {
 			uc.logger = slog.New(slog.NewTextHandler(&logs, nil))
 			tc.configure(tasks, writer)
 			id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
-			pending.Add(id, true)
+			registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
 			finish := runReconciliation(t, uc, liveness)
 			finish()
 			if mutex.held || slots.calls != 1 || len(pending.List()) != 0 || writer.events == 0 || logs.Len() == 0 {
@@ -357,7 +444,7 @@ func TestNewReconcilePendingUseCasePanicsForNonPositiveTerminationGrace(t *testi
 			}()
 			uc, pending, tasks, liveness, writer, termination, killed, pathLocks, slots, mutex, _ := newReconcileFixture(t, domain.StateRecovering, false, false)
 			_ = uc
-			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, termination, killed, pathLocks, newAdoptionResumeUseCase(t), slots, mutex, domain.ClockFunc(time.Now), time.Second, grace, slog.Default())
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, newAdoptionResumeUseCase(t), slots, mutex, domain.ClockFunc(time.Now), time.Second, grace, slog.Default())
 		})
 	}
 }
@@ -368,13 +455,13 @@ func TestReconcilePendingRecoveryWriteOrder(t *testing.T) {
 		present bool
 		want    []string
 	}{
-		{"success", true, []string{"load", "lock", "load", "adopted-marker", "recovered-marker", "exit-code", "save", "event", "unlock", "slot"}},
-		{"failure", false, []string{"load", "lock", "load", "adopted-marker", "exit-code", "save", "event", "unlock", "slot"}},
+		{"success", true, []string{"lock", "load", "unlock", "lock", "load", "adopted-marker", "recovered-marker", "exit-code", "save", "event", "unlock", "slot"}},
+		{"failure", false, []string{"lock", "load", "unlock", "lock", "load", "adopted-marker", "exit-code", "save", "event", "unlock", "slot"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			uc, pending, _, liveness, _, _, _, _, _, _, order := newReconcileFixture(t, domain.StateRecovering, true, tc.present)
+			uc, pending, tasks, liveness, _, _, _, _, _, _, order := newReconcileFixture(t, domain.StateRecovering, true, tc.present)
 			id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
-			pending.Add(id, true)
+			registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
 			finish := runReconciliation(t, uc, liveness)
 			finish()
 			if !reflect.DeepEqual(*order, tc.want) {
@@ -385,9 +472,9 @@ func TestReconcilePendingRecoveryWriteOrder(t *testing.T) {
 }
 
 func TestReconcilePendingTimeoutClaimsBeforeSendingAndUsesTerminationGrace(t *testing.T) {
-	uc, pending, _, _, _, termination, _, _, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
+	uc, pending, tasks, _, _, termination, _, _, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
 	id := adoptionID(t, "reconcile-"+string(domain.StateTimeout))
-	pending.Add(id, false)
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendUnsent)
 	done := make(chan struct{})
 	go func() {
 		uc.reconcileOne(context.Background(), id)
@@ -415,9 +502,9 @@ func TestReconcilePendingTimeoutClaimsBeforeSendingAndUsesTerminationGrace(t *te
 }
 
 func TestReconcilePendingTimeoutOnlyConfirmsAfterSignalWasSent(t *testing.T) {
-	uc, pending, _, _, _, termination, _, _, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
+	uc, pending, tasks, _, _, termination, _, _, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
 	id := adoptionID(t, "reconcile-"+string(domain.StateTimeout))
-	pending.Add(id, true)
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendSent)
 	done := make(chan struct{})
 	go func() {
 		uc.reconcileOne(context.Background(), id)
@@ -445,9 +532,9 @@ func TestReconcilePendingTimeoutOnlyConfirmsAfterSignalWasSent(t *testing.T) {
 }
 
 func TestReconcilePendingCancellingConfirmsKilledAfterDeath(t *testing.T) {
-	uc, pending, _, _, _, termination, killed, _, _, _, _ := newReconcileFixture(t, domain.StateCancelling, false, false)
+	uc, pending, tasks, _, _, termination, killed, _, _, _, _ := newReconcileFixture(t, domain.StateCancelling, false, false)
 	id := adoptionID(t, "reconcile-"+string(domain.StateCancelling))
-	pending.Add(id, true)
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendSent)
 	termination.confirmDead = true
 	done := make(chan struct{})
 	go func() {
@@ -475,6 +562,122 @@ func TestReconcilePendingCancellingConfirmsKilledAfterDeath(t *testing.T) {
 	}
 }
 
+func TestReconcilePendingAfterConfirmedDeathDoesNotRestoreSendAuthority(t *testing.T) {
+	uc, pending, tasks, _, _, termination, _, _, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
+	id := adoptionID(t, "reconcile-"+string(domain.StateTimeout))
+	snapshot := tasks.entries[id]
+	registerReconcilePending(t, pending, snapshot, PendingSendUnsent)
+
+	uc.reconcilePendingAfterConfirmedDeath(id)
+
+	entries := pending.List()
+	if len(entries) != 1 || pendingDisposition(entries[0]) != PendingSendConfirmOnly || entries[0].authority != (ProcessSignalAuthority{}) {
+		t.Fatalf("pending=%+v, want confirm-only without authority", entries)
+	}
+	authority, ok := processSignalAuthority(snapshot)
+	if !ok {
+		t.Fatal("fixture requires signal authority")
+	}
+	claim, found := pending.ClaimForSend(id, authority)
+	if !found || claim.Token != 0 || termination.send != 0 {
+		t.Fatalf("claim=%+v found=%v sends=%d, want no resend claim", claim, found, termination.send)
+	}
+}
+
+func TestReconcilePendingTimeoutDispatchRemovesPendingBeforeDispatch(t *testing.T) {
+	uc, pending, tasks, _, _, _, _, pathLocks, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
+	id := adoptionID(t, "reconcile-"+string(domain.StateTimeout))
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
+
+	uc.completeTerminated(context.Background(), id, tasks.entries[id], true, time.Now())
+
+	if pathLocks.calls != 1 || len(pending.List()) != 0 {
+		t.Fatalf("pathLocks=%d pending=%+v", pathLocks.calls, pending.List())
+	}
+}
+
+func TestTimeoutRecoveryRemovesPendingBeforeResumeDispatch(t *testing.T) {
+	_, testFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("resolve test file path")
+	}
+
+	for _, tc := range []struct {
+		name     string
+		source   string
+		function string
+	}{
+		{name: "adoption", source: "adopt.go", function: "confirmTimeoutTermination"},
+		{name: "reconciliation", source: "reconcile.go", function: "completeTerminated"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			assertPendingRemovalPrecedesResumeDispatch(t, filepath.Join(filepath.Dir(testFile), tc.source), tc.function)
+		})
+	}
+}
+
+func assertPendingRemovalPrecedesResumeDispatch(t *testing.T, sourcePath, functionName string) {
+	t.Helper()
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, sourcePath, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var removePos, dispatchPos token.Pos
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != functionName {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			block, ok := node.(*ast.BlockStmt)
+			if !ok {
+				return true
+			}
+			for index, statement := range block.List {
+				dispatch, ok := statement.(*ast.GoStmt)
+				if !ok || !isResumeRecoveryCall(dispatch.Call) {
+					continue
+				}
+				dispatchPos = dispatch.Pos()
+				for previous := index - 1; previous >= 0; previous-- {
+					remove, ok := block.List[previous].(*ast.ExprStmt)
+					if ok && isPendingRemoveCall(remove.X) {
+						removePos = remove.Pos()
+						break
+					}
+				}
+			}
+			return true
+		})
+	}
+	if !removePos.IsValid() || !dispatchPos.IsValid() {
+		t.Fatalf("remove=%v dispatch=%v in %s", removePos.IsValid(), dispatchPos.IsValid(), sourcePath)
+	}
+	if removePos > dispatchPos {
+		t.Fatalf("pending removal must precede resume dispatch in %s", sourcePath)
+	}
+}
+
+func isPendingRemoveCall(expression ast.Expr) bool {
+	call, ok := expression.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != "Remove" {
+		return false
+	}
+	pending, ok := selector.X.(*ast.SelectorExpr)
+	return ok && pending.Sel.Name == "pending"
+}
+
+func isResumeRecoveryCall(call *ast.CallExpr) bool {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	return ok && selector.Sel.Name == "resumeRecovery"
+}
+
 func TestReconcilePendingWithoutPIDConfirmsInsteadOfSending(t *testing.T) {
 	uc, pending, tasks, _, _, termination, _, _, _, _, _ := newReconcileFixture(t, domain.StateCancelling, false, false)
 	id := adoptionID(t, "reconcile-"+string(domain.StateCancelling))
@@ -483,7 +686,7 @@ func TestReconcilePendingWithoutPIDConfirmsInsteadOfSending(t *testing.T) {
 	snapshot.ProcessStartedAt = nil
 	snapshot.AdoptedAfterRestart = true
 	tasks.entries[id] = snapshot
-	pending.Add(id, false)
+	registerReconcilePending(t, pending, snapshot, PendingSendConfirmOnly)
 	done := make(chan struct{})
 	go func() {
 		uc.reconcileOne(context.Background(), id)
@@ -511,11 +714,65 @@ func TestReconcilePendingWithoutPIDConfirmsInsteadOfSending(t *testing.T) {
 }
 
 func TestReconcilePendingStopsWhenContextIsCancelled(t *testing.T) {
-	uc, pending, _, liveness, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateRecovering, false, false)
+	uc, pending, tasks, liveness, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateRecovering, false, false)
 	id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
-	pending.Add(id, true)
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
 	run := startReconciliation(t, uc, liveness)
 	run.stop()
+}
+
+func TestReconcilePendingCancellationStopsBeforeNextEntryLoad(t *testing.T) {
+	first := adoptionID(t, "reconcile-cancel-first")
+	second := adoptionID(t, "reconcile-cancel-second")
+	firstSnapshot := adoptionSnapshot(t, first, domain.StateRecovering)
+	secondSnapshot := adoptionSnapshot(t, second, domain.StateRecovering)
+	order := []string{}
+	pending := &PendingReconciliationSet{}
+	registerReconcilePending(t, pending, firstSnapshot, PendingSendConfirmOnly)
+	registerReconcilePending(t, pending, secondSnapshot, PendingSendConfirmOnly)
+	tasks := &reconcileStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{first: firstSnapshot, second: secondSnapshot}, order: &order}
+	liveness := &reconcileLivenessFake{called: make(chan struct{}), release: make(chan struct{}, 1)}
+	termination := &reconcileTerminationFake{called: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{})}
+	uc := NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, &reconcileWriterFake{order: &order}, &adoptionFinalizerFake{}, termination, &reconcileKilledFake{}, &reconcilePathLocksFake{order: &order}, newAdoptionResumeUseCase(t), &reconcileSlotsFake{order: &order}, &reconcileMutexFake{order: &order}, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		uc.reconcileTick(ctx)
+		close(done)
+	}()
+	<-liveness.called
+	cancel()
+	liveness.release <- struct{}{}
+	<-done
+	if tasks.loads != 1 || termination.confirm != 0 || termination.send != 0 {
+		t.Fatalf("loads=%d confirm=%d send=%d", tasks.loads, termination.confirm, termination.send)
+	}
+}
+
+func TestReconcilePendingRecoveringCancellationAfterReadStopsBeforeLock(t *testing.T) {
+	id := adoptionID(t, "reconcile-cancel-after-read")
+	snapshot := adoptionSnapshot(t, id, domain.StateRecovering)
+	order := []string{}
+	pending := &PendingReconciliationSet{}
+	registerReconcilePending(t, pending, snapshot, PendingSendConfirmOnly)
+	tasks := &reconcileStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}, order: &order}
+	ctx, cancel := context.WithCancel(context.Background())
+	reader := &reconcileReaderFake{present: true, afterRead: cancel}
+	writer := &reconcileWriterFake{order: &order}
+	slots := &reconcileSlotsFake{order: &order}
+	mutex := &reconcileMutexFake{order: &order}
+	liveness := &reconcileLivenessFake{dead: true, called: make(chan struct{}), release: make(chan struct{}, 1)}
+	liveness.release <- struct{}{}
+	uc := NewReconcilePendingUseCase(pending, tasks, liveness, reader, writer, &adoptionFinalizerFake{}, &reconcileTerminationFake{called: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{})}, &reconcileKilledFake{}, &reconcilePathLocksFake{order: &order}, newAdoptionResumeUseCase(t), slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+
+	uc.reconcileRecovering(ctx, id)
+
+	if reader.calls != 1 || tasks.loads != 0 || tasks.saves != 0 || mutex.held || len(order) != 0 || slots.calls != 0 || len(pending.List()) != 1 {
+		t.Fatalf("reader=%d loads=%d saves=%d held=%t order=%v slots=%d pending=%+v", reader.calls, tasks.loads, tasks.saves, mutex.held, order, slots.calls, pending.List())
+	}
+	if writer.adoptedMarkers != 0 || writer.recoveredMarkers != 0 || writer.exitCodes != 0 || writer.events != 0 {
+		t.Fatalf("writer=%+v", writer)
+	}
 }
 
 var _ ContractReader = (*reconcileReaderFake)(nil)
