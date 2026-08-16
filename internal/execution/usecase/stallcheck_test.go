@@ -31,7 +31,7 @@ func (f testTickerFactory) NewTicker(time.Duration) stallTicker { return f.ticke
 func stallUC(t *testing.T, id domain.TaskID, s *testStore, dead bool, liveErr error, now time.Time, logger *slog.Logger) *checkStallUseCase {
 	t.Helper()
 	r := s.r
-	return newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, id, dead, liveErr), &testWriter{r: r}, &testClock{at: now, r: r, id: id}, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry(), logger)
+	return newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, id, dead, liveErr), &testWriter{r: r}, &testClock{at: now, r: r, id: id}, testTracker(r), time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry(), logger)
 }
 
 func TestCheckStallThresholdAndNilLastEvent(t *testing.T) {
@@ -48,7 +48,7 @@ func TestCheckStallThresholdAndNilLastEvent(t *testing.T) {
 			snap := testSnapshot(t, id, domain.StateRunning, start, tc.last)
 			s := &testStore{r: r, loads: map[string]domain.TaskSnapshot{id.String(): snap}}
 			w := &testWriter{r: r}
-			uc := newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, id, false, nil), w, &testClock{at: start.Add(tc.gap), r: r, id: id}, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry())
+			uc := newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, id, false, nil), w, &testClock{at: start.Add(tc.gap), r: r, id: id}, testTracker(r), time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry())
 			uc.checkOne(context.Background(), id)
 			if (len(w.events) > 0) != tc.want {
 				t.Fatalf("events=%v", w.events)
@@ -75,7 +75,7 @@ func TestCheckStallStopsScanAfterContextCancellation(t *testing.T) {
 	a, b := testSnapshot(t, one, domain.StateRunning, start, &start), testSnapshot(t, two, domain.StateRunning, start, &start)
 	s := &testStore{r: r, loads: map[string]domain.TaskSnapshot{one.String(): a, two.String(): b}, lists: [][]domain.TaskSnapshot{{a, b}}}
 	ctx, cancel := context.WithCancel(context.Background())
-	uc := newCheckStallUseCase(s, &testLocker{r: r}, execution.NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { cancel(); return false, nil }), func(domain.TaskID) string { return "lock" }), &testWriter{r: r}, &testClock{at: start.Add(1201 * time.Second), r: r, id: one}, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry())
+	uc := newCheckStallUseCase(s, &testLocker{r: r}, execution.NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { cancel(); return false, nil }), func(domain.TaskID) string { return "lock" }), &testWriter{r: r}, &testClock{at: start.Add(1201 * time.Second), r: r, id: one}, testTracker(r), time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry())
 	uc.scan(ctx)
 	if strings.Contains(fmt.Sprint(r.ops), "load:"+two.String()) {
 		t.Fatalf("ops=%v", r.ops)
@@ -89,7 +89,7 @@ func TestCheckStallChecksRunningAndStalledAndOrphans(t *testing.T) {
 	snap := testSnapshot(t, id, domain.StateStalled, now, nil)
 	s := &testStore{r: r, loads: map[string]domain.TaskSnapshot{id.String(): snap}, lists: [][]domain.TaskSnapshot{{snap}}}
 	w := &testWriter{r: r}
-	uc := newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, id, true, nil), w, &testClock{at: now, r: r, id: id}, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry())
+	uc := newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, id, true, nil), w, &testClock{at: now, r: r, id: id}, testTracker(r), time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry())
 	uc.scan(context.Background())
 	if fmt.Sprint(s.listStates[0]) != fmt.Sprint([]domain.TaskState{domain.StateRunning, domain.StateStalled}) || len(w.events) != 1 || w.events[0] != "TaskOrphanDetected" || s.saved[0].State != domain.StateOrphaned {
 		t.Fatalf("states=%v events=%v saved=%#v", s.listStates, w.events, s.saved)
@@ -104,7 +104,7 @@ func TestCheckStallFailuresUnlockAndContinue(t *testing.T) {
 	s := &testStore{r: r, loads: map[string]domain.TaskSnapshot{one.String(): a, two.String(): b}, saveErr: map[string]error{one.String(): errors.New("save failed")}, lists: [][]domain.TaskSnapshot{{a, b}}}
 	w := &testWriter{r: r}
 	var logs bytes.Buffer
-	uc := newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, one, false, nil), w, &testClock{at: start.Add(1201 * time.Second), r: r, id: one}, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry(), slog.New(slog.NewTextHandler(&logs, nil)))
+	uc := newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, one, false, nil), w, &testClock{at: start.Add(1201 * time.Second), r: r, id: one}, testTracker(r), time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry(), slog.New(slog.NewTextHandler(&logs, nil)))
 	uc.scan(context.Background())
 	ops := fmt.Sprint(r.ops)
 	if !strings.Contains(ops, "unlock:"+one.String()+" lock:"+two.String()) {
@@ -136,7 +136,7 @@ func TestCheckStallReadAndLivenessErrorClassification(t *testing.T) {
 			w := &testWriter{r: r}
 			var logs bytes.Buffer
 			logger := slog.New(slog.NewJSONHandler(&logs, nil))
-			uc := newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, id, false, tc.err), w, &testClock{at: start, r: r, id: id}, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry(), logger)
+			uc := newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, id, false, tc.err), w, &testClock{at: start, r: r, id: id}, testTracker(r), time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry(), logger)
 
 			uc.checkOne(context.Background(), id)
 
@@ -185,7 +185,7 @@ func TestCheckStallPersistWithTaskFailureLogsSnapshotValidationWithoutStateReadC
 	store := &testStore{r: r}
 	writer := &testWriter{r: r}
 	var logs bytes.Buffer
-	uc := newCheckStallUseCase(store, &testLocker{r: r}, testLive(r, id, false, nil), writer, &testClock{at: now, r: r, id: id}, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry(), slog.New(slog.NewJSONHandler(&logs, nil)))
+	uc := newCheckStallUseCase(store, &testLocker{r: r}, testLive(r, id, false, nil), writer, &testClock{at: now, r: r, id: id}, testTracker(r), time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry(), slog.New(slog.NewJSONHandler(&logs, nil)))
 
 	uc.persist(id, snapshot, task, nil, now, "mark-stalled")
 
@@ -242,7 +242,7 @@ func TestCheckStallTickerStopsOnCanceledContext(t *testing.T) {
 	id := testID(t, "ticker")
 	s := &testStore{r: r}
 	ticker := &testTicker{ch: make(chan time.Time, 1), r: r}
-	uc := newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, id, false, nil), &testWriter{r: r}, &testClock{r: r, id: id}, time.Second, testTickerFactory{ticker}, execution.NewLifecycleOwnershipRegistry())
+	uc := newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, id, false, nil), &testWriter{r: r}, &testClock{r: r, id: id}, testTracker(r), time.Second, testTickerFactory{ticker}, execution.NewLifecycleOwnershipRegistry())
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	uc.Run(ctx)
@@ -264,7 +264,7 @@ func TestCheckStallOwnershipSuppressesOnlyOrphanTransition(t *testing.T) {
 	if !acquired {
 		t.Fatal("ownership acquisition failed")
 	}
-	uc := newCheckStallUseCaseWithOwnership(store, &testLocker{r: r}, testLive(r, id, true, nil), writer, &testClock{at: start, r: r, id: id}, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time), r: r}}, ownership)
+	uc := newCheckStallUseCaseWithOwnership(store, &testLocker{r: r}, testLive(r, id, true, nil), writer, &testClock{at: start, r: r, id: id}, testTracker(r), time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time), r: r}}, ownership)
 	uc.checkOne(context.Background(), id)
 	if len(store.saved) != 1 || store.saved[0].State != domain.StateStalled {
 		t.Fatalf("owned dead task should continue stall evaluation: saved=%#v", store.saved)
@@ -288,7 +288,7 @@ func TestCheckStallConstructorAndInvalidTransitionLogger(t *testing.T) {
 			t.Fatal("expected panic")
 		}
 	}()
-	newCheckStallUseCase(nil, &testLocker{r: r}, testLive(r, id, false, nil), &testWriter{r: r}, &testClock{r: r, id: id}, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry())
+	newCheckStallUseCase(nil, &testLocker{r: r}, testLive(r, id, false, nil), &testWriter{r: r}, &testClock{r: r, id: id}, testTracker(r), time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry())
 }
 
 func TestCheckStallConstructorRejectsTypedNilDependencies(t *testing.T) {
@@ -299,10 +299,11 @@ func TestCheckStallConstructorRejectsTypedNilDependencies(t *testing.T) {
 	validLiveness := testLive(r, id, false, nil)
 	validContract := &testWriter{r: r}
 	validClock := &testClock{r: r, id: id}
+	validTracker := testTracker(r)
 	validTickers := testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}
 	validOwnership := execution.NewLifecycleOwnershipRegistry()
 
-	if newCheckStallUseCase(validTasks, validTaskMu, validLiveness, validContract, validClock, time.Second, validTickers, validOwnership) == nil {
+	if newCheckStallUseCase(validTasks, validTaskMu, validLiveness, validContract, validClock, validTracker, time.Second, validTickers, validOwnership) == nil {
 		t.Fatal("expected use case")
 	}
 	for _, tc := range []struct {
@@ -310,22 +311,25 @@ func TestCheckStallConstructorRejectsTypedNilDependencies(t *testing.T) {
 		call func()
 	}{
 		{"tasks", func() {
-			newCheckStallUseCase((*testStore)(nil), validTaskMu, validLiveness, validContract, validClock, time.Second, validTickers, validOwnership)
+			newCheckStallUseCase((*testStore)(nil), validTaskMu, validLiveness, validContract, validClock, testTracker(r), time.Second, validTickers, validOwnership)
 		}},
 		{"task-mutex", func() {
-			newCheckStallUseCase(validTasks, (*testLocker)(nil), validLiveness, validContract, validClock, time.Second, validTickers, validOwnership)
+			newCheckStallUseCase(validTasks, (*testLocker)(nil), validLiveness, validContract, validClock, testTracker(r), time.Second, validTickers, validOwnership)
 		}},
 		{"liveness", func() {
-			newCheckStallUseCase(validTasks, validTaskMu, (*execution.CheckLivenessUseCase)(nil), validContract, validClock, time.Second, validTickers, validOwnership)
+			newCheckStallUseCase(validTasks, validTaskMu, (*execution.CheckLivenessUseCase)(nil), validContract, validClock, testTracker(r), time.Second, validTickers, validOwnership)
 		}},
 		{"contract-writer", func() {
-			newCheckStallUseCase(validTasks, validTaskMu, validLiveness, (*testWriter)(nil), validClock, time.Second, validTickers, validOwnership)
+			newCheckStallUseCase(validTasks, validTaskMu, validLiveness, (*testWriter)(nil), validClock, testTracker(r), time.Second, validTickers, validOwnership)
 		}},
 		{"clock", func() {
-			newCheckStallUseCase(validTasks, validTaskMu, validLiveness, validContract, (*testClock)(nil), time.Second, validTickers, validOwnership)
+			newCheckStallUseCase(validTasks, validTaskMu, validLiveness, validContract, (*testClock)(nil), testTracker(r), time.Second, validTickers, validOwnership)
+		}},
+		{"tracker", func() {
+			newCheckStallUseCase(validTasks, validTaskMu, validLiveness, validContract, validClock, (*testStalledTimeTracker)(nil), time.Second, validTickers, validOwnership)
 		}},
 		{"tickers", func() {
-			newCheckStallUseCase(validTasks, validTaskMu, validLiveness, validContract, validClock, time.Second, (*testTickerFactory)(nil), validOwnership)
+			newCheckStallUseCase(validTasks, validTaskMu, validLiveness, validContract, validClock, testTracker(r), time.Second, (*testTickerFactory)(nil), validOwnership)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -365,5 +369,184 @@ func TestCheckStallInvalidTransitionLogsAreSeparated(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestCheckStallTrackerRunningToStalled(t *testing.T) {
+	start := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name  string
+		save  error
+		calls int
+	}{
+		{"save-success", nil, 1},
+		{"save-failure", errors.New("save failed"), 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &testRecorder{}
+			id := testID(t, "tracker-stall-"+tc.name)
+			tracker := testTracker(r)
+			now := start.Add(1201 * time.Second)
+			s := &testStore{r: r, loads: map[string]domain.TaskSnapshot{id.String(): testSnapshot(t, id, domain.StateRunning, start, &start)}, saveErr: map[string]error{id.String(): tc.save}}
+			uc := newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, id, false, nil), &testWriter{r: r}, &testClock{at: now, r: r, id: id}, tracker, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time), r: r}}, execution.NewLifecycleOwnershipRegistry())
+			uc.checkOne(context.Background(), id)
+			if len(tracker.calls) != tc.calls || tracker.takeCalls != 0 {
+				t.Fatalf("calls=%v take=%d", tracker.calls, tracker.takeCalls)
+			}
+			if tc.calls == 1 && (tracker.calls[0].kind != "enter" || tracker.calls[0].id != id || !tracker.calls[0].at.Equal(now)) {
+				t.Fatalf("calls=%v", tracker.calls)
+			}
+		})
+	}
+}
+
+func TestCheckStallTrackerStalledSelfLoopDoesNotRestart(t *testing.T) {
+	r := &testRecorder{}
+	id := testID(t, "tracker-self-loop")
+	start := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	last := start.Add(-1201 * time.Second)
+	tracker := testTracker(r)
+	s := &testStore{r: r, loads: map[string]domain.TaskSnapshot{id.String(): testSnapshot(t, id, domain.StateStalled, start, &last)}}
+	uc := newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, id, false, nil), &testWriter{r: r}, &testClock{at: start, r: r, id: id}, tracker, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time), r: r}}, execution.NewLifecycleOwnershipRegistry())
+	uc.checkOne(context.Background(), id)
+	if len(s.saved) != 1 || len(tracker.calls) != 0 || tracker.takeCalls != 0 {
+		t.Fatalf("saved=%v calls=%v take=%d", s.saved, tracker.calls, tracker.takeCalls)
+	}
+}
+
+func TestCheckStallTrackerOrphanTransitions(t *testing.T) {
+	start := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name  string
+		state domain.TaskState
+		save  error
+		calls int
+	}{
+		{"stalled-save-success", domain.StateStalled, nil, 1},
+		{"stalled-save-failure", domain.StateStalled, errors.New("save failed"), 0},
+		{"running-save-success", domain.StateRunning, nil, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &testRecorder{}
+			id := testID(t, "tracker-orphan-"+tc.name)
+			tracker := testTracker(r)
+			s := &testStore{r: r, loads: map[string]domain.TaskSnapshot{id.String(): testSnapshot(t, id, tc.state, start, nil)}, saveErr: map[string]error{id.String(): tc.save}}
+			uc := newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, id, true, nil), &testWriter{r: r}, &testClock{at: start, r: r, id: id}, tracker, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time), r: r}}, execution.NewLifecycleOwnershipRegistry())
+			uc.checkOne(context.Background(), id)
+			if len(tracker.calls) != tc.calls || tracker.takeCalls != 0 {
+				t.Fatalf("calls=%v take=%d", tracker.calls, tracker.takeCalls)
+			}
+			if tc.calls == 1 && (tracker.calls[0].kind != "leave" || tracker.calls[0].id != id || !tracker.calls[0].at.Equal(start)) {
+				t.Fatalf("calls=%v", tracker.calls)
+			}
+		})
+	}
+}
+
+func TestCheckStallTrackerIgnoresAppendEventResult(t *testing.T) {
+	start := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	for _, state := range []domain.TaskState{domain.StateRunning, domain.StateStalled} {
+		r := &testRecorder{}
+		id := testID(t, "tracker-append-"+string(state))
+		tracker := testTracker(r)
+		last := start.Add(-1201 * time.Second)
+		if state == domain.StateStalled {
+			last = start
+		}
+		s := &testStore{r: r, loads: map[string]domain.TaskSnapshot{id.String(): testSnapshot(t, id, state, start, &last)}}
+		uc := newCheckStallUseCase(s, &testLocker{r: r}, testLive(r, id, state == domain.StateStalled, nil), &testWriter{r: r, eventErr: errors.New("append failed")}, &testClock{at: start, r: r, id: id}, tracker, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time), r: r}}, execution.NewLifecycleOwnershipRegistry())
+		uc.checkOne(context.Background(), id)
+		if len(tracker.calls) != 1 || tracker.takeCalls != 0 {
+			t.Fatalf("state=%s calls=%v take=%d", state, tracker.calls, tracker.takeCalls)
+		}
+	}
+}
+
+func TestCheckStallTrackerCallsWhileTaskLockHeld(t *testing.T) {
+	start := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name             string
+		state            domain.TaskState
+		dead             bool
+		trackerOp, event string
+	}{
+		{"enter", domain.StateRunning, false, "enter-stalled", "TaskStalled"},
+		{"leave", domain.StateStalled, true, "leave-stalled", "TaskOrphanDetected"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &testRecorder{}
+			id := testID(t, "tracker-lock-"+tc.name)
+			locker := &testLocker{r: r}
+			tracker := testTracker(r)
+			tracker.locker = locker
+			last := start.Add(-1201 * time.Second)
+			if tc.state == domain.StateStalled {
+				last = start
+			}
+			s := &testStore{r: r, loads: map[string]domain.TaskSnapshot{id.String(): testSnapshot(t, id, tc.state, start, &last)}}
+			uc := newCheckStallUseCase(s, locker, testLive(r, id, tc.dead, nil), &testWriter{r: r}, &testClock{at: start, r: r, id: id}, tracker, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time), r: r}}, execution.NewLifecycleOwnershipRegistry())
+			uc.checkOne(context.Background(), id)
+			if len(tracker.held) != 1 || !tracker.held[0] {
+				t.Fatalf("held=%v", tracker.held)
+			}
+			assertOrderedSubsequence(t, r.ops, []string{"lock:" + id.String(), "load:" + id.String(), "clock:" + id.String(), "liveness:" + id.String(), "save:" + id.String(), tc.trackerOp + ":" + id.String(), "append-event:" + id.String() + ":" + tc.event, "unlock:" + id.String()})
+		})
+	}
+}
+
+func TestCheckStallTrackerIgnoresOutOfScopeStatePair(t *testing.T) {
+	r := &testRecorder{}
+	id := testID(t, "tracker-out-of-scope")
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	snapshot := testSnapshot(t, id, domain.StateRunning, now, nil)
+	task, err := snapshot.Restore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	tracker := testTracker(r)
+	uc := newCheckStallUseCase(&testStore{r: r}, &testLocker{r: r}, testLive(r, id, false, nil), &testWriter{r: r}, &testClock{at: now, r: r, id: id}, tracker, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time), r: r}}, execution.NewLifecycleOwnershipRegistry())
+	uc.persist(id, snapshot, task, nil, now, "mark-stalled")
+	if len(tracker.calls) != 0 || tracker.takeCalls != 0 {
+		t.Fatalf("calls=%v take=%d", tracker.calls, tracker.takeCalls)
+	}
+}
+
+func TestCheckStallInvalidTransitionDoesNotPersistOrTrack(t *testing.T) {
+	r := &testRecorder{}
+	id := testID(t, "tracker-invalid")
+	now := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	terminal := testSnapshot(t, id, domain.StateCompleted, now, nil)
+	task, err := terminal.Restore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name string
+		call func(*checkStallUseCase)
+	}{
+		{"mark-stalled", func(uc *checkStallUseCase) { uc.stall(id, terminal, task, 1201, now) }},
+		{"detect-orphan", func(uc *checkStallUseCase) { uc.orphan(id, terminal, task, now) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store, writer, tracker := &testStore{r: r}, &testWriter{r: r}, testTracker(r)
+			uc := newCheckStallUseCase(store, &testLocker{r: r}, testLive(r, id, false, nil), writer, &testClock{at: now, r: r, id: id}, tracker, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time), r: r}}, execution.NewLifecycleOwnershipRegistry())
+			tc.call(uc)
+			if len(store.saved) != 0 || len(writer.events) != 0 || len(tracker.calls) != 0 || tracker.takeCalls != 0 {
+				t.Fatalf("saved=%v events=%v calls=%v take=%d", store.saved, writer.events, tracker.calls, tracker.takeCalls)
+			}
+		})
+	}
+}
+
+func TestCheckStallTrackerNeverTakesTotal(t *testing.T) {
+	r := &testRecorder{}
+	id := testID(t, "tracker-no-total")
+	start := time.Date(2026, 8, 12, 12, 0, 0, 0, time.UTC)
+	last := start.Add(-1201 * time.Second)
+	tracker := testTracker(r)
+	uc := newCheckStallUseCase(&testStore{r: r, loads: map[string]domain.TaskSnapshot{id.String(): testSnapshot(t, id, domain.StateRunning, start, &last)}}, &testLocker{r: r}, testLive(r, id, false, nil), &testWriter{r: r}, &testClock{at: start, r: r, id: id}, tracker, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time), r: r}}, execution.NewLifecycleOwnershipRegistry())
+	uc.checkOne(context.Background(), id)
+	if tracker.takeCalls != 0 {
+		t.Fatalf("take total calls=%d", tracker.takeCalls)
 	}
 }

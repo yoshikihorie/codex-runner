@@ -34,25 +34,26 @@ func (realStallTickerFactory) NewTicker(d time.Duration) stallTicker {
 func (t realStallTicker) C() <-chan time.Time { return t.Ticker.C }
 
 type checkStallUseCase struct {
-	tasks     store.TaskStore
-	taskMu    taskLocker
-	liveness  *execution.CheckLivenessUseCase
-	contract  contract.ContractWriter
-	ownership execution.LifecycleOwnershipRegistry
-	clock     domain.Clock
-	logger    *slog.Logger
-	interval  time.Duration
-	tickers   stallTickerFactory
+	tasks       store.TaskStore
+	taskMu      taskLocker
+	liveness    *execution.CheckLivenessUseCase
+	contract    contract.ContractWriter
+	ownership   execution.LifecycleOwnershipRegistry
+	clock       domain.Clock
+	stalledTime stalledTimeTracker
+	logger      *slog.Logger
+	interval    time.Duration
+	tickers     stallTickerFactory
 }
 
-func NewCheckStallUseCase(tasks store.TaskStore, taskMu taskLocker, liveness *execution.CheckLivenessUseCase, contractWriter contract.ContractWriter, clock domain.Clock, ownership execution.LifecycleOwnershipRegistry, loggers ...*slog.Logger) *checkStallUseCase {
-	return newCheckStallUseCaseWithOwnership(tasks, taskMu, liveness, contractWriter, clock, time.Duration(stallScanIntervalSeconds)*time.Second, realStallTickerFactory{}, ownership, loggers...)
+func NewCheckStallUseCase(tasks store.TaskStore, taskMu taskLocker, liveness *execution.CheckLivenessUseCase, contractWriter contract.ContractWriter, clock domain.Clock, stalledTime stalledTimeTracker, ownership execution.LifecycleOwnershipRegistry, loggers ...*slog.Logger) *checkStallUseCase {
+	return newCheckStallUseCaseWithOwnership(tasks, taskMu, liveness, contractWriter, clock, stalledTime, time.Duration(stallScanIntervalSeconds)*time.Second, realStallTickerFactory{}, ownership, loggers...)
 }
-func newCheckStallUseCase(tasks store.TaskStore, taskMu taskLocker, liveness *execution.CheckLivenessUseCase, contractWriter contract.ContractWriter, clock domain.Clock, interval time.Duration, tickers stallTickerFactory, ownership execution.LifecycleOwnershipRegistry, loggers ...*slog.Logger) *checkStallUseCase {
-	return newCheckStallUseCaseWithOwnership(tasks, taskMu, liveness, contractWriter, clock, interval, tickers, ownership, loggers...)
+func newCheckStallUseCase(tasks store.TaskStore, taskMu taskLocker, liveness *execution.CheckLivenessUseCase, contractWriter contract.ContractWriter, clock domain.Clock, stalledTime stalledTimeTracker, interval time.Duration, tickers stallTickerFactory, ownership execution.LifecycleOwnershipRegistry, loggers ...*slog.Logger) *checkStallUseCase {
+	return newCheckStallUseCaseWithOwnership(tasks, taskMu, liveness, contractWriter, clock, stalledTime, interval, tickers, ownership, loggers...)
 }
-func newCheckStallUseCaseWithOwnership(tasks store.TaskStore, taskMu taskLocker, liveness *execution.CheckLivenessUseCase, contractWriter contract.ContractWriter, clock domain.Clock, interval time.Duration, tickers stallTickerFactory, ownership execution.LifecycleOwnershipRegistry, loggers ...*slog.Logger) *checkStallUseCase {
-	if isNilValue(tasks) || isNilValue(taskMu) || isNilValue(liveness) || isNilValue(contractWriter) || isNilValue(clock) || isNilValue(tickers) || isNilValue(ownership) {
+func newCheckStallUseCaseWithOwnership(tasks store.TaskStore, taskMu taskLocker, liveness *execution.CheckLivenessUseCase, contractWriter contract.ContractWriter, clock domain.Clock, stalledTime stalledTimeTracker, interval time.Duration, tickers stallTickerFactory, ownership execution.LifecycleOwnershipRegistry, loggers ...*slog.Logger) *checkStallUseCase {
+	if isNilValue(tasks) || isNilValue(taskMu) || isNilValue(liveness) || isNilValue(contractWriter) || isNilValue(clock) || isNilValue(stalledTime) || isNilValue(tickers) || isNilValue(ownership) {
 		panic("check stall use case requires non-nil dependencies")
 	}
 	if len(loggers) > 1 {
@@ -65,7 +66,7 @@ func newCheckStallUseCaseWithOwnership(tasks store.TaskStore, taskMu taskLocker,
 	if interval <= 0 {
 		panic("check stall use case requires positive interval")
 	}
-	return &checkStallUseCase{tasks: tasks, taskMu: taskMu, liveness: liveness, contract: contractWriter, ownership: ownership, clock: clock, logger: logger, interval: interval, tickers: tickers}
+	return &checkStallUseCase{tasks: tasks, taskMu: taskMu, liveness: liveness, contract: contractWriter, ownership: ownership, clock: clock, stalledTime: stalledTime, logger: logger, interval: interval, tickers: tickers}
 }
 
 func (uc *checkStallUseCase) Run(ctx context.Context) {
@@ -177,6 +178,12 @@ func (uc *checkStallUseCase) persist(taskID domain.TaskID, snapshot domain.TaskS
 	if err := uc.tasks.Save(taskID, updated); err != nil {
 		uc.logger.Warn("contract write failed", "code", contractWriteFailedCode, "task_id", taskID.String(), "operation", "save-task", "transition", transition, "error", err)
 		return
+	}
+	if snapshot.State == domain.StateRunning && updated.State == domain.StateStalled {
+		uc.stalledTime.EnterStalled(taskID, now)
+	}
+	if snapshot.State == domain.StateStalled && updated.State == domain.StateOrphaned {
+		uc.stalledTime.LeaveStalled(taskID, now)
 	}
 	for _, event := range events {
 		if err := uc.contract.AppendEvent(taskID, event); err != nil {

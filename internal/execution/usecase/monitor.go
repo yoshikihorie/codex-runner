@@ -7,10 +7,12 @@ import (
 	"io"
 	"log/slog"
 	"reflect"
+	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/contract"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/execution"
+	"github.com/yoshikihorie/codex-runner/internal/metrics"
 	"github.com/yoshikihorie/codex-runner/internal/store"
 )
 
@@ -27,17 +29,25 @@ type taskLocker interface {
 
 var _ taskLocker = (*store.TaskMutex)(nil)
 
-type MonitorTaskEventsUseCase struct {
-	monitor  execution.EventMonitor
-	tasks    store.TaskStore
-	taskMu   taskLocker
-	contract contract.ContractWriter
-	clock    domain.Clock
-	logger   *slog.Logger
+type stalledTimeTracker interface {
+	EnterStalled(taskID domain.TaskID, occurredAt time.Time)
+	LeaveStalled(taskID domain.TaskID, occurredAt time.Time) int
 }
 
-func NewMonitorTaskEventsUseCase(monitor execution.EventMonitor, tasks store.TaskStore, taskMu taskLocker, contractWriter contract.ContractWriter, clock domain.Clock, loggers ...*slog.Logger) *MonitorTaskEventsUseCase {
-	if isNilValue(monitor) || isNilValue(tasks) || isNilValue(taskMu) || isNilValue(contractWriter) || isNilValue(clock) {
+var _ stalledTimeTracker = (*metrics.StalledTimeTracker)(nil)
+
+type MonitorTaskEventsUseCase struct {
+	monitor     execution.EventMonitor
+	tasks       store.TaskStore
+	taskMu      taskLocker
+	contract    contract.ContractWriter
+	clock       domain.Clock
+	stalledTime stalledTimeTracker
+	logger      *slog.Logger
+}
+
+func NewMonitorTaskEventsUseCase(monitor execution.EventMonitor, tasks store.TaskStore, taskMu taskLocker, contractWriter contract.ContractWriter, clock domain.Clock, stalledTime stalledTimeTracker, loggers ...*slog.Logger) *MonitorTaskEventsUseCase {
+	if isNilValue(monitor) || isNilValue(tasks) || isNilValue(taskMu) || isNilValue(contractWriter) || isNilValue(clock) || isNilValue(stalledTime) {
 		panic("monitor task events use case requires non-nil dependencies")
 	}
 	if len(loggers) > 1 {
@@ -47,7 +57,7 @@ func NewMonitorTaskEventsUseCase(monitor execution.EventMonitor, tasks store.Tas
 	if len(loggers) == 1 && loggers[0] != nil {
 		logger = loggers[0]
 	}
-	return &MonitorTaskEventsUseCase{monitor: monitor, tasks: tasks, taskMu: taskMu, contract: contractWriter, clock: clock, logger: logger}
+	return &MonitorTaskEventsUseCase{monitor: monitor, tasks: tasks, taskMu: taskMu, contract: contractWriter, clock: clock, stalledTime: stalledTime, logger: logger}
 }
 
 func (u *MonitorTaskEventsUseCase) Run(ctx context.Context, taskID domain.TaskID, stdout io.Reader) error {
@@ -91,6 +101,8 @@ func (u *MonitorTaskEventsUseCase) observeKnown(taskID domain.TaskID, typ string
 	saved := u.tasks.Save(taskID, updated)
 	if saved != nil {
 		u.logContract(taskID, "save-task", "", saved)
+	} else if snapshot.State == domain.StateStalled {
+		u.stalledTime.LeaveStalled(taskID, now)
 	}
 	u.appendRaw(taskID, typ, raw)
 	if saved == nil {
