@@ -49,7 +49,7 @@ type lifecycleKillConfirmer interface {
 }
 type lifecycleTerminationEnsurer interface {
 	Confirm(context.Context, domain.TaskID) (bool, error)
-	SendAndConfirm(context.Context, domain.TaskID, int, time.Duration) (bool, error)
+	SendAndConfirm(context.Context, domain.TaskID, int, time.Duration) execution.TerminationAttemptResult
 }
 type processTerminator interface {
 	Terminate(int, time.Duration) error
@@ -279,16 +279,25 @@ func (o *TaskLifecycleOrchestrator) confirmUnlaunchedCancellation(ctx context.Co
 func (o *TaskLifecycleOrchestrator) handleStartingCancellation(ctx context.Context, taskID domain.TaskID, launched *execution.LaunchedProcess, send bool) {
 	var dead bool
 	var err error
+	var terminateErr error
 	if send {
-		dead, err = o.deps.Termination.SendAndConfirm(ctx, taskID, launched.Handle.PID, execution.TimeoutKillGrace)
+		result := o.deps.Termination.SendAndConfirm(ctx, taskID, launched.Handle.PID, execution.TimeoutKillGrace)
+		dead, err, terminateErr = result.Dead, result.ConfirmErr, result.TerminateErr
 	} else {
 		dead, err = o.deps.Termination.Confirm(ctx, taskID)
 	}
-	if err != nil || !dead {
+	if !dead {
 		if err != nil {
 			o.logger.Warn("confirm starting cancellation", "task_id", taskID.String(), "error", err)
 		}
-		disposition, authority := pendingRegistrationAfterSignal(taskID, launched.Handle, send, err)
+		if terminateErr != nil {
+			o.logger.Warn("terminate starting cancellation", "task_id", taskID.String(), "error", terminateErr)
+		}
+		signalErr := err
+		if send {
+			signalErr = terminateErr
+		}
+		disposition, authority := pendingRegistrationAfterSignal(taskID, launched.Handle, send, signalErr)
 		if registerErr := o.deps.Pending.Register(taskID, disposition, authority); registerErr != nil {
 			o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
 		}
@@ -304,7 +313,11 @@ func (o *TaskLifecycleOrchestrator) handleStartingCancellation(ctx context.Conte
 	if result.Confirmed {
 		o.deps.ConfirmKilled.ReleaseAfterConfirmation(ctx, result, taskID)
 	} else {
-		disposition, authority := pendingRegistrationAfterSignal(taskID, launched.Handle, send, err)
+		signalErr := err
+		if send {
+			signalErr = terminateErr
+		}
+		disposition, authority := pendingRegistrationAfterSignal(taskID, launched.Handle, send, signalErr)
 		if registerErr := o.deps.Pending.Register(taskID, disposition, authority); registerErr != nil {
 			o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
 		}
@@ -417,7 +430,7 @@ func (o *TaskLifecycleOrchestrator) confirmTerminal(ctx context.Context, taskID 
 		}
 		if killResult.Confirmed {
 			o.deps.ConfirmKilled.ReleaseAfterConfirmation(ctx, killResult, taskID)
-		} else if registerErr := o.deps.Pending.Register(taskID, recovery.PendingSendConfirmOnly, nil); registerErr != nil {
+		} else if registerErr := o.deps.Pending.Register(taskID, recovery.PendingSendSent, nil); registerErr != nil {
 			o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
 		}
 		return

@@ -30,6 +30,16 @@ const (
 	PendingSendConfirmOnly
 )
 
+type ClaimOutcome uint8
+
+const (
+	ClaimNotFound ClaimOutcome = iota
+	ClaimAcquired
+	ClaimAlreadyClaimed
+	ClaimSent
+	ClaimConfirmOnly
+)
+
 type pendingState int
 
 const (
@@ -48,10 +58,11 @@ type PendingEntry struct {
 
 type PendingRegistrar interface {
 	Register(taskID domain.TaskID, disposition PendingSendDisposition, authority *ProcessSignalAuthority) error
-	ClaimForSend(taskID domain.TaskID, authority ProcessSignalAuthority) (claim SendClaim, found bool)
+	ClaimForSend(taskID domain.TaskID, authority ProcessSignalAuthority) (claim SendClaim, outcome ClaimOutcome)
 	CompleteSend(claim SendClaim) bool
 	ReleaseSend(claim SendClaim) bool
 	InvalidateSend(claim SendClaim) bool
+	RemoveClaim(claim SendClaim) bool
 }
 
 type PendingReconciliationSet struct {
@@ -100,9 +111,6 @@ func (s *PendingReconciliationSet) Register(taskID domain.TaskID, disposition Pe
 		}
 	case pendingConfirmOnly:
 		switch disposition {
-		case PendingSendUnsent:
-			entry.state = pendingUnsent
-			entry.authority = *authority
 		case PendingSendSent:
 			entry.state = pendingSent
 		}
@@ -112,16 +120,21 @@ func (s *PendingReconciliationSet) Register(taskID domain.TaskID, disposition Pe
 	return nil
 }
 
-func (s *PendingReconciliationSet) ClaimForSend(taskID domain.TaskID, authority ProcessSignalAuthority) (claim SendClaim, found bool) {
+func (s *PendingReconciliationSet) ClaimForSend(taskID domain.TaskID, authority ProcessSignalAuthority) (claim SendClaim, outcome ClaimOutcome) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	entry, found := s.entries[taskID]
 	if !found {
-		return SendClaim{}, false
+		return SendClaim{}, ClaimNotFound
 	}
-	if entry.state != pendingUnsent {
-		return SendClaim{}, true
+	switch entry.state {
+	case pendingClaimed:
+		return SendClaim{}, ClaimAlreadyClaimed
+	case pendingSent:
+		return SendClaim{}, ClaimSent
+	case pendingConfirmOnly:
+		return SendClaim{}, ClaimConfirmOnly
 	}
 	if !pendingAuthorityEqual(entry.authority, authority) {
 		// Authority invalidation detected here fails closed by moving unsent to confirm-only, preventing future sends.
@@ -129,14 +142,14 @@ func (s *PendingReconciliationSet) ClaimForSend(taskID domain.TaskID, authority 
 		entry.authority = ProcessSignalAuthority{}
 		entry.claimToken = 0
 		s.entries[taskID] = entry
-		return SendClaim{}, true
+		return SendClaim{}, ClaimConfirmOnly
 	}
 	// A set instance cannot realistically issue 2^64 claims during its lifetime.
 	s.nextToken++
 	entry.claimToken = s.nextToken
 	entry.state = pendingClaimed
 	s.entries[taskID] = entry
-	return SendClaim{TaskID: taskID, Token: entry.claimToken, Authority: entry.authority}, true
+	return SendClaim{TaskID: taskID, Token: entry.claimToken, Authority: entry.authority}, ClaimAcquired
 }
 
 func (s *PendingReconciliationSet) CompleteSend(claim SendClaim) bool {
@@ -178,6 +191,18 @@ func (s *PendingReconciliationSet) InvalidateSend(claim SendClaim) bool {
 	entry.authority = ProcessSignalAuthority{}
 	entry.claimToken = 0
 	s.entries[claim.TaskID] = entry
+	return true
+}
+
+func (s *PendingReconciliationSet) RemoveClaim(claim SendClaim) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entry, found := s.entries[claim.TaskID]
+	if !found || entry.state != pendingClaimed || entry.taskID != claim.TaskID || entry.claimToken != claim.Token {
+		return false
+	}
+	delete(s.entries, claim.TaskID)
 	return true
 }
 

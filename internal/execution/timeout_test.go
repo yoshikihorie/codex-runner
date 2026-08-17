@@ -42,6 +42,13 @@ type timeoutTimerFake struct {
 	stopped   []bool
 }
 
+type timeoutNilContext struct{}
+
+func (*timeoutNilContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (*timeoutNilContext) Done() <-chan struct{}       { return nil }
+func (*timeoutNilContext) Err() error                  { return nil }
+func (*timeoutNilContext) Value(any) any               { return nil }
+
 func (f *timeoutTimerFake) AfterFunc(d time.Duration, callback func()) CancelFunc {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -200,7 +207,7 @@ func (f *timeoutPendingFake) Register(taskID domain.TaskID, disposition recovery
 	return f.set.Register(taskID, disposition, authority)
 }
 
-func (f *timeoutPendingFake) ClaimForSend(taskID domain.TaskID, authority recovery.ProcessSignalAuthority) (recovery.SendClaim, bool) {
+func (f *timeoutPendingFake) ClaimForSend(taskID domain.TaskID, authority recovery.ProcessSignalAuthority) (recovery.SendClaim, recovery.ClaimOutcome) {
 	return f.set.ClaimForSend(taskID, authority)
 }
 func (f *timeoutPendingFake) CompleteSend(claim recovery.SendClaim) bool {
@@ -211,6 +218,9 @@ func (f *timeoutPendingFake) ReleaseSend(claim recovery.SendClaim) bool {
 }
 func (f *timeoutPendingFake) InvalidateSend(claim recovery.SendClaim) bool {
 	return f.set.InvalidateSend(claim)
+}
+func (f *timeoutPendingFake) RemoveClaim(claim recovery.SendClaim) bool {
+	return f.set.RemoveClaim(claim)
 }
 
 type timeoutPathStoreFake struct {
@@ -470,13 +480,14 @@ func TestTerminationEnsurerConfirmAndSendOnce(t *testing.T) {
 				t.Fatalf("wait duration=%v want=%v", waitedFor, TimeoutKillGrace)
 			}
 			if tc.name == "dead-second" {
+				terminateErr := proc.err
 				sendEnsurer := NewTerminationEnsurer(timeoutLiveness(struct {
 					dead bool
 					err  error
 				}{dead: true}), proc, domain.ClockFunc(time.Now), func(context.Context, time.Duration) {})
-				sentDead, sendErr := sendEnsurer.SendAndConfirm(context.Background(), timeoutID(t, "send"), 44, time.Second)
-				if !sentDead || sendErr != nil {
-					t.Fatalf("SendAndConfirm dead=%v err=%v", sentDead, sendErr)
+				result := sendEnsurer.SendAndConfirm(context.Background(), timeoutID(t, "send"), 44, time.Second)
+				if !result.Dead || !errors.Is(result.TerminateErr, terminateErr) || result.ConfirmErr != nil {
+					t.Fatalf("SendAndConfirm() = %#v", result)
 				}
 				proc.mu.Lock()
 				calls := proc.calls
@@ -521,14 +532,31 @@ func TestTerminationEnsurerGracePeriodBoundary(t *testing.T) {
 					t.Fatalf("wait duration=%v want=%v", d, TimeoutKillGrace)
 				}
 			})
-			dead, err := ensurer.SendAndConfirm(context.Background(), timeoutID(t, "grace-boundary"), 321, TimeoutKillGrace)
-			if err != nil || dead != tc.wantDead || waits != tc.wantWaits {
-				t.Fatalf("dead=%v err=%v waits=%d", dead, err, waits)
+			result := ensurer.SendAndConfirm(context.Background(), timeoutID(t, "grace-boundary"), 321, TimeoutKillGrace)
+			if result.TerminateErr != nil || result.ConfirmErr != nil || result.Dead != tc.wantDead || waits != tc.wantWaits {
+				t.Fatalf("result=%#v waits=%d", result, waits)
 			}
 			if proc.calls != 1 || proc.pid != 321 || proc.grace != TimeoutKillGrace {
 				t.Fatalf("terminate calls=%d pid=%d grace=%v", proc.calls, proc.pid, proc.grace)
 			}
 		})
+	}
+}
+
+func TestTerminationEnsurerSendAndConfirmSeparatesTerminateAndConfirmErrors(t *testing.T) {
+	terminateErr := errors.New("terminate")
+	confirmErr := errors.New("confirm")
+	proc := &timeoutProcessFake{err: terminateErr}
+	ensurer := NewTerminationEnsurer(timeoutLiveness(struct {
+		dead bool
+		err  error
+	}{err: confirmErr}), proc, domain.ClockFunc(time.Now), func(context.Context, time.Duration) {})
+	result := ensurer.SendAndConfirm(context.Background(), timeoutID(t, "separate-errors"), 321, TimeoutKillGrace)
+	if result.Dead || !errors.Is(result.TerminateErr, terminateErr) || !errors.Is(result.ConfirmErr, confirmErr) {
+		t.Fatalf("SendAndConfirm() = %#v", result)
+	}
+	if proc.calls != 1 {
+		t.Fatalf("Terminate calls = %d, want 1", proc.calls)
 	}
 }
 
@@ -610,8 +638,8 @@ func TestEnforceTaskTimeoutPendingUsesReconciliationSet(t *testing.T) {
 		t.Fatalf("pending entries=%d", len(pending.List()))
 	}
 	authority := recovery.ProcessSignalAuthority{TaskID: snapshot.TaskID, PID: *snapshot.PID, ProcessStartedAt: *snapshot.ProcessStartedAt}
-	if claim, found := pending.ClaimForSend(snapshot.TaskID, authority); claim.Token != 0 || !found {
-		t.Fatalf("pending sent state claim=%+v found=%v", claim, found)
+	if claim, outcome := pending.ClaimForSend(snapshot.TaskID, authority); claim.Token != 0 || outcome == recovery.ClaimNotFound {
+		t.Fatalf("pending sent state claim=%+v outcome=%v", claim, outcome)
 	}
 }
 
@@ -647,13 +675,13 @@ func TestEnforceTaskTimeoutTerminateErrorRegistersUnsent(t *testing.T) {
 	if pending.disposition != recovery.PendingSendUnsent || pending.authority == nil || pending.authority.TaskID != snapshot.TaskID || pending.authority.PID != *snapshot.PID || !pending.authority.ProcessStartedAt.Equal(*snapshot.ProcessStartedAt) {
 		t.Fatalf("disposition=%v authority=%+v", pending.disposition, pending.authority)
 	}
-	claim, found := pending.ClaimForSend(snapshot.TaskID, *pending.authority)
-	second, secondFound := pending.ClaimForSend(snapshot.TaskID, *pending.authority)
-	if !found || claim.Token == 0 || !secondFound || second.Token != 0 || !pending.ReleaseSend(claim) {
-		t.Fatalf("claim=%+v found=%v", claim, found)
+	claim, outcome := pending.ClaimForSend(snapshot.TaskID, *pending.authority)
+	second, secondOutcome := pending.ClaimForSend(snapshot.TaskID, *pending.authority)
+	if outcome != recovery.ClaimAcquired || claim.Token == 0 || secondOutcome != recovery.ClaimAlreadyClaimed || second.Token != 0 || !pending.ReleaseSend(claim) {
+		t.Fatalf("claim=%+v outcome=%v", claim, outcome)
 	}
-	if next, found := pending.ClaimForSend(snapshot.TaskID, *pending.authority); !found || next.Token == 0 {
-		t.Fatalf("next=%+v found=%v", next, found)
+	if next, outcome := pending.ClaimForSend(snapshot.TaskID, *pending.authority); outcome != recovery.ClaimAcquired || next.Token == 0 {
+		t.Fatalf("next=%+v outcome=%v", next, outcome)
 	}
 }
 
@@ -899,8 +927,8 @@ func TestEnforceTaskTimeoutNotFoundAndPendingSet(t *testing.T) {
 		t.Fatalf("pending entries=%d", len(pending.List()))
 	}
 	authority := recovery.ProcessSignalAuthority{TaskID: snapshot.TaskID, PID: *snapshot.PID, ProcessStartedAt: *snapshot.ProcessStartedAt}
-	if claim, found := pending.ClaimForSend(snapshot.TaskID, authority); claim.Token != 0 || !found {
-		t.Fatalf("pending sent state claim=%+v found=%v", claim, found)
+	if claim, outcome := pending.ClaimForSend(snapshot.TaskID, authority); claim.Token != 0 || outcome == recovery.ClaimNotFound {
+		t.Fatalf("pending sent state claim=%+v outcome=%v", claim, outcome)
 	}
 }
 
@@ -932,6 +960,67 @@ func TestTerminationEnsurerConstructorRejectsNilDependencies(t *testing.T) {
 		{"proc", func() { NewTerminationEnsurer(validLiveness, nil, validClock, validWait) }},
 		{"clock", func() { NewTerminationEnsurer(validLiveness, validProc, nil, validWait) }},
 		{"wait", func() { NewTerminationEnsurer(validLiveness, validProc, validClock, nil) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			tc.make()
+		})
+	}
+}
+
+func TestTimeoutWatcherConstructorRejectsTypedNilDependencies(t *testing.T) {
+	validEnforce := &EnforceTaskTimeoutUseCase{}
+	validClock := domain.ClockFunc(time.Now)
+	validTimerFactory := &timeoutTimerFake{}
+	validContext := context.Background()
+	for _, tc := range []struct {
+		name string
+		make func()
+	}{
+		{"enforce", func() {
+			NewTimeoutWatcher((*EnforceTaskTimeoutUseCase)(nil), validClock, validTimerFactory, validContext, nil)
+		}},
+		{"clock", func() {
+			var clock domain.ClockFunc
+			NewTimeoutWatcher(validEnforce, clock, validTimerFactory, validContext, nil)
+		}},
+		{"timer factory", func() { NewTimeoutWatcher(validEnforce, validClock, (*timeoutTimerFake)(nil), validContext, nil) }},
+		{"base context", func() { NewTimeoutWatcher(validEnforce, validClock, validTimerFactory, (*timeoutNilContext)(nil), nil) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			tc.make()
+		})
+	}
+}
+
+func TestTerminationEnsurerConstructorRejectsTypedNilDependencies(t *testing.T) {
+	validLiveness := timeoutEnsurer(struct {
+		dead bool
+		err  error
+	}{dead: true}).liveness
+	validProc := &timeoutProcessFake{}
+	validClock := domain.ClockFunc(time.Now)
+	validWait := func(context.Context, time.Duration) {}
+	for _, tc := range []struct {
+		name string
+		make func()
+	}{
+		{"liveness", func() { NewTerminationEnsurer((*CheckLivenessUseCase)(nil), validProc, validClock, validWait) }},
+		{"proc", func() { NewTerminationEnsurer(validLiveness, (*timeoutProcessFake)(nil), validClock, validWait) }},
+		{"clock", func() { var clock domain.ClockFunc; NewTerminationEnsurer(validLiveness, validProc, clock, validWait) }},
+		{"wait", func() {
+			var wait func(context.Context, time.Duration)
+			NewTerminationEnsurer(validLiveness, validProc, validClock, wait)
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			defer func() {

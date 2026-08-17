@@ -41,7 +41,13 @@ type OrphanFinalizer interface {
 // TerminationEnsurer is satisfied by execution.TerminationEnsurer.
 type TerminationEnsurer interface {
 	Confirm(ctx context.Context, taskID domain.TaskID) (dead bool, err error)
-	SendAndConfirm(ctx context.Context, taskID domain.TaskID, pid int, grace time.Duration) (dead bool, err error)
+	SendAndConfirm(ctx context.Context, taskID domain.TaskID, pid int, grace time.Duration) TerminationAttemptResult
+}
+
+type TerminationAttemptResult struct {
+	Dead         bool
+	TerminateErr error
+	ConfirmErr   error
 }
 
 // KillConfirmer is satisfied by execution.ConfirmTaskKilledUseCase.
@@ -378,18 +384,20 @@ func (uc *AdoptRunningTasksUseCase) confirmTimeoutTermination(ctx context.Contex
 		uc.registerPending(taskID, snapshot)
 		return
 	}
-	claim, found := uc.pending.ClaimForSend(taskID, authority)
-	if !found || claim.Token == 0 {
+	claim, outcome := uc.pending.ClaimForSend(taskID, authority)
+	if outcome != ClaimAcquired {
 		return
 	}
-	dead, err := uc.termination.SendAndConfirm(ctx, taskID, pid, uc.grace)
-	if err != nil {
-		uc.logFailure("confirm timeout task termination failed", taskID, err)
-		uc.pending.ReleaseSend(claim)
-	}
-	if err != nil || !dead {
-		if err == nil {
+	result := uc.termination.SendAndConfirm(ctx, taskID, pid, uc.grace)
+	if !result.Dead {
+		if result.TerminateErr == nil {
+			uc.pending.CompleteSend(claim)
+			return
+		}
+		if _, valid := currentClaimAuthority(uc.tasks, uc.taskMu, claim); valid {
 			uc.pending.ReleaseSend(claim)
+		} else {
+			uc.pending.InvalidateSend(claim)
 		}
 		return
 	}
@@ -398,16 +406,14 @@ func (uc *AdoptRunningTasksUseCase) confirmTimeoutTermination(ctx context.Contex
 		uc.pending.InvalidateSend(claim)
 		return
 	}
-	uc.pending.CompleteSend(claim)
 	terminationConfirmedAt := uc.clock.Now()
 	if err := uc.releaseTimeoutPathLock(ctx, taskID, latest); err != nil {
 		uc.logFailure("start timeout recovery after termination failed", taskID, err)
-		uc.reconcilePendingAfterConfirmedDeath(taskID)
+		uc.pending.InvalidateSend(claim)
 		return
 	}
 	recoveryDispatchAt := uc.clock.Now()
-	uc.pending.Remove(taskID)
-	go uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: latest.SessionRef, Origin: domain.RecoveryOriginTimeout, OccurredAt: recoveryDispatchAt})
+	go uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: latest.SessionRef, Origin: domain.RecoveryOriginTimeout, OccurredAt: recoveryDispatchAt}, claim)
 	_ = terminationConfirmedAt
 }
 
@@ -416,7 +422,7 @@ func (uc *AdoptRunningTasksUseCase) startTimeoutRecovery(ctx context.Context, ta
 		return err
 	}
 	recoveryDispatchAt := uc.clock.Now()
-	go uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: snapshot.SessionRef, Origin: domain.RecoveryOriginTimeout, OccurredAt: recoveryDispatchAt})
+	go uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: snapshot.SessionRef, Origin: domain.RecoveryOriginTimeout, OccurredAt: recoveryDispatchAt}, SendClaim{})
 	return nil
 }
 
@@ -468,18 +474,20 @@ func (uc *AdoptRunningTasksUseCase) confirmCancellationTermination(ctx context.C
 		uc.registerPending(taskID, snapshot)
 		return
 	}
-	claim, found := uc.pending.ClaimForSend(taskID, authority)
-	if !found || claim.Token == 0 {
+	claim, outcome := uc.pending.ClaimForSend(taskID, authority)
+	if outcome != ClaimAcquired {
 		return
 	}
-	dead, err := uc.termination.SendAndConfirm(ctx, taskID, pid, uc.grace)
-	if err != nil {
-		uc.logFailure("confirm cancelling task termination failed", taskID, err)
-		uc.pending.ReleaseSend(claim)
-	}
-	if err != nil || !dead {
-		if err == nil {
+	result := uc.termination.SendAndConfirm(ctx, taskID, pid, uc.grace)
+	if !result.Dead {
+		if result.TerminateErr == nil {
+			uc.pending.CompleteSend(claim)
+			return
+		}
+		if _, valid := currentClaimAuthority(uc.tasks, uc.taskMu, claim); valid {
 			uc.pending.ReleaseSend(claim)
+		} else {
+			uc.pending.InvalidateSend(claim)
 		}
 		return
 	}
@@ -488,14 +496,13 @@ func (uc *AdoptRunningTasksUseCase) confirmCancellationTermination(ctx context.C
 		uc.pending.InvalidateSend(claim)
 		return
 	}
-	uc.pending.CompleteSend(claim)
 	terminationConfirmedAt := uc.clock.Now()
 	if err := uc.killed.ConfirmKilled(ctx, taskID, cancelledExitCode, true, terminationConfirmedAt); err != nil {
 		uc.logFailure("confirm cancelling task killed after termination failed", taskID, err)
-		uc.reconcilePendingAfterConfirmedDeath(taskID)
+		uc.pending.InvalidateSend(claim)
 		return
 	}
-	uc.pending.Remove(taskID)
+	uc.pending.RemoveClaim(claim)
 }
 
 func (uc *AdoptRunningTasksUseCase) recoverOrphan(ctx context.Context, taskID domain.TaskID, sessionRef *domain.SessionRef, occurredAt time.Time) string {
@@ -519,15 +526,25 @@ func (uc *AdoptRunningTasksUseCase) recoverOrphan(ctx context.Context, taskID do
 	}
 	recoveryDispatchAt := uc.clock.Now()
 	uc.resumeDispatch.dispatch(func() {
-		uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: sessionRef, Origin: domain.RecoveryOriginOrphan, OccurredAt: recoveryDispatchAt})
+		uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: sessionRef, Origin: domain.RecoveryOriginOrphan, OccurredAt: recoveryDispatchAt}, SendClaim{})
 	})
 	return adoptionOutcomeOrphanRecoveryStarted
 }
 
-func (uc *AdoptRunningTasksUseCase) resumeRecovery(ctx context.Context, in RecoverViaResumeInput) {
+func (uc *AdoptRunningTasksUseCase) resumeRecovery(ctx context.Context, in RecoverViaResumeInput, claim SendClaim) {
 	if _, err := uc.resume.Execute(ctx, in); err != nil {
 		uc.logFailure("resume recovery for adopted task failed", in.TaskID, err)
-		uc.reconcilePendingAfterConfirmedDeath(in.TaskID)
+		if claim.Token != 0 {
+			uc.pending.InvalidateSend(claim)
+		} else {
+			uc.reconcilePendingAfterConfirmedDeath(in.TaskID)
+		}
+		return
+	}
+	if claim.Token != 0 {
+		uc.pending.RemoveClaim(claim)
+	} else {
+		uc.pending.Remove(in.TaskID)
 	}
 }
 

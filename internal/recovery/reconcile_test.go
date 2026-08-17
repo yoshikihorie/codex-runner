@@ -90,11 +90,14 @@ type reconcileReaderResult struct {
 }
 
 type reconcileReaderFake struct {
-	present   bool
-	err       error
-	results   []reconcileReaderResult
-	calls     int
-	afterRead func()
+	present    bool
+	err        error
+	exitCode   int
+	exitExists bool
+	exitErr    error
+	results    []reconcileReaderResult
+	calls      int
+	afterRead  func()
 }
 
 func (f *reconcileReaderFake) ReadLastMessage(domain.TaskID) (bool, error) {
@@ -114,6 +117,9 @@ func (f *reconcileReaderFake) ReadLastMessage(domain.TaskID) (bool, error) {
 	return result.present, result.err
 }
 func (*reconcileReaderFake) ReadStderrLog(domain.TaskID) ([]byte, error) { return nil, nil }
+func (f *reconcileReaderFake) ReadExitCode(domain.TaskID) (int, bool, error) {
+	return f.exitCode, f.exitExists, f.exitErr
+}
 
 type reconcileWriterFake struct {
 	order            *[]string
@@ -171,6 +177,8 @@ type reconcileTerminationFake struct {
 	once         sync.Once
 	finished     chan struct{}
 	finishedOnce sync.Once
+	terminateErr error
+	confirmErr   error
 }
 
 func (f *reconcileTerminationFake) Confirm(context.Context, domain.TaskID) (bool, error) {
@@ -180,19 +188,23 @@ func (f *reconcileTerminationFake) Confirm(context.Context, domain.TaskID) (bool
 	f.finishedOnce.Do(func() { close(f.finished) })
 	return f.confirmDead, nil
 }
-func (f *reconcileTerminationFake) SendAndConfirm(_ context.Context, _ domain.TaskID, _ int, grace time.Duration) (bool, error) {
+func (f *reconcileTerminationFake) SendAndConfirm(_ context.Context, _ domain.TaskID, _ int, grace time.Duration) TerminationAttemptResult {
 	f.send++
 	f.grace = grace
 	f.once.Do(func() { close(f.called) })
 	<-f.release
 	f.finishedOnce.Do(func() { close(f.finished) })
-	return f.sendDead, nil
+	return TerminationAttemptResult{Dead: f.sendDead, TerminateErr: f.terminateErr, ConfirmErr: f.confirmErr}
 }
 
-type reconcileKilledFake struct{ calls int }
+type reconcileKilledFake struct {
+	calls       int
+	rawExitCode int
+}
 
-func (f *reconcileKilledFake) ConfirmKilled(context.Context, domain.TaskID, int, bool, time.Time) error {
+func (f *reconcileKilledFake) ConfirmKilled(_ context.Context, _ domain.TaskID, rawExitCode int, _ bool, _ time.Time) error {
 	f.calls++
+	f.rawExitCode = rawExitCode
 	return nil
 }
 
@@ -449,6 +461,78 @@ func TestNewReconcilePendingUseCasePanicsForNonPositiveTerminationGrace(t *testi
 	}
 }
 
+func TestNewReconcilePendingUseCaseRejectsTypedNilDependencies(t *testing.T) {
+	uc, pending, tasks, liveness, writer, termination, killed, pathLocks, slots, mutex, _ := newReconcileFixture(t, domain.StateRecovering, false, false)
+	_ = uc
+	resume := newAdoptionResumeUseCase(t)
+	for _, tc := range []struct {
+		name string
+		make func()
+	}{
+		{"pending", func() {
+			NewReconcilePendingUseCase((*PendingReconciliationSet)(nil), tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+		}},
+		{"tasks", func() {
+			NewReconcilePendingUseCase(pending, (*reconcileStoreFake)(nil), liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+		}},
+		{"liveness", func() {
+			NewReconcilePendingUseCase(pending, tasks, (*reconcileLivenessFake)(nil), &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+		}},
+		{"reader", func() {
+			NewReconcilePendingUseCase(pending, tasks, liveness, (*reconcileReaderFake)(nil), writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+		}},
+		{"writer", func() {
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, (*reconcileWriterFake)(nil), &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+		}},
+		{"finalizer", func() {
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, (*adoptionFinalizerFake)(nil), termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+		}},
+		{"termination", func() {
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, (*reconcileTerminationFake)(nil), killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+		}},
+		{"killed", func() {
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, (*reconcileKilledFake)(nil), pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+		}},
+		{"path-locks", func() {
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, (*reconcilePathLocksFake)(nil), resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+		}},
+		{"resume", func() {
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, (*RecoverViaResumeUseCase)(nil), slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+		}},
+		{"slots", func() {
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, (*reconcileSlotsFake)(nil), mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+		}},
+		{"task-mutex", func() {
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, (*reconcileMutexFake)(nil), domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+		}},
+		{"clock", func() {
+			var clock domain.ClockFunc
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, clock, time.Second, time.Second, slog.Default())
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			tc.make()
+		})
+	}
+}
+
+func TestReconcilePendingUsesExistingExitCodeForConfirmedCancellation(t *testing.T) {
+	uc, pending, tasks, _, _, _, killed, _, _, _, _ := newReconcileFixture(t, domain.StateCancelling, false, false)
+	id := adoptionID(t, "reconcile-"+string(domain.StateCancelling))
+	uc.reader = &reconcileReaderFake{exitCode: 23, exitExists: true}
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
+
+	uc.completeTerminated(context.Background(), id, tasks.entries[id], false, time.Now())
+	if killed.calls != 1 || killed.rawExitCode != 23 || len(pending.List()) != 0 {
+		t.Fatalf("calls=%d rawExitCode=%d pending=%+v", killed.calls, killed.rawExitCode, pending.List())
+	}
+}
+
 func TestReconcilePendingRecoveryWriteOrder(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
@@ -578,25 +662,26 @@ func TestReconcilePendingAfterConfirmedDeathDoesNotRestoreSendAuthority(t *testi
 	if !ok {
 		t.Fatal("fixture requires signal authority")
 	}
-	claim, found := pending.ClaimForSend(id, authority)
-	if !found || claim.Token != 0 || termination.send != 0 {
-		t.Fatalf("claim=%+v found=%v sends=%d, want no resend claim", claim, found, termination.send)
+	claim, outcome := pending.ClaimForSend(id, authority)
+	if outcome != ClaimConfirmOnly || claim.Token != 0 || termination.send != 0 {
+		t.Fatalf("claim=%+v outcome=%v sends=%d, want no resend claim", claim, outcome, termination.send)
 	}
 }
 
-func TestReconcilePendingTimeoutDispatchRemovesPendingBeforeDispatch(t *testing.T) {
+func TestReconcilePendingTimeoutDispatchRemovesPendingAfterResumeSucceeds(t *testing.T) {
 	uc, pending, tasks, _, _, _, _, pathLocks, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
 	id := adoptionID(t, "reconcile-"+string(domain.StateTimeout))
 	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
 
 	uc.completeTerminated(context.Background(), id, tasks.entries[id], true, time.Now())
+	waitForPendingRemoval(t, pending)
 
 	if pathLocks.calls != 1 || len(pending.List()) != 0 {
 		t.Fatalf("pathLocks=%d pending=%+v", pathLocks.calls, pending.List())
 	}
 }
 
-func TestTimeoutRecoveryRemovesPendingBeforeResumeDispatch(t *testing.T) {
+func TestTimeoutRecoveryResolvesClaimAfterResumeSucceedsOrFails(t *testing.T) {
 	_, testFile, _, ok := runtime.Caller(0)
 	if !ok {
 		t.Fatal("resolve test file path")
@@ -611,12 +696,14 @@ func TestTimeoutRecoveryRemovesPendingBeforeResumeDispatch(t *testing.T) {
 		{name: "reconciliation", source: "reconcile.go", function: "completeTerminated"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			assertPendingRemovalPrecedesResumeDispatch(t, filepath.Join(filepath.Dir(testFile), tc.source), tc.function)
+			sourcePath := filepath.Join(filepath.Dir(testFile), tc.source)
+			assertNoUnconditionalPendingRemovalBeforeDispatch(t, sourcePath, tc.function)
+			assertClaimResolutionAfterExecuteInResumeRecovery(t, sourcePath)
 		})
 	}
 }
 
-func assertPendingRemovalPrecedesResumeDispatch(t *testing.T, sourcePath, functionName string) {
+func assertNoUnconditionalPendingRemovalBeforeDispatch(t *testing.T, sourcePath, functionName string) {
 	t.Helper()
 	fileSet := token.NewFileSet()
 	file, err := parser.ParseFile(fileSet, sourcePath, nil, 0)
@@ -624,40 +711,72 @@ func assertPendingRemovalPrecedesResumeDispatch(t *testing.T, sourcePath, functi
 		t.Fatal(err)
 	}
 
-	var removePos, dispatchPos token.Pos
+	var dispatchPos token.Pos
+	var functionBody *ast.BlockStmt
 	for _, declaration := range file.Decls {
 		function, ok := declaration.(*ast.FuncDecl)
 		if !ok || function.Name.Name != functionName {
 			continue
 		}
+		functionBody = function.Body
 		ast.Inspect(function.Body, func(node ast.Node) bool {
-			block, ok := node.(*ast.BlockStmt)
-			if !ok {
-				return true
-			}
-			for index, statement := range block.List {
-				dispatch, ok := statement.(*ast.GoStmt)
-				if !ok || !isResumeRecoveryCall(dispatch.Call) {
-					continue
-				}
+			dispatch, ok := node.(*ast.GoStmt)
+			if ok && isResumeRecoveryCall(dispatch.Call) {
 				dispatchPos = dispatch.Pos()
-				for previous := index - 1; previous >= 0; previous-- {
-					remove, ok := block.List[previous].(*ast.ExprStmt)
-					if ok && isPendingRemoveCall(remove.X) {
-						removePos = remove.Pos()
-						break
-					}
-				}
 			}
 			return true
 		})
 	}
-	if !removePos.IsValid() || !dispatchPos.IsValid() {
-		t.Fatalf("remove=%v dispatch=%v in %s", removePos.IsValid(), dispatchPos.IsValid(), sourcePath)
+	if functionBody == nil || !dispatchPos.IsValid() {
+		t.Fatalf("resume dispatch not found in %s", sourcePath)
 	}
-	if removePos > dispatchPos {
-		t.Fatalf("pending removal must precede resume dispatch in %s", sourcePath)
+	ast.Inspect(functionBody, func(node ast.Node) bool {
+		expression, ok := node.(*ast.ExprStmt)
+		if ok && expression.Pos() < dispatchPos && isPendingRemoveCall(expression.X) {
+			t.Fatalf("pending removal before resume dispatch in %s", sourcePath)
+		}
+		return true
+	})
+}
+
+func assertClaimResolutionAfterExecuteInResumeRecovery(t *testing.T, sourcePath string) {
+	t.Helper()
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, sourcePath, nil, 0)
+	if err != nil {
+		t.Fatal(err)
 	}
+
+	var executePos token.Pos
+	var resolutionPositions []token.Pos
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "resumeRecovery" {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if isResumeExecuteCall(call) {
+				executePos = call.Pos()
+			}
+			if isClaimResolutionCall(call) {
+				resolutionPositions = append(resolutionPositions, call.Pos())
+			}
+			return true
+		})
+	}
+	if !executePos.IsValid() {
+		t.Fatalf("resume Execute not found in %s", sourcePath)
+	}
+	for _, resolutionPos := range resolutionPositions {
+		if resolutionPos > executePos {
+			return
+		}
+	}
+	t.Fatalf("claim resolution after resume Execute not found in %s", sourcePath)
 }
 
 func isPendingRemoveCall(expression ast.Expr) bool {
@@ -671,6 +790,20 @@ func isPendingRemoveCall(expression ast.Expr) bool {
 	}
 	pending, ok := selector.X.(*ast.SelectorExpr)
 	return ok && pending.Sel.Name == "pending"
+}
+
+func isResumeExecuteCall(call *ast.CallExpr) bool {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != "Execute" {
+		return false
+	}
+	resume, ok := selector.X.(*ast.SelectorExpr)
+	return ok && resume.Sel.Name == "resume"
+}
+
+func isClaimResolutionCall(call *ast.CallExpr) bool {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	return ok && (selector.Sel.Name == "RemoveClaim" || selector.Sel.Name == "InvalidateSend")
 }
 
 func isResumeRecoveryCall(call *ast.CallExpr) bool {

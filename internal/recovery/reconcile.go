@@ -24,7 +24,7 @@ type ReconcilePendingUseCase struct {
 	pending          *PendingReconciliationSet
 	tasks            AdoptionTaskStore
 	liveness         LivenessChecker
-	reader           ContractReader
+	reader           reconcileContractReader
 	writer           contract.ContractWriter
 	finalizer        OrphanFinalizer
 	termination      TerminationEnsurer
@@ -39,8 +39,13 @@ type ReconcilePendingUseCase struct {
 	logger           *slog.Logger
 }
 
-func NewReconcilePendingUseCase(pending *PendingReconciliationSet, tasks AdoptionTaskStore, liveness LivenessChecker, reader ContractReader, writer contract.ContractWriter, finalizer OrphanFinalizer, termination TerminationEnsurer, killed KillConfirmer, pathLocks PathLockReleaser, resume *RecoverViaResumeUseCase, slots SlotReleaser, taskMu TaskMutex, clock domain.Clock, interval time.Duration, terminationGrace time.Duration, logger *slog.Logger) *ReconcilePendingUseCase {
-	if pending == nil || tasks == nil || liveness == nil || reader == nil || writer == nil || finalizer == nil || termination == nil || killed == nil || pathLocks == nil || resume == nil || slots == nil || taskMu == nil || clock == nil {
+type reconcileContractReader interface {
+	ContractReader
+	ReadExitCode(domain.TaskID) (int, bool, error)
+}
+
+func NewReconcilePendingUseCase(pending *PendingReconciliationSet, tasks AdoptionTaskStore, liveness LivenessChecker, reader reconcileContractReader, writer contract.ContractWriter, finalizer OrphanFinalizer, termination TerminationEnsurer, killed KillConfirmer, pathLocks PathLockReleaser, resume *RecoverViaResumeUseCase, slots SlotReleaser, taskMu TaskMutex, clock domain.Clock, interval time.Duration, terminationGrace time.Duration, logger *slog.Logger) *ReconcilePendingUseCase {
+	if isNilAdoptionDependency(pending) || isNilAdoptionDependency(tasks) || isNilAdoptionDependency(liveness) || isNilAdoptionDependency(reader) || isNilAdoptionDependency(writer) || isNilAdoptionDependency(finalizer) || isNilAdoptionDependency(termination) || isNilAdoptionDependency(killed) || isNilAdoptionDependency(pathLocks) || isNilAdoptionDependency(resume) || isNilAdoptionDependency(slots) || isNilAdoptionDependency(taskMu) || isNilAdoptionDependency(clock) {
 		panic("reconcile pending use case requires non-nil dependencies")
 	}
 	if interval <= 0 {
@@ -177,7 +182,7 @@ func (uc *ReconcilePendingUseCase) reconcileOrphaned(ctx context.Context, taskID
 		uc.pending.Remove(taskID)
 		return
 	}
-	go uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: snapshot.SessionRef, Origin: domain.RecoveryOriginOrphan, OccurredAt: uc.clock.Now()})
+	go uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: snapshot.SessionRef, Origin: domain.RecoveryOriginOrphan, OccurredAt: uc.clock.Now()}, SendClaim{})
 }
 
 func (uc *ReconcilePendingUseCase) reconcileTermination(ctx context.Context, taskID domain.TaskID, snapshot domain.TaskSnapshot, timeout bool) {
@@ -186,17 +191,19 @@ func (uc *ReconcilePendingUseCase) reconcileTermination(ctx context.Context, tas
 	}
 	authority, hasAuthority := processSignalAuthority(snapshot)
 	if hasAuthority {
-		claim, found := uc.pending.ClaimForSend(taskID, authority)
-		if !found {
+		claim, outcome := uc.pending.ClaimForSend(taskID, authority)
+		switch outcome {
+		case ClaimNotFound, ClaimAlreadyClaimed:
 			return
-		}
-		if claim.Token != 0 {
+		case ClaimAcquired:
 			if ctx.Err() != nil {
 				uc.pending.ReleaseSend(claim)
 				return
 			}
 			go uc.sendAndReconcile(context.WithoutCancel(ctx), claim, snapshot, timeout)
 			return
+		case ClaimSent, ClaimConfirmOnly:
+			// Confirm-only paths intentionally do not own a send claim.
 		}
 	}
 	if ctx.Err() != nil {
@@ -214,14 +221,17 @@ func (uc *ReconcilePendingUseCase) reconcileTermination(ctx context.Context, tas
 }
 
 func (uc *ReconcilePendingUseCase) sendAndReconcile(ctx context.Context, claim SendClaim, snapshot domain.TaskSnapshot, timeout bool) {
-	dead, err := uc.termination.SendAndConfirm(ctx, claim.TaskID, claim.Authority.PID, uc.terminationGrace)
-	if err != nil {
-		uc.logFailure("confirm pending task termination after signal failed", claim.TaskID, err)
-		uc.pending.ReleaseSend(claim)
-		return
-	}
-	if !dead {
-		uc.pending.ReleaseSend(claim)
+	result := uc.termination.SendAndConfirm(ctx, claim.TaskID, claim.Authority.PID, uc.terminationGrace)
+	if !result.Dead {
+		if result.TerminateErr == nil {
+			uc.pending.CompleteSend(claim)
+			return
+		}
+		if _, valid := currentClaimAuthority(uc.tasks, uc.taskMu, claim); valid {
+			uc.pending.ReleaseSend(claim)
+		} else {
+			uc.pending.InvalidateSend(claim)
+		}
 		return
 	}
 	latest, valid := currentClaimAuthority(uc.tasks, uc.taskMu, claim)
@@ -229,11 +239,14 @@ func (uc *ReconcilePendingUseCase) sendAndReconcile(ctx context.Context, claim S
 		uc.pending.InvalidateSend(claim)
 		return
 	}
-	uc.pending.CompleteSend(claim)
-	uc.completeTerminated(ctx, claim.TaskID, latest, timeout, uc.clock.Now())
+	uc.completeTerminated(ctx, claim.TaskID, latest, timeout, uc.clock.Now(), claim)
 }
 
-func (uc *ReconcilePendingUseCase) completeTerminated(ctx context.Context, taskID domain.TaskID, snapshot domain.TaskSnapshot, timeout bool, terminationConfirmedAt time.Time) {
+func (uc *ReconcilePendingUseCase) completeTerminated(ctx context.Context, taskID domain.TaskID, snapshot domain.TaskSnapshot, timeout bool, terminationConfirmedAt time.Time, claims ...SendClaim) {
+	var claim SendClaim
+	if len(claims) > 0 {
+		claim = claims[0]
+	}
 	if ctx.Err() != nil {
 		return
 	}
@@ -241,7 +254,11 @@ func (uc *ReconcilePendingUseCase) completeTerminated(ctx context.Context, taskI
 		if snapshot.Subcommand == domain.SubcommandImpl {
 			if err := uc.pathLocks.Release(ctx, taskID); err != nil {
 				uc.logFailure("release path lock before pending timeout recovery failed", taskID, err)
-				uc.reconcilePendingAfterConfirmedDeath(taskID)
+				if claim.Token != 0 {
+					uc.pending.InvalidateSend(claim)
+				} else {
+					uc.reconcilePendingAfterConfirmedDeath(taskID)
+				}
 				return
 			}
 		}
@@ -249,22 +266,43 @@ func (uc *ReconcilePendingUseCase) completeTerminated(ctx context.Context, taskI
 			return
 		}
 		recoveryDispatchAt := uc.clock.Now()
-		uc.pending.Remove(taskID)
-		go uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: snapshot.SessionRef, Origin: domain.RecoveryOriginTimeout, OccurredAt: recoveryDispatchAt})
+		go uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: snapshot.SessionRef, Origin: domain.RecoveryOriginTimeout, OccurredAt: recoveryDispatchAt}, claim)
 		return
 	}
-	if err := uc.killed.ConfirmKilled(ctx, taskID, cancelledExitCode, true, terminationConfirmedAt); err != nil {
+	rawExitCode := cancelledExitCode
+	if existing, exists, err := uc.reader.ReadExitCode(taskID); err == nil && exists {
+		rawExitCode = existing
+	}
+	if err := uc.killed.ConfirmKilled(ctx, taskID, rawExitCode, true, terminationConfirmedAt); err != nil {
 		uc.logFailure("confirm pending cancelling task killed failed", taskID, err)
-		uc.reconcilePendingAfterConfirmedDeath(taskID)
+		if claim.Token != 0 {
+			uc.pending.InvalidateSend(claim)
+		} else {
+			uc.reconcilePendingAfterConfirmedDeath(taskID)
+		}
 		return
 	}
-	uc.pending.Remove(taskID)
+	if claim.Token != 0 {
+		uc.pending.RemoveClaim(claim)
+	} else {
+		uc.pending.Remove(taskID)
+	}
 }
 
-func (uc *ReconcilePendingUseCase) resumeRecovery(ctx context.Context, in RecoverViaResumeInput) {
+func (uc *ReconcilePendingUseCase) resumeRecovery(ctx context.Context, in RecoverViaResumeInput, claim SendClaim) {
 	if _, err := uc.resume.Execute(ctx, in); err != nil {
 		uc.logFailure("resume recovery for pending task failed", in.TaskID, err)
-		uc.reconcilePendingAfterConfirmedDeath(in.TaskID)
+		if claim.Token != 0 {
+			uc.pending.InvalidateSend(claim)
+		} else {
+			uc.reconcilePendingAfterConfirmedDeath(in.TaskID)
+		}
+		return
+	}
+	if claim.Token != 0 {
+		uc.pending.RemoveClaim(claim)
+	} else {
+		uc.pending.Remove(in.TaskID)
 	}
 }
 

@@ -358,15 +358,21 @@ type lifecycleRecordingTerminationEnsurer struct {
 	sendCalls    int
 	dead         bool
 	err          error
+	terminateErr error
+	confirmErr   error
 }
 
 func (f *lifecycleRecordingTerminationEnsurer) Confirm(context.Context, domain.TaskID) (bool, error) {
 	f.confirmCalls++
 	return f.dead, f.err
 }
-func (f *lifecycleRecordingTerminationEnsurer) SendAndConfirm(context.Context, domain.TaskID, int, time.Duration) (bool, error) {
+func (f *lifecycleRecordingTerminationEnsurer) SendAndConfirm(context.Context, domain.TaskID, int, time.Duration) execution.TerminationAttemptResult {
 	f.sendCalls++
-	return f.dead, f.err
+	terminateErr := f.terminateErr
+	if terminateErr == nil {
+		terminateErr = f.err
+	}
+	return execution.TerminationAttemptResult{Dead: f.dead, TerminateErr: terminateErr, ConfirmErr: f.confirmErr}
 }
 
 func (f *lifecycleRecordingTerminator) Terminate(pid int, grace time.Duration) error {
@@ -401,7 +407,7 @@ func (f *lifecycleRecordingPendingRegistrar) Register(id domain.TaskID, disposit
 	return f.set.Register(id, disposition, authority)
 }
 
-func (f *lifecycleRecordingPendingRegistrar) ClaimForSend(taskID domain.TaskID, authority recovery.ProcessSignalAuthority) (recovery.SendClaim, bool) {
+func (f *lifecycleRecordingPendingRegistrar) ClaimForSend(taskID domain.TaskID, authority recovery.ProcessSignalAuthority) (recovery.SendClaim, recovery.ClaimOutcome) {
 	return f.set.ClaimForSend(taskID, authority)
 }
 func (f *lifecycleRecordingPendingRegistrar) CompleteSend(claim recovery.SendClaim) bool {
@@ -412,6 +418,9 @@ func (f *lifecycleRecordingPendingRegistrar) ReleaseSend(claim recovery.SendClai
 }
 func (f *lifecycleRecordingPendingRegistrar) InvalidateSend(claim recovery.SendClaim) bool {
 	return f.set.InvalidateSend(claim)
+}
+func (f *lifecycleRecordingPendingRegistrar) RemoveClaim(claim recovery.SendClaim) bool {
+	return f.set.RemoveClaim(claim)
 }
 
 type lifecycleRecordingOwnership struct {
@@ -1065,7 +1074,7 @@ func TestTaskLifecycleCancellationConfirmationRegistersUnconfirmed(t *testing.T)
 			},
 			{
 				name:        "terminal",
-				disposition: recovery.PendingSendConfirmOnly,
+				disposition: recovery.PendingSendSent,
 				invoke: func(f *lifecycleFixture) {
 					cancelling := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)
 					f.tasks.loads = []lifecycleLoadResult{{snapshot: cancelling}, {snapshot: cancelling}}
@@ -1157,7 +1166,7 @@ func TestTaskLifecycleCancellationConfirmationDoesNotRereleaseAfterConfirmedPers
 		t.Fatalf("first confirmation release=%d pending=%d", f.killed.releaseCalls, f.pending.calls)
 	}
 	f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
-	if f.killed.lockedCalls != 2 || f.killed.releaseCalls != 1 || f.pending.calls != 1 || f.pending.dispositions[0] != recovery.PendingSendConfirmOnly || f.pending.authorities[0] != nil {
+	if f.killed.lockedCalls != 2 || f.killed.releaseCalls != 1 || f.pending.calls != 1 || f.pending.dispositions[0] != recovery.PendingSendSent || f.pending.authorities[0] != nil {
 		t.Fatalf("locked=%d release=%d pending=%+v", f.killed.lockedCalls, f.killed.releaseCalls, f.pending)
 	}
 }
@@ -1555,8 +1564,8 @@ func TestTaskLifecycleConfirmTerminalPrepareErrorInRaceStillConfirmsCancelling(t
 			if f.killed.releaseCalls != tc.wantRelease || f.pending.calls != tc.wantPending {
 				t.Fatalf("release=%d pending=%d", f.killed.releaseCalls, f.pending.calls)
 			}
-			if tc.wantPending == 1 && (f.pending.dispositions[0] != recovery.PendingSendConfirmOnly || f.pending.authorities[0] != nil) {
-				t.Fatal("pending registration was not confirmation only")
+			if tc.wantPending == 1 && (f.pending.dispositions[0] != recovery.PendingSendSent || f.pending.authorities[0] != nil) {
+				t.Fatal("pending registration was not sent")
 			}
 			if !lifecycleTraceSubsequence(f.trace, "confirm-killed-locked", "task-unlock", tc.traceAfterLock) {
 				t.Fatalf("post-unlock handling trace=%v", f.trace)

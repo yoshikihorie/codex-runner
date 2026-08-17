@@ -82,7 +82,7 @@ func (realTimerFactory) AfterFunc(d time.Duration, f func()) CancelFunc {
 }
 
 func NewTimeoutWatcher(enforce *EnforceTaskTimeoutUseCase, clock domain.Clock, timerFactory TimerFactory, baseCtx context.Context, logger *slog.Logger) *TimeoutWatcher {
-	if enforce == nil || clock == nil || timerFactory == nil || baseCtx == nil {
+	if isNilStatusDependency(enforce) || isNilStatusDependency(clock) || isNilStatusDependency(timerFactory) || isNilStatusDependency(baseCtx) {
 		panic("timeout watcher requires non-nil dependencies")
 	}
 	if logger == nil {
@@ -243,8 +243,10 @@ type TerminationEnsurer struct {
 	wait     func(ctx context.Context, d time.Duration)
 }
 
+type TerminationAttemptResult = recovery.TerminationAttemptResult
+
 func NewTerminationEnsurer(liveness *CheckLivenessUseCase, proc ProcessRunner, clock domain.Clock, wait func(ctx context.Context, d time.Duration)) *TerminationEnsurer {
-	if liveness == nil || proc == nil || clock == nil || wait == nil {
+	if isNilStatusDependency(liveness) || isNilStatusDependency(proc) || isNilStatusDependency(clock) || isNilStatusDependency(wait) {
 		panic("termination ensurer requires non-nil dependencies")
 	}
 	return &TerminationEnsurer{liveness: liveness, proc: proc, clock: clock, wait: wait}
@@ -271,11 +273,13 @@ func (e *TerminationEnsurer) Confirm(ctx context.Context, taskID domain.TaskID) 
 	return e.liveness.Execute(ctx, taskID)
 }
 
-func (e *TerminationEnsurer) SendAndConfirm(ctx context.Context, taskID domain.TaskID, pid int, grace time.Duration) (dead bool, err error) {
-	if terminateErr := e.proc.Terminate(pid, grace); terminateErr != nil {
+func (e *TerminationEnsurer) SendAndConfirm(ctx context.Context, taskID domain.TaskID, pid int, grace time.Duration) TerminationAttemptResult {
+	terminateErr := e.proc.Terminate(pid, grace)
+	if terminateErr != nil {
 		slog.Default().Warn("terminate task process group", "task_id", taskID.String(), "error", terminateErr)
 	}
-	return e.Confirm(ctx, taskID)
+	dead, confirmErr := e.Confirm(ctx, taskID)
+	return TerminationAttemptResult{Dead: dead, TerminateErr: terminateErr, ConfirmErr: confirmErr}
 }
 
 type RecoveryInvoker interface {

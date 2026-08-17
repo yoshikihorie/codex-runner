@@ -164,7 +164,7 @@ func (uc *CancelTaskUseCase) cancelPersisted(ctx context.Context, in CancelTaskI
 				return out, errCancelStateChanged
 			}
 		}
-		return out, err
+		return out, contractWriteError(err)
 	}
 	previous = snapshot.State
 	if snapshot.PID != nil {
@@ -199,12 +199,20 @@ func (uc *CancelTaskUseCase) cancelPersisted(ctx context.Context, in CancelTaskI
 	out = CancelTaskOutput{State: domain.StateCancelling, Events: events}
 	uc.taskMu.Unlock(in.TaskID)
 	locked = false
-	if previous == domain.StateOrphaned || (previous == domain.StateAdopted && pid == nil) {
-		if previous == domain.StateAdopted {
-			out.TerminationTriggered = true
-		}
+	if previous == domain.StateOrphaned {
 		_, err = uc.confirmer.Execute(ctx, execution.ConfirmTaskKilledInput{TaskID: in.TaskID, RawExitCode: 130, Estimated: true, OccurredAt: in.OccurredAt})
 		return out, err
+	}
+	pidlessAdopted := pid == nil &&
+		(previous == domain.StateAdopted ||
+			(snapshot.AdoptedAfterRestart &&
+				(previous == domain.StateRunning || previous == domain.StateStalled)))
+	if pidlessAdopted {
+		if err := uc.pendingRegistrar.Register(in.TaskID, recovery.PendingSendConfirmOnly, nil); err != nil {
+			return out, err
+		}
+		uc.timeoutDisarmer.Disarm(in.TaskID)
+		return out, nil
 	}
 	if pid != nil && ((previous == domain.StateStarting) || previous == domain.StateRunning || previous == domain.StateStalled || previous == domain.StateAdopted) {
 		out.TerminationTriggered = true

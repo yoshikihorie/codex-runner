@@ -18,9 +18,9 @@ func TestPendingRegistrarContract(t *testing.T) {
 	if err := registrar.Register(taskID, PendingSendUnsent, &authority); err != nil {
 		t.Fatalf("Register() error = %v", err)
 	}
-	claim, found := registrar.ClaimForSend(taskID, authority)
-	if !found || claim.Token == 0 {
-		t.Fatalf("ClaimForSend() = (%#v, %t)", claim, found)
+	claim, outcome := registrar.ClaimForSend(taskID, authority)
+	if outcome != ClaimAcquired || claim.Token == 0 {
+		t.Fatalf("ClaimForSend() = (%#v, %v)", claim, outcome)
 	}
 	if !registrar.ReleaseSend(claim) {
 		t.Fatal("ReleaseSend() = false")
@@ -116,7 +116,7 @@ func TestPendingRegisterStateTransitions(t *testing.T) {
 		{"unsent unsent", "unsent", PendingSendUnsent, pendingUnsent, nil, false},
 		{"unsent sent", "unsent", PendingSendSent, pendingSent, nil, false},
 		{"unsent confirm", "unsent", PendingSendConfirmOnly, pendingConfirmOnly, nil, true},
-		{"confirm unsent", "confirm", PendingSendUnsent, pendingUnsent, nil, false},
+		{"confirm unsent", "confirm", PendingSendUnsent, pendingConfirmOnly, nil, false},
 		{"confirm sent", "confirm", PendingSendSent, pendingSent, nil, false},
 		{"confirm confirm", "confirm", PendingSendConfirmOnly, pendingConfirmOnly, nil, false},
 		{"sent unsent", "sent", PendingSendUnsent, pendingSent, nil, false},
@@ -152,24 +152,63 @@ func TestPendingRegisterStateTransitions(t *testing.T) {
 
 func TestPendingClaimForSend(t *testing.T) {
 	missing := &PendingReconciliationSet{}
-	if claim, found := missing.ClaimForSend(pendingTestTaskID(t, "missing"), ProcessSignalAuthority{}); claim != (SendClaim{}) || found {
-		t.Fatalf("ClaimForSend(missing) = (%#v, %t)", claim, found)
+	if claim, outcome := missing.ClaimForSend(pendingTestTaskID(t, "missing"), ProcessSignalAuthority{}); claim != (SendClaim{}) || outcome != ClaimNotFound {
+		t.Fatalf("ClaimForSend(missing) = (%#v, %v)", claim, outcome)
 	}
 	taskID := pendingTestTaskID(t, "claim")
 	authority := pendingTestAuthority(taskID, 1)
 	set := pendingSetWithUnsent(t, taskID, authority)
-	claim, found := set.ClaimForSend(taskID, authority)
-	if !found || claim.TaskID != taskID || claim.Token == 0 || !pendingTestAuthorityEqual(claim.Authority, authority) {
-		t.Fatalf("ClaimForSend() = (%#v, %t)", claim, found)
+	claim, outcome := set.ClaimForSend(taskID, authority)
+	if outcome != ClaimAcquired || claim.TaskID != taskID || claim.Token == 0 || !pendingTestAuthorityEqual(claim.Authority, authority) {
+		t.Fatalf("ClaimForSend() = (%#v, %v)", claim, outcome)
 	}
 	if entry := pendingOnlyEntry(t, set); entry.state != pendingClaimed {
 		t.Fatalf("state = %v, want claimed", entry.state)
 	}
-	for _, state := range []string{"sent", "claimed", "confirm"} {
+	for state, want := range map[string]ClaimOutcome{"sent": ClaimSent, "claimed": ClaimAlreadyClaimed, "confirm": ClaimConfirmOnly} {
 		set := pendingSetInState(t, taskID, authority, state)
-		if claim, found := set.ClaimForSend(taskID, authority); claim != (SendClaim{}) || !found {
-			t.Fatalf("ClaimForSend(%s) = (%#v, %t)", state, claim, found)
+		if claim, outcome := set.ClaimForSend(taskID, authority); claim != (SendClaim{}) || outcome != want {
+			t.Fatalf("ClaimForSend(%s) = (%#v, %v)", state, claim, outcome)
 		}
+	}
+}
+
+func TestPendingClaimForSendAuthorityMismatchBecomesConfirmOnly(t *testing.T) {
+	taskID := pendingTestTaskID(t, "claim-mismatch-outcome")
+	authority := pendingTestAuthority(taskID, 1)
+	set := pendingSetWithUnsent(t, taskID, authority)
+	if claim, outcome := set.ClaimForSend(taskID, pendingTestAuthority(taskID, 2)); claim != (SendClaim{}) || outcome != ClaimConfirmOnly {
+		t.Fatalf("ClaimForSend() = (%#v, %v), want confirm-only", claim, outcome)
+	}
+	entry := pendingOnlyEntry(t, set)
+	if entry.state != pendingConfirmOnly || entry.authority != (ProcessSignalAuthority{}) || entry.claimToken != 0 {
+		t.Fatalf("entry = %#v, want cleared confirm-only entry", entry)
+	}
+}
+
+func TestPendingRemoveClaimOwnershipAndTokenLifetime(t *testing.T) {
+	taskID := pendingTestTaskID(t, "remove-claim")
+	authority := pendingTestAuthority(taskID, 1)
+	set := pendingSetWithUnsent(t, taskID, authority)
+	claim, outcome := set.ClaimForSend(taskID, authority)
+	if outcome != ClaimAcquired {
+		t.Fatalf("ClaimForSend() outcome = %v", outcome)
+	}
+	for _, invalid := range []SendClaim{{}, {TaskID: pendingTestTaskID(t, "remove-claim-other"), Token: claim.Token}, {TaskID: taskID, Token: claim.Token + 1}} {
+		if set.RemoveClaim(invalid) {
+			t.Fatalf("RemoveClaim(%#v) = true", invalid)
+		}
+	}
+	if !set.RemoveClaim(claim) {
+		t.Fatal("RemoveClaim(valid claim) = false")
+	}
+	pendingRequireNoEntry(t, set, taskID)
+	if err := set.Register(taskID, PendingSendUnsent, &authority); err != nil {
+		t.Fatal(err)
+	}
+	next, nextOutcome := set.ClaimForSend(taskID, authority)
+	if nextOutcome != ClaimAcquired || next.Token == claim.Token {
+		t.Fatalf("reclaim = (%#v, %v), reused token", next, nextOutcome)
 	}
 }
 
@@ -187,15 +226,15 @@ func TestPendingClaimAuthorityIdentity(t *testing.T) {
 	for _, tc := range mismatches {
 		t.Run("unsent mismatched "+tc.name+" becomes confirm-only", func(t *testing.T) {
 			set := pendingSetWithUnsent(t, taskID, authority)
-			if claim, found := set.ClaimForSend(taskID, tc.authority); claim != (SendClaim{}) || !found {
-				t.Fatalf("ClaimForSend(mismatch) = (%#v, %t)", claim, found)
+			if claim, outcome := set.ClaimForSend(taskID, tc.authority); claim != (SendClaim{}) || outcome != ClaimConfirmOnly {
+				t.Fatalf("ClaimForSend(mismatch) = (%#v, %v)", claim, outcome)
 			}
 			entry := pendingOnlyEntry(t, set)
 			if entry.state != pendingConfirmOnly || entry.authority != (ProcessSignalAuthority{}) || entry.claimToken != 0 {
 				t.Fatalf("entry after mismatch = %#v", entry)
 			}
-			if claim, found := set.ClaimForSend(taskID, authority); claim != (SendClaim{}) || !found {
-				t.Fatalf("ClaimForSend(old authority) = (%#v, %t)", claim, found)
+			if claim, outcome := set.ClaimForSend(taskID, authority); claim != (SendClaim{}) || outcome != ClaimConfirmOnly {
+				t.Fatalf("ClaimForSend(old authority) = (%#v, %v)", claim, outcome)
 			}
 		})
 	}
@@ -206,17 +245,17 @@ func TestPendingClaimAuthorityIdentity(t *testing.T) {
 			if state == "claimed" && before.claimToken == 0 {
 				t.Fatal("claimed entry token = 0")
 			}
-			if claim, found := set.ClaimForSend(taskID, mismatches[0].authority); claim != (SendClaim{}) || !found {
-				t.Fatalf("ClaimForSend(mismatch) = (%#v, %t)", claim, found)
+			if claim, outcome := set.ClaimForSend(taskID, mismatches[0].authority); claim != (SendClaim{}) || outcome == ClaimNotFound {
+				t.Fatalf("ClaimForSend(mismatch) = (%#v, %v)", claim, outcome)
 			}
 			pendingRequireEntryEqual(t, before, pendingOnlyEntry(t, set))
 		})
 	}
 	t.Run("released claim mismatch clears retained token", func(t *testing.T) {
 		set := pendingSetWithUnsent(t, taskID, authority)
-		claim, found := set.ClaimForSend(taskID, authority)
-		if !found || claim.Token == 0 {
-			t.Fatalf("ClaimForSend() = (%#v, %t)", claim, found)
+		claim, outcome := set.ClaimForSend(taskID, authority)
+		if outcome != ClaimAcquired || claim.Token == 0 {
+			t.Fatalf("ClaimForSend() = (%#v, %v)", claim, outcome)
 		}
 		if !set.ReleaseSend(claim) {
 			t.Fatal("ReleaseSend() = false")
@@ -224,15 +263,15 @@ func TestPendingClaimAuthorityIdentity(t *testing.T) {
 		if entry := pendingOnlyEntry(t, set); entry.state != pendingUnsent || entry.claimToken == 0 {
 			t.Fatalf("entry after release = %#v", entry)
 		}
-		if got, found := set.ClaimForSend(taskID, mismatches[0].authority); got != (SendClaim{}) || !found {
-			t.Fatalf("ClaimForSend(mismatch) = (%#v, %t)", got, found)
+		if got, outcome := set.ClaimForSend(taskID, mismatches[0].authority); got != (SendClaim{}) || outcome != ClaimConfirmOnly {
+			t.Fatalf("ClaimForSend(mismatch) = (%#v, %v)", got, outcome)
 		}
 		entry := pendingOnlyEntry(t, set)
 		if entry.state != pendingConfirmOnly || entry.authority != (ProcessSignalAuthority{}) || entry.claimToken != 0 {
 			t.Fatalf("entry after mismatch = %#v", entry)
 		}
-		if got, found := set.ClaimForSend(taskID, authority); got != (SendClaim{}) || !found {
-			t.Fatalf("ClaimForSend(old authority) = (%#v, %t)", got, found)
+		if got, outcome := set.ClaimForSend(taskID, authority); got != (SendClaim{}) || outcome != ClaimConfirmOnly {
+			t.Fatalf("ClaimForSend(old authority) = (%#v, %v)", got, outcome)
 		}
 	})
 	parsed, err := time.Parse(time.RFC3339Nano, authority.ProcessStartedAt.Format(time.RFC3339Nano))
@@ -242,8 +281,8 @@ func TestPendingClaimAuthorityIdentity(t *testing.T) {
 	equalButNotIdentical := authority
 	equalButNotIdentical.ProcessStartedAt = parsed
 	set := pendingSetWithUnsent(t, taskID, authority)
-	if claim, found := set.ClaimForSend(taskID, equalButNotIdentical); !found || claim.Token == 0 {
-		t.Fatalf("ClaimForSend(Equal time) = (%#v, %t)", claim, found)
+	if claim, outcome := set.ClaimForSend(taskID, equalButNotIdentical); outcome != ClaimAcquired || claim.Token == 0 {
+		t.Fatalf("ClaimForSend(Equal time) = (%#v, %v)", claim, outcome)
 	}
 }
 
@@ -282,9 +321,9 @@ func TestPendingInvalidateSend(t *testing.T) {
 	taskID := pendingTestTaskID(t, "invalidate")
 	authority := pendingTestAuthority(taskID, 1)
 	set := pendingSetWithUnsent(t, taskID, authority)
-	claim, found := set.ClaimForSend(taskID, authority)
-	if !found || claim.Token == 0 {
-		t.Fatalf("ClaimForSend() = (%#v, %t)", claim, found)
+	claim, outcome := set.ClaimForSend(taskID, authority)
+	if outcome != ClaimAcquired || claim.Token == 0 {
+		t.Fatalf("ClaimForSend() = (%#v, %v)", claim, outcome)
 	}
 	claim.Authority = ProcessSignalAuthority{}
 	if !set.InvalidateSend(claim) {
@@ -294,8 +333,8 @@ func TestPendingInvalidateSend(t *testing.T) {
 	if entry.state != pendingConfirmOnly || entry.authority != (ProcessSignalAuthority{}) || entry.claimToken != 0 {
 		t.Fatalf("entry after InvalidateSend() = %#v", entry)
 	}
-	if got, found := set.ClaimForSend(taskID, authority); got != (SendClaim{}) || !found {
-		t.Fatalf("ClaimForSend(old authority) = (%#v, %t)", got, found)
+	if got, outcome := set.ClaimForSend(taskID, authority); got != (SendClaim{}) || outcome != ClaimConfirmOnly {
+		t.Fatalf("ClaimForSend(old authority) = (%#v, %v)", got, outcome)
 	}
 
 	missing := &PendingReconciliationSet{}
@@ -463,9 +502,9 @@ func TestPendingConcurrentClaimsAndOperations(t *testing.T) {
 		go func(i int) {
 			defer wg.Done()
 			<-start
-			claim, found := set.ClaimForSend(ids[i], authorities[i])
-			if !found || claim.Token == 0 {
-				t.Errorf("claim %d = (%#v, %t)", i, claim, found)
+			claim, outcome := set.ClaimForSend(ids[i], authorities[i])
+			if outcome != ClaimAcquired || claim.Token == 0 {
+				t.Errorf("claim %d = (%#v, %v)", i, claim, outcome)
 				return
 			}
 			claims <- claim
@@ -585,7 +624,7 @@ func pendingSetInState(t *testing.T, taskID domain.TaskID, authority ProcessSign
 		if err := set.Register(taskID, PendingSendUnsent, &authority); err != nil {
 			t.Fatal(err)
 		}
-		if claim, found := set.ClaimForSend(taskID, authority); !found || claim.Token == 0 {
+		if claim, outcome := set.ClaimForSend(taskID, authority); outcome != ClaimAcquired || claim.Token == 0 {
 			t.Fatal("could not create claimed state")
 		}
 	default:

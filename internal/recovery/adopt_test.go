@@ -230,17 +230,19 @@ func (f *adoptionMutexFake) Unlock(domain.TaskID) {
 }
 
 type adoptionTerminationFake struct {
-	calls    int
-	sendDead bool
+	calls        int
+	sendDead     bool
+	terminateErr error
+	confirmErr   error
 }
 
 func (f *adoptionTerminationFake) Confirm(context.Context, domain.TaskID) (bool, error) {
 	f.calls++
 	return false, nil
 }
-func (f *adoptionTerminationFake) SendAndConfirm(context.Context, domain.TaskID, int, time.Duration) (bool, error) {
+func (f *adoptionTerminationFake) SendAndConfirm(context.Context, domain.TaskID, int, time.Duration) TerminationAttemptResult {
 	f.calls++
-	return f.sendDead, nil
+	return TerminationAttemptResult{Dead: f.sendDead, TerminateErr: f.terminateErr, ConfirmErr: f.confirmErr}
 }
 
 type adoptionKilledFake struct{ calls int }
@@ -366,6 +368,24 @@ func newAdoptionResumeUseCase(t *testing.T) *RecoverViaResumeUseCase {
 	t.Helper()
 	resume, _, _, _, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateOrphaned, nil, RecoveryResult{})
 	return resume
+}
+
+func waitForPendingRemoval(t *testing.T, pending *PendingReconciliationSet) {
+	t.Helper()
+	timeout := time.NewTimer(time.Second)
+	defer timeout.Stop()
+	tick := time.NewTicker(time.Millisecond)
+	defer tick.Stop()
+	for {
+		if len(pending.List()) == 0 {
+			return
+		}
+		select {
+		case <-tick.C:
+		case <-timeout.C:
+			t.Fatalf("pending recovery did not complete: %+v", pending.List())
+		}
+	}
 }
 
 func newAdoptionUseCase(tasks *adoptionStoreFake, liveness *adoptionLivenessFake, reader *adoptionReaderFake, writer *adoptionWriterFake, finalizer *adoptionFinalizerFake, resume *RecoverViaResumeUseCase, slots *adoptionSlotsFake, mutex *adoptionMutexFake) *AdoptRunningTasksUseCase {
@@ -952,7 +972,7 @@ func TestAdoptRunningTasksRegistersCanonicalPendingDispositions(t *testing.T) {
 	}
 }
 
-func TestAdoptTimeoutTerminationRemovesPendingBeforeDispatch(t *testing.T) {
+func TestAdoptTimeoutTerminationRemovesPendingAfterResumeSucceeds(t *testing.T) {
 	id := adoptionID(t, "timeout-confirmed-dispatch")
 	snapshot := adoptionSnapshot(t, id, domain.StateTimeout)
 	tasks := &adoptionStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}
@@ -969,9 +989,25 @@ func TestAdoptTimeoutTerminationRemovesPendingBeforeDispatch(t *testing.T) {
 	uc := NewAdoptRunningTasksUseCase(tasks, &adoptionLivenessFake{}, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), &adoptionSlotsFake{}, &adoptionSlotsFake{}, termination, &adoptionKilledFake{}, pathLocks, pending, &adoptionMutexFake{}, domain.ClockFunc(time.Now), &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, slog.Default())
 
 	uc.confirmTimeoutTermination(context.Background(), id, snapshot, *snapshot.PID)
+	waitForPendingRemoval(t, pending)
 
 	if termination.calls != 1 || pathLocks.calls != 1 || len(pending.List()) != 0 {
 		t.Fatalf("termination=%d pathLocks=%d pending=%+v", termination.calls, pathLocks.calls, pending.List())
+	}
+}
+
+func TestAdoptResumeRecoveryWithoutClaimRemovesPendingAfterSuccess(t *testing.T) {
+	id := adoptionID(t, "resume-without-claim")
+	pending := &PendingReconciliationSet{}
+	if err := pending.Register(id, PendingSendConfirmOnly, nil); err != nil {
+		t.Fatal(err)
+	}
+	uc := NewAdoptRunningTasksUseCase(&adoptionStoreFake{}, &adoptionLivenessFake{}, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), &adoptionSlotsFake{}, &adoptionSlotsFake{}, &adoptionTerminationFake{}, &adoptionKilledFake{}, &adoptionPathLocksFake{}, pending, &adoptionMutexFake{}, domain.ClockFunc(time.Now), &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, slog.Default())
+
+	uc.resumeRecovery(context.Background(), RecoverViaResumeInput{TaskID: id, Origin: domain.RecoveryOriginOrphan, OccurredAt: time.Now()}, SendClaim{})
+
+	if len(pending.List()) != 0 {
+		t.Fatalf("pending=%+v", pending.List())
 	}
 }
 
