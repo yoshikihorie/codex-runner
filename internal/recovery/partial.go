@@ -57,6 +57,9 @@ type SavePartialOutputUseCase struct {
 
 // NewSavePartialOutputUseCase constructs the use case. logger is optional and defaults to slog.Default.
 func NewSavePartialOutputUseCase(reader ContractReader, contract ContractWriter, loggers ...*slog.Logger) *SavePartialOutputUseCase {
+	if isNilAdoptionDependency(reader) || isNilAdoptionDependency(contract) {
+		panic("save partial output use case requires non-nil dependencies")
+	}
 	logger := slog.Default()
 	if len(loggers) > 0 && loggers[0] != nil {
 		logger = loggers[0]

@@ -8,18 +8,25 @@ import (
 
 	"github.com/yoshikihorie/codex-runner/internal/contract"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
+	"github.com/yoshikihorie/codex-runner/internal/metrics"
 	"github.com/yoshikihorie/codex-runner/internal/recovery"
 	"github.com/yoshikihorie/codex-runner/internal/store"
 )
 
 type killedStoreFake struct {
-	snapshot domain.TaskSnapshot
-	saveErr  error
-	saves    int
-	trace    *[]string
+	snapshot  domain.TaskSnapshot
+	saveErr   error
+	loadPanic any
+	saves     int
+	trace     *[]string
 }
 
-func (f *killedStoreFake) Load(domain.TaskID) (domain.TaskSnapshot, error) { return f.snapshot, nil }
+func (f *killedStoreFake) Load(domain.TaskID) (domain.TaskSnapshot, error) {
+	if f.loadPanic != nil {
+		panic(f.loadPanic)
+	}
+	return f.snapshot, nil
+}
 func (f *killedStoreFake) Save(_ domain.TaskID, snapshot domain.TaskSnapshot) error {
 	f.saves++
 	if f.trace != nil {
@@ -84,6 +91,28 @@ type killedDisarmerFake struct{ calls int }
 
 func (f *killedDisarmerFake) Disarm(domain.TaskID) { f.calls++ }
 
+type killedMetricsFake struct {
+	inputs []metrics.RecordTaskMetricsInput
+	record metrics.RecordTaskMetricsOutput
+}
+
+func (f *killedMetricsFake) Execute(_ context.Context, in metrics.RecordTaskMetricsInput) metrics.RecordTaskMetricsOutput {
+	f.inputs = append(f.inputs, in)
+	return f.record
+}
+
+type killedStalledTrackerFake struct {
+	calls int
+	id    domain.TaskID
+	total int
+}
+
+func (f *killedStalledTrackerFake) TakeTotal(id domain.TaskID) int {
+	f.calls++
+	f.id = id
+	return f.total
+}
+
 type killedSlotFake struct {
 	calls         int
 	beforeRelease func()
@@ -125,7 +154,7 @@ func killedFixture(t *testing.T) (*killedStoreFake, *killedReaderFake, *killedWr
 	disarmer := &killedDisarmerFake{}
 	slots := &killedSlotFake{}
 	paths := &killedPathStoreFake{}
-	uc := NewConfirmTaskKilledUseCase(tasks, writer, reader, store.NewTaskMutex(), disarmer, NewReleasePathLockUseCase(paths), slots, domain.ClockFunc(func() time.Time { return snapshot.StateUpdatedAt }))
+	uc := NewConfirmTaskKilledUseCase(tasks, writer, reader, store.NewTaskMutex(), disarmer, NewReleasePathLockUseCase(paths), slots, domain.ClockFunc(func() time.Time { return snapshot.StateUpdatedAt }), &killedMetricsFake{}, &killedStalledTrackerFake{})
 	return tasks, reader, writer, disarmer, slots, paths, uc
 }
 
@@ -198,8 +227,57 @@ func TestConfirmTaskKilledExecute_SaveFailureRetainsConfirmedResultAndReleases(t
 	tasks, _, _, disarmer, slots, paths, uc := killedFixture(t)
 	tasks.saveErr = errors.New("save")
 	out, err := uc.Execute(context.Background(), ConfirmTaskKilledInput{TaskID: tasks.snapshot.TaskID, RawExitCode: 130, Estimated: true, OccurredAt: tasks.snapshot.StateUpdatedAt})
-	if !errors.Is(err, domain.ErrContractWriteFailed) || len(out.Events) != 1 || tasks.saves != 1 || tasks.snapshot.State != domain.StateCancelling || disarmer.calls != 1 || paths.calls != 1 || slots.calls != 1 {
+	if !errors.Is(err, domain.ErrContractWriteFailed) || !errors.Is(err, tasks.saveErr) || len(out.Events) != 1 || tasks.saves != 1 || tasks.snapshot.State != domain.StateCancelling || disarmer.calls != 1 || paths.calls != 1 || slots.calls != 1 {
 		t.Fatalf("out=%#v err=%v saves=%d snapshot=%#v disarms=%d paths=%d slots=%d", out, err, tasks.saves, tasks.snapshot, disarmer.calls, paths.calls, slots.calls)
+	}
+}
+
+func TestConfirmTaskKilledExecute_UnlocksTaskMutexWhenLockedExecutionPanics(t *testing.T) {
+	snapshot := killedSnapshot(t)
+	tasks := &killedStoreFake{snapshot: snapshot, loadPanic: "load panic"}
+	taskMu := store.NewTaskMutex()
+	uc := NewConfirmTaskKilledUseCase(tasks, &killedWriterFake{}, &killedReaderFake{}, taskMu, &killedDisarmerFake{}, NewReleasePathLockUseCase(&killedPathStoreFake{}), &killedSlotFake{}, domain.ClockFunc(time.Now), &killedMetricsFake{}, &killedStalledTrackerFake{})
+
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("expected panic")
+			}
+		}()
+		_, _ = uc.Execute(context.Background(), ConfirmTaskKilledInput{TaskID: snapshot.TaskID, RawExitCode: 130, OccurredAt: snapshot.StateUpdatedAt})
+	}()
+
+	completed := make(chan struct{})
+	go func() {
+		taskMu.Lock(snapshot.TaskID)
+		taskMu.Unlock(snapshot.TaskID)
+		close(completed)
+	}()
+	select {
+	case <-completed:
+	case <-time.After(time.Second):
+		t.Fatal("panic left task mutex locked")
+	}
+}
+
+func TestConfirmTaskKilledExecuteLocked_ContractWriteErrorsRetainCauses(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		configure func(*killedStoreFake, *killedWriterFake, error)
+	}{
+		{"exit-code", func(_ *killedStoreFake, writer *killedWriterFake, cause error) { writer.exitErr = cause }},
+		{"task.json", func(tasks *killedStoreFake, _ *killedWriterFake, cause error) { tasks.saveErr = cause }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tasks, _, writer, _, _, _, uc := killedFixture(t)
+			cause := errors.New(tc.name)
+			tc.configure(tasks, writer, cause)
+
+			_, err := uc.ExecuteLocked(context.Background(), ConfirmTaskKilledInput{TaskID: tasks.snapshot.TaskID, RawExitCode: 130, OccurredAt: tasks.snapshot.StateUpdatedAt})
+			if !errors.Is(err, domain.ErrContractWriteFailed) || !errors.Is(err, cause) {
+				t.Fatalf("err=%v does not retain classification and cause", err)
+			}
+		})
 	}
 }
 
@@ -235,7 +313,7 @@ func TestConfirmTaskKilledExecute_SaveFailureUnlocksBeforeReleasingSlot(t *testi
 		taskMu.Lock(snapshot.TaskID)
 		taskMu.Unlock(snapshot.TaskID)
 	}
-	uc := NewConfirmTaskKilledUseCase(tasks, writer, reader, taskMu, disarmer, NewReleasePathLockUseCase(paths), slots, domain.ClockFunc(func() time.Time { return snapshot.StateUpdatedAt }))
+	uc := NewConfirmTaskKilledUseCase(tasks, writer, reader, taskMu, disarmer, NewReleasePathLockUseCase(paths), slots, domain.ClockFunc(func() time.Time { return snapshot.StateUpdatedAt }), &killedMetricsFake{}, &killedStalledTrackerFake{})
 
 	completed := make(chan error, 1)
 	go func() {
@@ -249,5 +327,83 @@ func TestConfirmTaskKilledExecute_SaveFailureUnlocksBeforeReleasingSlot(t *testi
 		}
 	case <-time.After(time.Second):
 		t.Fatal("confirmation did not unlock task mutex before releasing the slot")
+	}
+}
+
+func TestConfirmTaskKilledMetricsTerminalPersistenceCases(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		saveErr         error
+		appendErr       error
+		recorded        bool
+		wantPersisted   bool
+		wantTake        int
+		wantMetrics     int
+		wantReleaseEach int
+	}{
+		{"persisted", nil, nil, true, true, 1, 1, 1},
+		{"save failure", errors.New("save"), nil, true, false, 0, 0, 1},
+		{"event failure", nil, errors.New("append"), true, true, 1, 1, 1},
+		{"metrics fail soft", nil, nil, false, true, 1, 1, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := killedSnapshot(t)
+			tasks := &killedStoreFake{snapshot: snapshot, saveErr: tc.saveErr}
+			writer := &killedWriterFake{appendErr: tc.appendErr}
+			disarmer, slots, paths := &killedDisarmerFake{}, &killedSlotFake{}, &killedPathStoreFake{}
+			metricsRecorder := &killedMetricsFake{record: metrics.RecordTaskMetricsOutput{Recorded: tc.recorded}}
+			tracker := &killedStalledTrackerFake{total: 37}
+			uc := NewConfirmTaskKilledUseCase(tasks, writer, &killedReaderFake{}, store.NewTaskMutex(), disarmer, NewReleasePathLockUseCase(paths), slots, domain.ClockFunc(func() time.Time { return snapshot.StateUpdatedAt }), metricsRecorder, tracker)
+
+			result, err := uc.ExecuteLocked(context.Background(), ConfirmTaskKilledInput{TaskID: snapshot.TaskID, RawExitCode: 130, Estimated: true, OccurredAt: snapshot.StateUpdatedAt})
+			if result.Confirmed != true || result.TerminalPersisted != tc.wantPersisted || tracker.calls != tc.wantTake || (err != nil) != (tc.saveErr != nil) {
+				t.Fatalf("result=%+v err=%v tracker=%d", result, err, tracker.calls)
+			}
+			uc.ReleaseAfterConfirmation(context.Background(), result, snapshot.TaskID)
+			if len(metricsRecorder.inputs) != tc.wantMetrics || disarmer.calls != tc.wantReleaseEach || paths.calls != tc.wantReleaseEach || slots.calls != tc.wantReleaseEach {
+				t.Fatalf("metrics=%+v disarms=%d paths=%d slots=%d", metricsRecorder.inputs, disarmer.calls, paths.calls, slots.calls)
+			}
+			if tc.wantMetrics == 1 {
+				in := metricsRecorder.inputs[0]
+				if in.TaskID != snapshot.TaskID || in.FinalState != domain.StateKilled || !in.Estimated || !in.OccurredAt.Equal(snapshot.StateUpdatedAt) || in.StalledTotalMs != tracker.total {
+					t.Fatalf("metrics input=%+v", in)
+				}
+			}
+		})
+	}
+}
+
+func TestConfirmTaskKilledMetricsDoubleConfirmationAndDependencyGuards(t *testing.T) {
+	snapshot := killedSnapshot(t)
+	tasks := &killedStoreFake{snapshot: snapshot}
+	metricsRecorder := &killedMetricsFake{}
+	tracker := &killedStalledTrackerFake{total: 11}
+	uc := NewConfirmTaskKilledUseCase(tasks, &killedWriterFake{}, &killedReaderFake{}, store.NewTaskMutex(), &killedDisarmerFake{}, NewReleasePathLockUseCase(&killedPathStoreFake{}), &killedSlotFake{}, domain.ClockFunc(func() time.Time { return snapshot.StateUpdatedAt }), metricsRecorder, tracker)
+	in := ConfirmTaskKilledInput{TaskID: snapshot.TaskID, RawExitCode: 130, OccurredAt: snapshot.StateUpdatedAt}
+	if _, err := uc.Execute(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := uc.Execute(context.Background(), in); !errors.Is(err, domain.ErrInvalidStateTransition) || tracker.calls != 1 || len(metricsRecorder.inputs) != 1 {
+		t.Fatalf("err=%v takes=%d metrics=%d", err, tracker.calls, len(metricsRecorder.inputs))
+	}
+
+	for _, tc := range []struct {
+		name    string
+		metrics recovery.MetricsRecorder
+		tracker interface{ TakeTotal(domain.TaskID) int }
+	}{
+		{"nil metrics", nil, &killedStalledTrackerFake{}},
+		{"typed nil metrics", (*killedMetricsFake)(nil), &killedStalledTrackerFake{}},
+		{"nil tracker", &killedMetricsFake{}, nil},
+		{"typed nil tracker", &killedMetricsFake{}, (*killedStalledTrackerFake)(nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			NewConfirmTaskKilledUseCase(&killedStoreFake{snapshot: snapshot}, &killedWriterFake{}, &killedReaderFake{}, store.NewTaskMutex(), &killedDisarmerFake{}, NewReleasePathLockUseCase(&killedPathStoreFake{}), &killedSlotFake{}, domain.ClockFunc(time.Now), tc.metrics, tc.tracker)
+		})
 	}
 }

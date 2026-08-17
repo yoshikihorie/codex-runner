@@ -5,6 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"os"
+	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -503,7 +506,6 @@ func TestFinalizeTaskUseCaseScenarios(t *testing.T) {
 // the output-retention fix each returned a zero ResultState and nil Events.
 func TestFinalizeTaskUseCaseFailsafePreparationRetainsInitialResult(t *testing.T) {
 	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
-	initialWrite := errors.New("initial write")
 	for _, tc := range []struct {
 		name      string
 		configure func(*finalizeStoreFake)
@@ -525,13 +527,15 @@ func TestFinalizeTaskUseCaseFailsafePreparationRetainsInitialResult(t *testing.T
 		t.Run(tc.name, func(t *testing.T) {
 			s, _, w, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
 			tc.configure(s)
+			initialWrite := &os.PathError{Op: "write", Path: "/private/contract/initial", Err: errors.New("initial write")}
 			w.writeErrs = []error{initialWrite}
 			out, err := uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, now))
 			if err == nil || out.ResultState != domain.StateCompleted || out.Events == nil {
 				t.Fatalf("out=%+v err=%v", out, err)
 			}
 			requireEvents(t, out.Events, domain.StateCompleted, now)
-			if !errors.Is(out.ContractWriteError, domain.ErrContractWriteFailed) {
+			var initialPathErr *os.PathError
+			if !errors.Is(out.ContractWriteError, domain.ErrContractWriteFailed) || !errors.Is(out.ContractWriteError, initialWrite) || !errors.As(out.ContractWriteError, &initialPathErr) || initialPathErr != initialWrite {
 				t.Fatalf("contract err=%v", out.ContractWriteError)
 			}
 			calls, _, _ := slot.snapshot()
@@ -543,6 +547,114 @@ func TestFinalizeTaskUseCaseFailsafePreparationRetainsInitialResult(t *testing.T
 			}
 		})
 	}
+}
+
+func TestFinalizeTaskUseCaseFailsafeErrorsRetainInitialAndSecondaryCauses(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name      string
+		configure func(*finalizeStoreFake, *finalizeReaderFake, *finalizeWriterFake) error
+		stage     string
+		restore   bool
+	}{
+		{
+			name: "reload",
+			configure: func(s *finalizeStoreFake, _ *finalizeReaderFake, _ *finalizeWriterFake) error {
+				secondary := &os.LinkError{Op: "read", Old: "/private/contract/reload", New: "/private/contract/reload", Err: errors.New("reload")}
+				s.loads = []loadResult{{snapshot: s.latest}, {err: secondary}}
+				return secondary
+			},
+			stage: "reload for failsafe",
+		},
+		{
+			name: "restore",
+			configure: func(s *finalizeStoreFake, _ *finalizeReaderFake, _ *finalizeWriterFake) error {
+				bad := s.latest
+				bad.State = "invalid"
+				_, restoreErr := bad.Restore()
+				s.loads = []loadResult{{snapshot: s.latest}, {snapshot: bad}}
+				return restoreErr
+			},
+			stage:   "restore for failsafe",
+			restore: true,
+		},
+		{
+			name: "record-exit",
+			configure: func(s *finalizeStoreFake, _ *finalizeReaderFake, _ *finalizeWriterFake) error {
+				terminal := s.latest
+				terminal.State = domain.StateCompleted
+				code := domain.NewExitCode(0)
+				terminal.ExitCode = &code
+				s.loads = []loadResult{{snapshot: s.latest}, {snapshot: terminal}}
+				return domain.ErrInvalidStateTransition
+			},
+			stage: "record exit for failsafe",
+		},
+		{
+			name: "retry-non-retryable",
+			configure: func(_ *finalizeStoreFake, r *finalizeReaderFake, _ *finalizeWriterFake) error {
+				secondary := &os.LinkError{Op: "read", Old: "/private/contract/retry-read", New: "/private/contract/retry-read", Err: errors.New("retry read")}
+				r.exits = []struct {
+					code   int
+					exists bool
+					err    error
+				}{{}, {err: secondary}}
+				return secondary
+			},
+		},
+		{
+			name: "retry-write-failure",
+			configure: func(_ *finalizeStoreFake, _ *finalizeReaderFake, w *finalizeWriterFake) error {
+				secondary := &os.LinkError{Op: "write", Old: "/private/contract/retry", New: "/private/contract/retry", Err: errors.New("retry write")}
+				w.writeErrs = append(w.writeErrs, secondary)
+				return secondary
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, r, w, _, _, uc := finalizeFixtures(t, domain.StateRunning, now)
+			initial := &os.PathError{Op: "write", Path: "/private/contract/initial", Err: errors.New("initial write")}
+			w.writeErrs = []error{initial}
+			secondary := tc.configure(s, r, w)
+			out, err := uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, now))
+			var initialPathErr *os.PathError
+			if err == nil || !errors.Is(err, domain.ErrContractWriteFailed) || !errors.Is(err, initial) || !errors.As(err, &initialPathErr) || initialPathErr != initial || !tc.restore && !errors.Is(err, secondary) {
+				t.Fatalf("out=%+v err=%v initial=%#v secondary=%#v", out, err, initial, secondary)
+			}
+			if tc.stage != "" && !strings.Contains(err.Error(), tc.stage) {
+				t.Fatalf("err=%v, missing stage %q", err, tc.stage)
+			}
+			if wantLinkErr, ok := secondary.(*os.LinkError); ok {
+				var linkErr *os.LinkError
+				if !errors.As(err, &linkErr) || linkErr != wantLinkErr {
+					t.Fatalf("link error=%#v want=%#v", linkErr, wantLinkErr)
+				}
+			}
+			if tc.restore {
+				if !containsErrorShape(err, secondary) {
+					t.Fatalf("restore error tree=%v want type=%T message=%q", err, secondary, secondary.Error())
+				}
+			}
+		})
+	}
+}
+
+func containsErrorShape(err, want error) bool {
+	if err == nil {
+		return false
+	}
+	if reflect.TypeOf(err) == reflect.TypeOf(want) && err.Error() == want.Error() {
+		return true
+	}
+	if joined, ok := err.(interface{ Unwrap() []error }); ok {
+		for _, child := range joined.Unwrap() {
+			if containsErrorShape(child, want) {
+				return true
+			}
+		}
+		return false
+	}
+	return containsErrorShape(errors.Unwrap(err), want)
 }
 
 func TestFinalizeTaskUseCaseWriteFailuresAndContractRules(t *testing.T) {

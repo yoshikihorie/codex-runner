@@ -79,7 +79,7 @@ type resumeRecoverer struct {
 }
 
 func NewResumeRecoverer(launcher ResumeLauncher, reader ContractReader, codexBinaryPath string, clock Clock) Recoverer {
-	if launcher == nil || reader == nil || clock == nil {
+	if isNilAdoptionDependency(launcher) || isNilAdoptionDependency(reader) || isNilAdoptionDependency(clock) {
 		panic("resume recoverer requires non-nil dependencies")
 	}
 	return &resumeRecoverer{launcher: launcher, reader: reader, codexBinaryPath: codexBinaryPath, clock: clock}
@@ -105,20 +105,21 @@ type RecoverViaResumeUseCase struct {
 	partial         *SavePartialOutputUseCase
 	slotReleaser    SlotReleaser
 	metricsRecorder MetricsRecorder
+	stalledTracker  stalledTimeTracker
 	taskMu          TaskMutex
 	clock           Clock
 	logger          *slog.Logger
 }
 
-func NewRecoverViaResumeUseCase(tasks TaskStore, contract recoveryContractWriter, recoverer Recoverer, partial *SavePartialOutputUseCase, slotReleaser SlotReleaser, metricsRecorder MetricsRecorder, taskMu TaskMutex, clock Clock, loggers ...*slog.Logger) *RecoverViaResumeUseCase {
-	if tasks == nil || contract == nil || recoverer == nil || partial == nil || slotReleaser == nil || metricsRecorder == nil || taskMu == nil || clock == nil {
+func NewRecoverViaResumeUseCase(tasks TaskStore, contract recoveryContractWriter, recoverer Recoverer, partial *SavePartialOutputUseCase, slotReleaser SlotReleaser, metricsRecorder MetricsRecorder, stalledTracker stalledTimeTracker, taskMu TaskMutex, clock Clock, loggers ...*slog.Logger) *RecoverViaResumeUseCase {
+	if isNilAdoptionDependency(tasks) || isNilAdoptionDependency(contract) || isNilAdoptionDependency(recoverer) || isNilAdoptionDependency(partial) || isNilAdoptionDependency(slotReleaser) || isNilAdoptionDependency(metricsRecorder) || isNilAdoptionDependency(stalledTracker) || isNilAdoptionDependency(taskMu) || isNilAdoptionDependency(clock) {
 		panic("recover via resume use case requires non-nil dependencies")
 	}
 	logger := slog.Default()
 	if len(loggers) > 0 && loggers[0] != nil {
 		logger = loggers[0]
 	}
-	return &RecoverViaResumeUseCase{tasks: tasks, contract: contract, recoverer: recoverer, partial: partial, slotReleaser: slotReleaser, metricsRecorder: metricsRecorder, taskMu: taskMu, clock: clock, logger: logger}
+	return &RecoverViaResumeUseCase{tasks: tasks, contract: contract, recoverer: recoverer, partial: partial, slotReleaser: slotReleaser, metricsRecorder: metricsRecorder, stalledTracker: stalledTracker, taskMu: taskMu, clock: clock, logger: logger}
 }
 
 func (uc *RecoverViaResumeUseCase) Execute(ctx context.Context, in RecoverViaResumeInput) (RecoverViaResumeOutput, error) {
@@ -148,12 +149,14 @@ func (uc *RecoverViaResumeUseCase) Execute(ctx context.Context, in RecoverViaRes
 		}
 	}
 	completedAt := uc.clock.Now()
-	output, terminal := uc.finish(ctx, in, origin, result, completedAt)
+	cleanupCtx := context.WithoutCancel(ctx)
+	output, terminal := uc.finish(cleanupCtx, in, origin, result, completedAt)
 	if !terminal {
 		return output, fmt.Errorf("recovery: terminal transition was not persisted")
 	}
-	uc.metricsRecorder.Execute(ctx, metrics.RecordTaskMetricsInput{TaskID: in.TaskID, FinalState: output.FinalState, Estimated: true, OccurredAt: completedAt})
-	uc.slotReleaser.ReleaseAndAdvance(ctx, in.TaskID, uc.clock.Now())
+	stalledTotal := uc.stalledTracker.TakeTotal(in.TaskID)
+	uc.metricsRecorder.Execute(cleanupCtx, metrics.RecordTaskMetricsInput{TaskID: in.TaskID, FinalState: output.FinalState, Estimated: true, OccurredAt: completedAt, StalledTotalMs: stalledTotal})
+	uc.slotReleaser.ReleaseAndAdvance(cleanupCtx, in.TaskID, uc.clock.Now())
 	return output, nil
 }
 

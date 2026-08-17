@@ -1129,7 +1129,7 @@ func TestTaskLifecycleCancellationConfirmationReleasesConfirmedDespiteError(t *t
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newLifecycleFixture(t)
-			f.killed.lockedResult = execution.LockedKillResult{Confirmed: true}
+			f.killed.lockedResult = execution.LockedKillResult{Confirmed: true, TerminalPersisted: false}
 			f.killed.lockedErr = errors.New("persistence")
 			tc.invoke(f)
 			if f.killed.lockedCalls != 1 || f.killed.releaseCalls != 1 || f.pending.calls != 0 {

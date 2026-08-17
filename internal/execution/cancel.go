@@ -2,12 +2,14 @@ package execution
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/contract"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
+	"github.com/yoshikihorie/codex-runner/internal/metrics"
 	"github.com/yoshikihorie/codex-runner/internal/recovery"
 	"github.com/yoshikihorie/codex-runner/internal/store"
 )
@@ -20,9 +22,15 @@ type ConfirmTaskKilledInput struct {
 }
 type ConfirmTaskKilledOutput struct{ Events []domain.Event }
 type LockedKillResult struct {
-	Output     ConfirmTaskKilledOutput
-	Confirmed  bool
-	Subcommand domain.Subcommand
+	Output            ConfirmTaskKilledOutput
+	Confirmed         bool
+	TerminalPersisted bool
+	StalledTotalMs    int
+	Subcommand        domain.Subcommand
+}
+
+type killedStalledTimeTracker interface {
+	TakeTotal(domain.TaskID) int
 }
 
 type ConfirmTaskKilledUseCase struct {
@@ -33,12 +41,14 @@ type ConfirmTaskKilledUseCase struct {
 	timeoutDisarmer  TimeoutDisarmer
 	pathLockReleaser *ReleasePathLockUseCase
 	slotReleaser     recovery.SlotReleaser
+	metricsRecorder  recovery.MetricsRecorder
+	stalledTracker   killedStalledTimeTracker
 	clock            domain.Clock
 	logger           *slog.Logger
 }
 
-func NewConfirmTaskKilledUseCase(tasks store.TaskStore, writer contract.ContractWriter, reader store.ContractReader, taskMu *store.TaskMutex, disarmer TimeoutDisarmer, pathLocks *ReleasePathLockUseCase, slots recovery.SlotReleaser, clock domain.Clock, loggers ...*slog.Logger) *ConfirmTaskKilledUseCase {
-	if tasks == nil || writer == nil || reader == nil || taskMu == nil || disarmer == nil || pathLocks == nil || slots == nil || clock == nil {
+func NewConfirmTaskKilledUseCase(tasks store.TaskStore, writer contract.ContractWriter, reader store.ContractReader, taskMu *store.TaskMutex, disarmer TimeoutDisarmer, pathLocks *ReleasePathLockUseCase, slots recovery.SlotReleaser, clock domain.Clock, metricsRecorder recovery.MetricsRecorder, stalledTracker killedStalledTimeTracker, loggers ...*slog.Logger) *ConfirmTaskKilledUseCase {
+	if isNilStatusDependency(tasks) || isNilStatusDependency(writer) || isNilStatusDependency(reader) || isNilStatusDependency(taskMu) || isNilStatusDependency(disarmer) || isNilStatusDependency(pathLocks) || isNilStatusDependency(slots) || isNilStatusDependency(clock) || isNilStatusDependency(metricsRecorder) || isNilStatusDependency(stalledTracker) {
 		panic("confirm killed use case requires non-nil dependencies")
 	}
 	if len(loggers) > 1 {
@@ -48,13 +58,15 @@ func NewConfirmTaskKilledUseCase(tasks store.TaskStore, writer contract.Contract
 	if len(loggers) == 1 && loggers[0] != nil {
 		logger = loggers[0]
 	}
-	return &ConfirmTaskKilledUseCase{tasks: tasks, contractW: writer, reader: reader, taskMu: taskMu, timeoutDisarmer: disarmer, pathLockReleaser: pathLocks, slotReleaser: slots, clock: clock, logger: logger}
+	return &ConfirmTaskKilledUseCase{tasks: tasks, contractW: writer, reader: reader, taskMu: taskMu, timeoutDisarmer: disarmer, pathLockReleaser: pathLocks, slotReleaser: slots, metricsRecorder: metricsRecorder, stalledTracker: stalledTracker, clock: clock, logger: logger}
 }
 
 func (uc *ConfirmTaskKilledUseCase) Execute(ctx context.Context, in ConfirmTaskKilledInput) (ConfirmTaskKilledOutput, error) {
 	uc.taskMu.Lock(in.TaskID)
-	result, err := uc.ExecuteLocked(ctx, in)
-	uc.taskMu.Unlock(in.TaskID)
+	result, err := func() (LockedKillResult, error) {
+		defer uc.taskMu.Unlock(in.TaskID)
+		return uc.ExecuteLocked(ctx, in)
+	}()
 	if result.Confirmed {
 		uc.ReleaseAfterConfirmation(ctx, result, in.TaskID)
 	}
@@ -82,15 +94,17 @@ func (uc *ConfirmTaskKilledUseCase) ExecuteLocked(_ context.Context, in ConfirmT
 		return result, fatalErr
 	}
 	if writeErr != nil {
-		return result, fmt.Errorf("%w: exit-code", domain.ErrContractWriteFailed)
+		return result, fmt.Errorf("exit-code: %w", errors.Join(domain.ErrContractWriteFailed, writeErr))
 	}
 	updated, err := snapshot.WithTask(task, in.OccurredAt)
 	if err != nil {
 		return result, err
 	}
 	if err := uc.tasks.Save(in.TaskID, updated); err != nil {
-		return result, fmt.Errorf("%w: task.json", domain.ErrContractWriteFailed)
+		return result, fmt.Errorf("task.json: %w", errors.Join(domain.ErrContractWriteFailed, err))
 	}
+	result.TerminalPersisted = true
+	result.StalledTotalMs = uc.stalledTracker.TakeTotal(in.TaskID)
 	for _, event := range events {
 		if err := uc.contractW.AppendEvent(in.TaskID, event); err != nil {
 			uc.logger.Warn("append killed event failed (retained terminal state)", "task_id", in.TaskID.String(), "event_type", event.Type(), "error", err)
@@ -100,6 +114,16 @@ func (uc *ConfirmTaskKilledUseCase) ExecuteLocked(_ context.Context, in ConfirmT
 }
 
 func (uc *ConfirmTaskKilledUseCase) ReleaseAfterConfirmation(ctx context.Context, result LockedKillResult, taskID domain.TaskID) {
+	if result.TerminalPersisted {
+		for _, event := range result.Output.Events {
+			killed, ok := event.(domain.TaskKilled)
+			if !ok {
+				continue
+			}
+			uc.metricsRecorder.Execute(ctx, metrics.RecordTaskMetricsInput{TaskID: taskID, FinalState: domain.StateKilled, Estimated: killed.Estimated, OccurredAt: killed.OccurredAt, StalledTotalMs: result.StalledTotalMs})
+			break
+		}
+	}
 	uc.timeoutDisarmer.Disarm(taskID)
 	if result.Subcommand == domain.SubcommandImpl {
 		if err := uc.pathLockReleaser.Execute(ctx, ReleasePathLockInput{TaskID: taskID}); err != nil {

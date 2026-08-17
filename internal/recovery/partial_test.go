@@ -47,6 +47,27 @@ func (w *partialTestWriter) WritePartialOutput(_ domain.TaskID, content string) 
 	return w.err
 }
 
+func TestNewSavePartialOutputUseCaseRejectsNilDependencies(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func()
+	}{
+		{"nil reader", func() { NewSavePartialOutputUseCase(nil, &partialTestWriter{}) }},
+		{"typed nil reader", func() { NewSavePartialOutputUseCase((*partialTestReader)(nil), &partialTestWriter{}) }},
+		{"nil contract", func() { NewSavePartialOutputUseCase(&partialTestReader{}, nil) }},
+		{"typed nil contract", func() { NewSavePartialOutputUseCase(&partialTestReader{}, (*partialTestWriter)(nil)) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			tc.build()
+		})
+	}
+}
+
 func TestSavePartialOutputUseCaseExecute(t *testing.T) {
 	validTaskID, err := domain.NewTaskID("impl-20260808-120000-abcd-save-partial")
 	if err != nil {

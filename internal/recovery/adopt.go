@@ -9,6 +9,7 @@ import (
 
 	"github.com/yoshikihorie/codex-runner/internal/contract"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
+	"github.com/yoshikihorie/codex-runner/internal/metrics"
 )
 
 const (
@@ -55,6 +56,7 @@ type PathLockReleaser interface {
 
 type stalledTimeTracker interface {
 	LeaveStalled(domain.TaskID, time.Time) int
+	TakeTotal(domain.TaskID) int
 }
 
 type orphanResumeDispatcher interface {
@@ -84,28 +86,29 @@ type AdoptionOutcome struct {
 // AdoptRunningTasksUseCase re-establishes monitoring for tasks found in
 // non-terminal states after a daemon restart.
 type AdoptRunningTasksUseCase struct {
-	tasks          AdoptionTaskStore
-	liveness       LivenessChecker
-	reader         ContractReader
-	contract       contract.ContractWriter
-	finalizer      OrphanFinalizer
-	resume         *RecoverViaResumeUseCase
-	slots          SlotReleaser
-	resetter       SlotResetter
-	termination    TerminationEnsurer
-	killed         KillConfirmer
-	pathLocks      PathLockReleaser
-	pending        *PendingReconciliationSet
-	taskMu         TaskMutex
-	clock          domain.Clock
-	stalledTracker stalledTimeTracker
-	resumeDispatch orphanResumeDispatcher
-	grace          time.Duration
-	logger         *slog.Logger
+	tasks           AdoptionTaskStore
+	liveness        LivenessChecker
+	reader          ContractReader
+	contract        contract.ContractWriter
+	finalizer       OrphanFinalizer
+	resume          *RecoverViaResumeUseCase
+	slots           SlotReleaser
+	resetter        SlotResetter
+	termination     TerminationEnsurer
+	killed          KillConfirmer
+	pathLocks       PathLockReleaser
+	pending         *PendingReconciliationSet
+	taskMu          TaskMutex
+	clock           domain.Clock
+	stalledTracker  stalledTimeTracker
+	metricsRecorder MetricsRecorder
+	resumeDispatch  orphanResumeDispatcher
+	grace           time.Duration
+	logger          *slog.Logger
 }
 
-func NewAdoptRunningTasksUseCase(tasks AdoptionTaskStore, liveness LivenessChecker, reader ContractReader, writer contract.ContractWriter, finalizer OrphanFinalizer, resume *RecoverViaResumeUseCase, slots SlotReleaser, resetter SlotResetter, termination TerminationEnsurer, killed KillConfirmer, pathLocks PathLockReleaser, pending *PendingReconciliationSet, taskMu TaskMutex, clock domain.Clock, stalledTracker stalledTimeTracker, options ...any) *AdoptRunningTasksUseCase {
-	if isNilAdoptionDependency(tasks) || isNilAdoptionDependency(liveness) || isNilAdoptionDependency(reader) || isNilAdoptionDependency(writer) || isNilAdoptionDependency(finalizer) || isNilAdoptionDependency(resume) || isNilAdoptionDependency(slots) || isNilAdoptionDependency(resetter) || isNilAdoptionDependency(termination) || isNilAdoptionDependency(killed) || isNilAdoptionDependency(pathLocks) || isNilAdoptionDependency(pending) || isNilAdoptionDependency(taskMu) || isNilAdoptionDependency(clock) || isNilAdoptionDependency(stalledTracker) {
+func NewAdoptRunningTasksUseCase(tasks AdoptionTaskStore, liveness LivenessChecker, reader ContractReader, writer contract.ContractWriter, finalizer OrphanFinalizer, resume *RecoverViaResumeUseCase, slots SlotReleaser, resetter SlotResetter, termination TerminationEnsurer, killed KillConfirmer, pathLocks PathLockReleaser, pending *PendingReconciliationSet, taskMu TaskMutex, clock domain.Clock, stalledTracker stalledTimeTracker, metricsRecorder MetricsRecorder, options ...any) *AdoptRunningTasksUseCase {
+	if isNilAdoptionDependency(tasks) || isNilAdoptionDependency(liveness) || isNilAdoptionDependency(reader) || isNilAdoptionDependency(writer) || isNilAdoptionDependency(finalizer) || isNilAdoptionDependency(resume) || isNilAdoptionDependency(slots) || isNilAdoptionDependency(resetter) || isNilAdoptionDependency(termination) || isNilAdoptionDependency(killed) || isNilAdoptionDependency(pathLocks) || isNilAdoptionDependency(pending) || isNilAdoptionDependency(taskMu) || isNilAdoptionDependency(clock) || isNilAdoptionDependency(stalledTracker) || isNilAdoptionDependency(metricsRecorder) {
 		panic("adopt running tasks use case requires non-nil dependencies")
 	}
 	logger := slog.Default()
@@ -131,7 +134,7 @@ func NewAdoptRunningTasksUseCase(tasks AdoptionTaskStore, liveness LivenessCheck
 			panic("adopt running tasks use case received unsupported option")
 		}
 	}
-	return &AdoptRunningTasksUseCase{tasks: tasks, liveness: liveness, reader: reader, contract: writer, finalizer: finalizer, resume: resume, slots: slots, resetter: resetter, termination: termination, killed: killed, pathLocks: pathLocks, pending: pending, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker, resumeDispatch: resumeDispatch, grace: grace, logger: logger}
+	return &AdoptRunningTasksUseCase{tasks: tasks, liveness: liveness, reader: reader, contract: writer, finalizer: finalizer, resume: resume, slots: slots, resetter: resetter, termination: termination, killed: killed, pathLocks: pathLocks, pending: pending, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker, metricsRecorder: metricsRecorder, resumeDispatch: resumeDispatch, grace: grace, logger: logger}
 }
 
 func (uc *AdoptRunningTasksUseCase) Execute(ctx context.Context) (AdoptRunningTasksOutput, error) {
@@ -269,6 +272,15 @@ func (uc *AdoptRunningTasksUseCase) adoptRecovering(ctx context.Context, taskID 
 		return adoptionOutcomeError
 	}
 	uc.taskMu.Unlock(taskID)
+	finalState := domain.StateRecovered
+	if !present {
+		finalState = domain.StateLost
+		if snapshot.RecoveryOrigin != nil && *snapshot.RecoveryOrigin == domain.RecoveryOriginTimeout {
+			finalState = domain.StateTimeoutLost
+		}
+	}
+	stalledTotal := uc.stalledTracker.TakeTotal(taskID)
+	uc.metricsRecorder.Execute(ctx, metrics.RecordTaskMetricsInput{TaskID: taskID, FinalState: finalState, Estimated: true, OccurredAt: occurredAt, StalledTotalMs: stalledTotal})
 	uc.slots.ReleaseAndAdvance(ctx, taskID, uc.clock.Now())
 	if present {
 		return adoptionOutcomeOrphanRecovered

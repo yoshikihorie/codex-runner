@@ -68,9 +68,9 @@ func TestTimeoutRecoveryIntegrationNilSessionTransitionsToTimeoutLost(t *testing
 	recoverer := &timeoutRecoveryIntegrationRecoverer{}
 	metricsRecorder := &timeoutRecoveryIntegrationMetrics{}
 	slots := &timeoutRecoveryIntegrationSlots{}
-	recoveryUseCase := recovery.NewRecoverViaResumeUseCase(tasks, writer, recoverer, recovery.NewSavePartialOutputUseCase(reader, writer), slots, metricsRecorder, sharedMutex, domain.ClockFunc(func() time.Time { return now }))
-	proc := &timeoutProcessFake{}
 	stalledTracker := &metrics.StalledTimeTracker{}
+	recoveryUseCase := recovery.NewRecoverViaResumeUseCase(tasks, writer, recoverer, recovery.NewSavePartialOutputUseCase(reader, writer), slots, metricsRecorder, stalledTracker, sharedMutex, domain.ClockFunc(func() time.Time { return now }))
+	proc := &timeoutProcessFake{}
 	liveness := NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }), func(domain.TaskID) string { return filepath.Join(root, "unused.lock") })
 	enforce := NewEnforceTaskTimeoutUseCase(tasks, writer, proc, recoveryUseCase, NewTerminationEnsurer(liveness, proc, domain.ClockFunc(func() time.Time { return now }), func(context.Context, time.Duration) {}), &recovery.PendingReconciliationSet{}, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), sharedMutex, domain.ClockFunc(func() time.Time { return now }), stalledTracker)
 	if _, err := enforce.Execute(context.Background(), EnforceTaskTimeoutInput{TaskID: id, ResolvedTimeoutSeconds: 1800, OccurredAt: now}); err != nil {

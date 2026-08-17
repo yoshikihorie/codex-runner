@@ -113,6 +113,42 @@ func TestSlotFinalizerLogsAdvanceErrorAndDoesNotStartLifecycle(t *testing.T) {
 	}
 }
 
+func TestSlotFinalizerDoesNotStartLifecycleAfterAdvanceCancellation(t *testing.T) {
+	payload := advanceQueuedPayload(t, "slot-cancel")
+	queue := &advanceQueueFake{payloads: []execution.TaskLaunchPayload{payload}}
+	registry := &advanceRegistryFake{ids: map[domain.TaskID]struct{}{}}
+	launching := &advanceLaunchingFake{snapshots: map[domain.TaskID]domain.TaskSnapshot{}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	registry.removeHook = cancel
+	starter := &lifecycleStarterFake{accepted: true}
+
+	NewSlotReleaser(NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1), starter).ReleaseAndAdvance(ctx, domain.TaskID{}, time.Now())
+	if len(starter.started) != 0 || queue.dequeueCalls != 0 || registry.addCalls != 0 || launching.registerCalls != 0 {
+		t.Fatalf("starts=%d dequeue=%d add=%d register=%d", len(starter.started), queue.dequeueCalls, registry.addCalls, launching.registerCalls)
+	}
+}
+
+func TestNewSlotReleaserRejectsNilStarter(t *testing.T) {
+	advance := NewAdvanceQueueUseCase(execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1)
+	for _, tc := range []struct {
+		name    string
+		starter execution.TaskLifecycleStarter
+	}{
+		{"nil-interface", nil},
+		{"typed-nil", (*lifecycleStarterFake)(nil)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if got := recover(); got != "slot releaser requires non-nil dependencies" {
+					t.Fatalf("panic=%v", got)
+				}
+			}()
+			NewSlotReleaser(advance, tc.starter)
+		})
+	}
+}
+
 func TestSlotFinalizerRunnerReceivesOnlyBaseContextValues(t *testing.T) {
 	type key string
 	baseCtx := context.WithValue(context.Background(), key("base"), "base-value")

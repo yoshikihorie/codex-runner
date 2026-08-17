@@ -21,7 +21,7 @@ type slotFinalizer struct {
 }
 
 func NewSlotReleaser(advance *AdvanceQueueUseCase, starter execution.TaskLifecycleStarter, loggers ...*slog.Logger) recovery.SlotReleaser {
-	if advance == nil || starter == nil {
+	if advance == nil || isNilValue(starter) {
 		panic("slot releaser requires non-nil dependencies")
 	}
 	if len(loggers) > 1 {

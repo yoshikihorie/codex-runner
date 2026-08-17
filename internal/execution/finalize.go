@@ -96,7 +96,9 @@ func (f *contractWriteFailure) Error() string {
 	return fmt.Sprintf("%s write failed (%s attempt): %v", f.stage, f.attempt, f.cause)
 }
 
-func (f *contractWriteFailure) Unwrap() error { return domain.ErrContractWriteFailed }
+func (f *contractWriteFailure) Unwrap() []error {
+	return []error{domain.ErrContractWriteFailed, f.cause}
+}
 
 // Prepare reads terminal artifacts before taskMu is acquired.
 func (uc *FinalizeTaskUseCase) Prepare(in FinalizeTaskInput) (PreparedFinalizeTask, error) {
@@ -169,28 +171,28 @@ func (uc *FinalizeTaskUseCase) executeLocked(in FinalizeTaskInput, present bool)
 	uc.logStructuredContractFailure(in.TaskID, writeFail)
 	retrySnapshot, loadErr := uc.tasks.Load(in.TaskID)
 	if loadErr != nil {
-		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: task.State(), Events: events, ContractWriteError: writeFail}, RecordExited: true}, fmt.Errorf("reload for failsafe: %w", loadErr)
+		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: task.State(), Events: events, ContractWriteError: writeFail}, RecordExited: true}, fmt.Errorf("reload for failsafe: %w", errors.Join(writeFail, loadErr))
 	}
 	retryTask, restoreErr := retrySnapshot.Restore()
 	if restoreErr != nil {
-		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: task.State(), Events: events, ContractWriteError: writeFail}, RecordExited: true}, fmt.Errorf("restore for failsafe: %w", restoreErr)
+		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: task.State(), Events: events, ContractWriteError: writeFail}, RecordExited: true}, fmt.Errorf("restore for failsafe: %w", errors.Join(writeFail, restoreErr))
 	}
 	retryPreviousState := retryTask.State()
 	retryEvents, recordErr := retryTask.RecordExit(exitCode, false, in.Estimated, in.AdoptedAfterRestart, in.OccurredAt)
 	if recordErr != nil {
-		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: task.State(), Events: events, ContractWriteError: writeFail}, RecordExited: true}, fmt.Errorf("record exit for failsafe: %w", recordErr)
+		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: task.State(), Events: events, ContractWriteError: writeFail}, RecordExited: true}, fmt.Errorf("record exit for failsafe: %w", errors.Join(writeFail, recordErr))
 	}
 
 	retryWriteFail, retryNonRetryable, retryPersisted := uc.writeTerminalState(in.TaskID, exitCode, retryTask, retrySnapshot, retryEvents, in.OccurredAt, "retry")
 	if retryNonRetryable != nil {
-		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}, RecordExited: true}, retryNonRetryable
+		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}, RecordExited: true}, errors.Join(writeFail, retryNonRetryable)
 	}
 	if retryPersisted {
 		return uc.persistedFinalizeResult(in.TaskID, retryPreviousState, retryTask.State(), retryEvents, in.OccurredAt, FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}), nil
 	}
 	if retryWriteFail != nil {
 		uc.logStructuredContractFailure(in.TaskID, retryWriteFail)
-		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}, RecordExited: true}, retryWriteFail
+		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}, RecordExited: true}, errors.Join(writeFail, retryWriteFail)
 	}
 	return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}, RecordExited: true}, nil
 }

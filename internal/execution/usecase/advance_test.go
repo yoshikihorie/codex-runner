@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
 	"time"
@@ -12,8 +13,10 @@ import (
 
 type advanceQueueFake struct {
 	payloads     []execution.TaskLaunchPayload
+	dequeueCalls int
 	prependCalls int
 	reindexCalls int
+	dequeueHook  func()
 }
 
 func (q *advanceQueueFake) Enqueue(payload execution.TaskLaunchPayload) int {
@@ -21,11 +24,15 @@ func (q *advanceQueueFake) Enqueue(payload execution.TaskLaunchPayload) int {
 	return len(q.payloads)
 }
 func (q *advanceQueueFake) Dequeue() (execution.TaskLaunchPayload, bool) {
+	q.dequeueCalls++
 	if len(q.payloads) == 0 {
 		return execution.TaskLaunchPayload{}, false
 	}
 	payload := q.payloads[0]
 	q.payloads = q.payloads[1:]
+	if q.dequeueHook != nil {
+		q.dequeueHook()
+	}
 	return payload, true
 }
 func (q *advanceQueueFake) Prepend(payload execution.TaskLaunchPayload) {
@@ -54,16 +61,53 @@ type advanceRegistryFake struct {
 	ids         map[domain.TaskID]struct{}
 	addCalls    int
 	removeCalls int
+	addHook     func()
+	removeHook  func()
 }
 
-func (r *advanceRegistryFake) Size() int               { return len(r.ids) }
-func (r *advanceRegistryFake) Add(id domain.TaskID)    { r.addCalls++; r.ids[id] = struct{}{} }
-func (r *advanceRegistryFake) Remove(id domain.TaskID) { r.removeCalls++; delete(r.ids, id) }
+func (r *advanceRegistryFake) Size() int { return len(r.ids) }
+func (r *advanceRegistryFake) Add(id domain.TaskID) {
+	r.addCalls++
+	r.ids[id] = struct{}{}
+	if r.addHook != nil {
+		r.addHook()
+	}
+}
+func (r *advanceRegistryFake) Remove(id domain.TaskID) {
+	r.removeCalls++
+	delete(r.ids, id)
+	if r.removeHook != nil {
+		r.removeHook()
+	}
+}
 func (r *advanceRegistryFake) Reset(ids []domain.TaskID) {
 	r.ids = make(map[domain.TaskID]struct{}, len(ids))
 	for _, id := range ids {
 		r.ids[id] = struct{}{}
 	}
+}
+
+type advanceLaunchingFake struct {
+	snapshots       map[domain.TaskID]domain.TaskSnapshot
+	registerCalls   int
+	unregisterCalls int
+	registerHook    func()
+}
+
+func (r *advanceLaunchingFake) Register(id domain.TaskID, snapshot domain.TaskSnapshot) {
+	r.registerCalls++
+	r.snapshots[id] = snapshot
+	if r.registerHook != nil {
+		r.registerHook()
+	}
+}
+func (r *advanceLaunchingFake) Unregister(id domain.TaskID) {
+	r.unregisterCalls++
+	delete(r.snapshots, id)
+}
+func (r *advanceLaunchingFake) Lookup(id domain.TaskID) (domain.TaskSnapshot, bool) {
+	snapshot, ok := r.snapshots[id]
+	return snapshot, ok
 }
 
 func TestAdvanceQueueUseCaseDequeuesFIFOAndReleasesSlot(t *testing.T) {
@@ -146,6 +190,80 @@ func TestAdvanceQueueRestoresPayloadWhenSnapshotConstructionFails(t *testing.T) 
 	}
 	if snapshot, registered := launching.Lookup(payload.Task.ID()); registered || snapshot != (domain.TaskSnapshot{}) {
 		t.Fatalf("snapshot=%#v registered=%t", snapshot, registered)
+	}
+}
+
+func TestAdvanceQueueUseCaseCancellationCompensatesEachPromotionCheckpoint(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		slug   string
+		cancel func(context.CancelFunc, *advanceQueueFake, *advanceRegistryFake, *advanceLaunchingFake)
+		check  func(*testing.T, execution.TaskLaunchPayload, *advanceQueueFake, *advanceRegistryFake, *advanceLaunchingFake)
+	}{
+		{
+			name: "after-remove-before-dequeue",
+			slug: "rm",
+			cancel: func(cancel context.CancelFunc, _ *advanceQueueFake, registry *advanceRegistryFake, _ *advanceLaunchingFake) {
+				registry.removeHook = cancel
+			},
+			check: func(t *testing.T, payload execution.TaskLaunchPayload, queue *advanceQueueFake, registry *advanceRegistryFake, launching *advanceLaunchingFake) {
+				if queue.dequeueCalls != 0 || registry.addCalls != 0 || launching.registerCalls != 0 || len(queue.payloads) != 1 || queue.payloads[0].Task.ID() != payload.Task.ID() {
+					t.Fatalf("dequeue=%d add=%d register=%d queue=%#v", queue.dequeueCalls, registry.addCalls, launching.registerCalls, queue.payloads)
+				}
+			},
+		},
+		{
+			name: "after-dequeue",
+			slug: "dq",
+			cancel: func(cancel context.CancelFunc, queue *advanceQueueFake, _ *advanceRegistryFake, _ *advanceLaunchingFake) {
+				queue.dequeueHook = cancel
+			},
+			check: func(t *testing.T, payload execution.TaskLaunchPayload, queue *advanceQueueFake, registry *advanceRegistryFake, launching *advanceLaunchingFake) {
+				if queue.prependCalls != 1 || queue.reindexCalls != 0 || registry.addCalls != 0 || launching.registerCalls != 0 || len(queue.payloads) != 1 || queue.payloads[0].Task.ID() != payload.Task.ID() {
+					t.Fatalf("prepend=%d reindex=%d add=%d register=%d queue=%#v", queue.prependCalls, queue.reindexCalls, registry.addCalls, launching.registerCalls, queue.payloads)
+				}
+			},
+		},
+		{
+			name: "after-add",
+			slug: "add",
+			cancel: func(cancel context.CancelFunc, _ *advanceQueueFake, registry *advanceRegistryFake, _ *advanceLaunchingFake) {
+				registry.addHook = cancel
+			},
+			check: func(t *testing.T, payload execution.TaskLaunchPayload, queue *advanceQueueFake, registry *advanceRegistryFake, launching *advanceLaunchingFake) {
+				if queue.prependCalls != 1 || queue.reindexCalls != 1 || registry.removeCalls != 2 || registry.addCalls != 1 || launching.registerCalls != 0 || registry.Size() != 0 || len(queue.payloads) != 1 || queue.payloads[0].Task.ID() != payload.Task.ID() {
+					t.Fatalf("prepend=%d reindex=%d remove=%d add=%d register=%d registry=%d queue=%#v", queue.prependCalls, queue.reindexCalls, registry.removeCalls, registry.addCalls, launching.registerCalls, registry.Size(), queue.payloads)
+				}
+			},
+		},
+		{
+			name: "after-register",
+			slug: "reg",
+			cancel: func(cancel context.CancelFunc, _ *advanceQueueFake, _ *advanceRegistryFake, launching *advanceLaunchingFake) {
+				launching.registerHook = cancel
+			},
+			check: func(t *testing.T, payload execution.TaskLaunchPayload, queue *advanceQueueFake, registry *advanceRegistryFake, launching *advanceLaunchingFake) {
+				if queue.prependCalls != 1 || queue.reindexCalls != 1 || registry.removeCalls != 2 || registry.addCalls != 1 || launching.registerCalls != 1 || launching.unregisterCalls != 1 || registry.Size() != 0 || len(launching.snapshots) != 0 || len(queue.payloads) != 1 || queue.payloads[0].Task.ID() != payload.Task.ID() {
+					t.Fatalf("prepend=%d reindex=%d remove=%d add=%d register=%d unregister=%d registry=%d launching=%#v queue=%#v", queue.prependCalls, queue.reindexCalls, registry.removeCalls, registry.addCalls, launching.registerCalls, launching.unregisterCalls, registry.Size(), launching.snapshots, queue.payloads)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := advanceQueuedPayload(t, "advance-cancel-"+tc.slug)
+			queue := &advanceQueueFake{payloads: []execution.TaskLaunchPayload{payload}}
+			registry := &advanceRegistryFake{ids: map[domain.TaskID]struct{}{}}
+			launching := &advanceLaunchingFake{snapshots: map[domain.TaskID]domain.TaskSnapshot{}}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			tc.cancel(cancel, queue, registry, launching)
+
+			got, found, err := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1).Execute(ctx, domain.TaskID{}, time.Now())
+			if !errors.Is(err, context.Canceled) || found || got.Task != nil {
+				t.Fatalf("payload=%#v found=%t err=%v", got, found, err)
+			}
+			tc.check(t, payload, queue, registry, launching)
+		})
 	}
 }
 

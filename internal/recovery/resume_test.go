@@ -100,6 +100,32 @@ func TestResumeRecovererAllowsNilSessionRef(t *testing.T) {
 	}
 }
 
+func TestNewResumeRecovererRejectsTypedNilDependencies(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func()
+	}{
+		{"launcher", func() {
+			NewResumeRecoverer((*resumeLauncherFake)(nil), &resumeReaderFake{}, "/usr/local/bin/codex", domain.ClockFunc(time.Now))
+		}},
+		{"reader", func() {
+			NewResumeRecoverer(&resumeLauncherFake{}, (*resumeReaderFake)(nil), "/usr/local/bin/codex", domain.ClockFunc(time.Now))
+		}},
+		{"clock", func() {
+			NewResumeRecoverer(&resumeLauncherFake{}, &resumeReaderFake{}, "/usr/local/bin/codex", (domain.ClockFunc)(nil))
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			tc.build()
+		})
+	}
+}
+
 func recoveryEvent[T domain.Event](t *testing.T, events []domain.Event) T {
 	t.Helper()
 	for _, event := range events {
@@ -124,6 +150,7 @@ type recovererFake struct {
 	calls  int
 	origin domain.RecoveryOrigin
 	mutex  *recoveryMutexFake
+	cancel context.CancelFunc
 }
 
 func (f *recovererFake) Resume(_ context.Context, _ domain.TaskID, _ *domain.SessionRef, origin domain.RecoveryOrigin) (RecoveryResult, error) {
@@ -132,14 +159,18 @@ func (f *recovererFake) Resume(_ context.Context, _ domain.TaskID, _ *domain.Ses
 	}
 	f.calls++
 	f.origin = origin
+	if f.cancel != nil {
+		f.cancel()
+	}
 	return f.result, f.err
 }
 
 type recoveryStoreFake struct {
-	snapshot domain.TaskSnapshot
-	loads    int
-	saves    int
-	saveErr  error
+	snapshot  domain.TaskSnapshot
+	loads     int
+	saves     int
+	saveErr   error
+	saveErrOn int
 }
 
 func (f *recoveryStoreFake) Load(domain.TaskID) (domain.TaskSnapshot, error) {
@@ -149,8 +180,11 @@ func (f *recoveryStoreFake) Load(domain.TaskID) (domain.TaskSnapshot, error) {
 
 func (f *recoveryStoreFake) Save(_ domain.TaskID, snapshot domain.TaskSnapshot) error {
 	f.saves++
+	if f.saveErrOn == f.saves {
+		return f.saveErr
+	}
 	f.snapshot = snapshot
-	return f.saveErr
+	return nil
 }
 
 type recoveryWriterFake struct {
@@ -189,21 +223,43 @@ func (f *recoveryWriterFake) AppendEvent(_ domain.TaskID, event domain.Event) er
 
 type recoveryMetricsFake struct {
 	inputs []metrics.RecordTaskMetricsInput
+	record metrics.RecordTaskMetricsOutput
+	ctxErr error
 }
 
-func (f *recoveryMetricsFake) Execute(_ context.Context, in metrics.RecordTaskMetricsInput) metrics.RecordTaskMetricsOutput {
+func (f *recoveryMetricsFake) Execute(ctx context.Context, in metrics.RecordTaskMetricsInput) metrics.RecordTaskMetricsOutput {
 	f.inputs = append(f.inputs, in)
-	return metrics.RecordTaskMetricsOutput{Recorded: true}
+	f.ctxErr = ctx.Err()
+	return f.record
+}
+
+type recoveryStalledTrackerFake struct {
+	calls  int
+	taskID domain.TaskID
+	total  int
+	trace  *[]string
+}
+
+func (f *recoveryStalledTrackerFake) LeaveStalled(domain.TaskID, time.Time) int { return 0 }
+func (f *recoveryStalledTrackerFake) TakeTotal(taskID domain.TaskID) int {
+	f.calls++
+	f.taskID = taskID
+	if f.trace != nil {
+		*f.trace = append(*f.trace, "take")
+	}
+	return f.total
 }
 
 type recoverySlotFake struct {
-	calls int
-	at    time.Time
+	calls  int
+	at     time.Time
+	ctxErr error
 }
 
-func (f *recoverySlotFake) ReleaseAndAdvance(_ context.Context, _ domain.TaskID, at time.Time) {
+func (f *recoverySlotFake) ReleaseAndAdvance(ctx context.Context, _ domain.TaskID, at time.Time) {
 	f.calls++
 	f.at = at
+	f.ctxErr = ctx.Err()
 }
 
 type recoveryMutexFake struct {
@@ -311,14 +367,91 @@ func newRecoveryUseCaseFixture(t *testing.T, state domain.TaskState, session *do
 	mutex := &recoveryMutexFake{}
 	recoverer := &recovererFake{result: result, mutex: mutex}
 	metricsRecorder := &recoveryMetricsFake{}
+	tracker := &recoveryStalledTrackerFake{total: 41}
 	slots := &recoverySlotFake{}
 	clock := &recoveryClockFake{values: []time.Time{
 		time.Date(2026, 8, 13, 12, 1, 0, 0, time.UTC),
 		time.Date(2026, 8, 13, 12, 2, 0, 0, time.UTC),
 	}}
 	partial := NewSavePartialOutputUseCase(writer, writer)
-	uc := NewRecoverViaResumeUseCase(store, writer, recoverer, partial, slots, metricsRecorder, mutex, clock)
+	uc := NewRecoverViaResumeUseCase(store, writer, recoverer, partial, slots, metricsRecorder, tracker, mutex, clock)
 	return uc, store, writer, recoverer, metricsRecorder, slots, mutex
+}
+
+func TestRecoverViaResumeUseCaseTakesStalledTotalForEveryTerminal(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		state     domain.TaskState
+		session   bool
+		result    RecoveryResult
+		wantState domain.TaskState
+		saveErr   error
+		recorded  bool
+	}{
+		{"recovered", domain.StateTimeout, true, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)}, domain.StateRecovered, nil, true},
+		{"timeout lost", domain.StateTimeout, false, RecoveryResult{}, domain.StateTimeoutLost, nil, true},
+		{"lost", domain.StateOrphaned, true, RecoveryResult{ExitCode: domain.NewExitCode(1)}, domain.StateLost, nil, true},
+		{"terminal save failure", domain.StateTimeout, true, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)}, domain.StateRecovered, errors.New("save"), true},
+		{"metrics fail soft", domain.StateOrphaned, true, RecoveryResult{ExitCode: domain.NewExitCode(1)}, domain.StateLost, nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var session *domain.SessionRef
+			if tc.session {
+				value := recoveryTestSession(t)
+				session = &value
+			}
+			uc, store, _, _, recorder, slots, _ := newRecoveryUseCaseFixture(t, tc.state, session, tc.result)
+			store.saveErr, store.saveErrOn = tc.saveErr, 2
+			out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: session, Origin: map[domain.TaskState]domain.RecoveryOrigin{domain.StateTimeout: domain.RecoveryOriginTimeout, domain.StateOrphaned: domain.RecoveryOriginOrphan}[tc.state], OccurredAt: time.Now()})
+			if err != nil || out.FinalState != tc.wantState || len(recorder.inputs) != 1 || !recorder.inputs[0].Estimated || recorder.inputs[0].StalledTotalMs != 41 || slots.calls != 1 {
+				t.Fatalf("out=(%+v,%v) metrics=%+v slots=%d", out, err, recorder.inputs, slots.calls)
+			}
+		})
+	}
+}
+
+func TestRecoverViaResumeUseCaseCompletesTerminalCleanupAfterContextCancellation(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, store, _, recoverer, recorder, slots, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	ctx, cancel := context.WithCancel(context.Background())
+	recoverer.cancel = cancel
+
+	out, err := uc.Execute(ctx, RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
+	if err != nil || out.FinalState != domain.StateRecovered || store.snapshot.State != domain.StateRecovered {
+		t.Fatalf("out=(%+v, %v) snapshot=%#v", out, err, store.snapshot)
+	}
+	if len(recorder.inputs) != 1 || recorder.ctxErr != nil || slots.calls != 1 || slots.ctxErr != nil {
+		t.Fatalf("metrics=%+v metrics_ctx_err=%v slots=%d slot_ctx_err=%v", recorder.inputs, recorder.ctxErr, slots.calls, slots.ctxErr)
+	}
+}
+
+func TestRecoverViaResumeUseCaseSavesPartialOutputAfterContextCancellation(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, store, writer, recoverer, recorder, slots, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{ExitCode: domain.NewExitCode(1)})
+	writer.stderr = []byte("incomplete output")
+	ctx, cancel := context.WithCancel(context.Background())
+	recoverer.cancel = cancel
+
+	out, err := uc.Execute(ctx, RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
+	if err != nil || out.FinalState != domain.StateTimeoutLost || !out.PartialOutputSaved || store.snapshot.State != domain.StateTimeoutLost {
+		t.Fatalf("out=(%+v, %v) snapshot=%#v", out, err, store.snapshot)
+	}
+	if writer.partialCalls != 1 || len(recorder.inputs) != 1 || recorder.ctxErr != nil || slots.calls != 1 || slots.ctxErr != nil {
+		t.Fatalf("partial=%d metrics=%+v metrics_ctx_err=%v slots=%d slot_ctx_err=%v", writer.partialCalls, recorder.inputs, recorder.ctxErr, slots.calls, slots.ctxErr)
+	}
+}
+
+func TestRecoverViaResumeUseCaseRejectsNilStalledTracker(t *testing.T) {
+	for _, tracker := range []stalledTimeTracker{nil, (*recoveryStalledTrackerFake)(nil)} {
+		t.Run("nil", func(t *testing.T) {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			NewRecoverViaResumeUseCase(&recoveryStoreFake{}, &recoveryWriterFake{}, &recovererFake{}, NewSavePartialOutputUseCase(&recoveryWriterFake{}, &recoveryWriterFake{}), &recoverySlotFake{}, &recoveryMetricsFake{}, tracker, &recoveryMutexFake{}, domain.ClockFunc(time.Now))
+		})
+	}
 }
 
 func TestRecoverViaResumeUseCaseTimeoutSuccess(t *testing.T) {
