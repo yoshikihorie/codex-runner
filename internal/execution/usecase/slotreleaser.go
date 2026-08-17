@@ -35,7 +35,7 @@ func NewSlotReleaser(advance *AdvanceQueueUseCase, starter execution.TaskLifecyc
 }
 
 func (f *slotFinalizer) ReleaseAndAdvance(ctx context.Context, taskID domain.TaskID, now time.Time) {
-	payload, found, err := f.advance.Execute(ctx, taskID, now)
+	payload, id, found, err := f.advance.Execute(ctx, taskID, now)
 	if err != nil {
 		f.logger.Warn("advance queue after releasing slot", "task_id", taskID.String(), "error", err)
 		return
@@ -43,7 +43,11 @@ func (f *slotFinalizer) ReleaseAndAdvance(ctx context.Context, taskID domain.Tas
 	if !found {
 		return
 	}
-	f.starter.Start(payload)
+	if !f.starter.Start(payload) {
+		f.advance.CompensateRejectedStart(payload, id, now)
+		return
+	}
+	f.advance.CommitStart(payload, id)
 }
 
 var _ recovery.SlotReleaser = (*slotFinalizer)(nil)

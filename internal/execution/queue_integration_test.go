@@ -20,9 +20,12 @@ import (
 
 type queueIntegrationStarter struct{ payloads []execution.TaskLaunchPayload }
 
-func (s *queueIntegrationStarter) Start(payload execution.TaskLaunchPayload) {
+func (s *queueIntegrationStarter) Start(payload execution.TaskLaunchPayload) bool {
 	s.payloads = append(s.payloads, cloneLaunchPayload(payload))
+	return true
 }
+
+func (*queueIntegrationStarter) Shutdown(context.Context) {}
 
 type queueIntegrationOptions struct {
 	model  string
@@ -50,6 +53,10 @@ func (a *recordingAdmitter) Admit(input execution.TaskAdmissionInput) (execution
 	result, err := a.inner.Admit(input)
 	a.records = append(a.records, recordedAdmission{input: cloneAdmissionInput(input), result: cloneAdmissionResult(result)})
 	return result, err
+}
+
+func (a *recordingAdmitter) CompensateRejectedStart(taskID domain.TaskID) error {
+	return a.inner.CompensateRejectedStart(taskID)
 }
 
 type queueIntegrationFixture struct {

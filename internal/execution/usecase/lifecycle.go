@@ -122,9 +122,16 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 	defer release()
 	defer o.deps.Launching.Unregister(taskID)
 
+	if o.stopForCancellation(ctx, input) {
+		return
+	}
 	lock, err := o.deps.AcquireForChild(input.TaskDirPath)
 	if err != nil {
 		o.fail(ctx, input)
+		return
+	}
+	if o.stopForCancellation(ctx, input) {
+		_ = lock.Close()
 		return
 	}
 	if err = o.deps.RecordStarting.Execute(ctx, input.Task, input.ResolvedTimeout, input.Model, input.ReasoningEffort, domain.ExecutionRouteDaemon, input.PromptText, input.Now); err != nil {
@@ -137,6 +144,10 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		if isNilValue(o.deps.CreateWorktree) {
 			_ = lock.Close()
 			o.fail(ctx, input)
+			return
+		}
+		if o.stopForCancellation(ctx, input) {
+			_ = lock.Close()
 			return
 		}
 		out, createErr := o.deps.CreateWorktree.Execute(ctx, execution.CreateWorktreeInput{TaskID: taskID, SourceWorkingDir: input.SourceWorkingDir})
@@ -156,9 +167,17 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		_ = lock.Close()
 		return
 	}
+	if o.stopForCancellation(ctx, input) {
+		_ = lock.Close()
+		return
+	}
 	launched, err := o.deps.Launch.Execute(ctx, execution.LaunchParams{TaskID: taskID, Subcommand: input.Task.Subcommand(), Model: input.Model, SandboxMode: input.SandboxMode, WorkingDir: *workingDir, PromptText: input.PromptText, TaskDirPath: input.TaskDirPath, AllowResume: true, LivenessLockFile: lock, PTYEnabled: o.launchConfig.PTYEnabled, CodexBinaryPath: o.launchConfig.CodexBinaryPath, ReasoningEffort: input.ReasoningEffort})
 	if err != nil || launched == nil || launched.Handle == nil || launched.Waiter == nil {
 		o.fail(ctx, input)
+		return
+	}
+	if ctx.Err() != nil {
+		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true)
 		return
 	}
 	cancelling, recordErr := o.recordProcessAtLaunchBoundary(ctx, input, launched)
@@ -168,6 +187,10 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 	}
 	if recordErr != nil {
 		o.handleRecordProcessFailure(ctx, input, launched)
+		return
+	}
+	if ctx.Err() != nil {
+		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true)
 		return
 	}
 	confirmed, err := o.deps.ConfirmRunning.Execute(ctx, taskID, input.Now)
@@ -186,8 +209,24 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		return
 	}
 	deadline := launched.Handle.ProcessStartedAt.Add(time.Duration(input.ResolvedTimeout.ResolvedSeconds()) * time.Second)
+	if ctx.Err() != nil {
+		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true)
+		return
+	}
 	o.deps.TimeoutArmer.Arm(taskID, deadline, input.ResolvedTimeout.ResolvedSeconds())
+	if ctx.Err() != nil {
+		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true)
+		return
+	}
 	o.monitorAndFinalize(ctx, input, launched)
+}
+
+func (o *TaskLifecycleOrchestrator) stopForCancellation(ctx context.Context, input TaskLifecycleInput) bool {
+	if ctx.Err() == nil {
+		return false
+	}
+	o.fail(context.WithoutCancel(ctx), input)
+	return true
 }
 
 func (o *TaskLifecycleOrchestrator) recordProcessAtLaunchBoundary(ctx context.Context, input TaskLifecycleInput, launched *execution.LaunchedProcess) (bool, error) {

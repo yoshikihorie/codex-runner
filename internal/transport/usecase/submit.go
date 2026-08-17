@@ -31,6 +31,7 @@ type SubmitPathLockReleaser interface {
 }
 type TaskAdmitter interface {
 	Admit(execution.TaskAdmissionInput) (execution.TaskAdmissionResult, error)
+	CompensateRejectedStart(domain.TaskID) error
 }
 type TaskOptionResolver interface {
 	ResolveModel(domain.Subcommand, *string) (string, bool)
@@ -95,9 +96,11 @@ type submitWireInput struct {
 type submitError struct {
 	code, message string
 	detail        map[string]any
+	cause         error
 }
 
 func (e *submitError) Error() string { return e.code }
+func (e *submitError) Unwrap() error { return e.cause }
 
 func submitFailure(code, message string, detail map[string]any) error {
 	return &submitError{code: code, message: message, detail: detail}
@@ -195,7 +198,18 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 		return SubmitTaskOutput{}, err
 	}
 	if result.LaunchPayload != nil {
-		uc.starter.Start(*result.LaunchPayload)
+		if !uc.starter.Start(*result.LaunchPayload) {
+			if cleanupErr := uc.admitter.CompensateRejectedStart(id); cleanupErr != nil {
+				uc.logger.Error("compensate rejected lifecycle start", "task_id", id.String(), "error", execution.ErrorTypeName(cleanupErr))
+			}
+			if acquired {
+				if cleanupErr := uc.pathLockReleaser.Release(context.WithoutCancel(ctx), id); cleanupErr != nil {
+					uc.logger.Error("release path lock after rejected lifecycle start", "task_id", id.String(), "error", execution.ErrorTypeName(cleanupErr))
+				}
+			}
+			uc.releaseReservation(id)
+			return SubmitTaskOutput{}, &submitError{code: "TASK_DIR_CREATE_FAILED", message: "error.taskDir.createFailed", cause: context.Canceled}
+		}
 	}
 	return SubmitTaskOutput{TaskID: id, State: domain.StateQueued, QueuePosition: result.QueuePosition, Events: result.Events}, nil
 }

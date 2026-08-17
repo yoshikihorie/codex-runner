@@ -18,6 +18,33 @@ type lifecycleRunnerFake struct {
 	input  TaskLifecycleInput
 }
 
+type lifecycleStarterFake struct {
+	started  []execution.TaskLaunchPayload
+	accepted bool
+}
+
+func (f *lifecycleStarterFake) Start(payload execution.TaskLaunchPayload) bool {
+	f.started = append(f.started, payload)
+	return f.accepted
+}
+
+func TestSlotFinalizerCommitsAcceptedStart(t *testing.T) {
+	payload := advanceQueuedPayload(t, "slot-commit")
+	queue := &advanceQueueFake{payloads: []execution.TaskLaunchPayload{payload}}
+	registry := &advanceRegistryFake{ids: map[domain.TaskID]struct{}{}}
+	launching := execution.NewLaunchingTaskRegistry()
+	advance := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1)
+	starter := &lifecycleStarterFake{accepted: true}
+
+	NewSlotReleaser(advance, starter).ReleaseAndAdvance(context.Background(), domain.TaskID{}, time.Now())
+	if len(starter.started) != 1 {
+		t.Fatalf("starts=%d", len(starter.started))
+	}
+	if _, promoted := advance.promotions[payload.Task.ID()]; promoted {
+		t.Fatal("promotion remained after accepted start")
+	}
+}
+
 func (f *lifecycleRunnerFake) Run(ctx context.Context, input TaskLifecycleInput) {
 	f.ctx, f.input = ctx, input
 	close(f.called)

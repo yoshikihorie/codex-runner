@@ -11,6 +11,7 @@ import (
 
 	"github.com/yoshikihorie/codex-runner/internal/contract"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
+	"github.com/yoshikihorie/codex-runner/internal/metrics"
 	"github.com/yoshikihorie/codex-runner/internal/recovery"
 	"github.com/yoshikihorie/codex-runner/internal/store"
 )
@@ -216,6 +217,57 @@ func (f *finalizeTimeoutFake) snapshot() (int, domain.TaskID) {
 
 var _ TimeoutDisarmer = (*finalizeTimeoutFake)(nil)
 
+type finalizeStalledTrackerFake struct {
+	mu         sync.Mutex
+	trace      *finalizeTrace
+	leaveCalls int
+	takeCalls  int
+	total      int
+}
+
+func (f *finalizeStalledTrackerFake) LeaveStalled(domain.TaskID, time.Time) int {
+	f.trace.add("leave-stalled")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.leaveCalls++
+	return f.total
+}
+
+func (f *finalizeStalledTrackerFake) TakeTotal(domain.TaskID) int {
+	f.trace.add("take-total")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.takeCalls++
+	return f.total
+}
+
+func (f *finalizeStalledTrackerFake) snapshot() (int, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.leaveCalls, f.takeCalls
+}
+
+type finalizeMetricsFake struct {
+	mu     sync.Mutex
+	trace  *finalizeTrace
+	inputs []metrics.RecordTaskMetricsInput
+	output metrics.RecordTaskMetricsOutput
+}
+
+func (f *finalizeMetricsFake) Execute(_ context.Context, in metrics.RecordTaskMetricsInput) metrics.RecordTaskMetricsOutput {
+	f.trace.add("metrics")
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.inputs = append(f.inputs, in)
+	return f.output
+}
+
+func (f *finalizeMetricsFake) snapshot() []metrics.RecordTaskMetricsInput {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]metrics.RecordTaskMetricsInput(nil), f.inputs...)
+}
+
 func finalizeID(t *testing.T) domain.TaskID {
 	t.Helper()
 	id, err := domain.NewTaskID("impl-20260809-120000-abcd-finalize")
@@ -240,7 +292,9 @@ func finalizeFixtures(t *testing.T, state domain.TaskState, now time.Time) (*fin
 	slot := &finalizeSlotFake{trace: trace}
 	taskMu := store.NewTaskMutex()
 	timeout := &finalizeTimeoutFake{trace: trace, taskMu: taskMu}
-	return s, r, w, slot, timeout, NewFinalizeTaskUseCase(s, w, r, domain.ClockFunc(func() time.Time { return now }), taskMu, slot, timeout)
+	tracker := &finalizeStalledTrackerFake{trace: trace}
+	recorder := &finalizeMetricsFake{trace: trace}
+	return s, r, w, slot, timeout, NewFinalizeTaskUseCase(s, w, r, domain.ClockFunc(func() time.Time { return now }), taskMu, slot, timeout, recorder, tracker)
 }
 func finalizeInput(id domain.TaskID, at time.Time) FinalizeTaskInput {
 	return FinalizeTaskInput{TaskID: id, RawExitCode: 0, OccurredAt: at}
@@ -675,6 +729,8 @@ func TestNewFinalizeTaskUseCaseContract(t *testing.T) {
 	s, r, w, slot, timeout, _ := finalizeFixtures(t, domain.StateRunning, now)
 	clock := domain.ClockFunc(func() time.Time { return now })
 	mu := store.NewTaskMutex()
+	tracker := &finalizeStalledTrackerFake{trace: &finalizeTrace{}}
+	recorder := &finalizeMetricsFake{trace: &finalizeTrace{}}
 	mustPanic := func(t *testing.T, f func()) {
 		t.Helper()
 		defer func() {
@@ -688,18 +744,24 @@ func TestNewFinalizeTaskUseCaseContract(t *testing.T) {
 		name string
 		f    func()
 	}{
-		{"tasks", func() { NewFinalizeTaskUseCase(nil, w, r, clock, mu, slot, timeout) }}, {"writer", func() { NewFinalizeTaskUseCase(s, nil, r, clock, mu, slot, timeout) }}, {"reader", func() { NewFinalizeTaskUseCase(s, w, nil, clock, mu, slot, timeout) }}, {"clock", func() { NewFinalizeTaskUseCase(s, w, r, nil, mu, slot, timeout) }}, {"mutex", func() { NewFinalizeTaskUseCase(s, w, r, clock, nil, slot, timeout) }}, {"slot", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, nil, timeout) }}, {"timeout", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, nil) }}, {"many loggers", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, slog.Default(), slog.Default()) }},
+		{"tasks", func() { NewFinalizeTaskUseCase(nil, w, r, clock, mu, slot, timeout, recorder, tracker) }}, {"writer", func() { NewFinalizeTaskUseCase(s, nil, r, clock, mu, slot, timeout, recorder, tracker) }}, {"reader", func() { NewFinalizeTaskUseCase(s, w, nil, clock, mu, slot, timeout, recorder, tracker) }}, {"clock", func() { NewFinalizeTaskUseCase(s, w, r, nil, mu, slot, timeout, recorder, tracker) }}, {"mutex", func() { NewFinalizeTaskUseCase(s, w, r, clock, nil, slot, timeout, recorder, tracker) }}, {"slot", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, nil, timeout, recorder, tracker) }}, {"timeout", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, nil, recorder, tracker) }}, {"metrics nil", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, nil, tracker) }}, {"metrics typed nil", func() {
+			NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, (*finalizeMetricsFake)(nil), tracker)
+		}}, {"tracker nil", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, recorder, nil) }}, {"tracker typed nil", func() {
+			NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, recorder, (*finalizeStalledTrackerFake)(nil))
+		}}, {"many loggers", func() {
+			NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, recorder, tracker, slog.Default(), slog.Default())
+		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) { mustPanic(t, tc.f) })
 	}
-	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout); got.logger != slog.Default() || got.timeoutDisarmer != timeout {
+	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, recorder, tracker); got.logger != slog.Default() || got.timeoutDisarmer != timeout || got.metricsRecorder != recorder || got.stalledTracker != tracker {
 		t.Fatal("default logger not used")
 	}
-	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, nil); got.logger != slog.Default() {
+	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, recorder, tracker, nil); got.logger != slog.Default() {
 		t.Fatal("nil logger not default")
 	}
 	logger := slog.New(slog.NewTextHandler(testingWriter{t}, nil))
-	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, logger); got.logger != logger {
+	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, recorder, tracker, logger); got.logger != logger {
 		t.Fatal("provided logger not retained")
 	}
 }
@@ -759,5 +821,116 @@ func TestFinalizeTaskUseCaseStructuredContractWriteLogs(t *testing.T) {
 		if got.level != slog.LevelError || got.attrs["code"] != machineCodeContractWriteFailed || got.attrs["stage"] != "exit-code" || got.attrs["attempt"] != want.attempt || got.attrs["task_id"] != s.latest.TaskID.String() || fmt.Sprint(got.attrs["error"]) != want.cause.Error() {
 			t.Fatalf("log[%d]=%#v", i, got)
 		}
+	}
+}
+
+func TestFinalizeTaskUseCaseTerminalPersistenceFinalizesStalledMetrics(t *testing.T) {
+	now := time.Date(2026, 8, 17, 12, 1, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name           string
+		state          domain.TaskState
+		rawExitCode    int
+		present        bool
+		configure      func(*finalizeStoreFake, *finalizeWriterFake)
+		wantPersisted  bool
+		wantLeave      int
+		wantTake       int
+		wantMetrics    int
+		wantFinalState domain.TaskState
+		wantEstimated  bool
+	}{
+		{
+			name:  "completed saved from stalled records corrected estimated event",
+			state: domain.StateStalled, present: true, wantPersisted: true, wantLeave: 1, wantTake: 1, wantMetrics: 1, wantFinalState: domain.StateCompleted, wantEstimated: true,
+		},
+		{
+			name:  "failed retry save uses retry stalled snapshot",
+			state: domain.StateRunning, rawExitCode: 1, present: true, wantPersisted: true, wantLeave: 1, wantTake: 1, wantMetrics: 1, wantFinalState: domain.StateFailed,
+			configure: func(s *finalizeStoreFake, _ *finalizeWriterFake) {
+				retry := s.latest
+				retry.State = domain.StateStalled
+				s.loads = []loadResult{{snapshot: s.latest}, {snapshot: retry}}
+				s.saveErrs = []error{errors.New("initial save")}
+			},
+		},
+		{
+			name:  "event append failure retains persisted terminal state",
+			state: domain.StateStalled, present: true, wantPersisted: true, wantLeave: 1, wantTake: 1, wantMetrics: 1, wantFinalState: domain.StateCompleted,
+			configure: func(_ *finalizeStoreFake, w *finalizeWriterFake) { w.appendErrs = []error{errors.New("append")} },
+		},
+		{
+			name:  "all saves fail retains resource release without metrics",
+			state: domain.StateStalled, present: true, configure: func(s *finalizeStoreFake, _ *finalizeWriterFake) {
+				s.saveErrs = []error{errors.New("initial"), errors.New("retry")}
+			},
+		},
+		{
+			name:  "past stalled total is taken when current state is not stalled",
+			state: domain.StateRunning, present: false, wantPersisted: true, wantTake: 1, wantMetrics: 1, wantFinalState: domain.StateFailed,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, r, w, slot, timeout, uc := finalizeFixtures(t, tc.state, now)
+			r.present = tc.present
+			tracker := uc.stalledTracker.(*finalizeStalledTrackerFake)
+			tracker.total = 321
+			recorder := uc.metricsRecorder.(*finalizeMetricsFake)
+			if tc.configure != nil {
+				tc.configure(s, w)
+			}
+			if tc.name == "completed saved from stalled records corrected estimated event" {
+				s.latest.AdoptedAfterRestart = true
+			}
+			prepared, err := uc.Prepare(FinalizeTaskInput{TaskID: s.latest.TaskID, RawExitCode: tc.rawExitCode, Estimated: false, OccurredAt: now})
+			if err != nil {
+				t.Fatal(err)
+			}
+			uc.taskMu.Lock(s.latest.TaskID)
+			result, _ := uc.ExecuteLocked(context.Background(), prepared)
+			uc.taskMu.Unlock(s.latest.TaskID)
+			if result.TerminalPersisted != tc.wantPersisted || len(recorder.snapshot()) != 0 {
+				t.Fatalf("result=%+v metrics=%v", result, recorder.snapshot())
+			}
+			uc.ReleaseAfterFinalization(context.Background(), result, s.latest.TaskID)
+			leave, take := tracker.snapshot()
+			inputs := recorder.snapshot()
+			if leave != tc.wantLeave || take != tc.wantTake || len(inputs) != tc.wantMetrics {
+				t.Fatalf("leave=%d take=%d metrics=%v", leave, take, inputs)
+			}
+			if tc.wantMetrics == 1 {
+				in := inputs[0]
+				if in.TaskID != s.latest.TaskID || in.FinalState != tc.wantFinalState || !in.OccurredAt.Equal(now) || in.StalledTotalMs != 321 {
+					t.Fatalf("metrics input=%+v", in)
+				}
+				if in.Estimated != tc.wantEstimated {
+					t.Fatalf("metrics estimated=%t want %t", in.Estimated, tc.wantEstimated)
+				}
+			}
+			wantRelease := 0
+			if result.RecordExited {
+				wantRelease = 1
+			}
+			if calls, _ := timeout.snapshot(); calls != wantRelease {
+				t.Fatalf("disarms=%d", calls)
+			}
+			if calls, _, _ := slot.snapshot(); calls != wantRelease {
+				t.Fatalf("releases=%d", calls)
+			}
+			if tc.wantMetrics == 1 {
+				calls := uc.contractW.(*finalizeWriterFake).trace.snapshot()
+				wantSuffix := []string{"leave-stalled", "take-total", "metrics", "disarm", "release-slot"}
+				if tc.wantLeave == 0 {
+					wantSuffix = wantSuffix[1:]
+				}
+				if len(calls) < len(wantSuffix) {
+					t.Fatalf("trace=%v", calls)
+				}
+				for i, want := range wantSuffix {
+					if calls[len(calls)-len(wantSuffix)+i] != want {
+						t.Fatalf("trace=%v want suffix=%v", calls, wantSuffix)
+					}
+				}
+			}
+		})
 	}
 }

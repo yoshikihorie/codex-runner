@@ -71,10 +71,12 @@ func (f *submitPathLockReleaserFake) Release(ctx context.Context, id domain.Task
 }
 
 type submitAdmitterFake struct {
-	input  execution.TaskAdmissionInput
-	calls  int
-	result execution.TaskAdmissionResult
-	err    error
+	input         execution.TaskAdmissionInput
+	calls         int
+	result        execution.TaskAdmissionResult
+	err           error
+	compensated   []domain.TaskID
+	compensateErr error
 }
 
 func (f *submitAdmitterFake) Admit(in execution.TaskAdmissionInput) (execution.TaskAdmissionResult, error) {
@@ -83,9 +85,22 @@ func (f *submitAdmitterFake) Admit(in execution.TaskAdmissionInput) (execution.T
 	return f.result, f.err
 }
 
-type submitStarterFake struct{ payloads []execution.TaskLaunchPayload }
+func (f *submitAdmitterFake) CompensateRejectedStart(id domain.TaskID) error {
+	f.compensated = append(f.compensated, id)
+	return f.compensateErr
+}
 
-func (f *submitStarterFake) Start(p execution.TaskLaunchPayload) { f.payloads = append(f.payloads, p) }
+type submitStarterFake struct {
+	payloads []execution.TaskLaunchPayload
+	rejected bool
+}
+
+func (f *submitStarterFake) Start(p execution.TaskLaunchPayload) bool {
+	f.payloads = append(f.payloads, p)
+	return !f.rejected
+}
+
+func (*submitStarterFake) Shutdown(context.Context) {}
 
 type submitOptionsFake struct {
 	model, effort     string
@@ -311,6 +326,23 @@ func TestSubmitExecuteAdmissionResultsStartOnlyImmediatePayload(t *testing.T) {
 				t.Fatalf("starter payload mismatch")
 			}
 		})
+	}
+}
+
+func TestSubmitTaskUseCaseCompensatesRejectedLifecycleStart(t *testing.T) {
+	fixture := newSubmitFixture()
+	fixture.starter.rejected = true
+	fixture.admitter.result.LaunchPayload = &execution.TaskLaunchPayload{Model: "payload"}
+	in := validSubmitInput(t)
+	in.Subcommand = "impl"
+	in.RawPaths = []string{"/private/tmp/submit-rejected-start"}
+
+	_, err := fixture.uc.Execute(context.Background(), in)
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err=%v", err)
+	}
+	if len(fixture.starter.payloads) != 1 || len(fixture.admitter.compensated) != 1 || len(fixture.store.released) != 1 || fixture.releaser.calls != 1 {
+		t.Fatalf("starts=%d compensations=%d reservations=%d path_locks=%d", len(fixture.starter.payloads), len(fixture.admitter.compensated), len(fixture.store.released), fixture.releaser.calls)
 	}
 }
 

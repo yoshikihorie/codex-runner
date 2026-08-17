@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/execution"
+	"github.com/yoshikihorie/codex-runner/internal/recovery"
 	"github.com/yoshikihorie/codex-runner/internal/transport"
 )
 
@@ -53,21 +53,22 @@ type CancelTaskOutput struct {
 var errCancelStateChanged = errors.New("cancel state changed")
 
 type CancelTaskUseCase struct {
-	tasks           CancelTaskStore
-	queue           CancelTaskQueue
-	queueMu         *sync.Mutex
-	taskMu          CancelTaskMutex
-	events          CancelEventAppender
-	terminator      CancelProcessTerminator
-	timeoutDisarmer execution.TimeoutDisarmer
-	confirmer       *execution.ConfirmTaskKilledUseCase
-	stalledTracker  stalledTimeTracker
-	clock           domain.Clock
-	logger          *slog.Logger
+	tasks            CancelTaskStore
+	queue            CancelTaskQueue
+	queueMu          *sync.Mutex
+	taskMu           CancelTaskMutex
+	events           CancelEventAppender
+	terminator       CancelProcessTerminator
+	pendingRegistrar recovery.PendingRegistrar
+	timeoutDisarmer  execution.TimeoutDisarmer
+	confirmer        *execution.ConfirmTaskKilledUseCase
+	stalledTracker   stalledTimeTracker
+	clock            domain.Clock
+	logger           *slog.Logger
 }
 
-func NewCancelTaskUseCase(tasks CancelTaskStore, queue CancelTaskQueue, queueMu *sync.Mutex, taskMu CancelTaskMutex, events CancelEventAppender, terminator CancelProcessTerminator, disarmer execution.TimeoutDisarmer, confirmer *execution.ConfirmTaskKilledUseCase, stalledTracker stalledTimeTracker, clock domain.Clock, loggers ...*slog.Logger) *CancelTaskUseCase {
-	if isNilStatusUseCaseDependency(tasks) || isNilStatusUseCaseDependency(queue) || isNilStatusUseCaseDependency(queueMu) || isNilStatusUseCaseDependency(taskMu) || isNilStatusUseCaseDependency(events) || isNilStatusUseCaseDependency(terminator) || isNilStatusUseCaseDependency(disarmer) || isNilStatusUseCaseDependency(confirmer) || isNilStatusUseCaseDependency(stalledTracker) || isNilStatusUseCaseDependency(clock) {
+func NewCancelTaskUseCase(tasks CancelTaskStore, queue CancelTaskQueue, queueMu *sync.Mutex, taskMu CancelTaskMutex, events CancelEventAppender, terminator CancelProcessTerminator, pendingRegistrar recovery.PendingRegistrar, disarmer execution.TimeoutDisarmer, confirmer *execution.ConfirmTaskKilledUseCase, stalledTracker stalledTimeTracker, clock domain.Clock, loggers ...*slog.Logger) *CancelTaskUseCase {
+	if isNilStatusUseCaseDependency(tasks) || isNilStatusUseCaseDependency(queue) || isNilStatusUseCaseDependency(queueMu) || isNilStatusUseCaseDependency(taskMu) || isNilStatusUseCaseDependency(events) || isNilStatusUseCaseDependency(terminator) || isNilStatusUseCaseDependency(pendingRegistrar) || isNilStatusUseCaseDependency(disarmer) || isNilStatusUseCaseDependency(confirmer) || isNilStatusUseCaseDependency(stalledTracker) || isNilStatusUseCaseDependency(clock) {
 		panic("cancel task use case requires non-nil dependencies")
 	}
 	if len(loggers) > 1 {
@@ -77,7 +78,7 @@ func NewCancelTaskUseCase(tasks CancelTaskStore, queue CancelTaskQueue, queueMu 
 	if len(loggers) == 1 && loggers[0] != nil {
 		logger = loggers[0]
 	}
-	return &CancelTaskUseCase{tasks: tasks, queue: queue, queueMu: queueMu, taskMu: taskMu, events: events, terminator: terminator, timeoutDisarmer: disarmer, confirmer: confirmer, stalledTracker: stalledTracker, clock: clock, logger: logger}
+	return &CancelTaskUseCase{tasks: tasks, queue: queue, queueMu: queueMu, taskMu: taskMu, events: events, terminator: terminator, pendingRegistrar: pendingRegistrar, timeoutDisarmer: disarmer, confirmer: confirmer, stalledTracker: stalledTracker, clock: clock, logger: logger}
 }
 
 func (uc *CancelTaskUseCase) Execute(ctx context.Context, in CancelTaskInput) (CancelTaskOutput, error) {
@@ -103,7 +104,7 @@ func (uc *CancelTaskUseCase) Execute(ctx context.Context, in CancelTaskInput) (C
 	queueLocked = false
 	reserved, err := uc.tasks.IsReserved(in.TaskID)
 	if err != nil {
-		return CancelTaskOutput{}, fmt.Errorf("%w: reservation", domain.ErrContractWriteFailed)
+		return CancelTaskOutput{}, contractWriteError(err)
 	}
 	if !reserved {
 		return CancelTaskOutput{}, domain.ErrTaskNotFound
@@ -131,7 +132,7 @@ func (uc *CancelTaskUseCase) cancelQueued(in CancelTaskInput, payload execution.
 		return CancelTaskOutput{}, err
 	}
 	if err := uc.tasks.Save(in.TaskID, snapshot); err != nil {
-		return CancelTaskOutput{}, fmt.Errorf("%w: task.json", domain.ErrContractWriteFailed)
+		return CancelTaskOutput{}, contractWriteError(err)
 	}
 	committed = true
 	if err := uc.events.AppendEvent(in.TaskID, events[0]); err != nil {
@@ -151,12 +152,13 @@ func (uc *CancelTaskUseCase) cancelPersisted(ctx context.Context, in CancelTaskI
 	}()
 	var previous domain.TaskState
 	var pid *int
+	var processStartedAt *time.Time
 	snapshot, err := uc.tasks.Load(in.TaskID)
 	if err != nil {
 		if errors.Is(err, domain.ErrTaskNotFound) {
 			reserved, checkErr := uc.tasks.IsReserved(in.TaskID)
 			if checkErr != nil {
-				return out, fmt.Errorf("%w: reservation", domain.ErrContractWriteFailed)
+				return out, contractWriteError(checkErr)
 			}
 			if reserved {
 				return out, errCancelStateChanged
@@ -168,6 +170,10 @@ func (uc *CancelTaskUseCase) cancelPersisted(ctx context.Context, in CancelTaskI
 	if snapshot.PID != nil {
 		value := *snapshot.PID
 		pid = &value
+	}
+	if snapshot.ProcessStartedAt != nil {
+		value := *snapshot.ProcessStartedAt
+		processStartedAt = &value
 	}
 	task, err := snapshot.Restore()
 	if err != nil {
@@ -182,7 +188,7 @@ func (uc *CancelTaskUseCase) cancelPersisted(ctx context.Context, in CancelTaskI
 		return out, err
 	}
 	if err := uc.tasks.Save(in.TaskID, updated); err != nil {
-		return out, fmt.Errorf("%w: task.json", domain.ErrContractWriteFailed)
+		return out, contractWriteError(err)
 	}
 	if previous == domain.StateStalled {
 		uc.stalledTracker.LeaveStalled(in.TaskID, in.OccurredAt)
@@ -204,12 +210,28 @@ func (uc *CancelTaskUseCase) cancelPersisted(ctx context.Context, in CancelTaskI
 		out.TerminationTriggered = true
 		if terminateErr := uc.terminator.Terminate(*pid, execution.TimeoutKillGrace); terminateErr != nil {
 			uc.logger.Warn("terminate cancelled task", "task_id", in.TaskID.String(), "error", terminateErr)
+			disposition, authority := cancelPendingRegistration(in.TaskID, pid, processStartedAt)
+			if registerErr := uc.pendingRegistrar.Register(in.TaskID, disposition, authority); registerErr != nil {
+				return out, errors.Join(terminateErr, registerErr)
+			}
 		}
 		if previous != domain.StateStarting {
 			uc.timeoutDisarmer.Disarm(in.TaskID)
 		}
 	}
 	return out, nil
+}
+
+func contractWriteError(cause error) error {
+	return errors.Join(domain.ErrContractWriteFailed, cause)
+}
+
+func cancelPendingRegistration(taskID domain.TaskID, pid *int, processStartedAt *time.Time) (recovery.PendingSendDisposition, *recovery.ProcessSignalAuthority) {
+	if pid == nil || *pid <= 0 || processStartedAt == nil || processStartedAt.IsZero() {
+		return recovery.PendingSendConfirmOnly, nil
+	}
+	authority := recovery.ProcessSignalAuthority{TaskID: taskID, PID: *pid, ProcessStartedAt: *processStartedAt}
+	return recovery.PendingSendUnsent, &authority
 }
 
 func (uc *CancelTaskUseCase) Handle(req transport.Request) transport.Response {

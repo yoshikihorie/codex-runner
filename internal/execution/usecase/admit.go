@@ -85,6 +85,16 @@ func (u *AdmitTaskUseCase) Admit(input execution.TaskAdmissionInput) (execution.
 	return u.Execute(context.Background(), input)
 }
 
+// CompensateRejectedStart releases the immediate-admission reservation after
+// the lifecycle shutdown gate has rejected its launch.
+func (u *AdmitTaskUseCase) CompensateRejectedStart(taskID domain.TaskID) error {
+	u.queueMu.Lock()
+	defer u.queueMu.Unlock()
+	u.launching.Unregister(taskID)
+	u.registry.Remove(taskID)
+	return nil
+}
+
 func validateAdmissionInput(input execution.TaskAdmissionInput) error {
 	switch {
 	case input.TaskID.String() == "":

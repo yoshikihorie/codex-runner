@@ -13,9 +13,9 @@ import (
 type taskLifecycleStarter struct {
 	runner    taskLifecycleRunner
 	tasksRoot string
-	baseCtx   context.Context
 	clock     domain.Clock
 	logger    *slog.Logger
+	starter   *execution.DefaultTaskLifecycleStarter
 }
 
 func NewTaskLifecycleStarter(runner taskLifecycleRunner, tasksRoot string, baseCtx context.Context, clock domain.Clock, loggers ...*slog.Logger) (*taskLifecycleStarter, error) {
@@ -32,13 +32,20 @@ func NewTaskLifecycleStarter(runner taskLifecycleRunner, tasksRoot string, baseC
 	if len(loggers) == 1 && loggers[0] != nil {
 		logger = loggers[0]
 	}
-	return &taskLifecycleStarter{runner: runner, tasksRoot: tasksRoot, baseCtx: baseCtx, clock: clock, logger: logger}, nil
+	starter := &taskLifecycleStarter{runner: runner, tasksRoot: tasksRoot, clock: clock, logger: logger}
+	starter.starter = execution.NewDefaultTaskLifecycleStarter(baseCtx, starter.run)
+	return starter, nil
 }
 
-func (s *taskLifecycleStarter) Start(payload execution.TaskLaunchPayload) {
-	ctx, cancel := context.WithCancel(s.baseCtx)
+func (s *taskLifecycleStarter) run(ctx context.Context, payload execution.TaskLaunchPayload) {
 	input := TaskLifecycleInput{TaskLaunchPayload: payload, TaskDirPath: filepath.Join(s.tasksRoot, payload.Task.ID().String()), Now: s.clock.Now()}
-	go func() { defer cancel(); s.runner.Run(ctx, input) }()
+	s.runner.Run(ctx, input)
 }
+
+func (s *taskLifecycleStarter) Start(payload execution.TaskLaunchPayload) bool {
+	return s.starter.Start(payload)
+}
+
+func (s *taskLifecycleStarter) Shutdown(ctx context.Context) { s.starter.Shutdown(ctx) }
 
 var _ execution.TaskLifecycleStarter = (*taskLifecycleStarter)(nil)

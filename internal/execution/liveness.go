@@ -91,7 +91,10 @@ func NewCheckLivenessUseCase(lock domain.LivenessLock, resolveLockPath lockPathR
 }
 
 // Execute reports whether taskID's liveness lock is unheld.
-func (u *CheckLivenessUseCase) Execute(_ context.Context, taskID domain.TaskID) (dead bool, err error) {
+func (u *CheckLivenessUseCase) Execute(ctx context.Context, taskID domain.TaskID) (dead bool, err error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	dead, err = u.lock.TryAcquire(u.resolveLockPath(taskID))
 	switch {
 	case err == nil:
