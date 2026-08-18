@@ -150,6 +150,9 @@ func (f *killedPendingFake) Register(taskID domain.TaskID, disposition recovery.
 func (*killedPendingFake) ClaimForSend(domain.TaskID, recovery.ProcessSignalAuthority) (recovery.SendClaim, recovery.ClaimOutcome) {
 	return recovery.SendClaim{}, recovery.ClaimNotFound
 }
+func (*killedPendingFake) ClaimInitialSend(domain.TaskID, recovery.ProcessSignalAuthority) (recovery.SendClaim, recovery.ClaimOutcome) {
+	return recovery.SendClaim{}, recovery.ClaimNotFound
+}
 func (*killedPendingFake) CompleteSend(recovery.SendClaim) bool   { return false }
 func (*killedPendingFake) ReleaseSend(recovery.SendClaim) bool    { return false }
 func (*killedPendingFake) InvalidateSend(recovery.SendClaim) bool { return false }

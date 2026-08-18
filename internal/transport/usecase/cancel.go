@@ -29,7 +29,11 @@ type CancelEventAppender interface {
 	AppendEvent(domain.TaskID, domain.Event) error
 }
 type CancelProcessTerminator interface {
-	Terminate(int, time.Duration) error
+	SendTerminate(int) error
+	SendKill(int) error
+}
+type cancelTerminationEnsurer interface {
+	SendAndConfirm(context.Context, domain.TaskID, recovery.ProcessSignalAuthority, time.Duration) recovery.TerminationAttemptResult
 }
 type CancelTaskMutex interface {
 	Lock(domain.TaskID)
@@ -59,6 +63,7 @@ type CancelTaskUseCase struct {
 	taskMu           CancelTaskMutex
 	events           CancelEventAppender
 	terminator       CancelProcessTerminator
+	termination      cancelTerminationEnsurer
 	pendingRegistrar recovery.PendingRegistrar
 	timeoutDisarmer  execution.TimeoutDisarmer
 	confirmer        *execution.ConfirmTaskKilledUseCase
@@ -67,18 +72,22 @@ type CancelTaskUseCase struct {
 	logger           *slog.Logger
 }
 
-func NewCancelTaskUseCase(tasks CancelTaskStore, queue CancelTaskQueue, queueMu *sync.Mutex, taskMu CancelTaskMutex, events CancelEventAppender, terminator CancelProcessTerminator, pendingRegistrar recovery.PendingRegistrar, disarmer execution.TimeoutDisarmer, confirmer *execution.ConfirmTaskKilledUseCase, stalledTracker stalledTimeTracker, clock domain.Clock, loggers ...*slog.Logger) *CancelTaskUseCase {
-	if isNilStatusUseCaseDependency(tasks) || isNilStatusUseCaseDependency(queue) || isNilStatusUseCaseDependency(queueMu) || isNilStatusUseCaseDependency(taskMu) || isNilStatusUseCaseDependency(events) || isNilStatusUseCaseDependency(terminator) || isNilStatusUseCaseDependency(pendingRegistrar) || isNilStatusUseCaseDependency(disarmer) || isNilStatusUseCaseDependency(confirmer) || isNilStatusUseCaseDependency(stalledTracker) || isNilStatusUseCaseDependency(clock) {
+func NewCancelTaskUseCase(tasks CancelTaskStore, queue CancelTaskQueue, queueMu *sync.Mutex, taskMu CancelTaskMutex, events CancelEventAppender, terminator CancelProcessTerminator, termination cancelTerminationEnsurer, pendingRegistrar recovery.PendingRegistrar, disarmer execution.TimeoutDisarmer, confirmer *execution.ConfirmTaskKilledUseCase, stalledTracker stalledTimeTracker, clock domain.Clock, options ...any) *CancelTaskUseCase {
+	if isNilStatusUseCaseDependency(tasks) || isNilStatusUseCaseDependency(queue) || isNilStatusUseCaseDependency(queueMu) || isNilStatusUseCaseDependency(taskMu) || isNilStatusUseCaseDependency(events) || isNilStatusUseCaseDependency(terminator) || isNilStatusUseCaseDependency(termination) || isNilStatusUseCaseDependency(pendingRegistrar) || isNilStatusUseCaseDependency(disarmer) || isNilStatusUseCaseDependency(confirmer) || isNilStatusUseCaseDependency(stalledTracker) || isNilStatusUseCaseDependency(clock) {
 		panic("cancel task use case requires non-nil dependencies")
 	}
-	if len(loggers) > 1 {
-		panic("cancel task use case accepts at most one logger")
-	}
 	logger := slog.Default()
-	if len(loggers) == 1 && loggers[0] != nil {
-		logger = loggers[0]
+	for _, option := range options {
+		switch value := option.(type) {
+		case *slog.Logger:
+			if value != nil {
+				logger = value
+			}
+		default:
+			panic("cancel task use case received unsupported option")
+		}
 	}
-	return &CancelTaskUseCase{tasks: tasks, queue: queue, queueMu: queueMu, taskMu: taskMu, events: events, terminator: terminator, pendingRegistrar: pendingRegistrar, timeoutDisarmer: disarmer, confirmer: confirmer, stalledTracker: stalledTracker, clock: clock, logger: logger}
+	return &CancelTaskUseCase{tasks: tasks, queue: queue, queueMu: queueMu, taskMu: taskMu, events: events, terminator: terminator, termination: termination, pendingRegistrar: pendingRegistrar, timeoutDisarmer: disarmer, confirmer: confirmer, stalledTracker: stalledTracker, clock: clock, logger: logger}
 }
 
 func (uc *CancelTaskUseCase) Execute(ctx context.Context, in CancelTaskInput) (CancelTaskOutput, error) {
@@ -209,22 +218,63 @@ func (uc *CancelTaskUseCase) cancelPersisted(ctx context.Context, in CancelTaskI
 				(previous == domain.StateRunning || previous == domain.StateStalled)))
 	if pidlessAdopted {
 		if err := uc.pendingRegistrar.Register(in.TaskID, recovery.PendingSendConfirmOnly, nil); err != nil {
-			return out, err
+			return out, contractWriteError(err)
 		}
 		uc.timeoutDisarmer.Disarm(in.TaskID)
 		return out, nil
 	}
 	if pid != nil && ((previous == domain.StateStarting) || previous == domain.StateRunning || previous == domain.StateStalled || previous == domain.StateAdopted) {
 		out.TerminationTriggered = true
-		if terminateErr := uc.terminator.Terminate(*pid, execution.TimeoutKillGrace); terminateErr != nil {
-			uc.logger.Warn("terminate cancelled task", "task_id", in.TaskID.String(), "error", terminateErr)
-			disposition, authority := cancelPendingRegistration(in.TaskID, pid, processStartedAt)
-			if registerErr := uc.pendingRegistrar.Register(in.TaskID, disposition, authority); registerErr != nil {
-				return out, errors.Join(terminateErr, registerErr)
+		if previous != domain.StateStarting && processStartedAt != nil {
+			authority := recovery.ProcessSignalAuthority{TaskID: in.TaskID, PID: *pid, ProcessStartedAt: *processStartedAt, ExpectedState: domain.StateCancelling}
+			result := uc.termination.SendAndConfirm(ctx, in.TaskID, authority, execution.TimeoutKillGrace)
+			if result.TerminateErr != nil {
+				uc.logger.Warn("terminate cancelled task", "task_id", in.TaskID.String(), "error", result.TerminateErr)
 			}
-		}
-		if previous != domain.StateStarting {
+			if result.ConfirmErr != nil {
+				uc.logger.Warn("confirm cancelled task termination", "task_id", in.TaskID.String(), "error", result.ConfirmErr)
+			}
+			if result.Dead {
+				_, confirmErr := uc.confirmer.Execute(ctx, execution.ConfirmTaskKilledInput{TaskID: in.TaskID, RawExitCode: 130, Estimated: true, OccurredAt: uc.clock.Now()})
+				if confirmErr == nil {
+					return out, nil
+				}
+				if registerErr := uc.pendingRegistrar.Register(in.TaskID, recovery.PendingSendConfirmOnly, nil); registerErr != nil {
+					return out, errors.Join(confirmErr, contractWriteError(registerErr))
+				}
+				uc.timeoutDisarmer.Disarm(in.TaskID)
+				return out, confirmErr
+			}
+			var disposition recovery.PendingSendDisposition
+			var pendingAuthority *recovery.ProcessSignalAuthority
+			if result.TerminateErr == nil {
+				disposition = recovery.PendingSendSent
+			} else if errors.Is(result.TerminateErr, recovery.ErrProcessSignalAuthorityInvalid) {
+				disposition = recovery.PendingSendConfirmOnly
+			} else {
+				disposition, pendingAuthority = cancelPendingRegistration(in.TaskID, pid, processStartedAt)
+			}
+			if registerErr := uc.pendingRegistrar.Register(in.TaskID, disposition, pendingAuthority); registerErr != nil {
+				registerErr = contractWriteError(registerErr)
+				if result.TerminateErr != nil {
+					return out, errors.Join(result.TerminateErr, registerErr)
+				}
+				return out, registerErr
+			}
 			uc.timeoutDisarmer.Disarm(in.TaskID)
+			return out, nil
+		} else {
+			terminateErr := uc.terminator.SendTerminate(*pid)
+			if terminateErr != nil {
+				uc.logger.Warn("terminate cancelled task", "task_id", in.TaskID.String(), "error", terminateErr)
+				disposition, authority := cancelPendingRegistration(in.TaskID, pid, processStartedAt)
+				if registerErr := uc.pendingRegistrar.Register(in.TaskID, disposition, authority); registerErr != nil {
+					return out, errors.Join(terminateErr, contractWriteError(registerErr))
+				}
+			}
+			if previous == domain.StateStarting {
+				return out, nil
+			}
 		}
 	}
 	return out, nil
@@ -238,7 +288,7 @@ func cancelPendingRegistration(taskID domain.TaskID, pid *int, processStartedAt 
 	if pid == nil || *pid <= 0 || processStartedAt == nil || processStartedAt.IsZero() {
 		return recovery.PendingSendConfirmOnly, nil
 	}
-	authority := recovery.ProcessSignalAuthority{TaskID: taskID, PID: *pid, ProcessStartedAt: *processStartedAt}
+	authority := recovery.ProcessSignalAuthority{TaskID: taskID, PID: *pid, ProcessStartedAt: *processStartedAt, ExpectedState: domain.StateCancelling}
 	return recovery.PendingSendUnsent, &authority
 }
 

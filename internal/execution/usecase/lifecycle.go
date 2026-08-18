@@ -16,7 +16,7 @@ import (
 )
 
 type TimeoutArmer interface {
-	Arm(domain.TaskID, time.Time, int)
+	Arm(domain.TaskID, time.Time, int, domain.LifecycleGeneration)
 }
 type stdoutFileOpener interface {
 	Open(string) (*os.File, error)
@@ -49,7 +49,7 @@ type lifecycleKillConfirmer interface {
 }
 type lifecycleTerminationEnsurer interface {
 	Confirm(context.Context, domain.TaskID) (bool, error)
-	SendAndConfirm(context.Context, domain.TaskID, int, time.Duration) execution.TerminationAttemptResult
+	SendAndConfirm(context.Context, domain.TaskID, recovery.ProcessSignalAuthority, time.Duration) execution.TerminationAttemptResult
 }
 type processTerminator interface {
 	Terminate(int, time.Duration) error
@@ -114,7 +114,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		return
 	}
 	taskID := input.Task.ID()
-	release, acquired := o.deps.Ownership.Acquire(taskID)
+	generation, release, acquired := o.deps.Ownership.Acquire(taskID)
 	if !acquired {
 		o.logger.Error("task lifecycle ownership conflict", "task_id", taskID.String())
 		return
@@ -177,12 +177,12 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		return
 	}
 	if ctx.Err() != nil {
-		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true)
+		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true, generation)
 		return
 	}
 	cancelling, recordErr := o.recordProcessAtLaunchBoundary(ctx, input, launched)
 	if cancelling {
-		o.handleStartingCancellation(ctx, taskID, launched, true)
+		o.handleStartingCancellation(ctx, taskID, launched, true, generation)
 		return
 	}
 	if recordErr != nil {
@@ -190,7 +190,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		return
 	}
 	if ctx.Err() != nil {
-		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true)
+		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true, generation)
 		return
 	}
 	confirmed, err := o.deps.ConfirmRunning.Execute(ctx, taskID, input.Now)
@@ -205,17 +205,17 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		return
 	}
 	if confirmed.State == domain.StateCancelling {
-		o.handleStartingCancellation(ctx, taskID, launched, false)
+		o.handleStartingCancellation(ctx, taskID, launched, false, generation)
 		return
 	}
 	deadline := launched.Handle.ProcessStartedAt.Add(time.Duration(input.ResolvedTimeout.ResolvedSeconds()) * time.Second)
 	if ctx.Err() != nil {
-		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true)
+		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true, generation)
 		return
 	}
-	o.deps.TimeoutArmer.Arm(taskID, deadline, input.ResolvedTimeout.ResolvedSeconds())
+	o.deps.TimeoutArmer.Arm(taskID, deadline, input.ResolvedTimeout.ResolvedSeconds(), generation)
 	if ctx.Err() != nil {
-		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true)
+		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true, generation)
 		return
 	}
 	o.monitorAndFinalize(ctx, input, launched)
@@ -276,12 +276,13 @@ func (o *TaskLifecycleOrchestrator) confirmUnlaunchedCancellation(ctx context.Co
 	return true
 }
 
-func (o *TaskLifecycleOrchestrator) handleStartingCancellation(ctx context.Context, taskID domain.TaskID, launched *execution.LaunchedProcess, send bool) {
+func (o *TaskLifecycleOrchestrator) handleStartingCancellation(ctx context.Context, taskID domain.TaskID, launched *execution.LaunchedProcess, send bool, generation domain.LifecycleGeneration) {
 	var dead bool
 	var err error
 	var terminateErr error
 	if send {
-		result := o.deps.Termination.SendAndConfirm(ctx, taskID, launched.Handle.PID, execution.TimeoutKillGrace)
+		authority := recovery.ProcessSignalAuthority{TaskID: taskID, PID: launched.Handle.PID, ProcessStartedAt: launched.Handle.ProcessStartedAt, ExpectedState: domain.StateCancelling, LifecycleGeneration: &generation}
+		result := o.deps.Termination.SendAndConfirm(ctx, taskID, authority, execution.TimeoutKillGrace)
 		dead, err, terminateErr = result.Dead, result.ConfirmErr, result.TerminateErr
 	} else {
 		dead, err = o.deps.Termination.Confirm(ctx, taskID)
@@ -297,7 +298,7 @@ func (o *TaskLifecycleOrchestrator) handleStartingCancellation(ctx context.Conte
 		if send {
 			signalErr = terminateErr
 		}
-		disposition, authority := pendingRegistrationAfterSignal(taskID, launched.Handle, send, signalErr)
+		disposition, authority := pendingRegistrationAfterSignal(taskID, launched.Handle, send, signalErr, generation)
 		if registerErr := o.deps.Pending.Register(taskID, disposition, authority); registerErr != nil {
 			o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
 		}
@@ -317,7 +318,7 @@ func (o *TaskLifecycleOrchestrator) handleStartingCancellation(ctx context.Conte
 		if send {
 			signalErr = terminateErr
 		}
-		disposition, authority := pendingRegistrationAfterSignal(taskID, launched.Handle, send, signalErr)
+		disposition, authority := pendingRegistrationAfterSignal(taskID, launched.Handle, send, signalErr, generation)
 		if registerErr := o.deps.Pending.Register(taskID, disposition, authority); registerErr != nil {
 			o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
 		}
@@ -375,7 +376,7 @@ func (o *TaskLifecycleOrchestrator) handleRecordProcessFailure(ctx context.Conte
 	if err == nil && dead {
 		o.fail(ctx, input)
 	} else {
-		disposition, authority := pendingRegistrationAfterSignal(taskID, launched.Handle, true, terminateErr)
+		disposition, authority := pendingRegistrationAfterSignal(taskID, launched.Handle, true, terminateErr, 0)
 		if registerErr := o.deps.Pending.Register(taskID, disposition, authority); registerErr != nil {
 			o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
 		}
@@ -455,7 +456,7 @@ func (o *TaskLifecycleOrchestrator) confirmTerminal(ctx context.Context, taskID 
 	}
 }
 
-func pendingRegistrationAfterSignal(taskID domain.TaskID, handle *domain.ProcessHandle, sent bool, signalErr error) (recovery.PendingSendDisposition, *recovery.ProcessSignalAuthority) {
+func pendingRegistrationAfterSignal(taskID domain.TaskID, handle *domain.ProcessHandle, sent bool, signalErr error, generation domain.LifecycleGeneration) (recovery.PendingSendDisposition, *recovery.ProcessSignalAuthority) {
 	if !sent {
 		return recovery.PendingSendConfirmOnly, nil
 	}
@@ -465,7 +466,7 @@ func pendingRegistrationAfterSignal(taskID domain.TaskID, handle *domain.Process
 	if handle == nil || handle.PID <= 0 || handle.ProcessStartedAt.IsZero() {
 		return recovery.PendingSendConfirmOnly, nil
 	}
-	authority := recovery.ProcessSignalAuthority{TaskID: taskID, PID: handle.PID, ProcessStartedAt: handle.ProcessStartedAt}
+	authority := recovery.ProcessSignalAuthority{TaskID: taskID, PID: handle.PID, ProcessStartedAt: handle.ProcessStartedAt, ExpectedState: domain.StateCancelling, LifecycleGeneration: &generation}
 	return recovery.PendingSendUnsent, &authority
 }
 

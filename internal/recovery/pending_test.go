@@ -39,6 +39,252 @@ func TestPendingRegistrarContract(t *testing.T) {
 	if !registrar.InvalidateSend(claim) {
 		t.Fatal("InvalidateSend() = false")
 	}
+	initialID := pendingTestTaskID(t, "contract-initial")
+	initialAuthority := pendingTestAuthority(initialID, 3)
+	claim, outcome = registrar.ClaimInitialSend(initialID, initialAuthority)
+	if outcome != ClaimAcquired || claim.Token == 0 {
+		t.Fatalf("ClaimInitialSend() = (%#v, %v)", claim, outcome)
+	}
+	if !registrar.RemoveClaim(claim) {
+		t.Fatal("RemoveClaim() = false")
+	}
+}
+
+func TestPendingClaimInitialSendStateTable(t *testing.T) {
+	taskID := pendingTestTaskID(t, "initial-state-table")
+	authority := pendingTestAuthority(taskID, 1)
+	otherTaskID := pendingTestTaskID(t, "initial-state-other")
+	otherTaskAuthority := pendingTestAuthority(otherTaskID, 1)
+	differentPID := authority
+	differentPID.PID++
+	differentStart := authority
+	differentStart.ProcessStartedAt = differentStart.ProcessStartedAt.Add(time.Second)
+	differentState := authority
+	differentState.ExpectedState = domain.StateTimeout
+	differentNilGeneration := authority
+	differentNilGeneration.LifecycleGeneration = nil
+	nilGeneration := authority
+	nilGeneration.LifecycleGeneration = nil
+	differentGeneration := authority
+	differentGenerationValue := domain.LifecycleGeneration(*authority.LifecycleGeneration + 1)
+	differentGeneration.LifecycleGeneration = &differentGenerationValue
+	equalGenerationValue := *authority.LifecycleGeneration
+	equalGenerationDifferentPointer := authority
+	equalGenerationDifferentPointer.LifecycleGeneration = &equalGenerationValue
+
+	for _, tc := range []struct {
+		name          string
+		initial       string
+		callAuthority ProcessSignalAuthority
+		wantOutcome   ClaimOutcome
+		wantState     pendingState
+		wantClaim     bool
+		unchanged     bool
+	}{
+		{"missing", "missing", authority, ClaimAcquired, pendingClaimed, true, false},
+		{"unsent equal generation value", "unsent", equalGenerationDifferentPointer, ClaimAcquired, pendingClaimed, true, false},
+		{"unsent nil generation mismatch", "unsent", nilGeneration, ClaimConfirmOnly, pendingConfirmOnly, false, false},
+		{"unsent task ID mismatch", "unsent", otherTaskAuthority, ClaimConfirmOnly, pendingConfirmOnly, false, false},
+		{"unsent PID mismatch", "unsent", differentPID, ClaimConfirmOnly, pendingConfirmOnly, false, false},
+		{"unsent process start mismatch", "unsent", differentStart, ClaimConfirmOnly, pendingConfirmOnly, false, false},
+		{"unsent expected state mismatch", "unsent", differentState, ClaimConfirmOnly, pendingConfirmOnly, false, false},
+		{"unsent generation nilness mismatch", "unsent", differentNilGeneration, ClaimConfirmOnly, pendingConfirmOnly, false, false},
+		{"unsent generation value mismatch", "unsent", differentGeneration, ClaimConfirmOnly, pendingConfirmOnly, false, false},
+		{"claimed", "claimed", authority, ClaimAlreadyClaimed, pendingClaimed, false, true},
+		{"sent", "sent", authority, ClaimSent, pendingSent, false, true},
+		{"confirm-only", "confirm", authority, ClaimConfirmOnly, pendingConfirmOnly, false, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			set := pendingSetInState(t, taskID, authority, tc.initial)
+			before := PendingEntry{}
+			if tc.unchanged {
+				before = pendingOnlyEntry(t, set)
+			}
+			claim, outcome := set.ClaimInitialSend(taskID, tc.callAuthority)
+			if outcome != tc.wantOutcome {
+				t.Fatalf("ClaimInitialSend() outcome = %v, want %v", outcome, tc.wantOutcome)
+			}
+			if tc.wantClaim {
+				if claim.TaskID != taskID || claim.Token == 0 || !pendingTestAuthorityEqual(claim.Authority, authority) {
+					t.Fatalf("ClaimInitialSend() claim = %#v", claim)
+				}
+			} else if claim != (SendClaim{}) {
+				t.Fatalf("ClaimInitialSend() claim = %#v, want zero", claim)
+			}
+			after := pendingOnlyEntry(t, set)
+			if after.state != tc.wantState {
+				t.Fatalf("state = %v, want %v", after.state, tc.wantState)
+			}
+			if tc.unchanged {
+				pendingRequireEntryEqual(t, before, after)
+			}
+			if tc.wantState == pendingConfirmOnly && (after.authority != (ProcessSignalAuthority{}) || after.claimToken != 0) {
+				t.Fatalf("confirm-only entry = %#v", after)
+			}
+		})
+	}
+}
+
+func TestPendingClaimInitialSendRemoveClaimCompensatesByOrigin(t *testing.T) {
+	taskID := pendingTestTaskID(t, "initial-compensation")
+	authority := pendingTestAuthority(taskID, 1)
+	for _, tc := range []struct {
+		name    string
+		set     func() *PendingReconciliationSet
+		present bool
+	}{
+		{"new entry", func() *PendingReconciliationSet { return &PendingReconciliationSet{} }, false},
+		{"existing unsent", func() *PendingReconciliationSet { return pendingSetWithUnsent(t, taskID, authority) }, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			set := tc.set()
+			claim, outcome := set.ClaimInitialSend(taskID, authority)
+			if outcome != ClaimAcquired || claim.Token == 0 {
+				t.Fatalf("ClaimInitialSend() = (%#v, %v)", claim, outcome)
+			}
+			if !set.RemoveClaim(claim) {
+				t.Fatal("RemoveClaim() = false")
+			}
+			if !tc.present {
+				pendingRequireNoEntry(t, set, taskID)
+				return
+			}
+			entry := pendingOnlyEntry(t, set)
+			if entry.state != pendingUnsent || !pendingTestAuthorityEqual(entry.authority, authority) || entry.claimToken != 0 {
+				t.Fatalf("restored entry = %#v", entry)
+			}
+			nextClaim, nextOutcome := set.ClaimInitialSend(taskID, authority)
+			if nextOutcome != ClaimAcquired || nextClaim.Token == claim.Token {
+				t.Fatalf("claim after compensation = (%#v, %v)", nextClaim, nextOutcome)
+			}
+		})
+	}
+}
+
+func TestPendingClaimInitialSendStaleCompensationDoesNotMutateCurrentClaim(t *testing.T) {
+	taskID := pendingTestTaskID(t, "initial-stale-compensation")
+	authority := pendingTestAuthority(taskID, 1)
+	set := pendingSetWithUnsent(t, taskID, authority)
+	first, outcome := set.ClaimInitialSend(taskID, authority)
+	if outcome != ClaimAcquired || !set.ReleaseSend(first) {
+		t.Fatalf("first claim = (%#v, %v)", first, outcome)
+	}
+	second, outcome := set.ClaimInitialSend(taskID, authority)
+	if outcome != ClaimAcquired || second.Token == first.Token {
+		t.Fatalf("second claim = (%#v, %v)", second, outcome)
+	}
+	if set.RemoveClaim(first) {
+		t.Fatal("stale RemoveClaim() = true")
+	}
+	entry := pendingOnlyEntry(t, set)
+	if entry.state != pendingClaimed || entry.claimToken != second.Token {
+		t.Fatalf("stale RemoveClaim changed entry: %#v", entry)
+	}
+	wrongTaskClaim := second
+	wrongTaskClaim.TaskID = pendingTestTaskID(t, "initial-wrong-task")
+	if set.RemoveClaim(wrongTaskClaim) {
+		t.Fatal("wrong task RemoveClaim() = true")
+	}
+	set.entries[taskID] = PendingEntry{taskID: pendingTestTaskID(t, "initial-corrupt-entry"), state: pendingClaimed, claimToken: second.Token}
+	if set.RemoveClaim(second) {
+		t.Fatal("entry task ID mismatch RemoveClaim() = true")
+	}
+}
+
+func TestPendingClaimInitialSendConcurrentClaimants(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*testing.T, domain.TaskID, ProcessSignalAuthority) *PendingReconciliationSet
+	}{
+		{"missing", func(_ *testing.T, _ domain.TaskID, _ ProcessSignalAuthority) *PendingReconciliationSet {
+			return &PendingReconciliationSet{}
+		}},
+		{"unsent", pendingSetWithUnsent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			taskID := pendingTestTaskID(t, "initial-concurrent-"+tc.name)
+			authority := pendingTestAuthority(taskID, 1)
+			set := tc.set(t, taskID, authority)
+			start := make(chan struct{})
+			results := make(chan struct {
+				claim   SendClaim
+				outcome ClaimOutcome
+			}, 2)
+			var wg sync.WaitGroup
+			for range 2 {
+				wg.Add(1)
+				go func() {
+					defer wg.Done()
+					<-start
+					claim, outcome := set.ClaimInitialSend(taskID, authority)
+					results <- struct {
+						claim   SendClaim
+						outcome ClaimOutcome
+					}{claim, outcome}
+				}()
+			}
+			close(start)
+			wg.Wait()
+			close(results)
+			acquired := 0
+			for result := range results {
+				if result.outcome == ClaimAcquired && result.claim.Token != 0 {
+					acquired++
+					continue
+				}
+				if result.outcome != ClaimAlreadyClaimed || result.claim != (SendClaim{}) {
+					t.Fatalf("result = (%#v, %v)", result.claim, result.outcome)
+				}
+			}
+			if acquired != 1 {
+				t.Fatalf("acquired claimants = %d", acquired)
+			}
+		})
+	}
+}
+
+func TestPendingClaimInitialSendConcurrentTerminalOperationsHaveOneOwner(t *testing.T) {
+	taskID := pendingTestTaskID(t, "initial-terminal-race")
+	authority := pendingTestAuthority(taskID, 1)
+	set := pendingSetWithUnsent(t, taskID, authority)
+	claim, outcome := set.ClaimInitialSend(taskID, authority)
+	if outcome != ClaimAcquired || claim.Token == 0 {
+		t.Fatalf("ClaimInitialSend() = (%#v, %v)", claim, outcome)
+	}
+	start := make(chan struct{})
+	results := make(chan bool, 4)
+	var wg sync.WaitGroup
+	for _, action := range []func(SendClaim) bool{set.CompleteSend, set.ReleaseSend, set.InvalidateSend, set.RemoveClaim} {
+		wg.Add(1)
+		go func(action func(SendClaim) bool) {
+			defer wg.Done()
+			<-start
+			results <- action(claim)
+		}(action)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	winners := 0
+	for result := range results {
+		if result {
+			winners++
+		}
+	}
+	if winners != 1 {
+		t.Fatalf("terminal operation winners = %d", winners)
+	}
+}
+
+func TestPendingClaimInitialSendAcceptsEqualNilGenerations(t *testing.T) {
+	taskID := pendingTestTaskID(t, "initial-nil-generations")
+	authority := pendingTestAuthority(taskID, 1)
+	authority.LifecycleGeneration = nil
+	set := pendingSetWithUnsent(t, taskID, authority)
+	claim, outcome := set.ClaimInitialSend(taskID, authority)
+	if outcome != ClaimAcquired || claim.Token == 0 || !pendingTestAuthorityEqual(claim.Authority, authority) {
+		t.Fatalf("ClaimInitialSend() = (%#v, %v)", claim, outcome)
+	}
 }
 
 func TestPendingRegisterValidationDoesNotMutate(t *testing.T) {
@@ -655,10 +901,17 @@ func pendingRequireEntryEqual(t *testing.T, want, got PendingEntry) {
 	}
 }
 func pendingTestAuthority(taskID domain.TaskID, pid int) ProcessSignalAuthority {
-	return ProcessSignalAuthority{TaskID: taskID, PID: pid, ProcessStartedAt: time.Date(2026, time.August, 10, 12, 0, pid, 0, time.Local)}
+	generation := domain.LifecycleGeneration(1)
+	return ProcessSignalAuthority{TaskID: taskID, PID: pid, ProcessStartedAt: time.Date(2026, time.August, 10, 12, 0, pid, 0, time.Local), ExpectedState: domain.StateCancelling, LifecycleGeneration: &generation}
 }
 func pendingTestAuthorityEqual(a, b ProcessSignalAuthority) bool {
-	return a.TaskID == b.TaskID && a.PID == b.PID && a.ProcessStartedAt.Equal(b.ProcessStartedAt)
+	if a.TaskID != b.TaskID || a.PID != b.PID || !a.ProcessStartedAt.Equal(b.ProcessStartedAt) || a.ExpectedState != b.ExpectedState {
+		return false
+	}
+	if a.LifecycleGeneration == nil || b.LifecycleGeneration == nil {
+		return a.LifecycleGeneration == nil && b.LifecycleGeneration == nil
+	}
+	return *a.LifecycleGeneration == *b.LifecycleGeneration
 }
 func ptr(value ProcessSignalAuthority) *ProcessSignalAuthority { return &value }
 func pendingTestTaskID(t *testing.T, slug string) domain.TaskID {

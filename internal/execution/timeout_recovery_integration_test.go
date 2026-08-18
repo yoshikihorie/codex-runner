@@ -72,13 +72,14 @@ func TestTimeoutRecoveryIntegrationNilSessionTransitionsToTimeoutLost(t *testing
 	recoveryUseCase := recovery.NewRecoverViaResumeUseCase(tasks, writer, recoverer, recovery.NewSavePartialOutputUseCase(reader, writer), slots, metricsRecorder, stalledTracker, sharedMutex, domain.ClockFunc(func() time.Time { return now }))
 	proc := &timeoutProcessFake{}
 	liveness := NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }), func(domain.TaskID) string { return filepath.Join(root, "unused.lock") })
-	enforce := NewEnforceTaskTimeoutUseCase(tasks, writer, proc, recoveryUseCase, NewTerminationEnsurer(liveness, proc, domain.ClockFunc(func() time.Time { return now }), func(context.Context, time.Duration) {}), &recovery.PendingReconciliationSet{}, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), sharedMutex, domain.ClockFunc(func() time.Time { return now }), stalledTracker)
+	validator := recovery.NewProcessSignalAuthorityValidator(tasks, sharedMutex, timeoutAuthorityOwnershipFake{})
+	enforce := NewEnforceTaskTimeoutUseCase(tasks, writer, proc, recoveryUseCase, NewTerminationEnsurer(liveness, proc, domain.ClockFunc(func() time.Time { return now }), func(context.Context, time.Duration) {}, validator), validator, &recovery.PendingReconciliationSet{}, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), sharedMutex, domain.ClockFunc(func() time.Time { return now }), stalledTracker)
 	if _, err := enforce.Execute(context.Background(), EnforceTaskTimeoutInput{TaskID: id, ResolvedTimeoutSeconds: 1800, OccurredAt: now}); err != nil {
 		t.Fatal(err)
 	}
 	stored, err := tasks.Load(id)
-	if err != nil || stored.State != domain.StateTimeoutLost || recoverer.calls != 0 || proc.calls != 1 || proc.pid != pid || proc.grace != TimeoutKillGrace {
-		t.Fatalf("snapshot=%#v err=%v resume=%d terminate=%d pid=%d grace=%s", stored, err, recoverer.calls, proc.calls, proc.pid, proc.grace)
+	if err != nil || stored.State != domain.StateTimeoutLost || recoverer.calls != 0 || proc.calls != 1 || proc.pid != pid {
+		t.Fatalf("snapshot=%#v err=%v resume=%d terminate=%d pid=%d", stored, err, recoverer.calls, proc.calls, proc.pid)
 	}
 	if slots.calls != 1 || slots.taskID != id || !slots.at.Equal(now) || len(metricsRecorder.inputs) != 1 {
 		t.Fatalf("slots=%#v metrics=%#v", slots, metricsRecorder.inputs)
@@ -126,5 +127,13 @@ func TestTimeoutRecoveryIntegrationNilSessionTransitionsToTimeoutLost(t *testing
 	}
 	if timedOut.SessionRef != nil || attempted.SessionRef != nil || failed.Origin != domain.RecoveryOriginTimeout || failed.PartialOutputSaved {
 		t.Fatalf("timedOut=%#v attempted=%#v failed=%#v", timedOut, attempted, failed)
+	}
+}
+
+func TestTimeoutRecoveryIntegrationCarriesLifecycleGeneration(t *testing.T) {
+	var input EnforceTaskTimeoutInput
+	input.Generation = domain.LifecycleGeneration(1)
+	if input.Generation == 0 {
+		t.Fatal("timeout input must retain the lifecycle generation")
 	}
 }

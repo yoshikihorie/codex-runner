@@ -39,7 +39,17 @@ type stallOwnershipSequence struct {
 	calls  int
 }
 
-func (s *stallOwnershipSequence) Acquire(domain.TaskID) (func(), bool) { return func() {}, false }
+func (s *stallOwnershipSequence) Acquire(domain.TaskID) (domain.LifecycleGeneration, func(), bool) {
+	return 0, func() {}, false
+}
+
+func (*stallOwnershipSequence) Current(domain.TaskID) (domain.LifecycleGeneration, bool) {
+	return 0, false
+}
+
+func (*stallOwnershipSequence) WithCurrent(domain.TaskID, domain.LifecycleGeneration, func() error) (bool, error) {
+	return false, nil
+}
 
 func (s *stallOwnershipSequence) IsOwned(domain.TaskID) bool {
 	if s.calls >= len(s.values) {
@@ -382,7 +392,7 @@ func TestCheckStallOwnershipSuppressesOnlyOrphanTransition(t *testing.T) {
 	store := &testStore{r: r, loads: map[string]domain.TaskSnapshot{id.String(): snapshot}}
 	writer := &testWriter{r: r}
 	ownership := execution.NewLifecycleOwnershipRegistry()
-	release, acquired := ownership.Acquire(id)
+	_, release, acquired := ownership.Acquire(id)
 	if !acquired {
 		t.Fatal("ownership acquisition failed")
 	}

@@ -283,29 +283,54 @@ func TestProcessRunnerLaunchPassesPTYArguments(t *testing.T) {
 	}
 }
 
-func TestProcessRunnerTerminateDelegatesArgumentsAndError(t *testing.T) {
-	original := terminateProcessGroup
-	t.Cleanup(func() { terminateProcessGroup = original })
+var _ ProcessRunner = (*processRunner)(nil)
 
-	wantErr := errors.New("terminate failed")
-	const wantPID = 12345
-	wantGrace := 7 * time.Second
-	var gotPID int
-	var gotGrace time.Duration
-	callCount := 0
-	terminateProcessGroup = func(pid int, grace time.Duration) error {
-		gotPID = pid
-		gotGrace = grace
-		callCount++
-		return wantErr
-	}
+func TestProcessRunnerSignalDelegatesArgumentsAndError(t *testing.T) {
+	originalTerminate, originalKill := sendTerminate, sendKill
+	t.Cleanup(func() { sendTerminate, sendKill = originalTerminate, originalKill })
 
-	err := NewProcessRunner(launchTestLogs{}).Terminate(wantPID, wantGrace)
-	if gotPID != wantPID || gotGrace != wantGrace || callCount != 1 {
-		t.Fatalf("pid, grace, calls = %d, %v, %d", gotPID, gotGrace, callCount)
-	}
-	if err != wantErr {
-		t.Fatalf("error = %v, want same error %v", err, wantErr)
+	for _, tt := range []struct {
+		name string
+		send func(ProcessRunner, int) error
+		want error
+	}{
+		{
+			name: "terminate",
+			send: func(runner ProcessRunner, pid int) error { return runner.SendTerminate(pid) },
+			want: errors.New("terminate failed"),
+		},
+		{
+			name: "kill",
+			send: func(runner ProcessRunner, pid int) error { return runner.SendKill(pid) },
+			want: errors.New("kill failed"),
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			const wantPID = 12345
+			terminateCalls, killCalls := 0, 0
+			var terminatePID, killPID int
+			sendTerminate = func(pid int) error {
+				terminateCalls++
+				terminatePID = pid
+				return tt.want
+			}
+			sendKill = func(pid int) error {
+				killCalls++
+				killPID = pid
+				return tt.want
+			}
+
+			err := tt.send(NewProcessRunner(launchTestLogs{}), wantPID)
+			if err != tt.want {
+				t.Fatalf("error = %v, want same error %v", err, tt.want)
+			}
+			if tt.name == "terminate" && (terminateCalls != 1 || killCalls != 0 || terminatePID != wantPID) {
+				t.Fatalf("terminate calls,pid; kill calls = %d,%d; %d", terminateCalls, terminatePID, killCalls)
+			}
+			if tt.name == "kill" && (killCalls != 1 || terminateCalls != 0 || killPID != wantPID) {
+				t.Fatalf("kill calls,pid; terminate calls = %d,%d; %d", killCalls, killPID, terminateCalls)
+			}
+		})
 	}
 }
 

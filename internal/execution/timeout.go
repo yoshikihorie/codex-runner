@@ -56,6 +56,7 @@ type armedTimer struct {
 	deadline               time.Time
 	resolvedTimeoutSeconds int
 	generation             uint64
+	lifecycleGeneration    domain.LifecycleGeneration
 	retryAttempts          int
 	executing              bool
 }
@@ -91,7 +92,7 @@ func NewTimeoutWatcher(enforce *EnforceTaskTimeoutUseCase, clock domain.Clock, t
 	return &TimeoutWatcher{enforce: enforce, clock: clock, timerFactory: timerFactory, baseCtx: baseCtx, logger: logger, timers: make(map[domain.TaskID]armedTimer), closeDone: make(chan struct{})}
 }
 
-func (w *TimeoutWatcher) Arm(taskID domain.TaskID, deadline time.Time, resolvedTimeoutSeconds int) {
+func (w *TimeoutWatcher) Arm(taskID domain.TaskID, deadline time.Time, resolvedTimeoutSeconds int, lifecycleGeneration domain.LifecycleGeneration) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if w.closed {
@@ -132,6 +133,7 @@ func (w *TimeoutWatcher) Arm(taskID domain.TaskID, deadline time.Time, resolvedT
 		_, err := w.enforce.Execute(w.baseCtx, EnforceTaskTimeoutInput{
 			TaskID:                 taskID,
 			ResolvedTimeoutSeconds: armed.resolvedTimeoutSeconds,
+			Generation:             armed.lifecycleGeneration,
 			OccurredAt:             w.clock.Now(),
 		})
 		w.finishExecution(taskID, generation, err)
@@ -146,7 +148,7 @@ func (w *TimeoutWatcher) Arm(taskID domain.TaskID, deadline time.Time, resolvedT
 		}
 		return stopped
 	}
-	w.timers[taskID] = armedTimer{cancel: cancel, deadline: deadline, resolvedTimeoutSeconds: resolvedTimeoutSeconds, generation: generation}
+	w.timers[taskID] = armedTimer{cancel: cancel, deadline: deadline, resolvedTimeoutSeconds: resolvedTimeoutSeconds, generation: generation, lifecycleGeneration: lifecycleGeneration}
 	close(ready)
 }
 
@@ -185,7 +187,7 @@ func (w *TimeoutWatcher) finishExecution(taskID domain.TaskID, generation uint64
 		entry.executing = true
 		w.timers[taskID] = entry
 		w.mu.Unlock()
-		_, retryErr := w.enforce.Execute(w.baseCtx, EnforceTaskTimeoutInput{TaskID: taskID, ResolvedTimeoutSeconds: entry.resolvedTimeoutSeconds, OccurredAt: w.clock.Now()})
+		_, retryErr := w.enforce.Execute(w.baseCtx, EnforceTaskTimeoutInput{TaskID: taskID, ResolvedTimeoutSeconds: entry.resolvedTimeoutSeconds, Generation: entry.lifecycleGeneration, OccurredAt: w.clock.Now()})
 		w.finishExecution(taskID, generation, retryErr)
 		if retryErr != nil {
 			w.logger.Error("enforce task timeout", "task_id", taskID.String(), "error", retryErr)
@@ -237,19 +239,23 @@ func (w *TimeoutWatcher) Close() error {
 }
 
 type TerminationEnsurer struct {
-	liveness *CheckLivenessUseCase
-	proc     ProcessRunner
-	clock    domain.Clock
-	wait     func(ctx context.Context, d time.Duration)
+	liveness  *CheckLivenessUseCase
+	proc      ProcessRunner
+	clock     domain.Clock
+	wait      func(ctx context.Context, d time.Duration)
+	validator *recovery.ProcessSignalAuthorityValidator
 }
 
 type TerminationAttemptResult = recovery.TerminationAttemptResult
 
-func NewTerminationEnsurer(liveness *CheckLivenessUseCase, proc ProcessRunner, clock domain.Clock, wait func(ctx context.Context, d time.Duration)) *TerminationEnsurer {
+func NewTerminationEnsurer(liveness *CheckLivenessUseCase, proc ProcessRunner, clock domain.Clock, wait func(ctx context.Context, d time.Duration), validator *recovery.ProcessSignalAuthorityValidator) *TerminationEnsurer {
 	if isNilStatusDependency(liveness) || isNilStatusDependency(proc) || isNilStatusDependency(clock) || isNilStatusDependency(wait) {
 		panic("termination ensurer requires non-nil dependencies")
 	}
-	return &TerminationEnsurer{liveness: liveness, proc: proc, clock: clock, wait: wait}
+	if isNilStatusDependency(validator) {
+		panic("termination ensurer requires a non-nil authority validator")
+	}
+	return &TerminationEnsurer{liveness: liveness, proc: proc, clock: clock, wait: wait, validator: validator}
 }
 
 func contextWait(ctx context.Context, d time.Duration) {
@@ -273,13 +279,34 @@ func (e *TerminationEnsurer) Confirm(ctx context.Context, taskID domain.TaskID) 
 	return e.liveness.Execute(ctx, taskID)
 }
 
-func (e *TerminationEnsurer) SendAndConfirm(ctx context.Context, taskID domain.TaskID, pid int, grace time.Duration) TerminationAttemptResult {
-	terminateErr := e.proc.Terminate(pid, grace)
-	if terminateErr != nil {
-		slog.Default().Warn("terminate task process group", "task_id", taskID.String(), "error", terminateErr)
+func (e *TerminationEnsurer) SendAndConfirm(ctx context.Context, taskID domain.TaskID, authority recovery.ProcessSignalAuthority, grace time.Duration) TerminationAttemptResult {
+	termErr := e.send(ctx, authority, e.proc.SendTerminate)
+	e.wait(ctx, grace)
+	dead, confirmErr := e.liveness.Execute(ctx, taskID)
+	if confirmErr != nil || dead {
+		return TerminationAttemptResult{Dead: dead, TerminateErr: termErr, ConfirmErr: confirmErr}
 	}
-	dead, confirmErr := e.Confirm(ctx, taskID)
-	return TerminationAttemptResult{Dead: dead, TerminateErr: terminateErr, ConfirmErr: confirmErr}
+	killErr := e.send(ctx, authority, e.proc.SendKill)
+	dead, confirmErr = e.liveness.Execute(ctx, taskID)
+	return TerminationAttemptResult{Dead: dead, TerminateErr: joinSignalErrors(termErr, killErr), ConfirmErr: confirmErr}
+}
+
+func (e *TerminationEnsurer) send(ctx context.Context, authority recovery.ProcessSignalAuthority, action func(int) error) error {
+	executed, err := e.validator.Validate(ctx, authority, action)
+	if !executed && err == nil {
+		return recovery.ErrProcessSignalAuthorityInvalid
+	}
+	return err
+}
+
+func joinSignalErrors(termErr, killErr error) error {
+	if termErr == nil {
+		return killErr
+	}
+	if killErr == nil {
+		return termErr
+	}
+	return errors.Join(termErr, killErr)
 }
 
 type RecoveryInvoker interface {
@@ -304,6 +331,7 @@ var _ taskLocker = (*store.TaskMutex)(nil)
 type EnforceTaskTimeoutInput struct {
 	TaskID                 domain.TaskID
 	ResolvedTimeoutSeconds int
+	Generation             domain.LifecycleGeneration
 	OccurredAt             time.Time
 }
 
@@ -318,6 +346,7 @@ type EnforceTaskTimeoutUseCase struct {
 	proc             ProcessRunner
 	recovery         RecoveryInvoker
 	termination      *TerminationEnsurer
+	validator        *recovery.ProcessSignalAuthorityValidator
 	pendingRegistrar recovery.PendingRegistrar
 	pathLockReleaser *ReleasePathLockUseCase
 	taskMu           taskLocker
@@ -325,11 +354,14 @@ type EnforceTaskTimeoutUseCase struct {
 	stalledTracker   stalledTimeTracker
 }
 
-func NewEnforceTaskTimeoutUseCase(tasks store.TaskStore, contractWriter contract.ContractWriter, proc ProcessRunner, recoveryInvoker RecoveryInvoker, termination *TerminationEnsurer, pendingRegistrar recovery.PendingRegistrar, pathLockReleaser *ReleasePathLockUseCase, taskMu taskLocker, clock domain.Clock, stalledTracker stalledTimeTracker) *EnforceTaskTimeoutUseCase {
+func NewEnforceTaskTimeoutUseCase(tasks store.TaskStore, contractWriter contract.ContractWriter, proc ProcessRunner, recoveryInvoker RecoveryInvoker, termination *TerminationEnsurer, validator *recovery.ProcessSignalAuthorityValidator, pendingRegistrar recovery.PendingRegistrar, pathLockReleaser *ReleasePathLockUseCase, taskMu taskLocker, clock domain.Clock, stalledTracker stalledTimeTracker) *EnforceTaskTimeoutUseCase {
 	if isNilStatusDependency(tasks) || isNilStatusDependency(contractWriter) || isNilStatusDependency(proc) || isNilStatusDependency(recoveryInvoker) || isNilStatusDependency(termination) || isNilStatusDependency(pendingRegistrar) || isNilStatusDependency(pathLockReleaser) || isNilStatusDependency(taskMu) || isNilStatusDependency(clock) || isNilStatusDependency(stalledTracker) {
 		panic("enforce task timeout use case requires non-nil dependencies")
 	}
-	return &EnforceTaskTimeoutUseCase{tasks: tasks, contract: contractWriter, proc: proc, recovery: recoveryInvoker, termination: termination, pendingRegistrar: pendingRegistrar, pathLockReleaser: pathLockReleaser, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker}
+	if isNilStatusDependency(validator) {
+		panic("enforce task timeout use case requires a non-nil authority validator")
+	}
+	return &EnforceTaskTimeoutUseCase{tasks: tasks, contract: contractWriter, proc: proc, recovery: recoveryInvoker, termination: termination, validator: validator, pendingRegistrar: pendingRegistrar, pathLockReleaser: pathLockReleaser, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker}
 }
 
 func (uc *EnforceTaskTimeoutUseCase) Execute(ctx context.Context, in EnforceTaskTimeoutInput) (EnforceTaskTimeoutOutput, error) {
@@ -349,18 +381,29 @@ func (uc *EnforceTaskTimeoutUseCase) Execute(ctx context.Context, in EnforceTask
 	operationErr := contractErr
 	disposition := recovery.PendingSendConfirmOnly
 	var authority *recovery.ProcessSignalAuthority
+	var dead bool
+	var confirmErr error
 	if snapshot.PID != nil && snapshot.ProcessStartedAt != nil {
-		candidate := recovery.ProcessSignalAuthority{TaskID: snapshot.TaskID, PID: *snapshot.PID, ProcessStartedAt: *snapshot.ProcessStartedAt}
+		generation := in.Generation
+		candidate := recovery.ProcessSignalAuthority{TaskID: snapshot.TaskID, PID: *snapshot.PID, ProcessStartedAt: *snapshot.ProcessStartedAt, ExpectedState: domain.StateTimeout, LifecycleGeneration: &generation}
 		authority = &candidate
-		if terminateErr := uc.proc.Terminate(*snapshot.PID, TimeoutKillGrace); terminateErr != nil {
+		result := uc.termination.SendAndConfirm(ctx, in.TaskID, candidate, TimeoutKillGrace)
+		if terminateErr := result.TerminateErr; terminateErr != nil {
 			slog.Default().Warn("terminate task process group", "task_id", in.TaskID.String(), "error", terminateErr)
-			disposition = recovery.PendingSendUnsent
+			if errors.Is(terminateErr, recovery.ErrProcessSignalAuthorityInvalid) {
+				disposition = recovery.PendingSendConfirmOnly
+				authority = nil
+			} else {
+				disposition = recovery.PendingSendUnsent
+			}
 		} else {
 			disposition = recovery.PendingSendSent
 			authority = nil
 		}
+		dead, confirmErr = result.Dead, result.ConfirmErr
+	} else {
+		dead, confirmErr = uc.termination.Confirm(ctx, in.TaskID)
 	}
-	dead, confirmErr := uc.termination.Confirm(ctx, in.TaskID)
 	if confirmErr != nil || !dead {
 		if registerErr := uc.pendingRegistrar.Register(in.TaskID, disposition, authority); registerErr != nil {
 			operationErr = errors.Join(operationErr, registerErr)

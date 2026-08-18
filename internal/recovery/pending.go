@@ -11,9 +11,11 @@ import (
 var ErrPendingClaimed = errors.New("recovery: pending entry is claimed for send")
 
 type ProcessSignalAuthority struct {
-	TaskID           domain.TaskID
-	PID              int
-	ProcessStartedAt time.Time
+	TaskID              domain.TaskID
+	PID                 int
+	ProcessStartedAt    time.Time
+	ExpectedState       domain.TaskState
+	LifecycleGeneration *domain.LifecycleGeneration
 }
 
 type SendClaim struct {
@@ -50,14 +52,16 @@ const (
 )
 
 type PendingEntry struct {
-	taskID     domain.TaskID
-	state      pendingState
-	authority  ProcessSignalAuthority
-	claimToken uint64
+	taskID                 domain.TaskID
+	state                  pendingState
+	authority              ProcessSignalAuthority
+	claimToken             uint64
+	initialClaimFromUnsent bool
 }
 
 type PendingRegistrar interface {
 	Register(taskID domain.TaskID, disposition PendingSendDisposition, authority *ProcessSignalAuthority) error
+	ClaimInitialSend(taskID domain.TaskID, authority ProcessSignalAuthority) (claim SendClaim, outcome ClaimOutcome)
 	ClaimForSend(taskID domain.TaskID, authority ProcessSignalAuthority) (claim SendClaim, outcome ClaimOutcome)
 	CompleteSend(claim SendClaim) bool
 	ReleaseSend(claim SendClaim) bool
@@ -141,6 +145,7 @@ func (s *PendingReconciliationSet) ClaimForSend(taskID domain.TaskID, authority 
 		entry.state = pendingConfirmOnly
 		entry.authority = ProcessSignalAuthority{}
 		entry.claimToken = 0
+		entry.initialClaimFromUnsent = false
 		s.entries[taskID] = entry
 		return SendClaim{}, ClaimConfirmOnly
 	}
@@ -148,6 +153,46 @@ func (s *PendingReconciliationSet) ClaimForSend(taskID domain.TaskID, authority 
 	s.nextToken++
 	entry.claimToken = s.nextToken
 	entry.state = pendingClaimed
+	entry.initialClaimFromUnsent = false
+	s.entries[taskID] = entry
+	return SendClaim{TaskID: taskID, Token: entry.claimToken, Authority: entry.authority}, ClaimAcquired
+}
+
+func (s *PendingReconciliationSet) ClaimInitialSend(taskID domain.TaskID, authority ProcessSignalAuthority) (claim SendClaim, outcome ClaimOutcome) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	entry, found := s.entries[taskID]
+	if !found {
+		if s.entries == nil {
+			s.entries = make(map[domain.TaskID]PendingEntry)
+		}
+		s.nextToken++
+		entry = PendingEntry{taskID: taskID, state: pendingClaimed, authority: authority, claimToken: s.nextToken}
+		s.entries[taskID] = entry
+		return SendClaim{TaskID: taskID, Token: entry.claimToken, Authority: entry.authority}, ClaimAcquired
+	}
+
+	switch entry.state {
+	case pendingClaimed:
+		return SendClaim{}, ClaimAlreadyClaimed
+	case pendingSent:
+		return SendClaim{}, ClaimSent
+	case pendingConfirmOnly:
+		return SendClaim{}, ClaimConfirmOnly
+	}
+	if !pendingAuthorityEqual(entry.authority, authority) {
+		entry.state = pendingConfirmOnly
+		entry.authority = ProcessSignalAuthority{}
+		entry.claimToken = 0
+		entry.initialClaimFromUnsent = false
+		s.entries[taskID] = entry
+		return SendClaim{}, ClaimConfirmOnly
+	}
+	s.nextToken++
+	entry.claimToken = s.nextToken
+	entry.state = pendingClaimed
+	entry.initialClaimFromUnsent = true
 	s.entries[taskID] = entry
 	return SendClaim{TaskID: taskID, Token: entry.claimToken, Authority: entry.authority}, ClaimAcquired
 }
@@ -162,6 +207,7 @@ func (s *PendingReconciliationSet) CompleteSend(claim SendClaim) bool {
 	}
 	entry.state = pendingSent
 	entry.authority = ProcessSignalAuthority{}
+	entry.initialClaimFromUnsent = false
 	s.entries[claim.TaskID] = entry
 	return true
 }
@@ -175,6 +221,7 @@ func (s *PendingReconciliationSet) ReleaseSend(claim SendClaim) bool {
 		return false
 	}
 	entry.state = pendingUnsent
+	entry.initialClaimFromUnsent = false
 	s.entries[claim.TaskID] = entry
 	return true
 }
@@ -190,6 +237,7 @@ func (s *PendingReconciliationSet) InvalidateSend(claim SendClaim) bool {
 	entry.state = pendingConfirmOnly
 	entry.authority = ProcessSignalAuthority{}
 	entry.claimToken = 0
+	entry.initialClaimFromUnsent = false
 	s.entries[claim.TaskID] = entry
 	return true
 }
@@ -201,6 +249,13 @@ func (s *PendingReconciliationSet) RemoveClaim(claim SendClaim) bool {
 	entry, found := s.entries[claim.TaskID]
 	if !found || entry.state != pendingClaimed || entry.taskID != claim.TaskID || entry.claimToken != claim.Token {
 		return false
+	}
+	if entry.initialClaimFromUnsent {
+		entry.state = pendingUnsent
+		entry.claimToken = 0
+		entry.initialClaimFromUnsent = false
+		s.entries[claim.TaskID] = entry
+		return true
 	}
 	delete(s.entries, claim.TaskID)
 	return true
@@ -264,5 +319,11 @@ func pendingEntryForRegistration(taskID domain.TaskID, disposition PendingSendDi
 }
 
 func pendingAuthorityEqual(left, right ProcessSignalAuthority) bool {
-	return left.TaskID == right.TaskID && left.PID == right.PID && left.ProcessStartedAt.Equal(right.ProcessStartedAt)
+	if left.TaskID != right.TaskID || left.PID != right.PID || !left.ProcessStartedAt.Equal(right.ProcessStartedAt) || left.ExpectedState != right.ExpectedState {
+		return false
+	}
+	if left.LifecycleGeneration == nil || right.LifecycleGeneration == nil {
+		return left.LifecycleGeneration == nil && right.LifecycleGeneration == nil
+	}
+	return *left.LifecycleGeneration == *right.LifecycleGeneration
 }

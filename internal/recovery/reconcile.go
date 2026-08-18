@@ -2,6 +2,7 @@ package recovery
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -79,11 +80,12 @@ func (uc *ReconcilePendingUseCase) reconcileTick(ctx context.Context) {
 		if ctx.Err() != nil {
 			return
 		}
-		uc.reconcileOne(ctx, entry.taskID)
+		uc.reconcileOne(ctx, entry)
 	}
 }
 
-func (uc *ReconcilePendingUseCase) reconcileOne(ctx context.Context, taskID domain.TaskID) {
+func (uc *ReconcilePendingUseCase) reconcileOne(ctx context.Context, entry PendingEntry) {
+	taskID := entry.taskID
 	if ctx.Err() != nil {
 		return
 	}
@@ -103,9 +105,9 @@ func (uc *ReconcilePendingUseCase) reconcileOne(ctx context.Context, taskID doma
 	case domain.StateOrphaned:
 		uc.reconcileOrphaned(ctx, taskID, snapshot)
 	case domain.StateTimeout:
-		uc.reconcileTermination(ctx, taskID, snapshot, true)
+		uc.reconcileTermination(ctx, taskID, snapshot, true, entry.authority)
 	case domain.StateCancelling:
-		uc.reconcileTermination(ctx, taskID, snapshot, false)
+		uc.reconcileTermination(ctx, taskID, snapshot, false, entry.authority)
 	default:
 		if isReconciliationTerminalState(snapshot.State) {
 			uc.pending.Remove(taskID)
@@ -185,12 +187,11 @@ func (uc *ReconcilePendingUseCase) reconcileOrphaned(ctx context.Context, taskID
 	go uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: snapshot.SessionRef, Origin: domain.RecoveryOriginOrphan, OccurredAt: uc.clock.Now()}, SendClaim{})
 }
 
-func (uc *ReconcilePendingUseCase) reconcileTermination(ctx context.Context, taskID domain.TaskID, snapshot domain.TaskSnapshot, timeout bool) {
+func (uc *ReconcilePendingUseCase) reconcileTermination(ctx context.Context, taskID domain.TaskID, snapshot domain.TaskSnapshot, timeout bool, authority ProcessSignalAuthority) {
 	if ctx.Err() != nil {
 		return
 	}
-	authority, hasAuthority := processSignalAuthority(snapshot)
-	if hasAuthority {
+	if validProcessSignalAuthority(authority) {
 		claim, outcome := uc.pending.ClaimForSend(taskID, authority)
 		switch outcome {
 		case ClaimNotFound, ClaimAlreadyClaimed:
@@ -221,8 +222,12 @@ func (uc *ReconcilePendingUseCase) reconcileTermination(ctx context.Context, tas
 }
 
 func (uc *ReconcilePendingUseCase) sendAndReconcile(ctx context.Context, claim SendClaim, snapshot domain.TaskSnapshot, timeout bool) {
-	result := uc.termination.SendAndConfirm(ctx, claim.TaskID, claim.Authority.PID, uc.terminationGrace)
+	result := uc.termination.SendAndConfirm(ctx, claim.TaskID, claim.Authority, uc.terminationGrace)
 	if !result.Dead {
+		if errors.Is(result.TerminateErr, ErrProcessSignalAuthorityInvalid) {
+			uc.pending.InvalidateSend(claim)
+			return
+		}
 		if result.TerminateErr == nil {
 			uc.pending.CompleteSend(claim)
 			return

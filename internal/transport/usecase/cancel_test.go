@@ -120,11 +120,66 @@ func (f *cancelEventsFake) AppendEvent(_ domain.TaskID, event domain.Event) erro
 }
 
 type cancelTerminatorFake struct {
-	calls int
-	pid   int
-	grace time.Duration
-	err   error
-	order *[]string
+	calls    int
+	pid      int
+	grace    time.Duration
+	termPIDs []int
+	killPIDs []int
+	err      error
+	order    *[]string
+}
+
+func (f *cancelTerminatorFake) SendTerminate(pid int) error {
+	f.calls++
+	f.pid = pid
+	f.termPIDs = append(f.termPIDs, pid)
+	if f.order != nil {
+		*f.order = append(*f.order, "terminate")
+	}
+	return f.err
+}
+
+func (f *cancelTerminatorFake) SendKill(pid int) error {
+	f.calls++
+	f.pid = pid
+	f.killPIDs = append(f.killPIDs, pid)
+	if f.order != nil {
+		*f.order = append(*f.order, "kill")
+	}
+	return f.err
+}
+
+type cancelTerminationEnsurerContract interface {
+	SendAndConfirm(context.Context, domain.TaskID, recovery.ProcessSignalAuthority, time.Duration) recovery.TerminationAttemptResult
+}
+
+func TestCancelTerminationAuthorityContractCarriesCancellingState(t *testing.T) {
+	id := cancelTaskID(t)
+	started := time.Date(2026, time.August, 18, 12, 0, 0, 0, time.UTC)
+	generation := domain.LifecycleGeneration(3)
+	authority := recovery.ProcessSignalAuthority{TaskID: id, PID: 4321, ProcessStartedAt: started, ExpectedState: domain.StateCancelling, LifecycleGeneration: &generation}
+	var _ cancelTerminationEnsurerContract = (*cancelTerminationEnsurerFake)(nil)
+	if authority.ExpectedState != domain.StateCancelling || authority.LifecycleGeneration == nil {
+		t.Fatalf("authority=%#v", authority)
+	}
+}
+
+type cancelTerminationEnsurerFake struct {
+	calls     int
+	taskID    domain.TaskID
+	authority recovery.ProcessSignalAuthority
+	grace     time.Duration
+	order     *[]string
+	result    recovery.TerminationAttemptResult
+}
+
+func (f *cancelTerminationEnsurerFake) SendAndConfirm(_ context.Context, taskID domain.TaskID, authority recovery.ProcessSignalAuthority, grace time.Duration) recovery.TerminationAttemptResult {
+	f.calls++
+	f.taskID, f.authority, f.grace = taskID, authority, grace
+	if f.order != nil {
+		*f.order = append(*f.order, "termination")
+	}
+	return f.result
 }
 
 func (f *cancelTerminatorFake) Terminate(pid int, grace time.Duration) error {
@@ -162,6 +217,9 @@ func (f *cancelPendingRegistrarFake) Register(taskID domain.TaskID, disposition 
 	return f.err
 }
 func (*cancelPendingRegistrarFake) ClaimForSend(domain.TaskID, recovery.ProcessSignalAuthority) (recovery.SendClaim, recovery.ClaimOutcome) {
+	return recovery.SendClaim{}, recovery.ClaimNotFound
+}
+func (*cancelPendingRegistrarFake) ClaimInitialSend(domain.TaskID, recovery.ProcessSignalAuthority) (recovery.SendClaim, recovery.ClaimOutcome) {
 	return recovery.SendClaim{}, recovery.ClaimNotFound
 }
 func (*cancelPendingRegistrarFake) CompleteSend(recovery.SendClaim) bool   { return false }
@@ -255,6 +313,14 @@ func cancelFixture(t *testing.T, payload execution.TaskLaunchPayload, removed bo
 	return cancelFixtureWithQueueMutexAndSlots(t, payload, removed, &sync.Mutex{}, &cancelSlotFake{})
 }
 
+func cancelFixtureWithTerminationEnsurer(t *testing.T, payload execution.TaskLaunchPayload, removed bool) (*cancelStoreFake, *cancelQueueFake, *cancelEventsFake, *cancelTerminatorFake, *cancelDisarmerFake, *cancelTerminationEnsurerFake, *CancelTaskUseCase) {
+	t.Helper()
+	tasks, queue, events, terminator, disarmer, base := cancelFixture(t, payload, removed)
+	termination := &cancelTerminationEnsurerFake{}
+	uc := NewCancelTaskUseCase(tasks, queue, base.queueMu, base.taskMu, events, terminator, termination, base.pendingRegistrar, disarmer, base.confirmer, base.stalledTracker, base.clock)
+	return tasks, queue, events, terminator, disarmer, termination, uc
+}
+
 func cancelFixtureWithQueueMutexAndSlots(t *testing.T, payload execution.TaskLaunchPayload, removed bool, queueMu *sync.Mutex, slots recovery.SlotReleaser) (*cancelStoreFake, *cancelQueueFake, *cancelEventsFake, *cancelTerminatorFake, *cancelDisarmerFake, *CancelTaskUseCase) {
 	t.Helper()
 	tasks := &cancelStoreFake{reserved: true}
@@ -264,7 +330,7 @@ func cancelFixtureWithQueueMutexAndSlots(t *testing.T, payload execution.TaskLau
 	disarmer := &cancelDisarmerFake{}
 	writer := &cancelWriterFake{}
 	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, writer, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), slots, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, &cancelPendingRegistrarFake{})
-	uc := NewCancelTaskUseCase(tasks, queue, queueMu, store.NewTaskMutex(), events, terminator, &cancelPendingRegistrarFake{}, disarmer, confirmer, &cancelStalledTrackerFake{}, domain.ClockFunc(func() time.Time { return time.Date(2026, 8, 11, 12, 1, 0, 0, time.UTC) }))
+	uc := NewCancelTaskUseCase(tasks, queue, queueMu, store.NewTaskMutex(), events, terminator, &cancelTerminationEnsurerFake{}, &cancelPendingRegistrarFake{}, disarmer, confirmer, &cancelStalledTrackerFake{}, domain.ClockFunc(func() time.Time { return time.Date(2026, 8, 11, 12, 1, 0, 0, time.UTC) }))
 	return tasks, queue, events, terminator, disarmer, uc
 }
 
@@ -408,16 +474,17 @@ func TestCancelTaskExecute_PersistedRunningStalledAndAdoptedTerminateBeforeDisar
 	for _, state := range []domain.TaskState{domain.StateRunning, domain.StateStalled, domain.StateAdopted} {
 		t.Run(string(state), func(t *testing.T) {
 			payload := cancelQueuedPayload(t)
-			tasks, _, _, terminator, disarmer, uc := cancelFixture(t, payload, false)
+			tasks, _, _, terminator, disarmer, termination, uc := cancelFixtureWithTerminationEnsurer(t, payload, false)
 			tasks.snapshot = cancelPersistedSnapshot(t, state, true)
+			processStartedAt := *tasks.snapshot.ProcessStartedAt
 			order := []string{}
-			terminator.order, disarmer.order = &order, &order
+			termination.order, disarmer.order = &order, &order
 			pending := uc.pendingRegistrar.(*cancelPendingRegistrarFake)
 			pending.order = &order
 
 			out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
-			if err != nil || !out.TerminationTriggered || terminator.calls != 1 || terminator.pid != 4321 || terminator.grace != execution.TimeoutKillGrace || pending.calls != 0 || disarmer.calls != 1 || strings.Join(order, ",") != "terminate,disarm" {
-				t.Fatalf("out=%#v err=%v terminator=%#v pending=%#v disarmer=%#v order=%#v", out, err, terminator, pending, disarmer, order)
+			if err != nil || !out.TerminationTriggered || termination.calls != 1 || termination.taskID != payload.Task.ID() || termination.authority.PID != 4321 || !termination.authority.ProcessStartedAt.Equal(processStartedAt) || termination.authority.ExpectedState != domain.StateCancelling || termination.authority.LifecycleGeneration != nil || termination.grace != execution.TimeoutKillGrace || len(terminator.termPIDs) != 0 || pending.calls != 1 || pending.disposition != recovery.PendingSendSent || pending.authority != nil || disarmer.calls != 1 || strings.Join(order, ",") != "termination,register,disarm" {
+				t.Fatalf("out=%#v err=%v termination=%#v terminator=%#v pending=%#v disarmer=%#v order=%#v", out, err, termination, terminator, pending, disarmer, order)
 			}
 		})
 	}
@@ -471,7 +538,7 @@ func TestCancelTaskExecute_PersistedAdoptedWithoutPIDRegistersConfirmOnly(t *tes
 	disarmer := &cancelDisarmerFake{}
 	terminator := &cancelTerminatorFake{}
 	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, pending)
-	uc := NewCancelTaskUseCase(tasks, queue, queue.queueMu, store.NewTaskMutex(), &cancelEventsFake{}, terminator, pending, disarmer, confirmer, &cancelStalledTrackerFake{}, domain.ClockFunc(time.Now))
+	uc := NewCancelTaskUseCase(tasks, queue, queue.queueMu, store.NewTaskMutex(), &cancelEventsFake{}, terminator, &cancelTerminationEnsurerFake{}, pending, disarmer, confirmer, &cancelStalledTrackerFake{}, domain.ClockFunc(time.Now))
 
 	out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
 	if err != nil || out.TerminationTriggered || pending.calls != 1 || pending.disposition != recovery.PendingSendConfirmOnly || pending.authority != nil || disarmer.calls != 1 || terminator.calls != 0 || tasks.snapshot.State != domain.StateCancelling {
@@ -499,7 +566,7 @@ func TestCancelTaskExecute_LiveAdoptedWithoutPIDRegistersConfirmOnly(t *testing.
 			disarmer := &cancelDisarmerFake{}
 			terminator := &cancelTerminatorFake{}
 			confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, pending)
-			uc := NewCancelTaskUseCase(tasks, queue, queue.queueMu, store.NewTaskMutex(), &cancelEventsFake{}, terminator, pending, disarmer, confirmer, &cancelStalledTrackerFake{}, domain.ClockFunc(time.Now))
+			uc := NewCancelTaskUseCase(tasks, queue, queue.queueMu, store.NewTaskMutex(), &cancelEventsFake{}, terminator, &cancelTerminationEnsurerFake{}, pending, disarmer, confirmer, &cancelStalledTrackerFake{}, domain.ClockFunc(time.Now))
 
 			out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
 			if err != nil || out.TerminationTriggered || pending.calls != 1 || pending.disposition != recovery.PendingSendConfirmOnly || pending.authority != nil || disarmer.calls != 1 || terminator.calls != 0 || tasks.snapshot.State != domain.StateCancelling {
@@ -547,36 +614,36 @@ func TestCancelTaskExecute_PersistedCancellingDoesNotResendTerminate(t *testing.
 
 func TestCancelTaskExecute_PersistedTerminateFailureRetainsCancellingAndLogs(t *testing.T) {
 	payload := cancelQueuedPayload(t)
-	tasks, _, _, terminator, disarmer, uc := cancelFixture(t, payload, false)
+	tasks, _, _, terminator, disarmer, termination, uc := cancelFixtureWithTerminationEnsurer(t, payload, false)
 	tasks.snapshot = cancelPersistedSnapshot(t, domain.StateRunning, true)
-	terminator.err = errors.New("terminate I/O failure")
+	termination.result.TerminateErr = errors.New("terminate I/O failure")
 	order := []string{}
-	terminator.order, disarmer.order = &order, &order
+	termination.order, disarmer.order = &order, &order
 	pending := uc.pendingRegistrar.(*cancelPendingRegistrarFake)
 	pending.order = &order
 	var logs bytes.Buffer
 	uc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 
 	out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
-	if err != nil || !out.TerminationTriggered || terminator.calls != 1 || pending.calls != 1 || pending.disposition != recovery.PendingSendUnsent || pending.authority == nil || pending.authority.TaskID != payload.Task.ID() || pending.authority.PID != 4321 || !pending.authority.ProcessStartedAt.Equal(*tasks.snapshot.ProcessStartedAt) || disarmer.calls != 1 || strings.Join(order, ",") != "terminate,register,disarm" || tasks.snapshot.State != domain.StateCancelling || !strings.Contains(logs.String(), "terminate I/O failure") {
+	if err != nil || !out.TerminationTriggered || termination.calls != 1 || terminator.calls != 0 || pending.calls != 1 || pending.disposition != recovery.PendingSendUnsent || pending.authority == nil || pending.authority.TaskID != payload.Task.ID() || pending.authority.PID != 4321 || !pending.authority.ProcessStartedAt.Equal(*tasks.snapshot.ProcessStartedAt) || disarmer.calls != 1 || strings.Join(order, ",") != "termination,register,disarm" || tasks.snapshot.State != domain.StateCancelling || !strings.Contains(logs.String(), "terminate I/O failure") {
 		t.Fatalf("out=%#v err=%v snapshot=%#v terminator=%#v pending=%#v disarmer=%#v order=%#v logs=%q", out, err, tasks.snapshot, terminator, pending, disarmer, order, logs.String())
 	}
 }
 
 func TestCancelTaskExecute_PersistedTerminateFailurePendingRegistrationFailureRetainsBothCauses(t *testing.T) {
 	payload := cancelQueuedPayload(t)
-	tasks, _, _, terminator, disarmer, uc := cancelFixture(t, payload, false)
+	tasks, _, _, terminator, disarmer, termination, uc := cancelFixtureWithTerminationEnsurer(t, payload, false)
 	tasks.snapshot = cancelPersistedSnapshot(t, domain.StateRunning, true)
 	terminateErr := errors.New("terminate failure")
 	registerErr := errors.New("register failure")
-	terminator.err = terminateErr
+	termination.result.TerminateErr = terminateErr
 	order := []string{}
-	terminator.order, disarmer.order = &order, &order
+	termination.order, disarmer.order = &order, &order
 	pending := uc.pendingRegistrar.(*cancelPendingRegistrarFake)
 	pending.err, pending.order = registerErr, &order
 
 	out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
-	if !out.TerminationTriggered || pending.calls != 1 || disarmer.calls != 0 || strings.Join(order, ",") != "terminate,register" || !errors.Is(err, terminateErr) || !errors.Is(err, registerErr) || tasks.snapshot.State != domain.StateCancelling {
+	if !out.TerminationTriggered || termination.calls != 1 || terminator.calls != 0 || pending.calls != 1 || disarmer.calls != 0 || strings.Join(order, ",") != "termination,register" || !errors.Is(err, terminateErr) || !errors.Is(err, registerErr) || tasks.snapshot.State != domain.StateCancelling {
 		t.Fatalf("out=%#v err=%v snapshot=%#v pending=%#v disarmer=%#v order=%#v", out, err, tasks.snapshot, pending, disarmer, order)
 	}
 }
@@ -776,7 +843,7 @@ func TestCancelTaskStalledTrackerPersistedTransitions(t *testing.T) {
 			tracker := &cancelStalledTrackerFake{}
 			disarmer := &cancelDisarmerFake{}
 			confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, &cancelPendingRegistrarFake{})
-			uc := NewCancelTaskUseCase(tasks, queue, &sync.Mutex{}, store.NewTaskMutex(), events, &cancelTerminatorFake{}, &cancelPendingRegistrarFake{}, disarmer, confirmer, tracker, domain.ClockFunc(time.Now))
+			uc := NewCancelTaskUseCase(tasks, queue, &sync.Mutex{}, store.NewTaskMutex(), events, &cancelTerminatorFake{}, &cancelTerminationEnsurerFake{}, &cancelPendingRegistrarFake{}, disarmer, confirmer, tracker, domain.ClockFunc(time.Now))
 			at := time.Date(2026, time.August, 11, 12, 2, 0, 0, time.UTC)
 			_, _ = uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: at})
 			if len(tracker.calls) != tc.wantCalls {
@@ -794,7 +861,7 @@ func TestCancelTaskQueuedSaveDoesNotUpdateStalledTracker(t *testing.T) {
 	tasks, queue, events := &cancelStoreFake{reserved: true}, &cancelQueueFake{payload: payload, removed: true}, &cancelEventsFake{}
 	tracker, disarmer := &cancelStalledTrackerFake{}, &cancelDisarmerFake{}
 	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, &cancelPendingRegistrarFake{})
-	uc := NewCancelTaskUseCase(tasks, queue, &sync.Mutex{}, store.NewTaskMutex(), events, &cancelTerminatorFake{}, &cancelPendingRegistrarFake{}, disarmer, confirmer, tracker, domain.ClockFunc(time.Now))
+	uc := NewCancelTaskUseCase(tasks, queue, &sync.Mutex{}, store.NewTaskMutex(), events, &cancelTerminatorFake{}, &cancelTerminationEnsurerFake{}, &cancelPendingRegistrarFake{}, disarmer, confirmer, tracker, domain.ClockFunc(time.Now))
 	_, _ = uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
 	if len(tracker.calls) != 0 {
 		t.Fatalf("queued cancel called LeaveStalled: %+v", tracker.calls)
@@ -812,8 +879,24 @@ func TestNewCancelTaskUseCaseRejectsNilStalledTimeTracker(t *testing.T) {
 			payload := cancelQueuedPayload(t)
 			tasks, queue, events, terminator, disarmer, _ := cancelFixture(t, payload, false)
 			confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, &cancelPendingRegistrarFake{})
-			NewCancelTaskUseCase(tasks, queue, &sync.Mutex{}, store.NewTaskMutex(), events, terminator, &cancelPendingRegistrarFake{}, disarmer, confirmer, tracker, domain.ClockFunc(time.Now))
+			NewCancelTaskUseCase(tasks, queue, &sync.Mutex{}, store.NewTaskMutex(), events, terminator, &cancelTerminationEnsurerFake{}, &cancelPendingRegistrarFake{}, disarmer, confirmer, tracker, domain.ClockFunc(time.Now))
 		})
+	}
+}
+
+func TestNewCancelTaskUseCaseRejectsNilTerminationEnsurer(t *testing.T) {
+	payload := cancelQueuedPayload(t)
+	tasks, queue, events, terminator, disarmer, _ := cancelFixture(t, payload, false)
+	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, &cancelPendingRegistrarFake{})
+	for _, termination := range []cancelTerminationEnsurer{nil, (*cancelTerminationEnsurerFake)(nil)} {
+		func() {
+			defer func() {
+				if recover() == nil {
+					t.Fatal("expected panic")
+				}
+			}()
+			NewCancelTaskUseCase(tasks, queue, &sync.Mutex{}, store.NewTaskMutex(), events, terminator, termination, &cancelPendingRegistrarFake{}, disarmer, confirmer, &cancelStalledTrackerFake{}, domain.ClockFunc(time.Now))
+		}()
 	}
 }
 
@@ -827,7 +910,7 @@ func TestNewCancelTaskUseCaseRejectsNilPendingRegistrar(t *testing.T) {
 	payload := cancelQueuedPayload(t)
 	tasks, queue, events, terminator, disarmer, _ := cancelFixture(t, payload, false)
 	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, &cancelPendingRegistrarFake{})
-	NewCancelTaskUseCase(tasks, queue, &sync.Mutex{}, store.NewTaskMutex(), events, terminator, pending, disarmer, confirmer, &cancelStalledTrackerFake{}, domain.ClockFunc(time.Now))
+	NewCancelTaskUseCase(tasks, queue, &sync.Mutex{}, store.NewTaskMutex(), events, terminator, &cancelTerminationEnsurerFake{}, pending, disarmer, confirmer, &cancelStalledTrackerFake{}, domain.ClockFunc(time.Now))
 }
 
 func TestCancelTaskStalledTrackerPreSaveFailures(t *testing.T) {
@@ -851,7 +934,7 @@ func TestCancelTaskStalledTrackerPreSaveFailures(t *testing.T) {
 			tasks := &cancelStoreFake{reserved: tc.reserved, snapshot: snapshot, loadErr: tc.loadErr}
 			tracker, disarmer := &cancelStalledTrackerFake{}, &cancelDisarmerFake{}
 			confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, &cancelPendingRegistrarFake{})
-			uc := NewCancelTaskUseCase(tasks, &cancelQueueFake{}, &sync.Mutex{}, store.NewTaskMutex(), &cancelEventsFake{}, &cancelTerminatorFake{}, &cancelPendingRegistrarFake{}, disarmer, confirmer, tracker, domain.ClockFunc(time.Now))
+			uc := NewCancelTaskUseCase(tasks, &cancelQueueFake{}, &sync.Mutex{}, store.NewTaskMutex(), &cancelEventsFake{}, &cancelTerminatorFake{}, &cancelTerminationEnsurerFake{}, &cancelPendingRegistrarFake{}, disarmer, confirmer, tracker, domain.ClockFunc(time.Now))
 			_, _ = uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
 			if len(tracker.calls) != 0 {
 				t.Fatalf("LeaveStalled calls=%d", len(tracker.calls))
@@ -866,7 +949,7 @@ func TestCancelTaskStalledTrackerNeverEntersOrTakes(t *testing.T) {
 	tasks := &cancelStoreFake{reserved: true, snapshot: cancelPersistedSnapshot(t, domain.StateStalled, true)}
 	tracker, disarmer := &cancelStalledTrackerFake{}, &cancelDisarmerFake{}
 	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, &cancelPendingRegistrarFake{})
-	uc := NewCancelTaskUseCase(tasks, &cancelQueueFake{}, &sync.Mutex{}, store.NewTaskMutex(), &cancelEventsFake{}, &cancelTerminatorFake{}, &cancelPendingRegistrarFake{}, disarmer, confirmer, tracker, domain.ClockFunc(time.Now))
+	uc := NewCancelTaskUseCase(tasks, &cancelQueueFake{}, &sync.Mutex{}, store.NewTaskMutex(), &cancelEventsFake{}, &cancelTerminatorFake{}, &cancelTerminationEnsurerFake{}, &cancelPendingRegistrarFake{}, disarmer, confirmer, tracker, domain.ClockFunc(time.Now))
 	_, _ = uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
 	if len(tracker.calls) != 1 {
 		t.Fatalf("LeaveStalled calls=%d, want 1", len(tracker.calls))

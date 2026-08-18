@@ -52,11 +52,14 @@ type executionLogOpener interface {
 
 type ProcessRunner interface {
 	Launch(ctx context.Context, params LaunchParams) (*LaunchedProcess, error)
-	Terminate(pid int, grace time.Duration) error
+	SendTerminate(pid int) error
+	SendKill(pid int) error
 }
 
 var launchNewSession = proc.LaunchNewSession
 var terminateProcessGroup = proc.TerminateProcessGroup
+var sendTerminate = proc.SendTerminate
+var sendKill = proc.SendKill
 var now = time.Now
 
 const (
@@ -161,7 +164,7 @@ func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.Resu
 		}
 		return nil
 	case <-ctx.Done():
-		terminateErr := l.runner.Terminate(cmd.Process.Pid, TimeoutKillGrace)
+		terminateErr := terminateProcessGroup(cmd.Process.Pid, TimeoutKillGrace)
 		timer := time.NewTimer(TimeoutKillGrace)
 		defer timer.Stop()
 		select {
@@ -254,8 +257,12 @@ func (r *processRunner) Launch(ctx context.Context, p LaunchParams) (*LaunchedPr
 	return &LaunchedProcess{Handle: handle, Waiter: &processWaiter{cmd: cmd}}, nil
 }
 
-func (r *processRunner) Terminate(pid int, grace time.Duration) error {
-	return terminateProcessGroup(pid, grace)
+func (r *processRunner) SendTerminate(pid int) error {
+	return sendTerminate(pid)
+}
+
+func (r *processRunner) SendKill(pid int) error {
+	return sendKill(pid)
 }
 
 type processWaiter struct {

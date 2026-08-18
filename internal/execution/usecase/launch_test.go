@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"testing"
-	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/execution"
@@ -23,7 +22,11 @@ func (f *launchRunnerFake) Launch(_ context.Context, p execution.LaunchParams) (
 	return f.result, f.err
 }
 
-func (f *launchRunnerFake) Terminate(_ int, _ time.Duration) error {
+func (f *launchRunnerFake) SendTerminate(_ int) error {
+	return nil
+}
+
+func (f *launchRunnerFake) SendKill(_ int) error {
 	return nil
 }
 

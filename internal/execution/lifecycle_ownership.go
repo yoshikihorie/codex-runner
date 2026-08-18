@@ -8,25 +8,27 @@ import (
 
 // LifecycleOwnershipRegistry serializes the in-memory lifecycle owner for a task.
 type LifecycleOwnershipRegistry interface {
-	Acquire(taskID domain.TaskID) (release func(), acquired bool)
+	Acquire(taskID domain.TaskID) (generation domain.LifecycleGeneration, release func(), acquired bool)
+	Current(taskID domain.TaskID) (generation domain.LifecycleGeneration, owned bool)
+	WithCurrent(taskID domain.TaskID, generation domain.LifecycleGeneration, action func() error) (executed bool, err error)
 	IsOwned(taskID domain.TaskID) bool
 }
 
 type lifecycleOwnershipRegistry struct {
 	mu         sync.RWMutex
-	owners     map[domain.TaskID]uint64
-	generation uint64
+	owners     map[domain.TaskID]domain.LifecycleGeneration
+	generation domain.LifecycleGeneration
 }
 
 func NewLifecycleOwnershipRegistry() LifecycleOwnershipRegistry {
-	return &lifecycleOwnershipRegistry{owners: make(map[domain.TaskID]uint64)}
+	return &lifecycleOwnershipRegistry{owners: make(map[domain.TaskID]domain.LifecycleGeneration)}
 }
 
-func (r *lifecycleOwnershipRegistry) Acquire(taskID domain.TaskID) (func(), bool) {
+func (r *lifecycleOwnershipRegistry) Acquire(taskID domain.TaskID) (domain.LifecycleGeneration, func(), bool) {
 	r.mu.Lock()
 	if _, exists := r.owners[taskID]; exists {
 		r.mu.Unlock()
-		return func() {}, false
+		return 0, func() {}, false
 	}
 	r.generation++
 	generation := r.generation
@@ -34,7 +36,7 @@ func (r *lifecycleOwnershipRegistry) Acquire(taskID domain.TaskID) (func(), bool
 	r.mu.Unlock()
 
 	var once sync.Once
-	return func() {
+	return generation, func() {
 		once.Do(func() {
 			r.mu.Lock()
 			if r.owners[taskID] == generation {
@@ -43,6 +45,24 @@ func (r *lifecycleOwnershipRegistry) Acquire(taskID domain.TaskID) (func(), bool
 			r.mu.Unlock()
 		})
 	}, true
+}
+
+func (r *lifecycleOwnershipRegistry) Current(taskID domain.TaskID) (domain.LifecycleGeneration, bool) {
+	r.mu.RLock()
+	generation, owned := r.owners[taskID]
+	r.mu.RUnlock()
+	return generation, owned
+}
+
+func (r *lifecycleOwnershipRegistry) WithCurrent(taskID domain.TaskID, generation domain.LifecycleGeneration, action func() error) (bool, error) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	current, owned := r.owners[taskID]
+	if !owned || current != generation {
+		return false, nil
+	}
+	err := action()
+	return true, err
 }
 
 func (r *lifecycleOwnershipRegistry) IsOwned(taskID domain.TaskID) bool {

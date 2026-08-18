@@ -2,13 +2,20 @@ package proc
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"syscall"
 	"testing"
 	"time"
 )
+
+type signalCall struct {
+	pid    int
+	signal syscall.Signal
+}
 
 func TestNewShutdownContextCancelsOnSIGTERM(t *testing.T) {
 	ctx, stop := NewShutdownContext(context.Background())
@@ -65,11 +72,106 @@ func TestTerminateProcessGroupIgnoresMissingProcess(t *testing.T) {
 	}
 }
 
-func TestTerminateProcessGroupRejectsNonPositivePID(t *testing.T) {
-	for _, pid := range []int{0, -1} {
-		if err := TerminateProcessGroup(pid, 0); err == nil {
-			t.Errorf("TerminateProcessGroup(%d) returned nil error", pid)
-		}
+func TestProcessGroupSignalRejectsInvalidPIDWithoutSignal(t *testing.T) {
+	original := syscallKill
+	t.Cleanup(func() { syscallKill = original })
+
+	var calls []signalCall
+	syscallKill = func(gotPID int, gotSignal syscall.Signal) error {
+		calls = append(calls, signalCall{pid: gotPID, signal: gotSignal})
+		return nil
+	}
+
+	for _, tt := range []struct {
+		name string
+		send func(int) error
+	}{
+		{name: "terminate process group", send: func(pid int) error { return TerminateProcessGroup(pid, 0) }},
+		{name: "send terminate", send: SendTerminate},
+		{name: "send kill", send: SendKill},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, pid := range []int{-1, 0, 1} {
+				calls = nil
+				err := tt.send(pid)
+				if err == nil {
+					t.Errorf("Send(%d) returned nil error", pid)
+					continue
+				}
+				wantErr := fmt.Sprintf("invalid pid %d: must be greater than 1", pid)
+				if err.Error() != wantErr {
+					t.Errorf("Send(%d) error = %q, want %q", pid, err, wantErr)
+				}
+				if len(calls) != 0 {
+					t.Errorf("Send(%d) calls = %#v, want no calls", pid, calls)
+				}
+			}
+		})
+	}
+}
+
+func TestSendTerminateAndSendKillDispatchExactlyOneSignal(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		send func(int) error
+		want syscall.Signal
+	}{
+		{name: "terminate", send: SendTerminate, want: syscall.SIGTERM},
+		{name: "kill", send: SendKill, want: syscall.SIGKILL},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			original := syscallKill
+			t.Cleanup(func() { syscallKill = original })
+
+			const pid = 12345
+			var calls []signalCall
+			syscallKill = func(gotPID int, gotSignal syscall.Signal) error {
+				calls = append(calls, signalCall{pid: gotPID, signal: gotSignal})
+				return nil
+			}
+
+			if err := tt.send(pid); err != nil {
+				t.Fatal(err)
+			}
+			wantCalls := []signalCall{{pid: -pid, signal: tt.want}}
+			if !slices.Equal(calls, wantCalls) {
+				t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+			}
+		})
+	}
+}
+
+func TestSendTerminateAndSendKillIgnoreMissingProcess(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		send func(int) error
+		want syscall.Signal
+		err  error
+	}{
+		{name: "terminate ESRCH", send: SendTerminate, want: syscall.SIGTERM, err: syscall.ESRCH},
+		{name: "terminate EPERM", send: SendTerminate, want: syscall.SIGTERM, err: syscall.EPERM},
+		{name: "kill ESRCH", send: SendKill, want: syscall.SIGKILL, err: syscall.ESRCH},
+		{name: "kill EPERM", send: SendKill, want: syscall.SIGKILL, err: syscall.EPERM},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			original := syscallKill
+			t.Cleanup(func() { syscallKill = original })
+
+			const pid = 12345
+			var calls []signalCall
+			syscallKill = func(gotPID int, gotSignal syscall.Signal) error {
+				calls = append(calls, signalCall{pid: gotPID, signal: gotSignal})
+				return tt.err
+			}
+
+			if err := tt.send(pid); err != nil {
+				t.Fatalf("error = %v, want nil", err)
+			}
+			wantCalls := []signalCall{{pid: -pid, signal: tt.want}}
+			if !slices.Equal(calls, wantCalls) {
+				t.Fatalf("calls = %#v, want %#v", calls, wantCalls)
+			}
+		})
 	}
 }
 
