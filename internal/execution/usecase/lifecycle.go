@@ -439,19 +439,31 @@ func (o *TaskLifecycleOrchestrator) monitorAndFinalize(ctx context.Context, inpu
 }
 
 func (o *TaskLifecycleOrchestrator) confirmTerminal(ctx context.Context, taskID domain.TaskID, raw int, waitErr error) {
+	if ctx.Err() != nil {
+		return
+	}
 	estimated := waitErr != nil
 	if estimated {
 		raw = 1
 	}
 	occurredAt := o.deps.Clock.Now()
+	if ctx.Err() != nil {
+		return
+	}
 	changes, unsubscribe := o.deps.Changes.Subscribe(taskID)
 	defer unsubscribe()
 	prepareCtx, cancelPrepare := context.WithCancel(ctx)
 	defer cancelPrepare()
 
+	if ctx.Err() != nil {
+		return
+	}
 	skipPrepare := false
 	if preSnapshot, preErr := o.deps.Tasks.Load(taskID); preErr == nil && preSnapshot.State == domain.StateCancelling {
 		skipPrepare = true
+	}
+	if ctx.Err() != nil {
+		return
 	}
 	var prepared execution.PreparedFinalizeTask
 	var err error
@@ -462,6 +474,9 @@ func (o *TaskLifecycleOrchestrator) confirmTerminal(ctx context.Context, taskID 
 		}
 		results := make(chan prepareResult, 1)
 		input := execution.FinalizeTaskInput{TaskID: taskID, RawExitCode: raw, Estimated: estimated, OccurredAt: occurredAt}
+		if ctx.Err() != nil {
+			return
+		}
 		go func() {
 			result := prepareResult{}
 			defer func() {
@@ -470,15 +485,27 @@ func (o *TaskLifecycleOrchestrator) confirmTerminal(ctx context.Context, taskID 
 				}
 				results <- result
 			}()
+			if prepareCtx.Err() != nil {
+				return
+			}
 			result.prepared, result.err = o.deps.Finalize.Prepare(prepareCtx, input)
 		}()
 		for {
 			select {
+			case <-ctx.Done():
+				cancelPrepare()
+				return
 			case result := <-results:
 				prepared, err = result.prepared, result.err
 				goto preparedOrCancelled
 			case <-changes:
+				if ctx.Err() != nil {
+					return
+				}
 				snapshot, loadErr := o.deps.Tasks.Load(taskID)
+				if ctx.Err() != nil {
+					return
+				}
 				if loadErr != nil {
 					o.logger.Warn("reload task after terminal change", "task_id", taskID.String(), "error", loadErr)
 					continue
@@ -493,17 +520,39 @@ func (o *TaskLifecycleOrchestrator) confirmTerminal(ctx context.Context, taskID 
 
 preparedOrCancelled:
 
+	if ctx.Err() != nil {
+		return
+	}
 	o.deps.TaskMu.Lock(taskID)
+	if ctx.Err() != nil {
+		o.deps.TaskMu.Unlock(taskID)
+		return
+	}
 	snapshot, loadErr := o.deps.Tasks.Load(taskID)
+	if ctx.Err() != nil {
+		o.deps.TaskMu.Unlock(taskID)
+		return
+	}
 	if loadErr != nil {
 		o.deps.TaskMu.Unlock(taskID)
 		o.logger.Error("reload task before terminal confirmation", "task_id", taskID.String(), "error", loadErr)
 		return
 	}
 	if snapshot.State == domain.StateCancelling {
+		if ctx.Err() != nil {
+			o.deps.TaskMu.Unlock(taskID)
+			return
+		}
 		killOccurredAt := o.deps.Clock.Now()
+		if ctx.Err() != nil {
+			o.deps.TaskMu.Unlock(taskID)
+			return
+		}
 		killResult, confirmErr := o.deps.ConfirmKilled.ExecuteLocked(ctx, execution.ConfirmTaskKilledInput{TaskID: taskID, RawExitCode: raw, Estimated: estimated, OccurredAt: killOccurredAt})
 		o.deps.TaskMu.Unlock(taskID)
+		if ctx.Err() != nil {
+			return
+		}
 		if confirmErr != nil {
 			o.logger.Warn("terminal lifecycle confirmation", "task_id", taskID.String(), "error", confirmErr)
 		}
@@ -524,8 +573,15 @@ preparedOrCancelled:
 		o.logger.Error("prepare task terminal confirmation", "task_id", taskID.String(), "error", err)
 		return
 	}
+	if ctx.Err() != nil {
+		o.deps.TaskMu.Unlock(taskID)
+		return
+	}
 	finalizeResult, finalizeErr := o.deps.Finalize.ExecuteLocked(ctx, prepared)
 	o.deps.TaskMu.Unlock(taskID)
+	if ctx.Err() != nil {
+		return
+	}
 	if finalizeErr != nil {
 		o.logger.Warn("terminal lifecycle confirmation", "task_id", taskID.String(), "error", finalizeErr)
 	}

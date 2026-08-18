@@ -152,19 +152,24 @@ type lifecycleFinalizeCall struct {
 	now                 time.Time
 }
 type lifecycleRecordingFinalizer struct {
-	calls          []lifecycleFinalizeCall
-	err            error
-	prepareErr     error
-	prepareCalls   int
-	trace          *[]string
-	releaseCalls   int
-	prepared       lifecycleFinalizeCall
-	prepareContext context.Context
-	prepareBlocked chan struct{}
-	allowPrepare   chan struct{}
+	calls           []lifecycleFinalizeCall
+	err             error
+	prepareErr      error
+	prepareCalls    int
+	trace           *[]string
+	releaseCalls    int
+	prepared        lifecycleFinalizeCall
+	prepareContext  context.Context
+	prepareBlocked  chan struct{}
+	allowPrepare    chan struct{}
+	prepareReturned chan struct{}
+	onExecuteLocked func()
 }
 
 func (f *lifecycleRecordingFinalizer) Prepare(ctx context.Context, in execution.FinalizeTaskInput) (execution.PreparedFinalizeTask, error) {
+	if f.prepareReturned != nil {
+		defer func() { f.prepareReturned <- struct{}{} }()
+	}
 	f.prepareCalls++
 	f.prepareContext = ctx
 	f.prepared = lifecycleFinalizeCall{in.TaskID, in.RawExitCode, in.Estimated, in.AdoptedAfterRestart, in.OccurredAt}
@@ -180,10 +185,14 @@ type lifecycleRecordingChangeNotifier struct {
 	subscribeCalls   int
 	unsubscribeCalls int
 	trace            *[]string
+	onSubscribe      func()
 }
 
 func (f *lifecycleRecordingChangeNotifier) Subscribe(domain.TaskID) (<-chan struct{}, func()) {
 	f.subscribeCalls++
+	if f.onSubscribe != nil {
+		f.onSubscribe()
+	}
 	return f.ch, func() {
 		f.unsubscribeCalls++
 	}
@@ -192,6 +201,9 @@ func (f *lifecycleRecordingChangeNotifier) Subscribe(domain.TaskID) (<-chan stru
 func (f *lifecycleRecordingFinalizer) ExecuteLocked(_ context.Context, _ execution.PreparedFinalizeTask) (execution.LockedFinalizeResult, error) {
 	f.calls = append(f.calls, f.prepared)
 	appendLifecycleTrace(f.trace, "finalize")
+	if f.onExecuteLocked != nil {
+		f.onExecuteLocked()
+	}
 	return execution.LockedFinalizeResult{RecordExited: true}, f.err
 }
 
@@ -218,6 +230,7 @@ type lifecycleRecordingKillConfirmer struct {
 	releaseCalls       int
 	releaseWhileLocked func() bool
 	releaseHook        func()
+	onExecuteLocked    func()
 	trace              *[]string
 }
 
@@ -231,6 +244,9 @@ func (f *lifecycleRecordingKillConfirmer) ExecuteLocked(_ context.Context, in ex
 	f.lockedCalls++
 	f.calls = append(f.calls, lifecycleConfirmKilledCall{in.TaskID, in.RawExitCode, in.Estimated, in.OccurredAt})
 	appendLifecycleTrace(f.trace, "confirm-killed-locked")
+	if f.onExecuteLocked != nil {
+		f.onExecuteLocked()
+	}
 	if f.lockedCalls <= len(f.lockedResults) {
 		var err error
 		if f.lockedCalls <= len(f.lockedErrors) {
@@ -554,11 +570,15 @@ type lifecycleRecordingClock struct {
 	now   time.Time
 	step  time.Duration
 	trace *[]string
+	onNow func(int)
 }
 
 func (f *lifecycleRecordingClock) Now() time.Time {
 	f.calls++
 	appendLifecycleTrace(f.trace, "clock-now")
+	if f.onNow != nil {
+		f.onNow(f.calls)
+	}
 	t := f.now
 	f.now = f.now.Add(f.step)
 	return t
@@ -1696,6 +1716,224 @@ func TestTaskLifecycleConfirmTerminalNonCancellingPreparesOnce(t *testing.T) {
 	if f.taskMu.lockCalls != f.taskMu.unlockCalls {
 		t.Fatalf("task mutex lock=%d unlock=%d", f.taskMu.lockCalls, f.taskMu.unlockCalls)
 	}
+}
+
+func TestTaskLifecycleConfirmTerminalShutdownQuiescence(t *testing.T) {
+	t.Run("already cancelled", func(t *testing.T) {
+		f := newLifecycleFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		f.orchestrator.confirmTerminal(ctx, f.input.Task.ID(), 23, nil)
+		if f.clock.calls != 0 || f.changes.subscribeCalls != 0 || f.tasks.loadCalls != 0 || f.finalizer.prepareCalls != 0 || f.taskMu.lockCalls != 0 || f.killed.lockedCalls != 0 || len(f.finalizer.calls) != 0 || f.killed.releaseCalls != 0 || f.finalizer.releaseCalls != 0 || f.pending.calls != 0 {
+			t.Fatalf("cancelled call performed side effects: trace=%v", f.trace)
+		}
+	})
+
+	t.Run("cancelled during initial load", func(t *testing.T) {
+		f := newLifecycleFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		f.tasks.onLoad = func(call int) {
+			if call == 1 {
+				cancel()
+			}
+		}
+		f.orchestrator.confirmTerminal(ctx, f.input.Task.ID(), 23, nil)
+		if f.tasks.loadCalls != 1 || f.finalizer.prepareCalls != 0 || f.taskMu.lockCalls != 0 || f.killed.lockedCalls != 0 || len(f.finalizer.calls) != 0 {
+			t.Fatalf("initial-load cancellation continued: trace=%v", f.trace)
+		}
+	})
+
+	t.Run("cancelled while prepare is blocked", func(t *testing.T) {
+		f := newLifecycleFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		f.finalizer.prepareBlocked = make(chan struct{}, 1)
+		f.finalizer.allowPrepare = make(chan struct{})
+		f.finalizer.prepareReturned = make(chan struct{}, 1)
+		prepareReturned := false
+		defer func() {
+			if prepareReturned {
+				return
+			}
+			close(f.finalizer.allowPrepare)
+			select {
+			case <-f.finalizer.prepareReturned:
+			case <-time.After(3 * time.Second):
+				t.Error("Prepare did not return during cleanup")
+			}
+		}()
+		done := make(chan struct{})
+		go func() { f.orchestrator.confirmTerminal(ctx, f.input.Task.ID(), 23, nil); close(done) }()
+		<-f.finalizer.prepareBlocked
+		cancel()
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("confirmation waited for Prepare")
+		}
+		close(f.finalizer.allowPrepare)
+		select {
+		case <-f.finalizer.prepareReturned:
+			prepareReturned = true
+		case <-time.After(3 * time.Second):
+			t.Fatal("Prepare did not return")
+		}
+		select {
+		case <-f.finalizer.prepareContext.Done():
+		default:
+			t.Fatal("Prepare context was not cancelled")
+		}
+		if f.tasks.loadCalls != 1 || f.taskMu.lockCalls != 0 || f.killed.lockedCalls != 0 || len(f.finalizer.calls) != 0 {
+			t.Fatalf("prepare cancellation continued: trace=%v", f.trace)
+		}
+	})
+
+	t.Run("cancelled during change reload", func(t *testing.T) {
+		f := newLifecycleFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		f.finalizer.prepareBlocked = make(chan struct{}, 1)
+		f.finalizer.allowPrepare = make(chan struct{})
+		f.finalizer.prepareReturned = make(chan struct{}, 1)
+		prepareReturned := false
+		defer func() {
+			if prepareReturned {
+				return
+			}
+			close(f.finalizer.allowPrepare)
+			select {
+			case <-f.finalizer.prepareReturned:
+			case <-time.After(3 * time.Second):
+				t.Error("Prepare did not return during cleanup")
+			}
+		}()
+		f.tasks.onLoad = func(call int) {
+			if call == 2 {
+				cancel()
+			}
+		}
+		done := make(chan struct{})
+		go func() { f.orchestrator.confirmTerminal(ctx, f.input.Task.ID(), 23, nil); close(done) }()
+		<-f.finalizer.prepareBlocked
+		f.changes.ch <- struct{}{}
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("confirmation did not return")
+		}
+		close(f.finalizer.allowPrepare)
+		<-f.finalizer.prepareReturned
+		prepareReturned = true
+		if f.tasks.loadCalls != 2 || f.taskMu.lockCalls != 0 || f.killed.lockedCalls != 0 || len(f.finalizer.calls) != 0 {
+			t.Fatalf("change reload cancellation continued: trace=%v", f.trace)
+		}
+	})
+
+	t.Run("cancelled while waiting for task mutex", func(t *testing.T) {
+		f := newLifecycleFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		shared := store.NewTaskMutex()
+		state := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateRunning)
+		tasks := &lifecycleSynchronizedTaskStore{snapshot: state}
+		attempt := make(chan struct{}, 1)
+		f.orchestrator.deps.Tasks = tasks
+		f.orchestrator.deps.TaskMu = lifecycleObservingTaskLocker{delegate: shared, trace: tasks, attempt: attempt}
+		shared.Lock(f.input.Task.ID())
+		done := make(chan struct{})
+		go func() { f.orchestrator.confirmTerminal(ctx, f.input.Task.ID(), 23, nil); close(done) }()
+		<-attempt
+		cancel()
+		shared.Unlock(f.input.Task.ID())
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("mutex cancellation did not return")
+		}
+		if tasks.loadCount != 1 || f.killed.lockedCalls != 0 || len(f.finalizer.calls) != 0 {
+			t.Fatalf("mutex cancellation continued: trace=%v", tasks.traceSnapshot())
+		}
+		shared.Lock(f.input.Task.ID())
+		shared.Unlock(f.input.Task.ID())
+	})
+
+	t.Run("cancelled during final load", func(t *testing.T) {
+		f := newLifecycleFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		f.tasks.onLoad = func(call int) {
+			if call == 2 {
+				cancel()
+			}
+		}
+		f.orchestrator.confirmTerminal(ctx, f.input.Task.ID(), 23, nil)
+		if f.tasks.loadCalls != 2 || f.taskMu.lockCalls != 1 || f.taskMu.unlockCalls != 1 || f.killed.lockedCalls != 0 || len(f.finalizer.calls) != 0 || f.pending.calls != 0 || f.finalizer.releaseCalls != 0 {
+			t.Fatalf("final-load cancellation continued: trace=%v", f.trace)
+		}
+	})
+
+	t.Run("cancelled during kill confirmation", func(t *testing.T) {
+		for _, confirmed := range []bool{false, true} {
+			t.Run(map[bool]string{false: "unconfirmed", true: "confirmed"}[confirmed], func(t *testing.T) {
+				f := newLifecycleFixture(t)
+				ctx, cancel := context.WithCancel(context.Background())
+				cancelling := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)
+				f.tasks.loads = []lifecycleLoadResult{{snapshot: cancelling}, {snapshot: cancelling}}
+				f.killed.lockedResult = execution.LockedKillResult{Confirmed: confirmed}
+				f.killed.onExecuteLocked = cancel
+				f.orchestrator.confirmTerminal(ctx, f.input.Task.ID(), 23, nil)
+				if f.killed.lockedCalls != 1 || f.taskMu.lockCalls != f.taskMu.unlockCalls || f.killed.releaseCalls != 0 || f.pending.calls != 0 {
+					t.Fatalf("kill cancellation continued: trace=%v", f.trace)
+				}
+			})
+		}
+	})
+
+	t.Run("cancelled during finalization", func(t *testing.T) {
+		f := newLifecycleFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		f.finalizer.onExecuteLocked = cancel
+		f.orchestrator.confirmTerminal(ctx, f.input.Task.ID(), 23, nil)
+		if len(f.finalizer.calls) != 1 || f.taskMu.lockCalls != f.taskMu.unlockCalls || f.finalizer.releaseCalls != 0 {
+			t.Fatalf("finalize cancellation continued: trace=%v", f.trace)
+		}
+	})
+
+	t.Run("cancelled during initial clock", func(t *testing.T) {
+		f := newLifecycleFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		f.clock.onNow = func(call int) {
+			if call == 1 {
+				cancel()
+			}
+		}
+		f.orchestrator.confirmTerminal(ctx, f.input.Task.ID(), 23, nil)
+		if f.changes.subscribeCalls != 0 || f.tasks.loadCalls != 0 {
+			t.Fatalf("clock cancellation continued: trace=%v", f.trace)
+		}
+	})
+
+	t.Run("cancelled during subscribe still unsubscribes", func(t *testing.T) {
+		f := newLifecycleFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		f.changes.onSubscribe = cancel
+		f.orchestrator.confirmTerminal(ctx, f.input.Task.ID(), 23, nil)
+		if f.tasks.loadCalls != 0 || f.changes.unsubscribeCalls != 1 {
+			t.Fatalf("subscribe cancellation cleanup=%d trace=%v", f.changes.unsubscribeCalls, f.trace)
+		}
+	})
+
+	t.Run("cancelled during kill clock", func(t *testing.T) {
+		f := newLifecycleFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancelling := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)
+		f.tasks.loads = []lifecycleLoadResult{{snapshot: cancelling}, {snapshot: cancelling}}
+		f.clock.onNow = func(call int) {
+			if call == 2 {
+				cancel()
+			}
+		}
+		f.orchestrator.confirmTerminal(ctx, f.input.Task.ID(), 23, nil)
+		if f.killed.lockedCalls != 0 || f.taskMu.lockCalls != f.taskMu.unlockCalls {
+			t.Fatalf("kill-clock cancellation continued: trace=%v", f.trace)
+		}
+	})
 }
 
 func TestTaskLifecycleConfirmTerminalPrepareRaceRoutesOnlyConfirmKilled(t *testing.T) {
