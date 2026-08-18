@@ -657,6 +657,41 @@ func TestAdoptRunningTasksResumesStartingRunningAndStalled(t *testing.T) {
 	}
 }
 
+func TestAdoptRunningTasksAdoptsStartingWithoutRecordedProcess(t *testing.T) {
+	t.Run("live task resumes monitoring", func(t *testing.T) {
+		id := adoptionID(t, "starting-no-process-live")
+		snapshot := adoptionSnapshot(t, id, domain.StateStarting)
+		if snapshot.PID != nil || snapshot.ProcessStartedAt != nil {
+			t.Fatalf("starting snapshot unexpectedly has process identity: %+v", snapshot)
+		}
+		tasks := &adoptionStoreFake{listed: []domain.TaskSnapshot{snapshot}, entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}
+		liveness := &adoptionLivenessFake{dead: map[domain.TaskID]bool{}, err: map[domain.TaskID]error{}}
+
+		out, err := newAdoptionUseCase(tasks, liveness, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), &adoptionSlotsFake{}, &adoptionMutexFake{}).Execute(context.Background())
+
+		if err != nil || len(out.Outcomes) != 1 || out.Outcomes[0].Outcome != adoptionOutcomeResumedMonitoring || liveness.calls != 1 || tasks.entries[id].State != domain.StateRunning || !tasks.entries[id].AdoptedAfterRestart {
+			t.Fatalf("out=(%+v,%v) liveness=%d snapshot=%+v", out, err, liveness.calls, tasks.entries[id])
+		}
+	})
+
+	t.Run("dead task becomes orphaned and requests recovery", func(t *testing.T) {
+		id := adoptionID(t, "starting-no-process-dead")
+		snapshot := adoptionSnapshot(t, id, domain.StateStarting)
+		if snapshot.PID != nil || snapshot.ProcessStartedAt != nil {
+			t.Fatalf("starting snapshot unexpectedly has process identity: %+v", snapshot)
+		}
+		tasks := &adoptionStoreFake{listed: []domain.TaskSnapshot{snapshot}, entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}
+		liveness := &adoptionLivenessFake{dead: map[domain.TaskID]bool{id: true}, err: map[domain.TaskID]error{}}
+		dispatcher := &adoptionOrphanResumeDispatcherFake{}
+
+		out, err := newOrphanAdoptionUseCase(t, tasks, liveness, &adoptionReaderFake{}, &adoptionFinalizerFake{}, dispatcher, &adoptionStalledTrackerFake{}, slog.Default()).Execute(context.Background())
+
+		if err != nil || len(out.Outcomes) != 1 || out.Outcomes[0].Outcome != adoptionOutcomeOrphanRecoveryStarted || liveness.calls != 1 || tasks.saved == nil || tasks.saved.State != domain.StateOrphaned || tasks.saved.PID != nil || tasks.saved.ProcessStartedAt != nil || dispatcher.calls != 1 {
+			t.Fatalf("out=(%+v,%v) liveness=%d saved=%+v dispatch=%d", out, err, liveness.calls, tasks.saved, dispatcher.calls)
+		}
+	})
+}
+
 func TestAdoptRunningTasksFinalizesDeadTaskWithOutput(t *testing.T) {
 	id := adoptionID(t, "dead-output")
 	snapshot := adoptionSnapshot(t, id, domain.StateRunning)

@@ -72,29 +72,39 @@ func (f *lifecycleRecordingCreateWorktree) Execute(_ context.Context, input exec
 }
 
 type lifecycleRecordingLauncher struct {
-	calls    int
-	params   []execution.LaunchParams
-	launched *execution.LaunchedProcess
-	err      error
-	trace    *[]string
+	calls     int
+	contexts  []context.Context
+	params    []execution.LaunchParams
+	launched  *execution.LaunchedProcess
+	err       error
+	onExecute func(context.Context)
+	trace     *[]string
 }
 
-func (f *lifecycleRecordingLauncher) Execute(_ context.Context, p execution.LaunchParams) (*execution.LaunchedProcess, error) {
+func (f *lifecycleRecordingLauncher) Execute(ctx context.Context, p execution.LaunchParams) (*execution.LaunchedProcess, error) {
 	f.calls++
+	f.contexts = append(f.contexts, ctx)
 	f.params = append(f.params, p)
 	appendLifecycleTrace(f.trace, "launch")
+	if f.onExecute != nil {
+		f.onExecute(ctx)
+	}
 	return f.launched, f.err
 }
 
 type lifecycleRecordingRecordProcess struct {
-	calls int
-	err   error
-	trace *[]string
+	calls     int
+	err       error
+	onExecute func()
+	trace     *[]string
 }
 
 func (f *lifecycleRecordingRecordProcess) Execute(_ context.Context, _ *domain.Task, _ *domain.ProcessHandle, _ time.Time) error {
 	f.calls++
 	appendLifecycleTrace(f.trace, "record-process")
+	if f.onExecute != nil {
+		f.onExecute()
+	}
 	return f.err
 }
 
@@ -104,6 +114,7 @@ type lifecycleRecordingTimeoutArmer struct {
 	deadlines   []time.Time
 	seconds     []int
 	generations []domain.LifecycleGeneration
+	onArm       func()
 	trace       *[]string
 }
 
@@ -114,6 +125,9 @@ func (f *lifecycleRecordingTimeoutArmer) Arm(id domain.TaskID, deadline time.Tim
 	f.seconds = append(f.seconds, seconds)
 	f.generations = append(f.generations, generation)
 	appendLifecycleTrace(f.trace, "timeout-arm")
+	if f.onArm != nil {
+		f.onArm()
+	}
 }
 
 type lifecycleRecordingMonitor struct {
@@ -250,10 +264,15 @@ type lifecycleRecordingTaskStore struct {
 	trace     *[]string
 	loadName  string
 	saveName  string
+	onLoad    func(int)
+	onSave    func(int)
 }
 
 func (f *lifecycleRecordingTaskStore) Load(id domain.TaskID) (domain.TaskSnapshot, error) {
 	f.loadCalls++
+	if f.onLoad != nil {
+		f.onLoad(f.loadCalls)
+	}
 	f.loadIDs = append(f.loadIDs, id)
 	appendLifecycleTrace(f.trace, f.loadName)
 	if f.loadIndex >= len(f.loads) {
@@ -265,6 +284,9 @@ func (f *lifecycleRecordingTaskStore) Load(id domain.TaskID) (domain.TaskSnapsho
 }
 func (f *lifecycleRecordingTaskStore) Save(_ domain.TaskID, s domain.TaskSnapshot) error {
 	f.saveCalls++
+	if f.onSave != nil {
+		f.onSave(f.saveCalls)
+	}
 	f.saved = append(f.saved, s)
 	appendLifecycleTrace(f.trace, f.saveName)
 	return f.saveErr
@@ -351,18 +373,22 @@ func (f *lifecycleRecordingPathLockReleaser) Release(_ context.Context, _ domain
 }
 
 type lifecycleRecordingLivenessLock struct {
-	calls     int
-	paths     []string
-	dead      bool
-	err       error
-	trace     *[]string
-	traceName string
+	calls        int
+	paths        []string
+	dead         bool
+	err          error
+	onTryAcquire func()
+	trace        *[]string
+	traceName    string
 }
 
 func (f *lifecycleRecordingLivenessLock) TryAcquire(path string) (bool, error) {
 	f.calls++
 	f.paths = append(f.paths, path)
 	appendLifecycleTrace(f.trace, f.traceName)
+	if f.onTryAcquire != nil {
+		f.onTryAcquire()
+	}
 	return f.dead, f.err
 }
 
@@ -778,6 +804,7 @@ type lifecycleFixture struct {
 	failWriter   *lifecycleRecordingContractWriter
 	failSlots    *lifecycleRecordingSlotReleaser
 	failLocks    *lifecycleRecordingPathLockReleaser
+	confirmTasks *lifecycleRecordingTaskStore
 	confirmLock  *lifecycleRecordingLivenessLock
 	recordLock   *lifecycleRecordingLivenessLock
 	taskMu       *lifecycleRecordingTaskLocker
@@ -824,7 +851,8 @@ func newLifecycleFixture(t *testing.T) *lifecycleFixture {
 	f.taskMu = &lifecycleRecordingTaskLocker{trace: &f.trace}
 	fail := NewFailTaskLaunchUseCase(f.failStore, f.taskMu, f.failWriter, &lifecycleRecordingContractReader{}, f.failSlots, f.failLocks, &lifecycleRecordingClock{now: testLifecycleTime, trace: &f.trace})
 	f.confirmLock = &lifecycleRecordingLivenessLock{trace: &f.trace, traceName: "confirm-running"}
-	confirm := NewConfirmTaskRunningUseCase(&lifecycleRecordingTaskStore{loads: []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateStarting)}}}, &lifecycleRecordingTaskLocker{}, execution.NewCheckLivenessUseCase(f.confirmLock, func(domain.TaskID) string { return "/private/tmp/task.lock" }), &lifecycleRecordingContractWriter{})
+	f.confirmTasks = &lifecycleRecordingTaskStore{loads: []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateStarting)}}}
+	confirm := NewConfirmTaskRunningUseCase(f.confirmTasks, &lifecycleRecordingTaskLocker{}, execution.NewCheckLivenessUseCase(f.confirmLock, func(domain.TaskID) string { return "/private/tmp/task.lock" }), &lifecycleRecordingContractWriter{})
 	f.recordLock = &lifecycleRecordingLivenessLock{trace: &f.trace, traceName: "check-liveness"}
 	stdout, err := os.Create(filepath.Join(t.TempDir(), "stdout.log"))
 	if err != nil {
@@ -901,6 +929,128 @@ func TestTaskLifecycleRunImplSuccessOrdersLaunchAndFinalization(t *testing.T) {
 	if f.timeout.deadlines[0] != f.launch.launched.Handle.ProcessStartedAt.Add(1800*time.Second) || f.finalizer.calls[0].adoptedAfterRestart || f.finalizer.calls[0].now != f.clock.now {
 		t.Fatalf("terminal values=%+v", f.finalizer.calls[0])
 	}
+}
+
+func TestTaskLifecycleRunShutdownQuiescence(t *testing.T) {
+	t.Run("pre-launch cancellation has no lifecycle side effects", func(t *testing.T) {
+		f := newLifecycleFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+
+		f.orchestrator.Run(ctx, f.input)
+
+		if f.acquire.calls != 0 || f.starting.calls != 0 || f.launch.calls != 0 || f.tasks.loadCalls != 0 || f.tasks.saveCalls != 0 || f.failStore.loadCalls != 0 || f.failStore.saveCalls != 0 || f.killed.lockedCalls != 0 || f.terminator.calls != 0 || f.termination.confirmCalls != 0 || f.termination.sendCalls != 0 || f.pending.calls != 0 || f.pending.claimCalls != 0 || f.pending.completeCalls != 0 || f.pending.releaseCalls != 0 || f.pending.invalidateCalls != 0 || f.pending.removeCalls != 0 || f.waiter.calls != 0 || f.failSlots.calls != 0 {
+			t.Fatalf("shutdown performed lifecycle side effects: trace=%v", f.trace)
+		}
+	})
+
+	t.Run("launch receives detached context and stops before result evaluation", func(t *testing.T) {
+		cases := []struct {
+			name      string
+			configure func(*lifecycleFixture)
+		}{
+			{"success", func(*lifecycleFixture) {}},
+			{"launch error", func(f *lifecycleFixture) { f.launch.err = errors.New("launch") }},
+			{"nil launch", func(f *lifecycleFixture) { f.launch.launched = nil }},
+			{"nil handle", func(f *lifecycleFixture) { f.launch.launched.Handle = nil }},
+			{"nil waiter", func(f *lifecycleFixture) { f.launch.launched.Waiter = nil }},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				f := newLifecycleFixture(t)
+				ctx, cancel := context.WithCancel(context.Background())
+				tc.configure(f)
+				f.launch.onExecute = func(launchCtx context.Context) {
+					if launchCtx.Err() != nil {
+						t.Fatal("launch context inherited cancellation")
+					}
+					cancel()
+				}
+
+				f.orchestrator.Run(ctx, f.input)
+
+				if ctx.Err() == nil || len(f.launch.contexts) != 1 || f.launch.contexts[0].Err() != nil || f.failStore.loadCalls != 0 || f.failStore.saveCalls != 0 || f.process.calls != 0 || f.terminator.calls != 0 || f.termination.confirmCalls != 0 || f.termination.sendCalls != 0 || f.killed.lockedCalls != 0 || f.pending.calls != 0 || f.pending.claimCalls != 0 || f.pending.completeCalls != 0 || f.pending.releaseCalls != 0 || f.pending.invalidateCalls != 0 || f.pending.removeCalls != 0 || f.waiter.calls != 0 {
+					t.Fatalf("launch shutdown was not quiescent: trace=%v", f.trace)
+				}
+			})
+		}
+	})
+
+	t.Run("record process return is checked after shutdown", func(t *testing.T) {
+		cases := []struct {
+			name      string
+			configure func(*lifecycleFixture, context.CancelFunc)
+		}{
+			{"success", func(f *lifecycleFixture, cancel context.CancelFunc) { f.process.onExecute = cancel }},
+			{"error", func(f *lifecycleFixture, cancel context.CancelFunc) {
+				f.process.err = errors.New("record")
+				f.process.onExecute = cancel
+			}},
+			{"cancelling", func(f *lifecycleFixture, cancel context.CancelFunc) {
+				f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateRunning)}, {snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
+				f.tasks.onLoad = func(call int) {
+					if call == 2 {
+						cancel()
+					}
+				}
+			}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				f := newLifecycleFixture(t)
+				ctx, cancel := context.WithCancel(context.Background())
+				tc.configure(f, cancel)
+				f.orchestrator.Run(ctx, f.input)
+				if ctx.Err() == nil || f.confirmLock.calls != 0 || f.timeout.calls != 0 || f.monitor.calls != 0 || f.terminator.calls != 0 || f.termination.confirmCalls != 0 || f.termination.sendCalls != 0 || f.killed.lockedCalls != 0 || f.failStore.loadCalls != 0 || f.failStore.saveCalls != 0 || f.pending.calls != 0 || f.pending.claimCalls != 0 || f.waiter.calls != 0 {
+					t.Fatalf("record-process shutdown was not quiescent: trace=%v", f.trace)
+				}
+			})
+		}
+	})
+
+	t.Run("confirm running return is checked after shutdown", func(t *testing.T) {
+		cases := []struct {
+			name      string
+			configure func(*lifecycleFixture, context.CancelFunc)
+		}{
+			{"success", func(f *lifecycleFixture, cancel context.CancelFunc) { f.confirmTasks.onSave = func(int) { cancel() } }},
+			{"error", func(f *lifecycleFixture, cancel context.CancelFunc) {
+				f.confirmLock.err = errors.New("liveness")
+				f.confirmLock.onTryAcquire = cancel
+			}},
+			{"dead", func(f *lifecycleFixture, cancel context.CancelFunc) {
+				f.confirmLock.dead = true
+				f.confirmLock.onTryAcquire = cancel
+			}},
+			{"cancelling", func(f *lifecycleFixture, cancel context.CancelFunc) {
+				f.confirmTasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
+				f.confirmTasks.onLoad = func(int) { cancel() }
+			}},
+		}
+		for _, tc := range cases {
+			t.Run(tc.name, func(t *testing.T) {
+				f := newLifecycleFixture(t)
+				ctx, cancel := context.WithCancel(context.Background())
+				tc.configure(f, cancel)
+				f.orchestrator.Run(ctx, f.input)
+				if ctx.Err() == nil || f.timeout.calls != 0 || f.monitor.calls != 0 || f.terminator.calls != 0 || f.termination.confirmCalls != 0 || f.termination.sendCalls != 0 || f.killed.lockedCalls != 0 || f.pending.calls != 0 || f.pending.claimCalls != 0 || f.waiter.calls != 0 || len(f.finalizer.calls) != 0 {
+					t.Fatalf("confirm-running shutdown was not quiescent: trace=%v", f.trace)
+				}
+			})
+		}
+	})
+
+	t.Run("timeout arming checkpoint does not start monitoring", func(t *testing.T) {
+		f := newLifecycleFixture(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		f.timeout.onArm = cancel
+
+		f.orchestrator.Run(ctx, f.input)
+
+		if ctx.Err() == nil || f.timeout.calls != 1 || f.monitor.calls != 0 || f.terminator.calls != 0 || f.termination.confirmCalls != 0 || f.termination.sendCalls != 0 || f.killed.lockedCalls != 0 || f.pending.calls != 0 || f.pending.claimCalls != 0 || f.waiter.calls != 0 || len(f.finalizer.calls) != 0 {
+			t.Fatalf("timeout shutdown was not quiescent: trace=%v", f.trace)
+		}
+	})
 }
 func TestTaskLifecycleRunRejectsDuplicateOwnershipBeforeLaunch(t *testing.T) {
 	f := newLifecycleFixture(t)

@@ -124,7 +124,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 	defer release()
 	defer o.deps.Launching.Unregister(taskID)
 
-	if o.stopForCancellation(ctx, input) {
+	if o.stopForCancellation(ctx) {
 		return
 	}
 	lock, err := o.deps.AcquireForChild(input.TaskDirPath)
@@ -132,7 +132,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		o.fail(ctx, input)
 		return
 	}
-	if o.stopForCancellation(ctx, input) {
+	if o.stopForCancellation(ctx) {
 		_ = lock.Close()
 		return
 	}
@@ -148,7 +148,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 			o.fail(ctx, input)
 			return
 		}
-		if o.stopForCancellation(ctx, input) {
+		if o.stopForCancellation(ctx) {
 			_ = lock.Close()
 			return
 		}
@@ -169,20 +169,23 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		_ = lock.Close()
 		return
 	}
-	if o.stopForCancellation(ctx, input) {
+	if o.stopForCancellation(ctx) {
 		_ = lock.Close()
 		return
 	}
-	launched, err := o.deps.Launch.Execute(ctx, execution.LaunchParams{TaskID: taskID, Subcommand: input.Task.Subcommand(), Model: input.Model, SandboxMode: input.SandboxMode, WorkingDir: *workingDir, PromptText: input.PromptText, TaskDirPath: input.TaskDirPath, AllowResume: true, LivenessLockFile: lock, PTYEnabled: o.launchConfig.PTYEnabled, CodexBinaryPath: o.launchConfig.CodexBinaryPath, ReasoningEffort: input.ReasoningEffort})
+	launchCtx := context.WithoutCancel(ctx)
+	launched, err := o.deps.Launch.Execute(launchCtx, execution.LaunchParams{TaskID: taskID, Subcommand: input.Task.Subcommand(), Model: input.Model, SandboxMode: input.SandboxMode, WorkingDir: *workingDir, PromptText: input.PromptText, TaskDirPath: input.TaskDirPath, AllowResume: true, LivenessLockFile: lock, PTYEnabled: o.launchConfig.PTYEnabled, CodexBinaryPath: o.launchConfig.CodexBinaryPath, ReasoningEffort: input.ReasoningEffort})
+	if ctx.Err() != nil {
+		return
+	}
 	if err != nil || launched == nil || launched.Handle == nil || launched.Waiter == nil {
 		o.fail(ctx, input)
 		return
 	}
+	cancelling, recordErr := o.recordProcessAtLaunchBoundary(ctx, input, launched)
 	if ctx.Err() != nil {
-		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true, generation)
 		return
 	}
-	cancelling, recordErr := o.recordProcessAtLaunchBoundary(ctx, input, launched)
 	if cancelling {
 		o.handleStartingCancellation(ctx, taskID, launched, true, generation)
 		return
@@ -191,11 +194,10 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		o.handleRecordProcessFailure(ctx, input, launched)
 		return
 	}
+	confirmed, err := o.deps.ConfirmRunning.Execute(ctx, taskID, input.Now)
 	if ctx.Err() != nil {
-		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true, generation)
 		return
 	}
-	confirmed, err := o.deps.ConfirmRunning.Execute(ctx, taskID, input.Now)
 	if err != nil {
 		o.logger.Warn("confirm running failed", "task_id", taskID.String(), "error", err)
 		raw, waitErr := o.waitLaunched(taskID, launched)
@@ -214,24 +216,15 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		return
 	}
 	deadline := launched.Handle.ProcessStartedAt.Add(time.Duration(input.ResolvedTimeout.ResolvedSeconds()) * time.Second)
-	if ctx.Err() != nil {
-		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true, generation)
-		return
-	}
 	o.deps.TimeoutArmer.Arm(taskID, deadline, input.ResolvedTimeout.ResolvedSeconds(), generation)
 	if ctx.Err() != nil {
-		o.handleStartingCancellation(context.WithoutCancel(ctx), taskID, launched, true, generation)
 		return
 	}
 	o.monitorAndFinalize(ctx, input, launched)
 }
 
-func (o *TaskLifecycleOrchestrator) stopForCancellation(ctx context.Context, input TaskLifecycleInput) bool {
-	if ctx.Err() == nil {
-		return false
-	}
-	o.fail(context.WithoutCancel(ctx), input)
-	return true
+func (o *TaskLifecycleOrchestrator) stopForCancellation(ctx context.Context) bool {
+	return ctx.Err() != nil
 }
 
 func (o *TaskLifecycleOrchestrator) recordProcessAtLaunchBoundary(ctx context.Context, input TaskLifecycleInput, launched *execution.LaunchedProcess) (bool, error) {
