@@ -388,12 +388,18 @@ func (f *lifecycleRecordingTerminator) Terminate(pid int, grace time.Duration) e
 }
 
 type lifecycleRecordingPendingRegistrar struct {
-	calls        int
-	taskIDs      []domain.TaskID
-	dispositions []recovery.PendingSendDisposition
-	authorities  []*recovery.ProcessSignalAuthority
-	trace        *[]string
-	set          recovery.PendingReconciliationSet
+	calls           int
+	taskIDs         []domain.TaskID
+	dispositions    []recovery.PendingSendDisposition
+	authorities     []*recovery.ProcessSignalAuthority
+	claimCalls      int
+	claimOutcomes   []recovery.ClaimOutcome
+	completeCalls   int
+	releaseCalls    int
+	invalidateCalls int
+	removeCalls     int
+	trace           *[]string
+	set             recovery.PendingReconciliationSet
 }
 
 var _ recovery.PendingRegistrar = (*lifecycleRecordingPendingRegistrar)(nil)
@@ -411,22 +417,29 @@ func (f *lifecycleRecordingPendingRegistrar) Register(id domain.TaskID, disposit
 	return f.set.Register(id, disposition, authority)
 }
 func (f *lifecycleRecordingPendingRegistrar) ClaimInitialSend(id domain.TaskID, authority recovery.ProcessSignalAuthority) (recovery.SendClaim, recovery.ClaimOutcome) {
-	return f.set.ClaimInitialSend(id, authority)
+	f.claimCalls++
+	claim, outcome := f.set.ClaimInitialSend(id, authority)
+	f.claimOutcomes = append(f.claimOutcomes, outcome)
+	return claim, outcome
 }
 
 func (f *lifecycleRecordingPendingRegistrar) ClaimForSend(taskID domain.TaskID, authority recovery.ProcessSignalAuthority) (recovery.SendClaim, recovery.ClaimOutcome) {
 	return f.set.ClaimForSend(taskID, authority)
 }
 func (f *lifecycleRecordingPendingRegistrar) CompleteSend(claim recovery.SendClaim) bool {
+	f.completeCalls++
 	return f.set.CompleteSend(claim)
 }
 func (f *lifecycleRecordingPendingRegistrar) ReleaseSend(claim recovery.SendClaim) bool {
+	f.releaseCalls++
 	return f.set.ReleaseSend(claim)
 }
 func (f *lifecycleRecordingPendingRegistrar) InvalidateSend(claim recovery.SendClaim) bool {
+	f.invalidateCalls++
 	return f.set.InvalidateSend(claim)
 }
 func (f *lifecycleRecordingPendingRegistrar) RemoveClaim(claim recovery.SendClaim) bool {
+	f.removeCalls++
 	return f.set.RemoveClaim(claim)
 }
 
@@ -672,6 +685,10 @@ func lifecycleTimeout(t *testing.T) domain.Timeout {
 	return timeout
 }
 func lifecycleSnapshot(t *testing.T, task *domain.Task, state domain.TaskState) domain.TaskSnapshot {
+	return lifecycleSnapshotWithProcessStartedAt(t, task, state, testLifecycleTime)
+}
+
+func lifecycleSnapshotWithProcessStartedAt(t *testing.T, task *domain.Task, state domain.TaskState, processStartedAt time.Time) domain.TaskSnapshot {
 	t.Helper()
 	timeout := lifecycleTimeout(t)
 	if _, err := task.Start(timeout, "gpt-5", testLifecycleTime); err != nil {
@@ -680,7 +697,7 @@ func lifecycleSnapshot(t *testing.T, task *domain.Task, state domain.TaskState) 
 	// ConfirmTaskRunningUseCase restores this snapshot and then transitions it to
 	// running. Record process information first so the resulting snapshot meets
 	// the running-state invariant.
-	if _, err := task.RecordProcessInfo(42, testLifecycleTime, testLifecycleTime); err != nil {
+	if _, err := task.RecordProcessInfo(42, processStartedAt, testLifecycleTime); err != nil {
 		t.Fatal(err)
 	}
 	snapshot, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil).WithTask(task, testLifecycleTime)
@@ -995,9 +1012,11 @@ func TestTaskLifecycleRunConvertsWaitErrorsToEstimatedExit(t *testing.T) {
 
 func TestTaskLifecycleStartingCancellationUsesEstimatedCancelledExitCode(t *testing.T) {
 	f := newLifecycleFixture(t)
+	cancelling := lifecycleSnapshotWithProcessStartedAt(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling, f.launch.launched.Handle.ProcessStartedAt)
+	f.tasks.loads = []lifecycleLoadResult{{snapshot: cancelling}}
 	f.termination.dead = true
 	f.orchestrator.handleStartingCancellation(context.Background(), f.input.Task.ID(), f.launch.launched, true, domain.LifecycleGeneration(1))
-	if f.termination.sendCalls != 1 || f.termination.confirmCalls != 0 || f.waiter.calls != 1 || f.killed.lockedCalls != 1 || f.killed.wrapperCalls != 0 {
+	if f.pending.claimCalls != 1 || len(f.pending.claimOutcomes) != 1 || f.pending.claimOutcomes[0] != recovery.ClaimAcquired || f.pending.completeCalls != 1 || f.termination.sendCalls != 1 || f.termination.confirmCalls != 0 || f.waiter.calls != 1 || f.killed.lockedCalls != 1 || f.killed.wrapperCalls != 0 {
 		t.Fatalf("unexpected cancellation handling: trace=%v", f.trace)
 	}
 	call := f.killed.calls[0]
@@ -1009,47 +1028,39 @@ func TestTaskLifecycleStartingCancellationUsesEstimatedCancelledExitCode(t *test
 	}
 }
 
-func TestTaskLifecycleStartingCancellationRegistersPendingBySignalOutcome(t *testing.T) {
+func TestTaskLifecycleStartingCancellationCompletesClaimBySignalOutcome(t *testing.T) {
 	cases := []struct {
-		name          string
-		send          bool
-		dead          bool
-		signalErr     error
-		invalidPID    bool
-		want          recovery.PendingSendDisposition
-		wantAuthority bool
+		name           string
+		dead           bool
+		terminateErr   error
+		confirmErr     error
+		wantComplete   int
+		wantRelease    int
+		wantInvalidate int
 	}{
-		{name: "confirm error", signalErr: errors.New("confirm"), want: recovery.PendingSendConfirmOnly},
-		{name: "confirm live", want: recovery.PendingSendConfirmOnly},
-		{name: "confirm dead unconfirmed", dead: true, want: recovery.PendingSendConfirmOnly},
-		{name: "send error with authority", send: true, signalErr: errors.New("send"), want: recovery.PendingSendUnsent, wantAuthority: true},
-		{name: "send error without authority", send: true, signalErr: errors.New("send"), invalidPID: true, want: recovery.PendingSendConfirmOnly},
-		{name: "send succeeds while live", send: true, want: recovery.PendingSendSent},
-		{name: "send succeeds dead unconfirmed", send: true, dead: true, want: recovery.PendingSendSent},
+		{name: "confirm error", confirmErr: errors.New("confirm"), wantComplete: 1},
+		{name: "confirm live", wantComplete: 1},
+		{name: "confirm dead unconfirmed", dead: true, wantComplete: 1},
+		{name: "retryable send error", terminateErr: errors.New("send"), wantRelease: 1},
+		{name: "authority invalid", terminateErr: recovery.ErrProcessSignalAuthorityInvalid, wantInvalidate: 1},
+		{name: "send succeeds while live", wantComplete: 1},
+		{name: "send succeeds dead unconfirmed", dead: true, wantComplete: 1},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newLifecycleFixture(t)
-			f.termination.dead, f.termination.err = tc.dead, tc.signalErr
+			cancelling := lifecycleSnapshotWithProcessStartedAt(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling, f.launch.launched.Handle.ProcessStartedAt)
+			f.tasks.loads = []lifecycleLoadResult{{snapshot: cancelling}}
+			f.termination.dead, f.termination.terminateErr, f.termination.confirmErr = tc.dead, tc.terminateErr, tc.confirmErr
 			f.killed.lockedResult = execution.LockedKillResult{}
-			if tc.invalidPID {
-				f.launch.launched.Handle.PID = 0
-			}
 
-			f.orchestrator.handleStartingCancellation(context.Background(), f.input.Task.ID(), f.launch.launched, tc.send, domain.LifecycleGeneration(1))
+			f.orchestrator.handleStartingCancellation(context.Background(), f.input.Task.ID(), f.launch.launched, true, domain.LifecycleGeneration(1))
 
-			if f.pending.calls != 1 || f.pending.dispositions[0] != tc.want {
+			if f.pending.claimCalls != 1 || len(f.pending.claimOutcomes) != 1 || f.pending.claimOutcomes[0] != recovery.ClaimAcquired || f.pending.completeCalls != tc.wantComplete || f.pending.releaseCalls != tc.wantRelease || f.pending.invalidateCalls != tc.wantInvalidate || f.pending.removeCalls != 0 {
 				t.Fatalf("pending=%+v", f.pending)
 			}
-			if !tc.wantAuthority {
-				if f.pending.authorities[0] != nil {
-					t.Fatalf("authority=%+v", f.pending.authorities[0])
-				}
-				return
-			}
-			got := f.pending.authorities[0]
-			if got == nil || got.TaskID != f.input.Task.ID() || got.PID != 42 || got.ProcessStartedAt != f.launch.launched.Handle.ProcessStartedAt {
-				t.Fatalf("authority=%+v", got)
+			if f.termination.sendCalls != 1 || f.termination.confirmCalls != 0 {
+				t.Fatalf("termination calls send=%d confirm=%d", f.termination.sendCalls, f.termination.confirmCalls)
 			}
 		})
 	}
@@ -1084,6 +1095,8 @@ func TestTaskLifecycleCancellationConfirmationRegistersUnconfirmed(t *testing.T)
 				name:        "starting",
 				disposition: recovery.PendingSendSent,
 				invoke: func(f *lifecycleFixture) {
+					cancelling := lifecycleSnapshotWithProcessStartedAt(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling, f.launch.launched.Handle.ProcessStartedAt)
+					f.tasks.loads = []lifecycleLoadResult{{snapshot: cancelling}}
 					f.termination.dead = true
 					f.orchestrator.handleStartingCancellation(context.Background(), f.input.Task.ID(), f.launch.launched, true, domain.LifecycleGeneration(1))
 				},
@@ -1103,10 +1116,14 @@ func TestTaskLifecycleCancellationConfirmationRegistersUnconfirmed(t *testing.T)
 				f.killed.lockedResult = execution.LockedKillResult{}
 				f.killed.lockedErr = confirmErr
 				tc.invoke(f)
-				if f.killed.lockedCalls != 1 || f.killed.releaseCalls != 0 || f.pending.calls != 1 || f.pending.taskIDs[0] != f.input.Task.ID() || f.pending.dispositions[0] != tc.disposition || f.pending.authorities[0] != nil {
+				if f.killed.lockedCalls != 1 || f.killed.releaseCalls != 0 {
 					t.Fatalf("locked=%d release=%d pending=%+v", f.killed.lockedCalls, f.killed.releaseCalls, f.pending)
 				}
-				if !lifecycleTraceSubsequence(f.trace, "confirm-killed-locked", "task-unlock", "pending-register") {
+				if tc.name == "starting" {
+					if f.pending.claimCalls != 1 || f.pending.completeCalls != 1 || f.pending.calls != 0 {
+						t.Fatalf("starting claim=%d complete=%d register=%d", f.pending.claimCalls, f.pending.completeCalls, f.pending.calls)
+					}
+				} else if f.pending.calls != 1 || f.pending.taskIDs[0] != f.input.Task.ID() || f.pending.dispositions[0] != tc.disposition || f.pending.authorities[0] != nil || !lifecycleTraceSubsequence(f.trace, "confirm-killed-locked", "task-unlock", "pending-register") {
 					t.Fatalf("pending registration did not follow unlock: %v", f.trace)
 				}
 				if tc.name == "starting" && (f.killed.wrapperCalls != 0 || f.waiter.calls != 1) {
@@ -1139,6 +1156,8 @@ func TestTaskLifecycleCancellationConfirmationReleasesConfirmedDespiteError(t *t
 		{
 			name: "starting",
 			invoke: func(f *lifecycleFixture) {
+				cancelling := lifecycleSnapshotWithProcessStartedAt(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling, f.launch.launched.Handle.ProcessStartedAt)
+				f.tasks.loads = []lifecycleLoadResult{{snapshot: cancelling}}
 				f.termination.dead = true
 				f.orchestrator.handleStartingCancellation(context.Background(), f.input.Task.ID(), f.launch.launched, true, domain.LifecycleGeneration(1))
 			},
@@ -1159,6 +1178,9 @@ func TestTaskLifecycleCancellationConfirmationReleasesConfirmedDespiteError(t *t
 			tc.invoke(f)
 			if f.killed.lockedCalls != 1 || f.killed.releaseCalls != 1 || f.pending.calls != 0 {
 				t.Fatalf("locked=%d release=%d pending=%d", f.killed.lockedCalls, f.killed.releaseCalls, f.pending.calls)
+			}
+			if tc.name == "starting" && (f.pending.claimCalls != 1 || f.pending.completeCalls != 1) {
+				t.Fatalf("starting claim=%d complete=%d", f.pending.claimCalls, f.pending.completeCalls)
 			}
 			if !lifecycleTraceSubsequence(f.trace, "confirm-killed-locked", "task-unlock", "release-after-confirmation") {
 				t.Fatalf("release did not follow unlock: %v", f.trace)

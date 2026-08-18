@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -277,6 +278,27 @@ func (o *TaskLifecycleOrchestrator) confirmUnlaunchedCancellation(ctx context.Co
 }
 
 func (o *TaskLifecycleOrchestrator) handleStartingCancellation(ctx context.Context, taskID domain.TaskID, launched *execution.LaunchedProcess, send bool, generation domain.LifecycleGeneration) {
+	var claim recovery.SendClaim
+	if send {
+		authority := recovery.ProcessSignalAuthority{TaskID: taskID, PID: launched.Handle.PID, ProcessStartedAt: launched.Handle.ProcessStartedAt, ExpectedState: domain.StateCancelling, LifecycleGeneration: &generation}
+		outcome := recovery.ClaimNotFound
+		claim, outcome = o.deps.Pending.ClaimInitialSend(taskID, authority)
+		switch outcome {
+		case recovery.ClaimAcquired:
+			if !o.prepareStartingClaim(taskID, launched.Handle, generation, claim) {
+				o.waitLaunched(taskID, launched)
+				return
+			}
+		case recovery.ClaimSent:
+			send = false
+		case recovery.ClaimAlreadyClaimed, recovery.ClaimConfirmOnly, recovery.ClaimNotFound:
+			o.waitLaunched(taskID, launched)
+			return
+		default:
+			o.waitLaunched(taskID, launched)
+			return
+		}
+	}
 	var dead bool
 	var err error
 	var terminateErr error
@@ -284,6 +306,13 @@ func (o *TaskLifecycleOrchestrator) handleStartingCancellation(ctx context.Conte
 		authority := recovery.ProcessSignalAuthority{TaskID: taskID, PID: launched.Handle.PID, ProcessStartedAt: launched.Handle.ProcessStartedAt, ExpectedState: domain.StateCancelling, LifecycleGeneration: &generation}
 		result := o.deps.Termination.SendAndConfirm(ctx, taskID, authority, execution.TimeoutKillGrace)
 		dead, err, terminateErr = result.Dead, result.ConfirmErr, result.TerminateErr
+		if terminateErr == nil {
+			o.deps.Pending.CompleteSend(claim)
+		} else if errors.Is(terminateErr, recovery.ErrProcessSignalAuthorityInvalid) {
+			o.deps.Pending.InvalidateSend(claim)
+		} else {
+			o.deps.Pending.ReleaseSend(claim)
+		}
 	} else {
 		dead, err = o.deps.Termination.Confirm(ctx, taskID)
 	}
@@ -293,14 +322,6 @@ func (o *TaskLifecycleOrchestrator) handleStartingCancellation(ctx context.Conte
 		}
 		if terminateErr != nil {
 			o.logger.Warn("terminate starting cancellation", "task_id", taskID.String(), "error", terminateErr)
-		}
-		signalErr := err
-		if send {
-			signalErr = terminateErr
-		}
-		disposition, authority := pendingRegistrationAfterSignal(taskID, launched.Handle, send, signalErr, generation)
-		if registerErr := o.deps.Pending.Register(taskID, disposition, authority); registerErr != nil {
-			o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
 		}
 		o.waitLaunched(taskID, launched)
 		return
@@ -313,17 +334,38 @@ func (o *TaskLifecycleOrchestrator) handleStartingCancellation(ctx context.Conte
 	}
 	if result.Confirmed {
 		o.deps.ConfirmKilled.ReleaseAfterConfirmation(ctx, result, taskID)
-	} else {
-		signalErr := err
-		if send {
-			signalErr = terminateErr
-		}
-		disposition, authority := pendingRegistrationAfterSignal(taskID, launched.Handle, send, signalErr, generation)
-		if registerErr := o.deps.Pending.Register(taskID, disposition, authority); registerErr != nil {
-			o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
-		}
 	}
 	o.waitLaunched(taskID, launched)
+}
+
+func (o *TaskLifecycleOrchestrator) prepareStartingClaim(taskID domain.TaskID, handle *domain.ProcessHandle, generation domain.LifecycleGeneration, claim recovery.SendClaim) bool {
+	o.deps.TaskMu.Lock(taskID)
+	snapshot, err := o.deps.Tasks.Load(taskID)
+	if err != nil {
+		o.deps.TaskMu.Unlock(taskID)
+		o.deps.Pending.RemoveClaim(claim)
+		o.logger.Warn("reload task before starting cancellation", "task_id", taskID.String(), "error", err)
+		return false
+	}
+	current, owned := o.deps.Ownership.Current(taskID)
+	if snapshot.State != domain.StateCancelling || !owned || current != generation || handle == nil || snapshot.PID != nil && (*snapshot.PID != handle.PID || snapshot.ProcessStartedAt == nil || !snapshot.ProcessStartedAt.Equal(handle.ProcessStartedAt)) {
+		o.deps.TaskMu.Unlock(taskID)
+		o.deps.Pending.RemoveClaim(claim)
+		return false
+	}
+	if snapshot.PID == nil {
+		snapshot.PID = &handle.PID
+		startedAt := handle.ProcessStartedAt
+		snapshot.ProcessStartedAt = &startedAt
+		if err := o.deps.Tasks.Save(taskID, snapshot); err != nil {
+			o.deps.TaskMu.Unlock(taskID)
+			o.deps.Pending.RemoveClaim(claim)
+			o.logger.Warn("record process for starting cancellation", "task_id", taskID.String(), "error", err)
+			return false
+		}
+	}
+	o.deps.TaskMu.Unlock(taskID)
+	return true
 }
 
 func (o *TaskLifecycleOrchestrator) waitLaunched(taskID domain.TaskID, launched *execution.LaunchedProcess) (int, error) {
