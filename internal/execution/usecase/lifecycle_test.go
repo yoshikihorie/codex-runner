@@ -1,12 +1,15 @@
 package usecase
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -408,6 +411,7 @@ type lifecycleRecordingPendingRegistrar struct {
 	taskIDs         []domain.TaskID
 	dispositions    []recovery.PendingSendDisposition
 	authorities     []*recovery.ProcessSignalAuthority
+	registerErr     error
 	claimCalls      int
 	claimOutcomes   []recovery.ClaimOutcome
 	completeCalls   int
@@ -430,6 +434,9 @@ func (f *lifecycleRecordingPendingRegistrar) Register(id domain.TaskID, disposit
 		f.authorities[len(f.authorities)-1] = &copy
 	}
 	appendLifecycleTrace(f.trace, "pending-register")
+	if f.registerErr != nil {
+		return f.registerErr
+	}
 	return f.set.Register(id, disposition, authority)
 }
 func (f *lifecycleRecordingPendingRegistrar) ClaimInitialSend(id domain.TaskID, authority recovery.ProcessSignalAuthority) (recovery.SendClaim, recovery.ClaimOutcome) {
@@ -1385,12 +1392,59 @@ func TestTaskLifecycleConfirmRunningErrorWaitsAndConfirmsExactlyOneTerminalBranc
 	}
 }
 
-func TestTaskLifecycleConfirmRunningDeadWaitsWithoutTerminalConfirmation(t *testing.T) {
+func TestTaskLifecycleConfirmRunningDeadRegistersPendingBeforeWaiting(t *testing.T) {
 	f := newLifecycleFixture(t)
 	f.confirmLock.dead = true
+
 	f.run()
-	if f.waiter.calls != 1 || len(f.finalizer.calls) != 0 || len(f.killed.calls) != 0 || f.timeout.calls != 0 || f.monitor.calls != 0 {
+
+	if f.pending.calls != 1 {
+		t.Fatalf("Pending.Register calls=%d", f.pending.calls)
+	}
+	if len(f.pending.taskIDs) != 1 || f.pending.taskIDs[0] != f.input.Task.ID() {
+		t.Fatalf("Pending.Register task IDs=%v want %s", f.pending.taskIDs, f.input.Task.ID())
+	}
+	if len(f.pending.dispositions) != 1 || f.pending.dispositions[0] != recovery.PendingSendConfirmOnly {
+		t.Fatalf("Pending.Register dispositions=%v want %v", f.pending.dispositions, recovery.PendingSendConfirmOnly)
+	}
+	if len(f.pending.authorities) != 1 || f.pending.authorities[0] != nil {
+		t.Fatalf("Pending.Register authorities=%v want [nil]", f.pending.authorities)
+	}
+	if !lifecycleTraceSubsequence(f.trace, "pending-register", "wait") {
+		t.Fatalf("Pending.Register did not precede Wait(): trace=%v", f.trace)
+	}
+	if f.waiter.calls != 1 || len(f.finalizer.calls) != 0 || len(f.killed.calls) != 0 || f.timeout.calls != 0 || f.monitor.calls != 0 || f.termination.confirmCalls != 0 || f.termination.sendCalls != 0 || f.terminator.calls != 0 {
 		t.Fatalf("dead confirmation continued lifecycle: trace=%v", f.trace)
+	}
+}
+
+func TestTaskLifecycleConfirmRunningDeadWaitsWhenPendingRegistrationFails(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.confirmLock.dead = true
+	f.pending.registerErr = errors.New("pending registration failed")
+	var logs bytes.Buffer
+	f.orchestrator.logger = slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+
+	f.run()
+
+	if f.pending.calls != 1 {
+		t.Fatalf("Pending.Register calls=%d", f.pending.calls)
+	}
+	if f.waiter.calls != 1 {
+		t.Fatalf("Wait() calls=%d", f.waiter.calls)
+	}
+	if !lifecycleTraceSubsequence(f.trace, "pending-register", "wait") {
+		t.Fatalf("Pending.Register did not precede Wait(): trace=%v", f.trace)
+	}
+	if len(f.finalizer.calls) != 0 || len(f.killed.calls) != 0 || f.timeout.calls != 0 || f.monitor.calls != 0 || f.termination.confirmCalls != 0 || f.termination.sendCalls != 0 || f.terminator.calls != 0 {
+		t.Fatalf("dead confirmation continued lifecycle: trace=%v", f.trace)
+	}
+	logOutput := logs.String()
+	if strings.Count(logOutput, "register pending lifecycle reconciliation") != 1 {
+		t.Fatalf("pending registration warning count=%d logs=%q", strings.Count(logOutput, "register pending lifecycle reconciliation"), logOutput)
+	}
+	if !strings.Contains(logOutput, f.input.Task.ID().String()) || !strings.Contains(logOutput, f.pending.registerErr.Error()) {
+		t.Fatalf("pending registration warning missing task ID or error: logs=%q", logOutput)
 	}
 }
 
