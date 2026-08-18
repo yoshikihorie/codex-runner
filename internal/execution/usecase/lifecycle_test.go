@@ -142,18 +142,34 @@ type lifecycleRecordingFinalizer struct {
 	trace          *[]string
 	releaseCalls   int
 	prepared       lifecycleFinalizeCall
+	prepareContext context.Context
 	prepareBlocked chan struct{}
 	allowPrepare   chan struct{}
 }
 
-func (f *lifecycleRecordingFinalizer) Prepare(in execution.FinalizeTaskInput) (execution.PreparedFinalizeTask, error) {
+func (f *lifecycleRecordingFinalizer) Prepare(ctx context.Context, in execution.FinalizeTaskInput) (execution.PreparedFinalizeTask, error) {
 	f.prepareCalls++
+	f.prepareContext = ctx
 	f.prepared = lifecycleFinalizeCall{in.TaskID, in.RawExitCode, in.Estimated, in.AdoptedAfterRestart, in.OccurredAt}
 	if f.prepareBlocked != nil {
 		f.prepareBlocked <- struct{}{}
 		<-f.allowPrepare
 	}
 	return execution.PreparedFinalizeTask{}, f.prepareErr
+}
+
+type lifecycleRecordingChangeNotifier struct {
+	ch               chan struct{}
+	subscribeCalls   int
+	unsubscribeCalls int
+	trace            *[]string
+}
+
+func (f *lifecycleRecordingChangeNotifier) Subscribe(domain.TaskID) (<-chan struct{}, func()) {
+	f.subscribeCalls++
+	return f.ch, func() {
+		f.unsubscribeCalls++
+	}
 }
 
 func (f *lifecycleRecordingFinalizer) ExecuteLocked(_ context.Context, _ execution.PreparedFinalizeTask) (execution.LockedFinalizeResult, error) {
@@ -747,6 +763,7 @@ type lifecycleFixture struct {
 	timeout      *lifecycleRecordingTimeoutArmer
 	monitor      *lifecycleRecordingMonitor
 	finalizer    *lifecycleRecordingFinalizer
+	changes      *lifecycleRecordingChangeNotifier
 	killed       *lifecycleRecordingKillConfirmer
 	tasks        *lifecycleRecordingTaskStore
 	failStore    *lifecycleRecordingTaskStore
@@ -788,6 +805,7 @@ func newLifecycleFixture(t *testing.T) *lifecycleFixture {
 	f.timeout = &lifecycleRecordingTimeoutArmer{trace: &f.trace}
 	f.monitor = &lifecycleRecordingMonitor{trace: &f.trace}
 	f.finalizer = &lifecycleRecordingFinalizer{trace: &f.trace}
+	f.changes = &lifecycleRecordingChangeNotifier{ch: make(chan struct{}, 1), trace: &f.trace}
 	f.killed = &lifecycleRecordingKillConfirmer{lockedResult: execution.LockedKillResult{Confirmed: true}, trace: &f.trace}
 	runningSnapshot := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateRunning)
 	f.tasks = &lifecycleRecordingTaskStore{loads: []lifecycleLoadResult{{snapshot: runningSnapshot}, {snapshot: runningSnapshot}, {snapshot: runningSnapshot}, {snapshot: runningSnapshot}}, trace: &f.trace, loadName: "load-final"}
@@ -813,7 +831,7 @@ func newLifecycleFixture(t *testing.T) *lifecycleFixture {
 	f.ownership = &lifecycleRecordingOwnership{acquired: true, trace: &f.trace}
 	f.launching = &lifecycleRecordingLaunching{trace: &f.trace}
 	f.clock = &lifecycleRecordingClock{now: testLifecycleTime.Add(2 * time.Hour), trace: &f.trace}
-	deps := TaskLifecycleDependencies{AcquireForChild: f.acquire.Acquire, RecordStarting: f.starting, CreateWorktree: f.worktree, Launch: f.launch, RecordProcess: f.process, FailLaunch: fail, ConfirmRunning: confirm, CheckLiveness: execution.NewCheckLivenessUseCase(f.recordLock, func(domain.TaskID) string { return "/private/tmp/task.lock" }), TimeoutArmer: f.timeout, Monitor: f.monitor, Finalize: f.finalizer, ConfirmKilled: f.killed, Tasks: f.tasks, TaskMu: f.taskMu, Terminator: f.terminator, Termination: f.termination, Pending: f.pending, Ownership: f.ownership, Launching: f.launching, OpenStdout: f.opener, Clock: f.clock}
+	deps := TaskLifecycleDependencies{AcquireForChild: f.acquire.Acquire, RecordStarting: f.starting, CreateWorktree: f.worktree, Launch: f.launch, RecordProcess: f.process, FailLaunch: fail, ConfirmRunning: confirm, CheckLiveness: execution.NewCheckLivenessUseCase(f.recordLock, func(domain.TaskID) string { return "/private/tmp/task.lock" }), TimeoutArmer: f.timeout, Monitor: f.monitor, Finalize: f.finalizer, ConfirmKilled: f.killed, Tasks: f.tasks, TaskMu: f.taskMu, Terminator: f.terminator, Termination: f.termination, Pending: f.pending, Ownership: f.ownership, Launching: f.launching, Changes: f.changes, OpenStdout: f.opener, Clock: f.clock}
 	f.orchestrator, err = NewTaskLifecycleOrchestrator(deps, TaskLifecycleLaunchConfig{CodexBinaryPath: "/private/tmp/codex", PTYEnabled: true})
 	if err != nil {
 		t.Fatal(err)
@@ -841,6 +859,15 @@ func TestTaskLifecycleOrchestratorRejectsNilLaunchingRegistry(t *testing.T) {
 	deps.Launching = nil
 	if _, err := NewTaskLifecycleOrchestrator(deps, f.orchestrator.launchConfig); err == nil {
 		t.Fatal("nil launching registry was accepted")
+	}
+}
+
+func TestTaskLifecycleOrchestratorRejectsNilTaskChangeNotifier(t *testing.T) {
+	f := newLifecycleFixture(t)
+	deps := f.orchestrator.deps
+	deps.Changes = nil
+	if _, err := NewTaskLifecycleOrchestrator(deps, f.orchestrator.launchConfig); err == nil {
+		t.Fatal("nil task change notifier was accepted")
 	}
 }
 func TestTaskLifecycleInputCarriesTaskScopedFields(t *testing.T) {
@@ -1367,8 +1394,8 @@ func TestTaskLifecycleConfirmRunningDeadWaitsWithoutTerminalConfirmation(t *test
 	}
 }
 
-// RED-05: cancellation committed after the terminal reader observed running
-// must choose ConfirmKilled from the state reloaded while taskMu is held.
+// RED-05: a cancellation committed while Prepare is blocked must confirm the
+// kill without waiting for terminal artifact reading to return.
 func TestTaskLifecycleRunTerminalRaceCancelWinsRoutesOnlyConfirmKilled(t *testing.T) {
 	f := newLifecycleFixture(t)
 	running := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateRunning)
@@ -1384,6 +1411,7 @@ func TestTaskLifecycleRunTerminalRaceCancelWinsRoutesOnlyConfirmKilled(t *testin
 	f.orchestrator.deps.TaskMu = shared
 	f.finalizer.prepareBlocked = make(chan struct{}, 1)
 	f.finalizer.allowPrepare = make(chan struct{})
+	defer close(f.finalizer.allowPrepare)
 
 	confirmed := make(chan struct{})
 	go func() {
@@ -1416,11 +1444,23 @@ func TestTaskLifecycleRunTerminalRaceCancelWinsRoutesOnlyConfirmKilled(t *testin
 		t.Fatal(err)
 	}
 	shared.Unlock(f.input.Task.ID())
-	close(f.finalizer.allowPrepare)
-	<-confirmed
+	f.changes.ch <- struct{}{}
+	select {
+	case <-confirmed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("terminal cancellation waited for blocked Prepare")
+	}
 
 	if f.killed.lockedCalls != 1 || len(f.finalizer.calls) != 0 {
 		t.Fatalf("ConfirmKilled=%d Finalize=%d", f.killed.lockedCalls, len(f.finalizer.calls))
+	}
+	if f.changes.subscribeCalls != 1 || f.changes.unsubscribeCalls != 1 {
+		t.Fatalf("subscribe=%d unsubscribe=%d", f.changes.subscribeCalls, f.changes.unsubscribeCalls)
+	}
+	select {
+	case <-f.finalizer.prepareContext.Done():
+	default:
+		t.Fatal("Prepare context was not cancelled after cancellation notification")
 	}
 }
 

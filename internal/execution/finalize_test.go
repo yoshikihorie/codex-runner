@@ -336,7 +336,7 @@ func TestFinalizeTaskUseCasePrepareReadsLastMessageOutsideTaskMutexExactlyOnce(t
 		t.Run(tc.name, func(t *testing.T) {
 			s, r, _, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
 			r.presentErr = tc.err
-			_, err := uc.Prepare(finalizeInput(s.latest.TaskID, now))
+			_, err := uc.Prepare(context.Background(), finalizeInput(s.latest.TaskID, now))
 			if !errors.Is(err, tc.err) || r.lastCalls != 1 {
 				t.Fatalf("err=%v reads=%d", err, r.lastCalls)
 			}
@@ -366,7 +366,7 @@ func TestFinalizeTaskUseCaseExecuteLockedUsesPreparedResultWithoutSecondRead(t *
 		t.Run(tc.name, func(t *testing.T) {
 			s, r, _, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
 			r.present = tc.present
-			prepared, err := uc.Prepare(finalizeInput(s.latest.TaskID, now))
+			prepared, err := uc.Prepare(context.Background(), finalizeInput(s.latest.TaskID, now))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -402,7 +402,7 @@ func TestFinalizeTaskUseCaseRecordExitedReleaseContractAfterTwoPhaseAPI(t *testi
 		t.Run(tc.name, func(t *testing.T) {
 			s, _, _, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
 			tc.configure(s)
-			prepared, err := uc.Prepare(finalizeInput(s.latest.TaskID, now))
+			prepared, err := uc.Prepare(context.Background(), finalizeInput(s.latest.TaskID, now))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -993,7 +993,7 @@ func TestFinalizeTaskUseCaseTerminalPersistenceFinalizesStalledMetrics(t *testin
 			if tc.name == "completed saved from stalled records corrected estimated event" {
 				s.latest.AdoptedAfterRestart = true
 			}
-			prepared, err := uc.Prepare(FinalizeTaskInput{TaskID: s.latest.TaskID, RawExitCode: tc.rawExitCode, Estimated: false, OccurredAt: now})
+			prepared, err := uc.Prepare(context.Background(), FinalizeTaskInput{TaskID: s.latest.TaskID, RawExitCode: tc.rawExitCode, Estimated: false, OccurredAt: now})
 			if err != nil {
 				t.Fatal(err)
 			}

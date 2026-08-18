@@ -101,7 +101,7 @@ func (f *contractWriteFailure) Unwrap() []error {
 }
 
 // Prepare reads terminal artifacts before taskMu is acquired.
-func (uc *FinalizeTaskUseCase) Prepare(in FinalizeTaskInput) (PreparedFinalizeTask, error) {
+func (uc *FinalizeTaskUseCase) Prepare(_ context.Context, in FinalizeTaskInput) (PreparedFinalizeTask, error) {
 	present, err := uc.reader.ReadLastMessage(in.TaskID)
 	if err != nil {
 		return PreparedFinalizeTask{}, err
@@ -111,7 +111,7 @@ func (uc *FinalizeTaskUseCase) Prepare(in FinalizeTaskInput) (PreparedFinalizeTa
 
 // Execute owns taskMu and releases the execution slot only after unlocking it.
 func (uc *FinalizeTaskUseCase) Execute(ctx context.Context, in FinalizeTaskInput) (FinalizeTaskOutput, error) {
-	prepared, err := uc.Prepare(in)
+	prepared, err := uc.Prepare(ctx, in)
 	if err != nil {
 		return FinalizeTaskOutput{}, err
 	}

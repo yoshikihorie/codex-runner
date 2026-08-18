@@ -39,7 +39,7 @@ type lifecycleRecordProcess interface {
 	Execute(context.Context, *domain.Task, *domain.ProcessHandle, time.Time) error
 }
 type lifecycleFinalizer interface {
-	Prepare(execution.FinalizeTaskInput) (execution.PreparedFinalizeTask, error)
+	Prepare(context.Context, execution.FinalizeTaskInput) (execution.PreparedFinalizeTask, error)
 	ExecuteLocked(context.Context, execution.PreparedFinalizeTask) (execution.LockedFinalizeResult, error)
 	ReleaseAfterFinalization(context.Context, execution.LockedFinalizeResult, domain.TaskID)
 }
@@ -78,6 +78,7 @@ type TaskLifecycleDependencies struct {
 	Pending       recovery.PendingRegistrar
 	Ownership     execution.LifecycleOwnershipRegistry
 	Launching     execution.LaunchingTaskRegistry
+	Changes       execution.TaskChangeNotifier
 	OpenStdout    stdoutFileOpener
 	Clock         domain.Clock
 }
@@ -99,7 +100,7 @@ func NewTaskLifecycleOrchestrator(deps TaskLifecycleDependencies, config TaskLif
 	if config.CodexBinaryPath == "" || !filepath.IsAbs(config.CodexBinaryPath) {
 		return nil, fmt.Errorf("task lifecycle codex binary path must be absolute")
 	}
-	if deps.AcquireForChild == nil || isNilValue(deps.RecordStarting) || isNilValue(deps.Launch) || isNilValue(deps.RecordProcess) || isNilValue(deps.FailLaunch) || isNilValue(deps.ConfirmRunning) || isNilValue(deps.CheckLiveness) || isNilValue(deps.TimeoutArmer) || isNilValue(deps.Monitor) || isNilValue(deps.Finalize) || isNilValue(deps.ConfirmKilled) || isNilValue(deps.Tasks) || isNilValue(deps.TaskMu) || isNilValue(deps.Termination) || isNilValue(deps.Terminator) || isNilValue(deps.Pending) || isNilValue(deps.Ownership) || isNilValue(deps.Launching) || isNilValue(deps.OpenStdout) || isNilValue(deps.Clock) {
+	if deps.AcquireForChild == nil || isNilValue(deps.RecordStarting) || isNilValue(deps.Launch) || isNilValue(deps.RecordProcess) || isNilValue(deps.FailLaunch) || isNilValue(deps.ConfirmRunning) || isNilValue(deps.CheckLiveness) || isNilValue(deps.TimeoutArmer) || isNilValue(deps.Monitor) || isNilValue(deps.Finalize) || isNilValue(deps.ConfirmKilled) || isNilValue(deps.Tasks) || isNilValue(deps.TaskMu) || isNilValue(deps.Termination) || isNilValue(deps.Terminator) || isNilValue(deps.Pending) || isNilValue(deps.Ownership) || isNilValue(deps.Launching) || isNilValue(deps.Changes) || isNilValue(deps.OpenStdout) || isNilValue(deps.Clock) {
 		return nil, fmt.Errorf("task lifecycle orchestrator requires non-nil dependencies")
 	}
 	logger := slog.Default()
@@ -447,6 +448,11 @@ func (o *TaskLifecycleOrchestrator) confirmTerminal(ctx context.Context, taskID 
 		raw = 1
 	}
 	occurredAt := o.deps.Clock.Now()
+	changes, unsubscribe := o.deps.Changes.Subscribe(taskID)
+	defer unsubscribe()
+	prepareCtx, cancelPrepare := context.WithCancel(ctx)
+	defer cancelPrepare()
+
 	skipPrepare := false
 	if preSnapshot, preErr := o.deps.Tasks.Load(taskID); preErr == nil && preSnapshot.State == domain.StateCancelling {
 		skipPrepare = true
@@ -454,8 +460,42 @@ func (o *TaskLifecycleOrchestrator) confirmTerminal(ctx context.Context, taskID 
 	var prepared execution.PreparedFinalizeTask
 	var err error
 	if !skipPrepare {
-		prepared, err = o.deps.Finalize.Prepare(execution.FinalizeTaskInput{TaskID: taskID, RawExitCode: raw, Estimated: estimated, OccurredAt: occurredAt})
+		type prepareResult struct {
+			prepared execution.PreparedFinalizeTask
+			err      error
+		}
+		results := make(chan prepareResult, 1)
+		input := execution.FinalizeTaskInput{TaskID: taskID, RawExitCode: raw, Estimated: estimated, OccurredAt: occurredAt}
+		go func() {
+			result := prepareResult{}
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					result.err = fmt.Errorf("prepare task terminal confirmation panic: %v", recovered)
+				}
+				results <- result
+			}()
+			result.prepared, result.err = o.deps.Finalize.Prepare(prepareCtx, input)
+		}()
+		for {
+			select {
+			case result := <-results:
+				prepared, err = result.prepared, result.err
+				goto preparedOrCancelled
+			case <-changes:
+				snapshot, loadErr := o.deps.Tasks.Load(taskID)
+				if loadErr != nil {
+					o.logger.Warn("reload task after terminal change", "task_id", taskID.String(), "error", loadErr)
+					continue
+				}
+				if snapshot.State == domain.StateCancelling {
+					cancelPrepare()
+					goto preparedOrCancelled
+				}
+			}
+		}
 	}
+
+preparedOrCancelled:
 
 	o.deps.TaskMu.Lock(taskID)
 	snapshot, loadErr := o.deps.Tasks.Load(taskID)
