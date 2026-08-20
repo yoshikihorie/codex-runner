@@ -58,21 +58,24 @@ func TestWriteExitCodeIdempotently(t *testing.T) {
 		name                    string
 		reader                  exitCodeReaderFake
 		writerErr               error
+		exitCode                int
 		wantWrites              int
 		wantWriteErr            bool
 		wantFatal               bool
 		wantContractWriteFailed bool
 	}{
-		{"missing writes once", exitCodeReaderFake{}, nil, 1, false, false, false},
-		{"same value skips write", exitCodeReaderFake{existing: 0, exists: true}, nil, 0, false, false, false},
-		{"mismatch fails closed", exitCodeReaderFake{existing: 1, exists: true}, nil, 0, false, true, true},
-		{"read failure fails closed", exitCodeReaderFake{err: errors.New("read")}, nil, 0, false, true, true},
-		{"write failure is returned separately", exitCodeReaderFake{}, writeFailure, 1, true, false, false},
+		{"missing writes once", exitCodeReaderFake{}, nil, 0, 1, false, false, false},
+		{"same value skips write", exitCodeReaderFake{existing: 0, exists: true}, nil, 0, 0, false, false, false},
+		{"mismatch fails closed", exitCodeReaderFake{existing: 1, exists: true}, nil, 0, 0, false, true, true},
+		{"read failure fails closed", exitCodeReaderFake{err: errors.New("read")}, nil, 0, 0, false, true, true},
+		{"write failure is returned separately", exitCodeReaderFake{}, writeFailure, 0, 1, true, false, false},
+		{"requested nonzero value is written", exitCodeReaderFake{}, nil, 137, 1, false, false, false},
+		{"same nonzero value skips write", exitCodeReaderFake{existing: 137, exists: true}, nil, 137, 0, false, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reader := tc.reader
 			writer := &exitCodeWriterFake{err: tc.writerErr}
-			writeErr, fatalErr := WriteExitCodeIdempotently(&reader, writer, id, domain.NewExitCode(0))
+			writeErr, fatalErr := WriteExitCodeIdempotently(&reader, writer, id, domain.NewExitCode(tc.exitCode))
 			if writer.writes != tc.wantWrites || (writeErr != nil) != tc.wantWriteErr || (fatalErr != nil) != tc.wantFatal {
 				t.Fatalf("writes=%d writeErr=%v fatalErr=%v", writer.writes, writeErr, fatalErr)
 			}
@@ -82,8 +85,8 @@ func TestWriteExitCodeIdempotently(t *testing.T) {
 			if reader.calls != 1 {
 				t.Fatalf("reader calls=%d, want=1", reader.calls)
 			}
-			if writer.writes > 0 && writer.code.Raw() != 0 {
-				t.Fatalf("written code=%d, want=0", writer.code.Raw())
+			if writer.writes > 0 && writer.code.Raw() != tc.exitCode {
+				t.Fatalf("written code=%d, want=%d", writer.code.Raw(), tc.exitCode)
 			}
 			if errors.Is(fatalErr, domain.ErrContractWriteFailed) != tc.wantContractWriteFailed {
 				t.Fatalf("fatalErr=%v", fatalErr)

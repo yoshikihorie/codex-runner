@@ -12,6 +12,7 @@ import (
 	"reflect"
 	"slices"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -461,6 +462,68 @@ func TestResumeLaunchArgs(t *testing.T) {
 	}
 }
 
+func TestResumeLauncherRejectsInvalidOutputLastMessagePathBeforeLaunch(t *testing.T) {
+	id := launchTestID(t)
+	otherID, err := domain.NewTaskID("impl-20260820-120001-a1b2-other")
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskDirPath := filepath.Join(taskPlacementRoot, id.String())
+	for _, tt := range []struct {
+		name                  string
+		outputLastMessagePath string
+	}{
+		{
+			name:                  "another task",
+			outputLastMessagePath: filepath.Join(taskPlacementRoot, otherID.String(), "last-message.md"),
+		},
+		{
+			name:                  "outside task placement",
+			outputLastMessagePath: filepath.Join(t.TempDir(), "last-message.md"),
+		},
+		{
+			name:                  "traverses to another task",
+			outputLastMessagePath: taskDirPath + "/../" + otherID.String() + "/last-message.md",
+		},
+		{
+			name:                  "symlink-style traversal to expected filename",
+			outputLastMessagePath: taskDirPath + "/link/../last-message.md",
+		},
+		{
+			name:                  "wrong filename",
+			outputLastMessagePath: filepath.Join(taskDirPath, "other-message.md"),
+		},
+		{
+			name:                  "relative path",
+			outputLastMessagePath: "last-message.md",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			originalLaunch := launchNewSession
+			t.Cleanup(func() { launchNewSession = originalLaunch })
+			launchCalls := 0
+			launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+				launchCalls++
+				return nil, nil
+			}
+
+			params := recovery.ResumeLaunchParams{
+				TaskID:                id,
+				CodexBinaryPath:       "/usr/local/bin/codex",
+				SessionID:             "session-id",
+				OutputLastMessagePath: tt.outputLastMessagePath,
+			}
+			err := NewResumeLauncher(&timeoutProcessFake{}).LaunchAndWait(context.Background(), params)
+			if err == nil || err.Error() != "resume launch paths are invalid" {
+				t.Fatalf("error = %v, want resume launch paths are invalid", err)
+			}
+			if launchCalls != 0 {
+				t.Fatalf("launch calls = %d, want 0", launchCalls)
+			}
+		})
+	}
+}
+
 func TestResumeLauncherDoesNotLaunchWhenContextCanceledAfterLockAcquisition(t *testing.T) {
 	originalFlock := flockFunc
 	t.Cleanup(func() { flockFunc = originalFlock })
@@ -633,6 +696,31 @@ func TestLimitedWriterLenReportsCapturedBytesWithinLimit(t *testing.T) {
 	}
 }
 
+func TestLimitedWriterAllowsConcurrentWriteAndLen(t *testing.T) {
+	writer := &limitedWriter{limit: resumeStderrBufferMaxBytes}
+	var waitGroup sync.WaitGroup
+	for range 8 {
+		waitGroup.Add(2)
+		go func() {
+			defer waitGroup.Done()
+			for range 1_000 {
+				if _, err := writer.Write([]byte("x")); err != nil {
+					t.Errorf("write error: %v", err)
+				}
+			}
+		}()
+		go func() {
+			defer waitGroup.Done()
+			for range 1_000 {
+				if got := writer.Len(); got < 0 || got > resumeStderrBufferMaxBytes {
+					t.Errorf("captured bytes = %d, want 0 through %d", got, resumeStderrBufferMaxBytes)
+				}
+			}
+		}()
+	}
+	waitGroup.Wait()
+}
+
 func TestResumeLauncherLogsCapturedStderrMetadataOnLaunchFailure(t *testing.T) {
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })
@@ -776,16 +864,18 @@ func TestResumeLauncherCancellationKillsOnlyAfterGraceAndWaits(t *testing.T) {
 	}
 }
 
-func TestResumeLauncherCancellationReturnsImmediatelyWhenKillFails(t *testing.T) {
+func TestResumeLauncherCancellationWaitsForCompletionWhenKillFails(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	waitResult := make(chan resumeWaitOutcome)
+	waitResult := make(chan resumeWaitOutcome, 1)
 	killErr := errors.New("kill failed")
 	runner := &resumeSignalRunnerFake{killErr: killErr}
+	waitErr := errors.New("wait failed")
+	runner.onKill = func() { waitResult <- resumeWaitOutcome{err: waitErr} }
 	launcher := &resumeLauncher{runner: runner, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), killGrace: time.Millisecond}
 	err := launcher.finishContextCancellation(ctx, &exec.Cmd{Process: &os.Process{Pid: 4321}}, waitResult, &limitedWriter{limit: resumeStderrBufferMaxBytes}, recovery.ResumeLaunchParams{TaskID: launchTestID(t)})
-	if !errors.Is(err, context.Canceled) || !errors.Is(err, killErr) {
-		t.Fatalf("error = %v, want cancellation and kill error", err)
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, killErr) || !errors.Is(err, waitErr) {
+		t.Fatalf("error = %v, want cancellation, kill, and wait errors", err)
 	}
 	if !slices.Equal(runner.terminatePIDs, []int{4321}) || !slices.Equal(runner.killPIDs, []int{4321}) {
 		t.Fatalf("terminate pids = %v, kill pids = %v", runner.terminatePIDs, runner.killPIDs)

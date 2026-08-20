@@ -9,9 +9,7 @@ import (
 	"go/parser"
 	"go/token"
 	"log/slog"
-	"path/filepath"
 	"reflect"
-	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -179,27 +177,32 @@ func (*reconcileWriterFake) AppendRawEvent(domain.TaskID, string, json.RawMessag
 }
 
 type reconcileTerminationFake struct {
-	confirmDead  bool
-	sendDead     bool
-	confirm      int
-	send         int
-	grace        time.Duration
-	called       chan struct{}
-	release      chan struct{}
-	once         sync.Once
-	finished     chan struct{}
-	finishedOnce sync.Once
-	terminateErr error
-	confirmErr   error
-	authority    ProcessSignalAuthority
+	confirmDead    bool
+	sendDead       bool
+	confirm        int
+	send           int
+	grace          time.Duration
+	called         chan struct{}
+	release        chan struct{}
+	once           sync.Once
+	finished       chan struct{}
+	finishedOnce   sync.Once
+	terminateErr   error
+	confirmErr     error
+	confirmOnlyErr error
+	authority      ProcessSignalAuthority
 }
 
-func (f *reconcileTerminationFake) Confirm(context.Context, domain.TaskID) (bool, error) {
+func (f *reconcileTerminationFake) Confirm(ctx context.Context, _ domain.TaskID) (bool, error) {
 	f.confirm++
 	f.once.Do(func() { close(f.called) })
-	<-f.release
-	f.finishedOnce.Do(func() { close(f.finished) })
-	return f.confirmDead, nil
+	select {
+	case <-f.release:
+		f.finishedOnce.Do(func() { close(f.finished) })
+		return f.confirmDead, f.confirmOnlyErr
+	case <-ctx.Done():
+		return false, ctx.Err()
+	}
 }
 func (f *reconcileTerminationFake) SendAndConfirm(_ context.Context, _ domain.TaskID, authority ProcessSignalAuthority, grace time.Duration) TerminationAttemptResult {
 	f.send++
@@ -209,19 +212,6 @@ func (f *reconcileTerminationFake) SendAndConfirm(_ context.Context, _ domain.Ta
 	<-f.release
 	f.finishedOnce.Do(func() { close(f.finished) })
 	return TerminationAttemptResult{Dead: f.sendDead, TerminateErr: f.terminateErr, ConfirmErr: f.confirmErr}
-}
-
-func TestReconcileTerminationKeepsClaimAuthority(t *testing.T) {
-	id := adoptionID(t, "authority")
-	started := time.Date(2026, time.August, 18, 12, 0, 0, 0, time.UTC)
-	generation := domain.LifecycleGeneration(2)
-	authority := ProcessSignalAuthority{TaskID: id, PID: 4321, ProcessStartedAt: started, ExpectedState: domain.StateCancelling, LifecycleGeneration: &generation}
-	termination := &reconcileTerminationFake{called: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{})}
-	close(termination.release)
-	termination.SendAndConfirm(context.Background(), id, authority, time.Second)
-	if termination.authority != authority {
-		t.Fatalf("authority=%#v want=%#v", termination.authority, authority)
-	}
 }
 
 type reconcileKilledFake struct {
@@ -747,6 +737,18 @@ func TestReconcilePendingTimeoutClaimsBeforeSendingAndUsesTerminationGrace(t *te
 	if termination.send != 1 || termination.confirm != 0 || termination.grace != 17*time.Second {
 		t.Fatalf("send=%d confirm=%d grace=%s", termination.send, termination.confirm, termination.grace)
 	}
+	snapshot := tasks.entries[id]
+	wantAuthority, ok := processSignalAuthority(snapshot)
+	if !ok {
+		t.Fatal("fixture requires process signal authority")
+	}
+	if !pendingAuthorityEqual(termination.authority, wantAuthority) {
+		t.Fatalf("authority=%#v, want=%#v", termination.authority, wantAuthority)
+	}
+	pendingEntries := pending.List()
+	if len(pendingEntries) != 1 || pendingEntries[0].state != pendingClaimed {
+		t.Fatalf("pending=%+v, want one claimed entry", pendingEntries)
+	}
 	close(termination.release)
 	select {
 	case <-termination.finished:
@@ -937,25 +939,68 @@ func TestReconcilePendingTimeoutDispatchRemovesPendingAfterResumeSucceeds(t *tes
 	}
 }
 
-func TestTimeoutRecoveryResolvesClaimAfterResumeSucceedsOrFails(t *testing.T) {
-	_, testFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("resolve test file path")
-	}
-
+func TestReconcileResumeRecoveryResolvesClaimPerOutcome(t *testing.T) {
 	for _, tc := range []struct {
-		name     string
-		source   string
-		function string
+		name      string
+		saveError bool
+		wantCount int
+		wantState pendingState
 	}{
-		{name: "adoption", source: "adopt.go", function: "confirmTimeoutTermination"},
-		{name: "reconciliation", source: "reconcile.go", function: "completeTerminated"},
+		{name: "success", wantCount: 0},
+		{name: "failure", saveError: true, wantCount: 1, wantState: pendingConfirmOnly},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			sourcePath := filepath.Join(filepath.Dir(testFile), tc.source)
-			assertNoUnconditionalPendingRemovalBeforeDispatch(t, sourcePath, tc.function)
-			assertClaimResolutionAfterExecuteInResumeRecovery(t, sourcePath)
+			uc, pending, _, _, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
+			session := recoveryTestSession(t)
+			resume, store, _, _, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+			if tc.saveError {
+				store.saveErr = errors.New("save failed")
+				store.saveErrOn = 1
+			}
+			uc.resume = resume
+
+			snapshot := store.snapshot
+			registerReconcilePending(t, pending, snapshot, PendingSendUnsent)
+			authority, ok := processSignalAuthority(snapshot)
+			if !ok {
+				t.Fatal("fixture requires process signal authority")
+			}
+			claim, outcome := pending.ClaimForSend(snapshot.TaskID, authority)
+			if outcome != ClaimAcquired {
+				t.Fatalf("outcome=%v, want %v", outcome, ClaimAcquired)
+			}
+
+			uc.resumeRecovery(context.Background(), RecoverViaResumeInput{
+				TaskID:     snapshot.TaskID,
+				SessionRef: snapshot.SessionRef,
+				Origin:     domain.RecoveryOriginTimeout,
+				OccurredAt: time.Now(),
+			}, claim)
+
+			entries := pending.List()
+			if len(entries) != tc.wantCount {
+				t.Fatalf("pending=%+v, want count=%d", entries, tc.wantCount)
+			}
+			if tc.wantCount == 1 && entries[0].state != tc.wantState {
+				t.Fatalf("state=%v, want %v", entries[0].state, tc.wantState)
+			}
 		})
+	}
+}
+
+func TestReconcilePendingConfirmErrorRetainsSentEntry(t *testing.T) {
+	uc, pending, tasks, _, _, termination, killed, _, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
+	id := adoptionID(t, "reconcile-"+string(domain.StateTimeout))
+	termination.confirmDead = true
+	termination.confirmOnlyErr = errors.New("confirm failed")
+	close(termination.release)
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendSent)
+
+	uc.reconcileOne(context.Background(), pending.List()[0])
+
+	entries := pending.List()
+	if killed.calls != 0 || len(entries) != 1 || entries[0].state != pendingSent {
+		t.Fatalf("killed=%d pending=%+v, want sent entry retained", killed.calls, entries)
 	}
 }
 
@@ -995,46 +1040,6 @@ func assertNoUnconditionalPendingRemovalBeforeDispatch(t *testing.T, sourcePath,
 	})
 }
 
-func assertClaimResolutionAfterExecuteInResumeRecovery(t *testing.T, sourcePath string) {
-	t.Helper()
-	fileSet := token.NewFileSet()
-	file, err := parser.ParseFile(fileSet, sourcePath, nil, 0)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	var executePos token.Pos
-	var resolutionPositions []token.Pos
-	for _, declaration := range file.Decls {
-		function, ok := declaration.(*ast.FuncDecl)
-		if !ok || function.Name.Name != "resumeRecovery" {
-			continue
-		}
-		ast.Inspect(function.Body, func(node ast.Node) bool {
-			call, ok := node.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			if isResumeExecuteCall(call) {
-				executePos = call.Pos()
-			}
-			if isClaimResolutionCall(call) {
-				resolutionPositions = append(resolutionPositions, call.Pos())
-			}
-			return true
-		})
-	}
-	if !executePos.IsValid() {
-		t.Fatalf("resume Execute not found in %s", sourcePath)
-	}
-	for _, resolutionPos := range resolutionPositions {
-		if resolutionPos > executePos {
-			return
-		}
-	}
-	t.Fatalf("claim resolution after resume Execute not found in %s", sourcePath)
-}
-
 func isPendingRemoveCall(expression ast.Expr) bool {
 	call, ok := expression.(*ast.CallExpr)
 	if !ok {
@@ -1046,20 +1051,6 @@ func isPendingRemoveCall(expression ast.Expr) bool {
 	}
 	pending, ok := selector.X.(*ast.SelectorExpr)
 	return ok && pending.Sel.Name == "pending"
-}
-
-func isResumeExecuteCall(call *ast.CallExpr) bool {
-	selector, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok || selector.Sel.Name != "Execute" {
-		return false
-	}
-	resume, ok := selector.X.(*ast.SelectorExpr)
-	return ok && resume.Sel.Name == "resume"
-}
-
-func isClaimResolutionCall(call *ast.CallExpr) bool {
-	selector, ok := call.Fun.(*ast.SelectorExpr)
-	return ok && (selector.Sel.Name == "RemoveClaim" || selector.Sel.Name == "InvalidateSend")
 }
 
 func isResumeRecoveryCall(call *ast.CallExpr) bool {
@@ -1130,10 +1121,18 @@ func TestReconcilePendingCancellationStopsBeforeNextEntryLoad(t *testing.T) {
 		uc.reconcileTick(ctx)
 		close(done)
 	}()
-	<-liveness.called
+	select {
+	case <-liveness.called:
+	case <-time.After(time.Second):
+		t.Fatal("liveness check did not start")
+	}
 	cancel()
 	liveness.release <- struct{}{}
-	<-done
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("reconciliation did not stop")
+	}
 	if tasks.loads != 1 || termination.confirm != 0 || termination.send != 0 {
 		t.Fatalf("loads=%d confirm=%d send=%d", tasks.loads, termination.confirm, termination.send)
 	}

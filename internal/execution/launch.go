@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sync"
 	"syscall"
 	"time"
 
@@ -118,10 +119,11 @@ func buildResumeArgs(params recovery.ResumeLaunchParams) []string {
 }
 
 func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.ResumeLaunchParams) error {
-	if !filepath.IsAbs(params.CodexBinaryPath) || !filepath.IsAbs(params.OutputLastMessagePath) {
-		return fmt.Errorf("resume launch paths must be absolute")
-	}
 	taskDirPath := filepath.Join(taskPlacementRoot, params.TaskID.String())
+	expectedOutputPath := filepath.Join(taskDirPath, "last-message.md")
+	if !filepath.IsAbs(params.CodexBinaryPath) || params.OutputLastMessagePath != expectedOutputPath {
+		return fmt.Errorf("resume launch paths are invalid")
+	}
 	lock, err := AcquireExistingForChild(taskDirPath)
 	if err != nil {
 		return fmt.Errorf("acquire resume liveness lock: %w", err)
@@ -196,22 +198,18 @@ func (l *resumeLauncher) finishContextCancellation(ctx context.Context, cmd *exe
 	}
 
 	killErr := l.runner.SendKill(cmd.Process.Pid)
-	if killErr != nil {
-		return l.finishCanceledResumeWait(params, ctx.Err(), resumeWaitOutcome{}, terminateErr, killErr, stderr)
-	}
-
 	reapTimer := time.NewTimer(l.killGrace)
 	defer reapTimer.Stop()
 	select {
 	case outcome := <-waitResult:
-		return l.finishCanceledResumeWait(params, ctx.Err(), outcome, terminateErr, nil, stderr)
+		return l.finishCanceledResumeWait(params, ctx.Err(), outcome, terminateErr, killErr, stderr)
 	case <-reapTimer.C:
 		return l.finishCanceledResumeWait(
 			params,
 			ctx.Err(),
 			resumeWaitOutcome{err: errors.New("resume process was not reaped after SIGKILL")},
 			terminateErr,
-			nil,
+			killErr,
 			stderr,
 		)
 	}
@@ -232,16 +230,23 @@ func (l *resumeLauncher) logStderr(params recovery.ResumeLaunchParams, err error
 }
 
 type limitedWriter struct {
+	mu     sync.Mutex
 	buffer bytes.Buffer
 	limit  int
 }
 
 // Len returns the number of bytes captured in the bounded buffer.
 func (w *limitedWriter) Len() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	return w.buffer.Len()
 }
 
 func (w *limitedWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+
 	if remaining := w.limit - w.buffer.Len(); remaining > 0 {
 		if len(p) > remaining {
 			_, _ = w.buffer.Write(p[:remaining])
