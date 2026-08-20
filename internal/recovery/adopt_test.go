@@ -80,6 +80,7 @@ type adoptionStoreFake struct {
 	loadResults map[domain.TaskID][]adoptionLoadResult
 	saves       int
 	saveErr     error
+	saveErrs    []error
 	saved       *domain.TaskSnapshot
 	order       *[]string
 }
@@ -109,10 +110,15 @@ func (f *adoptionStoreFake) Save(id domain.TaskID, s domain.TaskSnapshot) error 
 	if f.order != nil {
 		*f.order = append(*f.order, "save")
 	}
-	if f.saveErr == nil {
+	err := f.saveErr
+	if len(f.saveErrs) > 0 {
+		err = f.saveErrs[0]
+		f.saveErrs = f.saveErrs[1:]
+	}
+	if err == nil {
 		f.entries[id] = s
 	}
-	return f.saveErr
+	return err
 }
 
 type adoptionLivenessFake struct {
@@ -131,16 +137,33 @@ func (f *adoptionLivenessFake) Execute(_ context.Context, id domain.TaskID) (boo
 }
 
 type adoptionReaderFake struct {
+	present    bool
+	err        error
+	calls      int
+	exitCode   int
+	exitExists bool
+	exitErr    error
+	results    []adoptionReaderResult
+}
+
+type adoptionReaderResult struct {
 	present bool
 	err     error
-	calls   int
 }
 
 func (f *adoptionReaderFake) ReadLastMessage(domain.TaskID) (bool, error) {
 	f.calls++
+	if len(f.results) > 0 {
+		result := f.results[0]
+		f.results = f.results[1:]
+		return result.present, result.err
+	}
 	return f.present, f.err
 }
 func (*adoptionReaderFake) ReadStderrLog(domain.TaskID) ([]byte, error) { return nil, nil }
+func (f *adoptionReaderFake) ReadExitCode(domain.TaskID) (int, bool, error) {
+	return f.exitCode, f.exitExists, f.exitErr
+}
 
 type adoptionWriterFake struct {
 	events           []domain.Event
@@ -153,6 +176,7 @@ type adoptionWriterFake struct {
 	recoveredErr     error
 	exitErr          error
 	order            *[]string
+	onWriteExitCode  func(domain.ExitCode)
 }
 
 func (*adoptionWriterFake) WritePrompt(domain.TaskID, []byte) error         { return nil }
@@ -166,6 +190,9 @@ func (f *adoptionWriterFake) WriteExitCode(_ domain.TaskID, exitCode domain.Exit
 	f.exitCodes++
 	if f.order != nil {
 		*f.order = append(*f.order, "exit-code")
+	}
+	if f.onWriteExitCode != nil {
+		f.onWriteExitCode(exitCode)
 	}
 	return f.exitErr
 }
@@ -930,9 +957,92 @@ func TestResolveRecoveringLockedReturnsSaveErrorWithoutAppendingEvent(t *testing
 	writer := &adoptionWriterFake{}
 	var logs bytes.Buffer
 
-	err := resolveRecoveringLocked(tasks, writer, slog.New(slog.NewTextHandler(&logs, nil)), id, snapshot, true, time.Now())
+	err := resolveRecoveringLocked(tasks, &adoptionReaderFake{}, writer, slog.New(slog.NewTextHandler(&logs, nil)), id, snapshot, true, time.Now())
 	if !errors.Is(err, saveErr) || len(writer.events) != 0 || !strings.Contains(logs.String(), "save recovered task failed") {
 		t.Fatalf("err=%v events=%d logs=%q", err, len(writer.events), logs.String())
+	}
+}
+
+func TestResolveRecoveringLockedWritesMissingExitCodeBeforeSave(t *testing.T) {
+	id := adoptionID(t, "recovering-missing-exit")
+	snapshot := adoptionSnapshot(t, id, domain.StateRecovering)
+	order := []string{}
+	tasks := &adoptionStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}, order: &order}
+	writer := &adoptionWriterFake{order: &order}
+	if err := resolveRecoveringLocked(tasks, &adoptionReaderFake{}, writer, slog.Default(), id, snapshot, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if writer.exitCodes != 1 || tasks.saves != 1 || len(writer.events) == 0 || !reflect.DeepEqual(order, []string{"adopted-marker", "recovered-marker", "exit-code", "save", "event"}) {
+		t.Fatalf("writes=%d saves=%d events=%d order=%v", writer.exitCodes, tasks.saves, len(writer.events), order)
+	}
+}
+
+func TestResolveRecoveringLockedSkipsSameExitCodeOnRetry(t *testing.T) {
+	id := adoptionID(t, "recovering-same-exit")
+	snapshot := adoptionSnapshot(t, id, domain.StateRecovering)
+	tasks := &adoptionStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}
+	writer := &adoptionWriterFake{}
+	if err := resolveRecoveringLocked(tasks, &adoptionReaderFake{exitCode: 0, exitExists: true}, writer, slog.Default(), id, snapshot, true, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	if writer.exitCodes != 0 || tasks.saves != 1 || len(writer.events) == 0 {
+		t.Fatalf("writes=%d saves=%d events=%d", writer.exitCodes, tasks.saves, len(writer.events))
+	}
+}
+
+func TestResolveRecoveringLockedRejectsExitCodeMismatchWithoutOverwrite(t *testing.T) {
+	id := adoptionID(t, "recovering-mismatch")
+	snapshot := adoptionSnapshot(t, id, domain.StateRecovering)
+	tasks := &adoptionStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}
+	writer := &adoptionWriterFake{}
+	err := resolveRecoveringLocked(tasks, &adoptionReaderFake{exitCode: 1, exitExists: true}, writer, slog.Default(), id, snapshot, true, time.Now())
+	if !errors.Is(err, domain.ErrContractWriteFailed) || writer.exitCodes != 0 || tasks.saves != 0 || len(writer.events) != 0 {
+		t.Fatalf("err=%v writes=%d saves=%d events=%d", err, writer.exitCodes, tasks.saves, len(writer.events))
+	}
+}
+
+func TestResolveRecoveringLockedReadExitCodeFailureFailsClosed(t *testing.T) {
+	id := adoptionID(t, "recovering-read-error")
+	snapshot := adoptionSnapshot(t, id, domain.StateRecovering)
+	tasks := &adoptionStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}
+	writer := &adoptionWriterFake{}
+	err := resolveRecoveringLocked(tasks, &adoptionReaderFake{exitErr: errors.New("read exit")}, writer, slog.Default(), id, snapshot, true, time.Now())
+	if err == nil || writer.exitCodes != 0 || tasks.saves != 0 || len(writer.events) != 0 {
+		t.Fatalf("err=%v writes=%d saves=%d events=%d", err, writer.exitCodes, tasks.saves, len(writer.events))
+	}
+}
+
+func TestAdoptRunningTasksRecoveringSaveFailureRetryDoesNotRewriteExitCode(t *testing.T) {
+	id := adoptionID(t, "recovering-save-retry")
+	snapshot := adoptionSnapshot(t, id, domain.StateRecovering)
+	reader := &adoptionReaderFake{present: true}
+	writer := &adoptionWriterFake{onWriteExitCode: func(code domain.ExitCode) {
+		reader.exitCode, reader.exitExists = code.Raw(), true
+	}}
+	tasks := &adoptionStoreFake{listed: []domain.TaskSnapshot{snapshot}, entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}, saveErrs: []error{errors.New("save"), nil}}
+	slots := &adoptionSlotsFake{}
+	uc := newAdoptionUseCase(tasks, &adoptionLivenessFake{dead: map[domain.TaskID]bool{id: true}, err: map[domain.TaskID]error{}}, reader, writer, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), slots, &adoptionMutexFake{})
+	_, _ = uc.Execute(context.Background())
+	_, _ = uc.Execute(context.Background())
+	if writer.exitCodes != 1 || tasks.saves != 2 || slots.releases != 1 {
+		t.Fatalf("writes=%d saves=%d slots=%d", writer.exitCodes, tasks.saves, slots.releases)
+	}
+}
+
+func TestAdoptRunningTasksRecoveringRetryDoesNotReplaceDifferentExitCode(t *testing.T) {
+	id := adoptionID(t, "recovering-different-retry")
+	snapshot := adoptionSnapshot(t, id, domain.StateRecovering)
+	reader := &adoptionReaderFake{results: []adoptionReaderResult{{present: true}, {present: false}}}
+	writer := &adoptionWriterFake{onWriteExitCode: func(code domain.ExitCode) {
+		reader.exitCode, reader.exitExists = code.Raw(), true
+	}}
+	tasks := &adoptionStoreFake{listed: []domain.TaskSnapshot{snapshot}, entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}, saveErrs: []error{errors.New("save")}}
+	slots := &adoptionSlotsFake{}
+	uc := newAdoptionUseCase(tasks, &adoptionLivenessFake{dead: map[domain.TaskID]bool{id: true}, err: map[domain.TaskID]error{}}, reader, writer, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), slots, &adoptionMutexFake{})
+	_, _ = uc.Execute(context.Background())
+	_, _ = uc.Execute(context.Background())
+	if writer.exitCodes != 1 || reader.exitCode != 0 || tasks.saves != 1 || len(writer.events) != 0 || slots.releases != 0 {
+		t.Fatalf("writes=%d exit=%d saves=%d events=%d slots=%d", writer.exitCodes, reader.exitCode, tasks.saves, len(writer.events), slots.releases)
 	}
 }
 

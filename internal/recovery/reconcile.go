@@ -141,7 +141,7 @@ func (uc *ReconcilePendingUseCase) reconcileRecovering(ctx context.Context, task
 	uc.taskMu.Lock(taskID)
 	snapshot, err := uc.tasks.Load(taskID)
 	if err == nil && snapshot.State == domain.StateRecovering {
-		err = resolveRecoveringLocked(uc.tasks, uc.writer, uc.logger, taskID, snapshot, present, uc.clock.Now())
+		err = resolveRecoveringLocked(uc.tasks, uc.reader, uc.writer, uc.logger, taskID, snapshot, present, uc.clock.Now())
 	}
 	uc.taskMu.Unlock(taskID)
 	if err != nil {

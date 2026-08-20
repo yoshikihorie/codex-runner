@@ -101,6 +101,33 @@ func TestBuildLaunchArgs(t *testing.T) {
 	}
 }
 
+func TestBuildLaunchArgsTerminatesOptionsBeforePrompt(t *testing.T) {
+	for _, prompt := range []string{
+		"normal prompt",
+		"-",
+		"--help",
+		"--dangerously-bypass-approvals-and-sandbox",
+	} {
+		for _, pty := range []bool{false, true} {
+			name := "non-pty"
+			if pty {
+				name = "pty"
+			}
+			t.Run(prompt+"/"+name, func(t *testing.T) {
+				p := launchTestParams(t, nil)
+				p.PromptText = prompt
+				p.PTYEnabled = pty
+
+				_, args := buildLaunchArgs(p)
+				want := []string{"--", prompt}
+				if got := args[len(args)-len(want):]; !slices.Equal(got, want) {
+					t.Fatalf("argument suffix = %q, want %q", got, want)
+				}
+			})
+		}
+	}
+}
+
 func TestProcessRunnerLaunchMapsErrorsAndClosesLock(t *testing.T) {
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })

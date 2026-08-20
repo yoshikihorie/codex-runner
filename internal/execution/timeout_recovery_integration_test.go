@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -28,11 +30,189 @@ func (r *timeoutRecoveryIntegrationRecoverer) Resume(context.Context, domain.Tas
 // metricsAcceptanceFixture deliberately uses the file-backed metrics dependencies.
 // Terminal-route unit tests cover each route's state transition; these tests keep the
 // acceptance mapping focused on the persisted JSON Lines contract.
+const (
+	metricsAcceptanceSuccessExitCode = 0
+	metricsAcceptanceFailureExitCode = 1
+	metricsAcceptanceKilledExitCode  = 130
+)
+
+type metricsTerminalRoute int
+
+const (
+	metricsRouteFinalize metricsTerminalRoute = iota
+	metricsRouteConfirmKilled
+	metricsRouteResume
+	metricsRouteAdoptRecovering
+)
+
+type metricsAcceptanceSlots struct {
+	mu       sync.Mutex
+	calls    int
+	resetIDs [][]domain.TaskID
+}
+
+func (s *metricsAcceptanceSlots) ReleaseAndAdvance(context.Context, domain.TaskID, time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.calls++
+}
+func (s *metricsAcceptanceSlots) Reset(ids []domain.TaskID) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.resetIDs = append(s.resetIDs, append([]domain.TaskID(nil), ids...))
+}
+func (s *metricsAcceptanceSlots) count() int { s.mu.Lock(); defer s.mu.Unlock(); return s.calls }
+
+type metricsAcceptanceDisarmer struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (d *metricsAcceptanceDisarmer) Disarm(domain.TaskID) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.calls++
+}
+func (d *metricsAcceptanceDisarmer) count() int { d.mu.Lock(); defer d.mu.Unlock(); return d.calls }
+
+type metricsAcceptancePathLocks struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (*metricsAcceptancePathLocks) List() ([]PathLockSnapshot, error)                 { return nil, nil }
+func (*metricsAcceptancePathLocks) Save(domain.TaskID, []domain.NormalizedPath) error { return nil }
+func (p *metricsAcceptancePathLocks) Delete(domain.TaskID) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.calls++
+	return nil
+}
+func (p *metricsAcceptancePathLocks) count() int { p.mu.Lock(); defer p.mu.Unlock(); return p.calls }
+
+type metricsAcceptanceRecorder struct {
+	mu       sync.Mutex
+	delegate *metrics.RecordTaskMetricsUseCase
+	inputs   []metrics.RecordTaskMetricsInput
+	outputs  []metrics.RecordTaskMetricsOutput
+}
+
+func (r *metricsAcceptanceRecorder) Execute(ctx context.Context, in metrics.RecordTaskMetricsInput) metrics.RecordTaskMetricsOutput {
+	out := r.delegate.Execute(ctx, in)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.inputs = append(r.inputs, in)
+	r.outputs = append(r.outputs, out)
+	return out
+}
+func (r *metricsAcceptanceRecorder) single() (metrics.RecordTaskMetricsInput, metrics.RecordTaskMetricsOutput, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.inputs) != 1 || len(r.outputs) != 1 {
+		return metrics.RecordTaskMetricsInput{}, metrics.RecordTaskMetricsOutput{}, false
+	}
+	return r.inputs[0], r.outputs[0], true
+}
+
+type metricsAcceptanceFailingWriter struct {
+	mu    sync.Mutex
+	calls int
+	err   error
+}
+
+type metricsAcceptanceConcurrentWriter struct {
+	mu       sync.Mutex
+	delegate metrics.MetricsWriter
+	want     int
+	current  int
+	max      int
+	gate     chan struct{}
+}
+
+func newMetricsAcceptanceConcurrentWriter(delegate metrics.MetricsWriter, want int) *metricsAcceptanceConcurrentWriter {
+	return &metricsAcceptanceConcurrentWriter{delegate: delegate, want: want, gate: make(chan struct{})}
+}
+func (w *metricsAcceptanceConcurrentWriter) Append(id domain.TaskID, month string, line []byte) error {
+	w.mu.Lock()
+	w.current++
+	if w.current > w.max {
+		w.max = w.current
+	}
+	if w.current == w.want {
+		close(w.gate)
+	}
+	gate := w.gate
+	w.mu.Unlock()
+	<-gate
+	err := w.delegate.Append(id, month, line)
+	w.mu.Lock()
+	w.current--
+	w.mu.Unlock()
+	return err
+}
+func (w *metricsAcceptanceConcurrentWriter) maximum() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.max
+}
+
+func (w *metricsAcceptanceFailingWriter) Append(domain.TaskID, string, []byte) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.calls++
+	return w.err
+}
+func (w *metricsAcceptanceFailingWriter) count() int {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.calls
+}
+
+type metricsAcceptanceRecoverer struct{ result recovery.RecoveryResult }
+
+func (r *metricsAcceptanceRecoverer) Resume(context.Context, domain.TaskID, *domain.SessionRef, domain.RecoveryOrigin) (recovery.RecoveryResult, error) {
+	return r.result, nil
+}
+
+type metricsAcceptanceLiveness struct{}
+
+func (metricsAcceptanceLiveness) Execute(context.Context, domain.TaskID) (bool, error) {
+	return true, nil
+}
+
+type metricsAcceptanceFinalizer struct{}
+
+func (metricsAcceptanceFinalizer) Finalize(domain.TaskID, int, bool, bool, time.Time) error {
+	return nil
+}
+
+type metricsAcceptanceTermination struct{}
+
+func (metricsAcceptanceTermination) Confirm(context.Context, domain.TaskID) (bool, error) {
+	return true, nil
+}
+func (metricsAcceptanceTermination) SendAndConfirm(context.Context, domain.TaskID, recovery.ProcessSignalAuthority, time.Duration) recovery.TerminationAttemptResult {
+	return recovery.TerminationAttemptResult{Dead: true}
+}
+
+type metricsAcceptanceKilled struct{}
+
+func (metricsAcceptanceKilled) ConfirmKilled(context.Context, domain.TaskID, int, bool, time.Time) error {
+	return nil
+}
+
 type metricsAcceptanceFixture struct {
-	root  string
-	logs  string
-	tasks *store.FileTaskStore
-	now   time.Time
+	root, logs string
+	tasks      *store.FileTaskStore
+	writer     contract.ContractWriter
+	reader     *store.FileContractReader
+	events     *store.FileEventReader
+	mutex      *store.TaskMutex
+	slots      *metricsAcceptanceSlots
+	disarmer   *metricsAcceptanceDisarmer
+	pathLocks  *metricsAcceptancePathLocks
+	tracker    *metrics.StalledTimeTracker
+	now        time.Time
 }
 
 func newMetricsAcceptanceFixture(t *testing.T) metricsAcceptanceFixture {
@@ -47,10 +227,18 @@ func newMetricsAcceptanceFixture(t *testing.T) metricsAcceptanceFixture {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, time.August, 14, 12, 0, 0, 0, time.UTC)
-	return metricsAcceptanceFixture{root: root, logs: logs, tasks: tasks, now: now}
+	writer := contract.NewFileContractWriter(root, domain.ClockFunc(func() time.Time { return now }))
+	return metricsAcceptanceFixture{root: root, logs: logs, tasks: tasks, writer: writer, reader: store.NewFileContractReader(root), events: store.NewFileEventReader(root), mutex: store.NewTaskMutex(), slots: &metricsAcceptanceSlots{}, disarmer: &metricsAcceptanceDisarmer{}, pathLocks: &metricsAcceptancePathLocks{}, tracker: &metrics.StalledTimeTracker{}, now: now}
 }
 
-func (f metricsAcceptanceFixture) record(t *testing.T, suffix string, state domain.TaskState, occurredAt time.Time, lastMessage []byte, contentRecordingEnabled bool) (domain.TaskID, metrics.RecordTaskMetricsOutput) {
+func (f metricsAcceptanceFixture) newRecorder(content bool, writer metrics.MetricsWriter) *metricsAcceptanceRecorder {
+	if writer == nil {
+		writer = metrics.NewFileMetricsWriter(f.logs, 1<<20)
+	}
+	return &metricsAcceptanceRecorder{delegate: metrics.NewRecordTaskMetricsUseCase(f.tasks, f.events, f.reader, writer, content, domain.ClockFunc(func() time.Time { return f.now }), "daemon-test", nil, slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)))}
+}
+
+func (f metricsAcceptanceFixture) prepare(t *testing.T, suffix string, state domain.TaskState, occurredAt time.Time, lastMessage []byte) (domain.TaskID, *domain.SessionRef) {
 	t.Helper()
 	id, err := domain.NewTaskID("impl-20260814-120000-a1b2-" + suffix)
 	if err != nil {
@@ -59,36 +247,64 @@ func (f metricsAcceptanceFixture) record(t *testing.T, suffix string, state doma
 	if err := f.tasks.Reserve(id); err != nil {
 		t.Fatal(err)
 	}
-	started := occurredAt.Add(-time.Minute)
-	pid := 1
-	var recoveryOrigin *domain.RecoveryOrigin
-	if state == domain.StateRecovered || state == domain.StateTimeoutLost {
-		origin := domain.RecoveryOriginTimeout
-		recoveryOrigin = &origin
-	} else if state == domain.StateLost {
-		origin := domain.RecoveryOriginOrphan
-		recoveryOrigin = &origin
+	slug, err := domain.NewSlug(suffix)
+	if err != nil {
+		t.Fatal(err)
 	}
-	snapshot := domain.TaskSnapshot{TaskID: id, Subcommand: domain.SubcommandImpl, PID: &pid, Model: "test-model", RequestedAt: occurredAt.Add(-2 * time.Minute), ProcessStartedAt: &started, ResolvedTimeoutSeconds: 1800, State: state, StateUpdatedAt: occurredAt, Recovered: state == domain.StateRecovered, RecoveryOrigin: recoveryOrigin, Route: domain.ExecutionRouteDaemon, SchemaVersion: 1}
+	requested := occurredAt.Add(-2 * time.Minute)
+	task, _, err := domain.NewTask(id, domain.SubcommandImpl, slug, nil, requested, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	timeout, err := domain.NewTimeout(nil, 1800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = task.Start(timeout, "test-model", requested); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := domain.NewTaskSnapshotFromAdmission(task, timeout, "test-model", nil, domain.ExecutionRouteDaemon, requested)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = task.RecordProcessInfo(1, occurredAt.Add(-time.Minute), occurredAt.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err = task.ConfirmRunning(occurredAt.Add(-time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	sessionValue, err := domain.NewSessionRef("123e4567-e89b-12d3-a456-426614174000", requested, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := &sessionValue
+	switch state {
+	case domain.StateRunning:
+	case domain.StateCancelling:
+		_, err = task.RequestCancel(false, occurredAt)
+	case domain.StateTimeout:
+		_, err = task.MarkTimedOut(session, occurredAt)
+	case domain.StateOrphaned:
+		_, err = task.DetectOrphan("running", occurredAt)
+	case domain.StateRecovering:
+		_, err = task.MarkTimedOut(session, occurredAt)
+		if err == nil {
+			_, err = task.BeginRecovery(session, occurredAt)
+		}
+	default:
+		t.Fatalf("unsupported terminal preparation state %q", state)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err = snapshot.WithTask(task, occurredAt)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := f.tasks.Save(id, snapshot); err != nil {
 		t.Fatal(err)
 	}
-	writer := contract.NewFileContractWriter(f.root, domain.ClockFunc(func() time.Time { return f.now }))
-	if err := writer.WritePrompt(id, []byte("acceptance prompt")); err != nil {
-		t.Fatal(err)
-	}
-	startedRaw, err := json.Marshal(map[string]string{"occurred_at": started.Format(time.RFC3339)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.AppendRawEvent(id, "TaskStarted", json.RawMessage(startedRaw)); err != nil {
-		t.Fatal(err)
-	}
-	exitedRaw, err := json.Marshal(map[string]string{"occurred_at": occurredAt.Format(time.RFC3339)})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.AppendRawEvent(id, "TaskExited", json.RawMessage(exitedRaw)); err != nil {
+	if err := f.writer.WritePrompt(id, []byte("acceptance prompt")); err != nil {
 		t.Fatal(err)
 	}
 	if lastMessage != nil {
@@ -96,8 +312,83 @@ func (f metricsAcceptanceFixture) record(t *testing.T, suffix string, state doma
 			t.Fatal(err)
 		}
 	}
-	recorder := metrics.NewRecordTaskMetricsUseCase(f.tasks, store.NewFileEventReader(f.root), store.NewFileContractReader(f.root), metrics.NewFileMetricsWriter(f.logs, 1<<20), contentRecordingEnabled, domain.ClockFunc(func() time.Time { return f.now }), "daemon-test", nil, slog.New(slog.NewTextHandler(os.Stderr, nil)))
-	return id, recorder.Execute(context.Background(), metrics.RecordTaskMetricsInput{TaskID: id, FinalState: state, OccurredAt: occurredAt})
+	return id, session
+}
+
+type metricsAcceptanceResult struct {
+	TaskID   domain.TaskID
+	State    domain.TaskState
+	Snapshot domain.TaskSnapshot
+	Finalize FinalizeTaskOutput
+	Input    metrics.RecordTaskMetricsInput
+	Output   metrics.RecordTaskMetricsOutput
+	Err      error
+}
+
+func (f metricsAcceptanceFixture) finishE(ctx context.Context, id domain.TaskID, session *domain.SessionRef, route metricsTerminalRoute, expected domain.TaskState, occurredAt time.Time, content bool, writer metrics.MetricsWriter) metricsAcceptanceResult {
+	capture := f.newRecorder(content, writer)
+	result := metricsAcceptanceResult{TaskID: id, State: expected}
+	switch route {
+	case metricsRouteFinalize:
+		raw := metricsAcceptanceSuccessExitCode
+		if expected == domain.StateFailed {
+			raw = metricsAcceptanceFailureExitCode
+		}
+		uc := NewFinalizeTaskUseCase(f.tasks, f.writer, f.reader, domain.ClockFunc(func() time.Time { return f.now }), f.mutex, f.slots, f.disarmer, capture, f.tracker)
+		result.Finalize, result.Err = uc.Execute(ctx, FinalizeTaskInput{TaskID: id, RawExitCode: raw, OccurredAt: occurredAt})
+	case metricsRouteConfirmKilled:
+		uc := NewConfirmTaskKilledUseCase(f.tasks, f.writer, f.reader, f.mutex, f.disarmer, NewReleasePathLockUseCase(f.pathLocks), f.slots, domain.ClockFunc(func() time.Time { return f.now }), capture, f.tracker, &recovery.PendingReconciliationSet{})
+		var locked LockedKillResult
+		f.mutex.Lock(id)
+		locked, result.Err = uc.ExecuteLocked(ctx, ConfirmTaskKilledInput{TaskID: id, RawExitCode: metricsAcceptanceKilledExitCode, OccurredAt: occurredAt})
+		f.mutex.Unlock(id)
+		if locked.Confirmed {
+			uc.ReleaseAfterConfirmation(ctx, locked, id)
+		}
+	case metricsRouteResume:
+		recoveryResult := recovery.RecoveryResult{ExitCode: domain.NewExitCode(metricsAcceptanceFailureExitCode)}
+		if expected == domain.StateRecovered {
+			recoveryResult = recovery.RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(metricsAcceptanceSuccessExitCode)}
+		}
+		recoverer := &metricsAcceptanceRecoverer{result: recoveryResult}
+		uc := recovery.NewRecoverViaResumeUseCase(f.tasks, f.writer, recoverer, recovery.NewSavePartialOutputUseCase(f.reader, f.writer), f.slots, capture, f.tracker, f.mutex, domain.ClockFunc(func() time.Time { return f.now }))
+		origin := domain.RecoveryOriginTimeout
+		if expected == domain.StateLost {
+			origin = domain.RecoveryOriginOrphan
+		}
+		_, result.Err = uc.Execute(ctx, recovery.RecoverViaResumeInput{TaskID: id, SessionRef: session, Origin: origin, OccurredAt: occurredAt})
+	case metricsRouteAdoptRecovering:
+		dummy := recovery.NewRecoverViaResumeUseCase(f.tasks, f.writer, &metricsAcceptanceRecoverer{}, recovery.NewSavePartialOutputUseCase(f.reader, f.writer), f.slots, capture, f.tracker, f.mutex, domain.ClockFunc(func() time.Time { return f.now }))
+		adopt := recovery.NewAdoptRunningTasksUseCase(f.tasks, metricsAcceptanceLiveness{}, f.reader, f.writer, metricsAcceptanceFinalizer{}, dummy, f.slots, f.slots, metricsAcceptanceTermination{}, metricsAcceptanceKilled{}, NewReleasePathLockUseCase(f.pathLocks), &recovery.PendingReconciliationSet{}, f.mutex, domain.ClockFunc(func() time.Time { return f.now }), f.tracker, capture)
+		_, result.Err = adopt.Execute(ctx)
+	}
+	result.Snapshot, _ = f.tasks.Load(id)
+	result.Input, result.Output, _ = capture.single()
+	return result
+}
+
+func (f metricsAcceptanceFixture) record(t *testing.T, suffix string, route metricsTerminalRoute, expected domain.TaskState, occurredAt time.Time, lastMessage []byte, content bool) metricsAcceptanceResult {
+	t.Helper()
+	preState := domain.StateRunning
+	if route == metricsRouteConfirmKilled {
+		preState = domain.StateCancelling
+	}
+	if route == metricsRouteResume {
+		if expected == domain.StateLost {
+			preState = domain.StateOrphaned
+		} else {
+			preState = domain.StateTimeout
+		}
+	}
+	if route == metricsRouteAdoptRecovering {
+		preState = domain.StateRecovering
+	}
+	id, session := f.prepare(t, suffix, preState, occurredAt, lastMessage)
+	result := f.finishE(context.Background(), id, session, route, expected, occurredAt, content, nil)
+	if result.Err != nil {
+		t.Fatal(result.Err)
+	}
+	return result
 }
 
 func (f metricsAcceptanceFixture) line(t *testing.T, occurredAt time.Time) map[string]any {
@@ -130,11 +421,12 @@ func requireMetricsRecord(t *testing.T, f metricsAcceptanceFixture, id domain.Ta
 	return record
 }
 
-// The names below are the one-to-one SCN mapping required by FD-metrics-01.
+// This file covers the terminal routes assigned here; SCN-metrics-01-12,
+// SCN-metrics-01-13, and SCN-metrics-01-15 are covered by their concrete tests.
 func TestMetricsAcceptance_SCNMetrics0101_CompletedFinalizationWritesOneRecord(t *testing.T) {
 	f := newMetricsAcceptanceFixture(t)
-	id, out := f.record(t, "scn0101", domain.StateCompleted, f.now, []byte("acceptance answer"), true)
-	if !out.Recorded || requireMetricsRecord(t, f, id, domain.StateCompleted, f.now)["estimated"] != false {
+	result := f.record(t, "scn0101", metricsRouteFinalize, domain.StateCompleted, f.now, []byte("acceptance answer"), true)
+	if result.Snapshot.State != domain.StateCompleted || !result.Output.Recorded || result.Input.Estimated || requireMetricsRecord(t, f, result.TaskID, domain.StateCompleted, f.now)["estimated"] != false || f.slots.count() != 1 || f.disarmer.count() != 1 {
 		t.Fatal("completed metrics record was not persisted as non-estimated")
 	}
 	info, err := os.Stat(filepath.Join(f.logs, "task-metrics-2026-08.jsonl"))
@@ -153,9 +445,9 @@ func TestMetricsAcceptance_SCNMetrics0102_FailedWithoutLastMessageWritesZeroLeng
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newMetricsAcceptanceFixture(t)
-			id, out := f.record(t, tc.name, domain.StateFailed, f.now, tc.lastMessage, false)
-			record := requireMetricsRecord(t, f, id, domain.StateFailed, f.now)
-			if !out.Recorded || record["last_message_bytes"] != float64(0) || record["last_message_lines"] != float64(0) || record["last_message_body"] != nil || record["last_message_sha256"] != nil {
+			result := f.record(t, tc.name, metricsRouteFinalize, domain.StateFailed, f.now, tc.lastMessage, false)
+			record := requireMetricsRecord(t, f, result.TaskID, domain.StateFailed, f.now)
+			if result.Snapshot.State != domain.StateFailed || !result.Output.Recorded || record["last_message_bytes"] != float64(0) || record["last_message_lines"] != float64(0) || record["last_message_body"] != nil || record["last_message_sha256"] != nil {
 				t.Fatal("missing last message was not represented as zero length")
 			}
 		})
@@ -163,25 +455,31 @@ func TestMetricsAcceptance_SCNMetrics0102_FailedWithoutLastMessageWritesZeroLeng
 }
 
 func TestMetricsAcceptance_SCNMetrics0103_RecoveryAndKilledTerminalRoutesShareContract(t *testing.T) {
-	for _, state := range []domain.TaskState{domain.StateRecovered, domain.StateTimeoutLost, domain.StateLost, domain.StateKilled} {
-		t.Run(string(state), func(t *testing.T) {
+	for _, tc := range []struct {
+		state domain.TaskState
+		route metricsTerminalRoute
+	}{{domain.StateRecovered, metricsRouteResume}, {domain.StateTimeoutLost, metricsRouteResume}, {domain.StateLost, metricsRouteResume}, {domain.StateKilled, metricsRouteConfirmKilled}} {
+		t.Run(string(tc.state), func(t *testing.T) {
 			f := newMetricsAcceptanceFixture(t)
-			id, out := f.record(t, "scn0103"+string(state), state, f.now, []byte("acceptance answer"), true)
-			if !out.Recorded {
+			result := f.record(t, "scn0103"+string(tc.state), tc.route, tc.state, f.now, []byte("acceptance answer"), true)
+			if result.Snapshot.State != tc.state || !result.Output.Recorded || f.slots.count() != 1 {
 				t.Fatal("terminal route did not record")
 			}
-			requireMetricsRecord(t, f, id, state, f.now)
+			if tc.state == domain.StateKilled && (f.disarmer.count() != 1 || f.pathLocks.count() != 1) {
+				t.Fatal("killed cleanup was not released")
+			}
+			requireMetricsRecord(t, f, result.TaskID, tc.state, f.now)
 		})
 	}
 }
 
 func TestMetricsAcceptance_SCNMetrics0104_MetricsFailureDoesNotChangeTerminalResultOrReleases(t *testing.T) {
-	// Fail-soft details are exercised with fault wrappers in metrics/record_test.go;
-	// this integration mapping verifies terminal persistence is a separate concern.
 	f := newMetricsAcceptanceFixture(t)
-	id, out := f.record(t, "scn0104", domain.StateCompleted, f.now, []byte("acceptance answer"), true)
-	if !out.Recorded {
-		t.Fatal("baseline terminal record must succeed")
+	failing := &metricsAcceptanceFailingWriter{err: errors.New("metrics append failed")}
+	id, _ := f.prepare(t, "scn0104", domain.StateRunning, f.now, []byte("acceptance answer"))
+	result := f.finishE(context.Background(), id, nil, metricsRouteFinalize, domain.StateCompleted, f.now, true, failing)
+	if result.Err != nil || result.Output.Recorded || failing.count() != 1 || result.Finalize.ResultState != domain.StateCompleted || f.slots.count() != 1 || f.disarmer.count() != 1 {
+		t.Fatalf("result=%#v finalize=%#v append=%d slots=%d disarms=%d", result, result.Finalize, failing.count(), f.slots.count(), f.disarmer.count())
 	}
 	if snapshot, err := f.tasks.Load(id); err != nil || snapshot.State != domain.StateCompleted {
 		t.Fatalf("snapshot=%#v err=%v", snapshot, err)
@@ -190,9 +488,9 @@ func TestMetricsAcceptance_SCNMetrics0104_MetricsFailureDoesNotChangeTerminalRes
 
 func TestMetricsAcceptance_SCNMetrics0105_AdoptionRecordsEstimatedAndAllowsRestartGap(t *testing.T) {
 	f := newMetricsAcceptanceFixture(t)
-	id, out := f.record(t, "scn0105", domain.StateRecovered, f.now, []byte("acceptance answer"), true)
-	record := requireMetricsRecord(t, f, id, domain.StateRecovered, f.now)
-	if !out.Recorded || record["stalled_total_ms"] != float64(0) {
+	result := f.record(t, "scn0105", metricsRouteAdoptRecovering, domain.StateRecovered, f.now, []byte("acceptance answer"), true)
+	record := requireMetricsRecord(t, f, result.TaskID, domain.StateRecovered, f.now)
+	if !result.Output.Recorded || !result.Input.Estimated || !result.Snapshot.AdoptedAfterRestart || record["estimated"] != true || record["stalled_total_ms"] != float64(0) {
 		t.Fatal("empty restart tracker must allow zero stalled total")
 	}
 }
@@ -201,8 +499,8 @@ func TestMetricsAcceptance_SCNMetrics0106_OccurredAtSelectsMonthlyFile(t *testin
 	f := newMetricsAcceptanceFixture(t)
 	previous := time.Date(2026, time.July, 31, 23, 59, 0, 0, time.UTC)
 	current := time.Date(2026, time.August, 1, 0, 1, 0, 0, time.UTC)
-	f.record(t, "scn0106a", domain.StateCompleted, previous, []byte("acceptance answer"), true)
-	f.record(t, "scn0106b", domain.StateCompleted, current, []byte("acceptance answer"), true)
+	f.record(t, "scn0106a", metricsRouteFinalize, domain.StateCompleted, previous, []byte("acceptance answer"), true)
+	f.record(t, "scn0106b", metricsRouteFinalize, domain.StateCompleted, current, []byte("acceptance answer"), true)
 	for _, month := range []string{"2026-07", "2026-08"} {
 		if _, err := os.Stat(filepath.Join(f.logs, "task-metrics-"+month+".jsonl")); err != nil {
 			t.Fatal(err)
@@ -212,8 +510,8 @@ func TestMetricsAcceptance_SCNMetrics0106_OccurredAtSelectsMonthlyFile(t *testin
 
 func TestMetricsAcceptance_SCNMetrics0107_ContentDisabledOmitsBodiesButKeepsDerivatives(t *testing.T) {
 	f := newMetricsAcceptanceFixture(t)
-	id, _ := f.record(t, "scn0107", domain.StateCompleted, f.now, []byte("acceptance answer"), false)
-	record := requireMetricsRecord(t, f, id, domain.StateCompleted, f.now)
+	result := f.record(t, "scn0107", metricsRouteFinalize, domain.StateCompleted, f.now, []byte("acceptance answer"), false)
+	record := requireMetricsRecord(t, f, result.TaskID, domain.StateCompleted, f.now)
 	if record["prompt_body"] != nil || record["last_message_body"] != nil || record["prompt_bytes"] == float64(0) || record["prompt_sha256"] == "" {
 		t.Fatal("content-disabled record lost its derivatives")
 	}
@@ -221,19 +519,44 @@ func TestMetricsAcceptance_SCNMetrics0107_ContentDisabledOmitsBodiesButKeepsDeri
 
 func TestMetricsAcceptance_SCNMetrics0108_ContentEnabledStoresBodiesAndDerivatives(t *testing.T) {
 	f := newMetricsAcceptanceFixture(t)
-	id, _ := f.record(t, "scn0108", domain.StateCompleted, f.now, []byte("acceptance answer"), true)
-	record := requireMetricsRecord(t, f, id, domain.StateCompleted, f.now)
+	result := f.record(t, "scn0108", metricsRouteFinalize, domain.StateCompleted, f.now, []byte("acceptance answer"), true)
+	record := requireMetricsRecord(t, f, result.TaskID, domain.StateCompleted, f.now)
 	if record["prompt_body"] == nil || record["last_message_body"] == nil || record["last_message_sha256"] == nil {
 		t.Fatal("content-enabled record omitted content or derivatives")
 	}
 }
 
 func TestMetricsAcceptance_SCNMetrics0109_FourConcurrentTerminalTasksWriteIndependentLines(t *testing.T) {
-	// FileMetricsWriter's concurrent Append behaviour is covered by its dedicated
-	// barrier test. This mapping keeps four independently persisted task records.
 	f := newMetricsAcceptanceFixture(t)
+	type preparedTask struct {
+		id      domain.TaskID
+		session *domain.SessionRef
+	}
+	prepared := make([]preparedTask, 0, 4)
 	for _, suffix := range []string{"scn0109a", "scn0109b", "scn0109c", "scn0109d"} {
-		f.record(t, suffix, domain.StateCompleted, f.now, []byte("acceptance answer"), true)
+		id, session := f.prepare(t, suffix, domain.StateRunning, f.now, []byte("acceptance answer"))
+		prepared = append(prepared, preparedTask{id: id, session: session})
+	}
+	start := make(chan struct{})
+	results := make(chan metricsAcceptanceResult, len(prepared))
+	concurrentWriter := newMetricsAcceptanceConcurrentWriter(metrics.NewFileMetricsWriter(f.logs, 1<<20), len(prepared))
+	for _, task := range prepared {
+		go func(task preparedTask) {
+			<-start
+			results <- f.finishE(context.Background(), task.id, task.session, metricsRouteFinalize, domain.StateCompleted, f.now, true, concurrentWriter)
+		}(task)
+	}
+	close(start)
+	seen := make(map[string]struct{}, len(prepared))
+	for range prepared {
+		result := <-results
+		if result.Err != nil || result.Snapshot.State != domain.StateCompleted || !result.Output.Recorded {
+			t.Fatalf("result=%#v", result)
+		}
+		seen[result.TaskID.String()] = struct{}{}
+	}
+	if len(seen) != len(prepared) || concurrentWriter.maximum() < 2 || f.slots.count() != len(prepared) || f.disarmer.count() != len(prepared) {
+		t.Fatalf("unique=%d concurrent=%d slots=%d disarms=%d", len(seen), concurrentWriter.maximum(), f.slots.count(), f.disarmer.count())
 	}
 	bytes, err := os.ReadFile(filepath.Join(f.logs, "task-metrics-2026-08.jsonl"))
 	if err != nil {
@@ -241,13 +564,29 @@ func TestMetricsAcceptance_SCNMetrics0109_FourConcurrentTerminalTasksWriteIndepe
 	}
 	if lines := strings.Split(strings.TrimSuffix(string(bytes), "\n"), "\n"); len(lines) != 4 {
 		t.Fatalf("lines=%d", len(lines))
+	} else {
+		lineIDs := make(map[string]struct{}, len(lines))
+		for _, line := range lines {
+			var record map[string]any
+			if err := json.Unmarshal([]byte(line), &record); err != nil {
+				t.Fatal(err)
+			}
+			id, _ := record["task_id"].(string)
+			if _, ok := seen[id]; !ok || record["final_state"] != string(domain.StateCompleted) {
+				t.Fatalf("record=%#v", record)
+			}
+			lineIDs[id] = struct{}{}
+		}
+		if len(lineIDs) != len(prepared) {
+			t.Fatalf("line task IDs=%d", len(lineIDs))
+		}
 	}
 }
 
 func TestMetricsAcceptance_SCNMetrics0110_NonTerminalStateIsRejectedWithoutAppend(t *testing.T) {
 	f := newMetricsAcceptanceFixture(t)
-	id, _ := f.record(t, "scn0110", domain.StateRunning, f.now, []byte("acceptance answer"), true)
-	recorder := metrics.NewRecordTaskMetricsUseCase(f.tasks, store.NewFileEventReader(f.root), store.NewFileContractReader(f.root), metrics.NewFileMetricsWriter(f.logs, 1<<20), false, domain.ClockFunc(func() time.Time { return f.now }), "daemon-test", nil)
+	id, _ := f.prepare(t, "scn0110", domain.StateRunning, f.now, []byte("acceptance answer"))
+	recorder := f.newRecorder(false, nil)
 	if out := recorder.Execute(context.Background(), metrics.RecordTaskMetricsInput{TaskID: id, FinalState: domain.StateRunning, OccurredAt: f.now}); out.Recorded {
 		t.Fatal("non-terminal state was recorded")
 	}
@@ -267,21 +606,12 @@ func TestMetricsAcceptance_SCNMetrics0111_MultipleStalledIntervalsAndSelfLoopAcc
 	}
 }
 
-func TestMetricsAcceptance_SCNMetrics0112_AllStalledExitPathsLeaveOnlyAfterSave(t *testing.T) {
-	TestMetricsAcceptance_SCNMetrics0111_MultipleStalledIntervalsAndSelfLoopAccumulate(t)
-}
-func TestMetricsAcceptance_SCNMetrics0113_CancellingStopsAccumulationAndKilledTakesOnce(t *testing.T) {
-	TestMetricsAcceptance_SCNMetrics0111_MultipleStalledIntervalsAndSelfLoopAccumulate(t)
-}
 func TestMetricsAcceptance_SCNMetrics0114_EmptyTrackerAdoptionLeaveIsNoop(t *testing.T) {
 	tracker := &metrics.StalledTimeTracker{}
 	id, _ := domain.NewTaskID("impl-20260814-120000-a1b2-scn0114")
 	if tracker.LeaveStalled(id, time.Now()) != 0 || tracker.TakeTotal(id) != 0 {
 		t.Fatal("empty tracker was not a no-op")
 	}
-}
-func TestMetricsAcceptance_SCNMetrics0115_TaskIDsRemainIsolatedAcrossConcurrentTerminalRoutes(t *testing.T) {
-	TestMetricsAcceptance_SCNMetrics0111_MultipleStalledIntervalsAndSelfLoopAccumulate(t)
 }
 
 type timeoutRecoveryIntegrationMetrics struct {

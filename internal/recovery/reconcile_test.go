@@ -476,6 +476,30 @@ func TestReconcilePendingRecoveringSaveFailureRetainsPending(t *testing.T) {
 	}
 }
 
+func TestReconcilePendingRecoveringExitCodeMismatchFailsClosed(t *testing.T) {
+	uc, pending, tasks, liveness, writer, _, _, _, slots, _, _ := newReconcileFixture(t, domain.StateRecovering, true, true)
+	id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
+	uc.reader = &reconcileReaderFake{present: true, exitCode: 1, exitExists: true}
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
+	finish := runReconciliation(t, uc, liveness)
+	finish()
+	if tasks.saves != 0 || writer.exitCodes != 0 || writer.events != 0 || slots.calls != 0 || len(pending.List()) != 1 {
+		t.Fatal("recovering reconciliation did not fail closed")
+	}
+}
+
+func TestReconcilePendingRecoveringExitCodeReadFailureFailsClosed(t *testing.T) {
+	uc, pending, tasks, liveness, writer, _, _, _, slots, _, _ := newReconcileFixture(t, domain.StateRecovering, true, true)
+	id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
+	uc.reader = &reconcileReaderFake{present: true, exitErr: errors.New("read exit")}
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
+	finish := runReconciliation(t, uc, liveness)
+	finish()
+	if tasks.saves != 0 || writer.exitCodes != 0 || writer.events != 0 || slots.calls != 0 || len(pending.List()) != 1 {
+		t.Fatal("recovering reconciliation did not fail closed")
+	}
+}
+
 func TestNewReconcilePendingUseCasePanicsForNonPositiveTerminationGrace(t *testing.T) {
 	for _, grace := range []time.Duration{0, -time.Second} {
 		t.Run(grace.String(), func(t *testing.T) {

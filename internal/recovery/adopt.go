@@ -33,6 +33,11 @@ type AdoptionTaskStore interface {
 	ListByStates([]domain.TaskState) ([]domain.TaskSnapshot, error)
 }
 
+type adoptionContractReader interface {
+	ContractReader
+	contract.ExitCodeReader
+}
+
 // OrphanFinalizer is satisfied by execution.FinalizeTaskUseCase.
 type OrphanFinalizer interface {
 	Finalize(taskID domain.TaskID, rawExitCode int, estimated bool, adoptedAfterRestart bool, occurredAt time.Time) error
@@ -94,7 +99,7 @@ type AdoptionOutcome struct {
 type AdoptRunningTasksUseCase struct {
 	tasks           AdoptionTaskStore
 	liveness        LivenessChecker
-	reader          ContractReader
+	reader          adoptionContractReader
 	contract        contract.ContractWriter
 	finalizer       OrphanFinalizer
 	resume          *RecoverViaResumeUseCase
@@ -113,7 +118,7 @@ type AdoptRunningTasksUseCase struct {
 	logger          *slog.Logger
 }
 
-func NewAdoptRunningTasksUseCase(tasks AdoptionTaskStore, liveness LivenessChecker, reader ContractReader, writer contract.ContractWriter, finalizer OrphanFinalizer, resume *RecoverViaResumeUseCase, slots SlotReleaser, resetter SlotResetter, termination TerminationEnsurer, killed KillConfirmer, pathLocks PathLockReleaser, pending *PendingReconciliationSet, taskMu TaskMutex, clock domain.Clock, stalledTracker stalledTimeTracker, metricsRecorder MetricsRecorder, options ...any) *AdoptRunningTasksUseCase {
+func NewAdoptRunningTasksUseCase(tasks AdoptionTaskStore, liveness LivenessChecker, reader adoptionContractReader, writer contract.ContractWriter, finalizer OrphanFinalizer, resume *RecoverViaResumeUseCase, slots SlotReleaser, resetter SlotResetter, termination TerminationEnsurer, killed KillConfirmer, pathLocks PathLockReleaser, pending *PendingReconciliationSet, taskMu TaskMutex, clock domain.Clock, stalledTracker stalledTimeTracker, metricsRecorder MetricsRecorder, options ...any) *AdoptRunningTasksUseCase {
 	if isNilAdoptionDependency(tasks) || isNilAdoptionDependency(liveness) || isNilAdoptionDependency(reader) || isNilAdoptionDependency(writer) || isNilAdoptionDependency(finalizer) || isNilAdoptionDependency(resume) || isNilAdoptionDependency(slots) || isNilAdoptionDependency(resetter) || isNilAdoptionDependency(termination) || isNilAdoptionDependency(killed) || isNilAdoptionDependency(pathLocks) || isNilAdoptionDependency(pending) || isNilAdoptionDependency(taskMu) || isNilAdoptionDependency(clock) || isNilAdoptionDependency(stalledTracker) || isNilAdoptionDependency(metricsRecorder) {
 		panic("adopt running tasks use case requires non-nil dependencies")
 	}
@@ -274,7 +279,7 @@ func (uc *AdoptRunningTasksUseCase) adoptRecovering(ctx context.Context, taskID 
 		uc.registerPending(taskID, snapshot)
 		return adoptionOutcomeError
 	}
-	if err := resolveRecoveringLocked(uc.tasks, uc.contract, uc.logger, taskID, snapshot, present, occurredAt); err != nil {
+	if err := resolveRecoveringLocked(uc.tasks, uc.reader, uc.contract, uc.logger, taskID, snapshot, present, occurredAt); err != nil {
 		uc.taskMu.Unlock(taskID)
 		uc.logFailure("resolve recovering task failed", taskID, err)
 		uc.registerPendingConfirmOnly(taskID)
@@ -299,7 +304,7 @@ func (uc *AdoptRunningTasksUseCase) adoptRecovering(ctx context.Context, taskID 
 }
 
 // resolveRecoveringLocked persists recovery completion while the caller holds taskMu.
-func resolveRecoveringLocked(tasks AdoptionTaskStore, writer contract.ContractWriter, logger *slog.Logger, taskID domain.TaskID, snapshot domain.TaskSnapshot, present bool, occurredAt time.Time) error {
+func resolveRecoveringLocked(tasks AdoptionTaskStore, reader contract.ExitCodeReader, writer contract.ContractWriter, logger *slog.Logger, taskID domain.TaskID, snapshot domain.TaskSnapshot, present bool, occurredAt time.Time) error {
 	task, err := snapshot.Restore()
 	if err != nil {
 		return err
@@ -326,6 +331,10 @@ func resolveRecoveringLocked(tasks AdoptionTaskStore, writer contract.ContractWr
 		return err
 	}
 	updated.AdoptedAfterRestart = true
+	shouldWriteExitCode, err := contract.CheckExitCode(reader, taskID, exitCode)
+	if err != nil {
+		return err
+	}
 	if err := writer.WriteAdoptedMarker(taskID, occurredAt); err != nil {
 		logger.Error("write adopted marker failed", "task_id", taskID.String(), "error", err)
 	}
@@ -334,8 +343,10 @@ func resolveRecoveringLocked(tasks AdoptionTaskStore, writer contract.ContractWr
 			logger.Error("write recovered marker failed", "task_id", taskID.String(), "error", err)
 		}
 	}
-	if err := writer.WriteExitCode(taskID, exitCode); err != nil {
-		logger.Error("write recovery exit code failed", "task_id", taskID.String(), "error", err)
+	if shouldWriteExitCode {
+		if err := writer.WriteExitCode(taskID, exitCode); err != nil {
+			logger.Error("write recovery exit code failed", "task_id", taskID.String(), "error", err)
+		}
 	}
 	if err := tasks.Save(taskID, updated); err != nil {
 		logger.Error("save recovered task failed", "task_id", taskID.String(), "error", err)

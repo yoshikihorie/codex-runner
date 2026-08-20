@@ -77,7 +77,7 @@ func buildLaunchArgs(p LaunchParams) (headProcess string, args []string) {
 	if p.ReasoningEffort != nil {
 		args = append(args, "-c", "model_reasoning_effort="+*p.ReasoningEffort)
 	}
-	args = append(args, "--output-last-message", filepath.Join(p.TaskDirPath, "last-message.md"), p.PromptText)
+	args = append(args, "--output-last-message", filepath.Join(p.TaskDirPath, "last-message.md"), "--", p.PromptText)
 	if p.PTYEnabled {
 		return scriptBinaryPath, append([]string{"-q", "/dev/null", stdbufBinaryPath}, args...)
 	}
