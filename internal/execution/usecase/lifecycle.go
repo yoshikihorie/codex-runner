@@ -129,7 +129,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 	}
 	lock, err := o.deps.AcquireForChild(input.TaskDirPath)
 	if err != nil {
-		o.fail(ctx, input)
+		o.fail(ctx, input, 130, true)
 		return
 	}
 	if o.stopForCancellation(ctx) {
@@ -138,14 +138,14 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 	}
 	if err = o.deps.RecordStarting.Execute(ctx, input.Task, input.ResolvedTimeout, input.Model, input.ReasoningEffort, domain.ExecutionRouteDaemon, input.PromptText, input.Now); err != nil {
 		_ = lock.Close()
-		o.fail(ctx, input)
+		o.fail(ctx, input, 130, true)
 		return
 	}
 	workingDir := input.WorkingDir
 	if input.Task.Subcommand() == domain.SubcommandImpl {
 		if isNilValue(o.deps.CreateWorktree) {
 			_ = lock.Close()
-			o.fail(ctx, input)
+			o.fail(ctx, input, 130, true)
 			return
 		}
 		if o.stopForCancellation(ctx) {
@@ -155,14 +155,14 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		out, createErr := o.deps.CreateWorktree.Execute(ctx, execution.CreateWorktreeInput{TaskID: taskID, SourceWorkingDir: input.SourceWorkingDir})
 		if createErr != nil {
 			_ = lock.Close()
-			o.fail(ctx, input)
+			o.fail(ctx, input, 130, true)
 			return
 		}
 		workingDir = &out.WorkingDir
 	}
 	if workingDir == nil {
 		_ = lock.Close()
-		o.fail(ctx, input)
+		o.fail(ctx, input, 130, true)
 		return
 	}
 	if o.confirmUnlaunchedCancellation(ctx, taskID) {
@@ -179,7 +179,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		return
 	}
 	if err != nil || launched == nil || launched.Handle == nil || launched.Waiter == nil {
-		o.fail(ctx, input)
+		o.fail(ctx, input, 130, true)
 		return
 	}
 	cancelling, recordErr := o.recordProcessAtLaunchBoundary(ctx, input, launched)
@@ -245,19 +245,21 @@ func (o *TaskLifecycleOrchestrator) recordProcessAtLaunchBoundary(ctx context.Co
 	return false, o.deps.RecordProcess.Execute(ctx, input.Task, launched.Handle, input.Now)
 }
 
+// confirmUnlaunchedCancellation reports whether Run must stop before launch.
 func (o *TaskLifecycleOrchestrator) confirmUnlaunchedCancellation(ctx context.Context, taskID domain.TaskID) bool {
 	o.deps.TaskMu.Lock(taskID)
 	snapshot, err := o.deps.Tasks.Load(taskID)
 	if err != nil {
 		o.deps.TaskMu.Unlock(taskID)
 		o.logger.Warn("reload task before launch", "task_id", taskID.String(), "error", err)
-		return false
+		return true
 	}
 	task, err := snapshot.Restore()
 	if err != nil || task.State() != domain.StateCancelling {
 		o.deps.TaskMu.Unlock(taskID)
 		if err != nil {
 			o.logger.Warn("restore task before launch", "task_id", taskID.String(), "error", err)
+			return true
 		}
 		return false
 	}
@@ -373,16 +375,27 @@ func (o *TaskLifecycleOrchestrator) waitLaunched(taskID domain.TaskID, launched 
 	return raw, err
 }
 
-func (o *TaskLifecycleOrchestrator) fail(ctx context.Context, input TaskLifecycleInput) {
+func (o *TaskLifecycleOrchestrator) fail(ctx context.Context, input TaskLifecycleInput, rawExitCode int, estimated bool) bool {
 	taskID := input.Task.ID()
 	o.deps.TaskMu.Lock(taskID)
+	if ctx.Err() != nil {
+		o.deps.TaskMu.Unlock(taskID)
+		return false
+	}
 	snapshot, loadErr := o.deps.Tasks.Load(taskID)
 	if loadErr != nil {
+		o.deps.TaskMu.Unlock(taskID)
 		o.logger.Warn("reload task before launch failure", "task_id", taskID.String(), "error", loadErr)
-	} else if task, restoreErr := snapshot.Restore(); restoreErr != nil {
+		return false
+	}
+	task, restoreErr := snapshot.Restore()
+	if restoreErr != nil {
+		o.deps.TaskMu.Unlock(taskID)
 		o.logger.Warn("restore task before launch failure", "task_id", taskID.String(), "error", restoreErr)
-	} else if task.State() == domain.StateCancelling {
-		result, confirmErr := o.deps.ConfirmKilled.ExecuteLocked(ctx, execution.ConfirmTaskKilledInput{TaskID: taskID, RawExitCode: 130, Estimated: true, OccurredAt: o.deps.Clock.Now()})
+		return false
+	}
+	if task.State() == domain.StateCancelling {
+		result, confirmErr := o.deps.ConfirmKilled.ExecuteLocked(ctx, execution.ConfirmTaskKilledInput{TaskID: taskID, RawExitCode: rawExitCode, Estimated: estimated, OccurredAt: o.deps.Clock.Now()})
 		o.deps.TaskMu.Unlock(taskID)
 		if confirmErr != nil {
 			o.logger.Warn("confirm killed launch failure", "task_id", taskID.String(), "error", confirmErr)
@@ -392,7 +405,7 @@ func (o *TaskLifecycleOrchestrator) fail(ctx context.Context, input TaskLifecycl
 		} else if registerErr := o.deps.Pending.Register(taskID, recovery.PendingSendConfirmOnly, nil); registerErr != nil {
 			o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
 		}
-		return
+		return true
 	}
 
 	result, failErr := o.deps.FailLaunch.ExecuteLocked(ctx, FailTaskLaunchInput{Task: input.Task, ResolvedTimeout: input.ResolvedTimeout, Model: input.Model, ReasoningEffort: input.ReasoningEffort, OccurredAt: input.Now})
@@ -403,6 +416,7 @@ func (o *TaskLifecycleOrchestrator) fail(ctx context.Context, input TaskLifecycl
 	if result.Terminal {
 		o.deps.FailLaunch.ReleaseAfterFailure(ctx, taskID, result.Impl)
 	}
+	return true
 }
 
 func (o *TaskLifecycleOrchestrator) handleRecordProcessFailure(ctx context.Context, input TaskLifecycleInput, launched *execution.LaunchedProcess) {
@@ -412,15 +426,29 @@ func (o *TaskLifecycleOrchestrator) handleRecordProcessFailure(ctx context.Conte
 		o.logger.Warn("terminate after process record failure", "task_id", taskID.String(), "error", terminateErr)
 	}
 	dead, err := o.deps.CheckLiveness.Execute(ctx, taskID)
-	if err == nil && dead {
-		o.fail(ctx, input)
-	} else {
-		disposition, authority := pendingRegistrationAfterSignal(taskID, launched.Handle, true, terminateErr, 0)
-		if registerErr := o.deps.Pending.Register(taskID, disposition, authority); registerErr != nil {
-			o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
-		}
+	if ctx.Err() != nil {
+		return
 	}
-	o.waitLaunched(taskID, launched)
+
+	resolved := false
+	if err == nil && dead {
+		if ctx.Err() != nil {
+			return
+		}
+		resolved = o.fail(ctx, input, 130, true)
+	}
+	if ctx.Err() != nil {
+		return
+	}
+	rawExitCode, waitErr := o.waitLaunched(taskID, launched)
+	if ctx.Err() != nil || resolved {
+		return
+	}
+	estimated := waitErr != nil
+	if estimated {
+		rawExitCode = 1
+	}
+	o.fail(ctx, input, rawExitCode, estimated)
 }
 
 func (o *TaskLifecycleOrchestrator) monitorAndFinalize(ctx context.Context, input TaskLifecycleInput, launched *execution.LaunchedProcess) {
@@ -588,20 +616,6 @@ preparedOrCancelled:
 	if finalizeResult.RecordExited {
 		o.deps.Finalize.ReleaseAfterFinalization(ctx, finalizeResult, taskID)
 	}
-}
-
-func pendingRegistrationAfterSignal(taskID domain.TaskID, handle *domain.ProcessHandle, sent bool, signalErr error, generation domain.LifecycleGeneration) (recovery.PendingSendDisposition, *recovery.ProcessSignalAuthority) {
-	if !sent {
-		return recovery.PendingSendConfirmOnly, nil
-	}
-	if signalErr == nil {
-		return recovery.PendingSendSent, nil
-	}
-	if handle == nil || handle.PID <= 0 || handle.ProcessStartedAt.IsZero() {
-		return recovery.PendingSendConfirmOnly, nil
-	}
-	authority := recovery.ProcessSignalAuthority{TaskID: taskID, PID: handle.PID, ProcessStartedAt: handle.ProcessStartedAt, ExpectedState: domain.StateCancelling, LifecycleGeneration: &generation}
-	return recovery.PendingSendUnsent, &authority
 }
 
 var _ taskLifecycleRunner = (*TaskLifecycleOrchestrator)(nil)

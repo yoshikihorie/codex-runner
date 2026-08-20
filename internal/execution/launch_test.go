@@ -130,6 +130,68 @@ func TestProcessRunnerLaunchMapsErrorsAndClosesLock(t *testing.T) {
 	}
 }
 
+func TestProcessRunnerLaunchDetachesLaunchContext(t *testing.T) {
+	type contextKey struct{}
+
+	original := launchNewSession
+	t.Cleanup(func() { launchNewSession = original })
+	var captured context.Context
+	launchNewSession = func(ctx context.Context, _ string, _ []string, lock *os.File, _ io.Writer, _ io.Writer, _ ...string) (*exec.Cmd, error) {
+		captured = ctx
+		_ = lock.Close()
+		return &exec.Cmd{Process: &os.Process{Pid: 12345}}, nil
+	}
+
+	for _, tt := range []struct {
+		name       string
+		newContext func() (context.Context, context.CancelFunc)
+	}{
+		{
+			name: "cancel",
+			newContext: func() (context.Context, context.CancelFunc) {
+				return context.WithCancel(context.WithValue(context.Background(), contextKey{}, "expected"))
+			},
+		},
+		{
+			name: "deadline",
+			newContext: func() (context.Context, context.CancelFunc) {
+				return context.WithDeadline(context.WithValue(context.Background(), contextKey{}, "expected"), time.Now().Add(time.Hour))
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			captured = nil
+			parent, cancel := tt.newContext()
+			defer cancel()
+
+			launched, err := NewProcessRunner(launchTestLogs{logs: launchTestLogsFor(t)}).Launch(parent, launchTestParams(t, launchTestLock(t)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if launched.Handle == nil {
+				t.Fatal("launch handle is nil")
+			}
+			if captured == nil {
+				t.Fatal("launch context was not captured")
+			}
+
+			cancel()
+			if got := captured.Value(contextKey{}); got != "expected" {
+				t.Fatalf("value = %v, want expected", got)
+			}
+			if captured.Err() != nil {
+				t.Fatalf("context error = %v, want nil", captured.Err())
+			}
+			if captured.Done() != nil {
+				t.Fatal("context Done is non-nil")
+			}
+			if deadline, ok := captured.Deadline(); ok {
+				t.Fatalf("unexpected deadline: %v", deadline)
+			}
+		})
+	}
+}
+
 func TestProcessRunnerLaunchRejectsMissingTaskDirectoryBeforeDependencies(t *testing.T) {
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })

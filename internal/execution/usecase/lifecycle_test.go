@@ -1104,20 +1104,16 @@ func TestTaskLifecycleRunLaunchPreparationFailuresFailAndStop(t *testing.T) {
 }
 func TestTaskLifecycleRunRecordProcessFailureHandlesLiveness(t *testing.T) {
 	cases := []struct {
-		name          string
-		dead          bool
-		livenessErr   error
-		terminateErr  error
-		invalidHandle bool
-		wantFail      bool
-		want          recovery.PendingSendDisposition
-		wantAuthority bool
+		name           string
+		dead           bool
+		livenessErr    error
+		terminateErr   error
+		failBeforeWait bool
 	}{
-		{name: "dead", dead: true, wantFail: true},
-		{name: "live after successful terminate", want: recovery.PendingSendSent},
-		{name: "liveness error after successful terminate", livenessErr: errors.New("liveness"), want: recovery.PendingSendSent},
-		{name: "terminate error with authority", terminateErr: errors.New("terminate"), want: recovery.PendingSendUnsent, wantAuthority: true},
-		{name: "terminate error without authority", terminateErr: errors.New("terminate"), invalidHandle: true, want: recovery.PendingSendConfirmOnly},
+		{name: "dead", dead: true, failBeforeWait: true},
+		{name: "live after successful terminate"},
+		{name: "liveness error after successful terminate", livenessErr: errors.New("liveness")},
+		{name: "terminate error", terminateErr: errors.New("terminate")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1126,9 +1122,7 @@ func TestTaskLifecycleRunRecordProcessFailureHandlesLiveness(t *testing.T) {
 			f.recordLock.dead = tc.dead
 			f.recordLock.err = tc.livenessErr
 			f.terminator.err = tc.terminateErr
-			if tc.invalidHandle {
-				f.launch.launched.Handle.ProcessStartedAt = time.Time{}
-			}
+			f.failStore.saveName = "save"
 			f.failStore.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateStarting)}}
 			f.run()
 			if f.terminator.calls != 1 || f.terminator.pids[0] != 42 || f.terminator.graces[0] != execution.TimeoutKillGrace || f.waiter.calls != 1 || f.confirmLock.calls != 0 || f.timeout.calls != 0 || f.opener.calls != 0 || f.monitor.calls != 0 || len(f.finalizer.calls) != 0 || len(f.killed.calls) != 0 {
@@ -1137,19 +1131,38 @@ func TestTaskLifecycleRunRecordProcessFailureHandlesLiveness(t *testing.T) {
 			if !lifecycleTraceSubsequence(f.trace, "record-process", "terminate", "check-liveness") {
 				t.Fatalf("record failure order=%v", f.trace)
 			}
-			if tc.wantFail {
-				if f.failStore.saveCalls != 1 || f.failSlots.calls != 1 || f.pending.calls != 0 {
-					t.Fatal("dead process was not failed")
-				}
-			} else if f.failStore.saveCalls != 0 || f.failSlots.calls != 0 || f.pending.calls != 1 || f.pending.dispositions[0] != tc.want {
-				t.Fatal("live or unknown process was not pending")
-			} else if tc.wantAuthority {
-				got := f.pending.authorities[0]
-				if got == nil || got.TaskID != f.input.Task.ID() || got.PID != 42 || got.ProcessStartedAt != f.launch.launched.Handle.ProcessStartedAt {
-					t.Fatalf("authority=%+v", got)
-				}
-			} else if f.pending.authorities[0] != nil {
-				t.Fatalf("authority=%+v", f.pending.authorities[0])
+			if f.failStore.saveCalls != 1 || f.failSlots.calls != 1 || f.pending.calls != 0 {
+				t.Fatal("record process failure did not resolve without pending registration")
+			}
+			if tc.failBeforeWait && !lifecycleTraceSubsequence(f.trace, "check-liveness", "save", "wait") {
+				t.Fatalf("dead process did not resolve before wait: %v", f.trace)
+			}
+			if !tc.failBeforeWait && !lifecycleTraceSubsequence(f.trace, "check-liveness", "wait", "save") {
+				t.Fatalf("live or unknown process did not resolve after wait: %v", f.trace)
+			}
+		})
+	}
+}
+
+func TestTaskLifecycleRunStopsBeforeLaunchWhenUnlaunchedStateCannotBeRead(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		result lifecycleLoadResult
+	}{
+		{name: "load error", result: lifecycleLoadResult{err: domain.ErrTaskNotFound}},
+		{name: "restore error", result: lifecycleLoadResult{snapshot: domain.TaskSnapshot{}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newLifecycleFixture(t)
+			f.tasks.loads = []lifecycleLoadResult{tc.result}
+
+			f.run()
+
+			if f.launch.calls != 0 || f.process.calls != 0 || f.waiter.calls != 0 || f.terminator.calls != 0 || f.killed.lockedCalls != 0 || f.failStore.saveCalls != 0 || f.pending.calls != 0 {
+				t.Fatalf("unreadable pre-launch state performed lifecycle work: trace=%v", f.trace)
+			}
+			if f.taskMu.lockCalls != 1 || f.taskMu.unlockCalls != 1 || f.launching.unregisterCalls != 1 || f.ownership.releaseCalls != 1 {
+				t.Fatalf("unreadable pre-launch state did not close lifecycle ownership: trace=%v", f.trace)
 			}
 		})
 	}
@@ -1292,7 +1305,7 @@ func TestTaskLifecycleCancellationConfirmationRegistersUnconfirmed(t *testing.T)
 				disposition: recovery.PendingSendConfirmOnly,
 				invoke: func(f *lifecycleFixture) {
 					f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
-					f.orchestrator.fail(context.Background(), f.input)
+					f.orchestrator.fail(context.Background(), f.input, 130, true)
 				},
 			},
 			{
@@ -1354,7 +1367,7 @@ func TestTaskLifecycleCancellationConfirmationReleasesConfirmedDespiteError(t *t
 			name: "launch-failure",
 			invoke: func(f *lifecycleFixture) {
 				f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
-				f.orchestrator.fail(context.Background(), f.input)
+				f.orchestrator.fail(context.Background(), f.input, 130, true)
 			},
 		},
 		{
@@ -1418,7 +1431,7 @@ func TestTaskLifecycleFailReleasesConfirmedCancellationDespiteError(t *testing.T
 	f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
 	f.killed.lockedResult = execution.LockedKillResult{Confirmed: true}
 	f.killed.lockedErr = errors.New("contract")
-	f.orchestrator.fail(context.Background(), f.input)
+	f.orchestrator.fail(context.Background(), f.input, 130, true)
 	if f.killed.releaseCalls != 1 || !lifecycleTraceSubsequence(f.trace, "confirm-killed-locked", "task-unlock", "release-after-confirmation") {
 		t.Fatalf("confirmed cancellation was not released after unlock: trace=%v", f.trace)
 	}
@@ -1430,7 +1443,7 @@ func TestTaskLifecycleFailDoesNotReleaseUnconfirmedCancellation(t *testing.T) {
 		f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
 		f.killed.lockedResult = execution.LockedKillResult{}
 		f.killed.lockedErr = err
-		f.orchestrator.fail(context.Background(), f.input)
+		f.orchestrator.fail(context.Background(), f.input, 130, true)
 		if f.killed.releaseCalls != 0 || f.pending.calls != 1 || f.pending.dispositions[0] != recovery.PendingSendConfirmOnly || f.pending.authorities[0] != nil {
 			t.Fatalf("unconfirmed cancellation release=%d pending=%+v error=%v", f.killed.releaseCalls, f.pending, err)
 		}
@@ -1443,7 +1456,7 @@ func TestTaskLifecycleFailKeepsTaskMutexUntilFailureTransitionAndThenReleases(t 
 	f.failStore.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateStarting)}}
 	f.failStore.loadName = "load"
 	f.failStore.saveName = "save"
-	f.orchestrator.fail(context.Background(), f.input)
+	f.orchestrator.fail(context.Background(), f.input, 130, true)
 	if f.taskMu.lockCalls != 1 || f.taskMu.unlockCalls != 1 || f.failStore.saveCalls != 1 || f.failSlots.calls != 1 {
 		t.Fatalf("failure transition was not completed in one task mutex section: trace=%v", f.trace)
 	}
@@ -2121,8 +2134,8 @@ func TestTaskLifecycleRecordProcessFailureResolvesBeforeWait(t *testing.T) {
 		want []string
 	}{
 		{"dead", true, nil, []string{"record-process", "terminate", "check-liveness", "save", "wait"}},
-		{"live", false, nil, []string{"record-process", "terminate", "check-liveness", "pending-register", "wait"}},
-		{"liveness-error", false, errors.New("liveness"), []string{"record-process", "terminate", "check-liveness", "pending-register", "wait"}},
+		{"live", false, nil, []string{"record-process", "terminate", "check-liveness", "wait", "save"}},
+		{"liveness-error", false, errors.New("liveness"), []string{"record-process", "terminate", "check-liveness", "wait", "save"}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newLifecycleFixture(t)
@@ -2178,7 +2191,7 @@ func TestTaskLifecycleFailBranchesUseRealTaskMutexAndReleaseAfterUnlock(t *testi
 				f.orchestrator.deps.FailLaunch = NewFailTaskLaunchUseCase(f.failStore, shared, f.failWriter, &lifecycleRecordingContractReader{}, slots, paths, f.clock)
 			}
 			done := make(chan struct{})
-			go func() { f.orchestrator.fail(context.Background(), f.input); close(done) }()
+			go func() { f.orchestrator.fail(context.Background(), f.input, 130, true); close(done) }()
 			select {
 			case <-done:
 			case <-time.After(3 * time.Second):

@@ -245,7 +245,7 @@ func (r *processRunner) Launch(ctx context.Context, p LaunchParams) (*LaunchedPr
 	}
 	defer logs.Close()
 
-	cmd, err := launchNewSession(ctx, head, proc.SafeChildEnv(), p.LivenessLockFile, logs.Stdout, logs.Stderr, args...)
+	cmd, err := launchNewSession(context.WithoutCancel(ctx), head, proc.SafeChildEnv(), p.LivenessLockFile, logs.Stdout, logs.Stderr, args...)
 	if err != nil {
 		if p.PTYEnabled {
 			return nil, fmt.Errorf("%w: %v", domain.ErrPTYAllocationFailed, err)
