@@ -92,14 +92,10 @@ type processRunner struct {
 }
 
 type resumeLauncher struct {
-	runner    ProcessRunner
-	logger    *slog.Logger
-	killGrace time.Duration
-}
-
-type resumeWaitOutcome struct {
-	exitCode int
-	err      error
+	runner         ProcessRunner
+	logger         *slog.Logger
+	killGrace      time.Duration
+	newExitWatcher func(int) (proc.ExitWatcher, error)
 }
 
 // NewResumeLauncher constructs the recovery boundary without exposing execution process types.
@@ -111,14 +107,14 @@ func NewResumeLauncher(runner ProcessRunner, loggers ...*slog.Logger) recovery.R
 	if len(loggers) > 0 && loggers[0] != nil {
 		logger = loggers[0]
 	}
-	return &resumeLauncher{runner: runner, logger: logger, killGrace: TimeoutKillGrace}
+	return &resumeLauncher{runner: runner, logger: logger, killGrace: TimeoutKillGrace, newExitWatcher: proc.WatchExitWithoutReaping}
 }
 
 func buildResumeArgs(params recovery.ResumeLaunchParams) []string {
 	return []string{"exec", "resume", params.SessionID, "--output-last-message", params.OutputLastMessagePath}
 }
 
-func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.ResumeLaunchParams) error {
+func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.ResumeLaunchParams) (retErr error) {
 	taskDirPath := filepath.Join(taskPlacementRoot, params.TaskID.String())
 	expectedOutputPath := filepath.Join(taskDirPath, "last-message.md")
 	if !filepath.IsAbs(params.CodexBinaryPath) || params.OutputLastMessagePath != expectedOutputPath {
@@ -153,72 +149,91 @@ func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.Resu
 		return err
 	}
 	waiter := newResumeProcessWaiter(cmd)
-	waitResult := make(chan resumeWaitOutcome, 1)
-	go func() {
-		exitCode, waitErr := waiter.Wait()
-		waitResult <- resumeWaitOutcome{exitCode: exitCode, err: waitErr}
-	}()
-	select {
-	case outcome := <-waitResult:
-		if outcome.err != nil {
-			l.logStderr(params, outcome.err, &stderr)
-			return outcome.err
-		}
-		if outcome.exitCode != 0 {
-			l.logStderr(params, fmt.Errorf("resume process exited with code %d", outcome.exitCode), &stderr)
-		}
-		return nil
-	case <-ctx.Done():
-		return l.finishContextCancellation(ctx, cmd, waitResult, &stderr, params)
+	watcher, err := l.newExitWatcher(cmd.Process.Pid)
+	if err != nil {
+		retErr = l.finishWatcherFailure(cmd.Process.Pid, waiter, err, false, nil)
+		l.logStderr(params, retErr, &stderr)
+		return retErr
 	}
+	defer func() { retErr = errors.Join(retErr, watcher.Close()) }()
+
+	if watchErr := watcher.Wait(ctx); watchErr == nil {
+		retErr = l.finishResumeWait(params, nil, waiter, &stderr)
+		return retErr
+	} else if ctx.Err() == nil || !errors.Is(watchErr, ctx.Err()) {
+		retErr = l.finishWatcherFailure(cmd.Process.Pid, waiter, watchErr, false, nil)
+		l.logStderr(params, retErr, &stderr)
+		return retErr
+	}
+
+	retErr = l.finishContextCancellation(ctx, cmd.Process.Pid, watcher, waiter, &stderr, params)
+	return retErr
 }
 
-func (l *resumeLauncher) finishContextCancellation(ctx context.Context, cmd *exec.Cmd, waitResult <-chan resumeWaitOutcome, stderr *limitedWriter, params recovery.ResumeLaunchParams) error {
-	// Prefer an already completed wait result so signals are not sent to a reaped PID.
-	select {
-	case outcome := <-waitResult:
-		return l.finishCanceledResumeWait(params, ctx.Err(), outcome, nil, nil, stderr)
-	default:
+func (l *resumeLauncher) finishContextCancellation(ctx context.Context, pid int, watcher proc.ExitWatcher, waiter ProcessWaiter, stderr *limitedWriter, params recovery.ResumeLaunchParams) error {
+	ctxErr := ctx.Err()
+	terminateErr := l.runner.SendTerminate(pid)
+	graceCtx, cancel := context.WithTimeout(context.Background(), l.killGrace)
+	watchErr := watcher.Wait(graceCtx)
+	cancel()
+	if watchErr == nil {
+		return l.finishResumeWait(params, errors.Join(ctxErr, terminateErr), waiter, stderr)
+	}
+	if !errors.Is(watchErr, context.DeadlineExceeded) {
+		return l.finishWatcherFailure(pid, waiter, errors.Join(ctxErr, terminateErr, watchErr), false, nil)
 	}
 
-	terminateErr := l.runner.SendTerminate(cmd.Process.Pid)
-	timer := time.NewTimer(l.killGrace)
-	defer timer.Stop()
-	select {
-	case outcome := <-waitResult:
-		return l.finishCanceledResumeWait(params, ctx.Err(), outcome, terminateErr, nil, stderr)
-	case <-timer.C:
+	killErr := l.runner.SendKill(pid)
+	graceCtx, cancel = context.WithTimeout(context.Background(), l.killGrace)
+	watchErr = watcher.Wait(graceCtx)
+	cancel()
+	if watchErr == nil {
+		return l.finishResumeWait(params, errors.Join(ctxErr, terminateErr, killErr), waiter, stderr)
 	}
-
-	// A result may have arrived concurrently with the grace timer firing.
-	select {
-	case outcome := <-waitResult:
-		return l.finishCanceledResumeWait(params, ctx.Err(), outcome, terminateErr, nil, stderr)
-	default:
+	if errors.Is(watchErr, context.DeadlineExceeded) {
+		err := errors.Join(ctxErr, terminateErr, killErr, errors.New("resume process was not reaped after SIGKILL"))
+		l.logStderr(params, err, stderr)
+		return err
 	}
-
-	killErr := l.runner.SendKill(cmd.Process.Pid)
-	reapTimer := time.NewTimer(l.killGrace)
-	defer reapTimer.Stop()
-	select {
-	case outcome := <-waitResult:
-		return l.finishCanceledResumeWait(params, ctx.Err(), outcome, terminateErr, killErr, stderr)
-	case <-reapTimer.C:
-		return l.finishCanceledResumeWait(
-			params,
-			ctx.Err(),
-			resumeWaitOutcome{err: errors.New("resume process was not reaped after SIGKILL")},
-			terminateErr,
-			killErr,
-			stderr,
-		)
-	}
+	return l.finishWatcherFailure(pid, waiter, errors.Join(ctxErr, terminateErr, killErr, watchErr), true, killErr)
 }
 
-func (l *resumeLauncher) finishCanceledResumeWait(params recovery.ResumeLaunchParams, ctxErr error, outcome resumeWaitOutcome, terminateErr, killErr error, stderr *limitedWriter) error {
-	err := errors.Join(ctxErr, terminateErr, killErr, outcome.err)
-	l.logStderr(params, err, stderr)
-	return err
+func (l *resumeLauncher) finishWatcherFailure(pid int, waiter ProcessWaiter, watchErr error, killAttempted bool, killErr error) (retErr error) {
+	replacement, rewatchErr := l.newExitWatcher(pid)
+	if rewatchErr != nil {
+		if !killAttempted {
+			killErr = l.runner.SendKill(pid)
+		}
+		return errors.Join(watchErr, rewatchErr, killErr)
+	}
+	defer func() { retErr = errors.Join(retErr, replacement.Close()) }()
+
+	if !killAttempted {
+		killErr = l.runner.SendKill(pid)
+	}
+	if killErr != nil {
+		return errors.Join(watchErr, killErr)
+	}
+	graceCtx, cancel := context.WithTimeout(context.Background(), l.killGrace)
+	defer cancel()
+	if exitErr := replacement.Wait(graceCtx); exitErr != nil {
+		return errors.Join(watchErr, exitErr)
+	}
+	_, waitErr := waiter.Wait()
+	return errors.Join(watchErr, waitErr)
+}
+
+func (l *resumeLauncher) finishResumeWait(params recovery.ResumeLaunchParams, priorErr error, waiter ProcessWaiter, stderr *limitedWriter) error {
+	exitCode, waitErr := waiter.Wait()
+	err := errors.Join(priorErr, waitErr)
+	if err != nil {
+		l.logStderr(params, err, stderr)
+		return err
+	}
+	if exitCode != 0 {
+		l.logStderr(params, fmt.Errorf("resume process exited with code %d", exitCode), stderr)
+	}
+	return nil
 }
 
 func (l *resumeLauncher) logStderr(params recovery.ResumeLaunchParams, err error, stderr *limitedWriter) {

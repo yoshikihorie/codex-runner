@@ -27,6 +27,11 @@ type exitCodeWriterFake struct {
 	err    error
 }
 
+type exitCodeMismatchExpectation struct {
+	existing  int
+	attempted int
+}
+
 func (*exitCodeWriterFake) WritePrompt(domain.TaskID, []byte) error         { return nil }
 func (*exitCodeWriterFake) WriteReviewInput(domain.TaskID, []byte) error    { return nil }
 func (*exitCodeWriterFake) WriteCombinedPrompt(domain.TaskID, []byte) error { return nil }
@@ -63,14 +68,15 @@ func TestWriteExitCodeIdempotently(t *testing.T) {
 		wantWriteErr            bool
 		wantFatal               bool
 		wantContractWriteFailed bool
+		wantMismatch            *exitCodeMismatchExpectation
 	}{
-		{"missing writes once", exitCodeReaderFake{}, nil, 0, 1, false, false, false},
-		{"same value skips write", exitCodeReaderFake{existing: 0, exists: true}, nil, 0, 0, false, false, false},
-		{"mismatch fails closed", exitCodeReaderFake{existing: 1, exists: true}, nil, 0, 0, false, true, true},
-		{"read failure fails closed", exitCodeReaderFake{err: errors.New("read")}, nil, 0, 0, false, true, true},
-		{"write failure is returned separately", exitCodeReaderFake{}, writeFailure, 0, 1, true, false, false},
-		{"requested nonzero value is written", exitCodeReaderFake{}, nil, 137, 1, false, false, false},
-		{"same nonzero value skips write", exitCodeReaderFake{existing: 137, exists: true}, nil, 137, 0, false, false, false},
+		{"missing writes once", exitCodeReaderFake{}, nil, 0, 1, false, false, false, nil},
+		{"same value skips write", exitCodeReaderFake{existing: 0, exists: true}, nil, 0, 0, false, false, false, nil},
+		{"mismatch fails closed", exitCodeReaderFake{existing: 1, exists: true}, nil, 0, 0, false, true, true, &exitCodeMismatchExpectation{existing: 1, attempted: 0}},
+		{"read failure fails closed", exitCodeReaderFake{err: errors.New("read")}, nil, 0, 0, false, true, true, nil},
+		{"write failure is returned separately", exitCodeReaderFake{}, writeFailure, 0, 1, true, false, false, nil},
+		{"requested nonzero value is written", exitCodeReaderFake{}, nil, 137, 1, false, false, false, nil},
+		{"same nonzero value skips write", exitCodeReaderFake{existing: 137, exists: true}, nil, 137, 0, false, false, false, nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reader := tc.reader
@@ -91,11 +97,13 @@ func TestWriteExitCodeIdempotently(t *testing.T) {
 			if errors.Is(fatalErr, domain.ErrContractWriteFailed) != tc.wantContractWriteFailed {
 				t.Fatalf("fatalErr=%v", fatalErr)
 			}
-			if tc.name == "mismatch fails closed" {
-				existing, attempted, ok := ExitCodeMismatch(fatalErr)
-				if !ok || existing != 1 || attempted != 0 {
-					t.Fatalf("mismatch=(%d,%d,%t)", existing, attempted, ok)
+			existing, attempted, ok := ExitCodeMismatch(fatalErr)
+			if tc.wantMismatch == nil {
+				if ok {
+					t.Fatalf("mismatch=(%d,%d,%t), want none", existing, attempted, ok)
 				}
+			} else if !ok || existing != tc.wantMismatch.existing || attempted != tc.wantMismatch.attempted {
+				t.Fatalf("mismatch=(%d,%d,%t), want=(%d,%d,true)", existing, attempted, ok, tc.wantMismatch.existing, tc.wantMismatch.attempted)
 			}
 		})
 	}

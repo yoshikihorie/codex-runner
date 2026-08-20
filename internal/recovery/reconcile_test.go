@@ -9,7 +9,9 @@ import (
 	"go/parser"
 	"go/token"
 	"log/slog"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -930,6 +932,15 @@ func TestReconcilePendingTimeoutDispatchRemovesPendingAfterResumeSucceeds(t *tes
 	uc, pending, tasks, _, _, _, _, pathLocks, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
 	id := adoptionID(t, "reconcile-"+string(domain.StateTimeout))
 	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
+	_, testPath, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("caller path unavailable")
+	}
+	sourcePath, err := filepath.Abs(filepath.Join(filepath.Dir(testPath), "reconcile.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertNoUnconditionalPendingRemovalBeforeDispatch(t, sourcePath, "completeTerminated")
 
 	uc.completeTerminated(context.Background(), id, tasks.entries[id], true, time.Now())
 	waitForPendingRemoval(t, pending)
@@ -985,6 +996,35 @@ func TestReconcileResumeRecoveryResolvesClaimPerOutcome(t *testing.T) {
 				t.Fatalf("state=%v, want %v", entries[0].state, tc.wantState)
 			}
 		})
+	}
+}
+
+func TestReconcilePendingSendConfirmErrorRetainsSentEntry(t *testing.T) {
+	uc, pending, tasks, _, _, termination, _, _, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
+	id := adoptionID(t, "reconcile-"+string(domain.StateTimeout))
+	snapshot := tasks.entries[id]
+	registerReconcilePending(t, pending, snapshot, PendingSendUnsent)
+	authority, ok := processSignalAuthority(snapshot)
+	if !ok {
+		t.Fatal("fixture requires process signal authority")
+	}
+	claim, outcome := pending.ClaimForSend(id, authority)
+	if outcome != ClaimAcquired {
+		t.Fatalf("initial outcome=%v", outcome)
+	}
+	termination.sendDead = false
+	termination.terminateErr = nil
+	termination.confirmErr = errors.New("confirm failed")
+	close(termination.release)
+
+	uc.sendAndReconcile(context.Background(), claim, snapshot, true)
+
+	entries := pending.List()
+	if len(entries) != 1 || entries[0].state != pendingSent {
+		t.Fatalf("pending=%+v, want one sent entry", entries)
+	}
+	if _, outcome := pending.ClaimForSend(id, authority); outcome != ClaimSent {
+		t.Fatalf("outcome=%v, want %v", outcome, ClaimSent)
 	}
 }
 
@@ -1046,7 +1086,12 @@ func isPendingRemoveCall(expression ast.Expr) bool {
 		return false
 	}
 	selector, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok || selector.Sel.Name != "Remove" {
+	if !ok {
+		return false
+	}
+	switch selector.Sel.Name {
+	case "Remove", "RemoveClaim":
+	default:
 		return false
 	}
 	pending, ok := selector.X.(*ast.SelectorExpr)

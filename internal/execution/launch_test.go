@@ -814,85 +814,82 @@ func (f *resumeSignalRunnerFake) SendKill(pid int) error {
 	return f.killErr
 }
 
-func TestResumeLauncherCancellationPrefersAlreadyCompletedWait(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	waitResult := make(chan resumeWaitOutcome, 1)
-	waitResult <- resumeWaitOutcome{err: errors.New("wait failed")}
-	runner := &resumeSignalRunnerFake{}
-	launcher := &resumeLauncher{runner: runner, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), killGrace: time.Millisecond}
-	err := launcher.finishContextCancellation(ctx, &exec.Cmd{Process: &os.Process{Pid: 4321}}, waitResult, &limitedWriter{limit: resumeStderrBufferMaxBytes}, recovery.ResumeLaunchParams{TaskID: launchTestID(t)})
-	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "wait failed") {
-		t.Fatalf("error = %v, want joined cancellation and wait error", err)
-	}
-	if len(runner.terminatePIDs) != 0 || len(runner.killPIDs) != 0 {
-		t.Fatal("signals were sent after a completed wait result")
-	}
+type resumeExitWatcherFake struct {
+	waitErrs   []error
+	waitCalls  int
+	closeCalls int
+	closeErr   error
 }
 
-func TestResumeLauncherCancellationSkipsKillWhenTerminateCompletesWait(t *testing.T) {
+func (f *resumeExitWatcherFake) Wait(context.Context) error {
+	f.waitCalls++
+	if len(f.waitErrs) == 0 {
+		return nil
+	}
+	err := f.waitErrs[0]
+	f.waitErrs = f.waitErrs[1:]
+	return err
+}
+
+func (f *resumeExitWatcherFake) Close() error {
+	f.closeCalls++
+	return f.closeErr
+}
+
+type resumeWaiterFake struct {
+	calls int
+	code  int
+	err   error
+}
+
+func (f *resumeWaiterFake) Wait() (int, error) {
+	f.calls++
+	return f.code, f.err
+}
+
+func TestResumeLauncherCancellationWaitsOnlyAfterExitNotification(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	waitResult := make(chan resumeWaitOutcome, 1)
 	runner := &resumeSignalRunnerFake{}
-	runner.onTerminate = func() { waitResult <- resumeWaitOutcome{} }
+	watcher := &resumeExitWatcherFake{waitErrs: []error{context.DeadlineExceeded, nil}}
+	waiter := &resumeWaiterFake{}
 	launcher := &resumeLauncher{runner: runner, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), killGrace: time.Millisecond}
-	err := launcher.finishContextCancellation(ctx, &exec.Cmd{Process: &os.Process{Pid: 4321}}, waitResult, &limitedWriter{limit: resumeStderrBufferMaxBytes}, recovery.ResumeLaunchParams{TaskID: launchTestID(t)})
+	err := launcher.finishContextCancellation(ctx, 4321, watcher, waiter, &limitedWriter{limit: resumeStderrBufferMaxBytes}, recovery.ResumeLaunchParams{TaskID: launchTestID(t)})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
 	}
-	if !slices.Equal(runner.terminatePIDs, []int{4321}) || len(runner.killPIDs) != 0 {
-		t.Fatalf("terminate pids = %v, kill pids = %v", runner.terminatePIDs, runner.killPIDs)
+	if waiter.calls != 1 || !slices.Equal(runner.terminatePIDs, []int{4321}) || !slices.Equal(runner.killPIDs, []int{4321}) {
+		t.Fatalf("wait=%d terminate=%v kill=%v", waiter.calls, runner.terminatePIDs, runner.killPIDs)
 	}
 }
 
-func TestResumeLauncherCancellationKillsOnlyAfterGraceAndWaits(t *testing.T) {
+func TestResumeLauncherCancellationDoesNotReapAfterSecondGraceTimeout(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	waitResult := make(chan resumeWaitOutcome, 1)
-	terminateErr := errors.New("terminate failed")
-	waitErr := errors.New("wait failed")
-	runner := &resumeSignalRunnerFake{terminateErr: terminateErr}
-	runner.onKill = func() { waitResult <- resumeWaitOutcome{err: waitErr} }
-	launcher := &resumeLauncher{runner: runner, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), killGrace: time.Millisecond}
-	err := launcher.finishContextCancellation(ctx, &exec.Cmd{Process: &os.Process{Pid: 4321}}, waitResult, &limitedWriter{limit: resumeStderrBufferMaxBytes}, recovery.ResumeLaunchParams{TaskID: launchTestID(t)})
-	if !errors.Is(err, context.Canceled) || !errors.Is(err, terminateErr) || !errors.Is(err, waitErr) {
-		t.Fatalf("error = %v, want cancellation, terminate, and wait errors", err)
-	}
-	if !slices.Equal(runner.terminatePIDs, []int{4321}) || !slices.Equal(runner.killPIDs, []int{4321}) {
-		t.Fatalf("terminate pids = %v, kill pids = %v", runner.terminatePIDs, runner.killPIDs)
-	}
-}
-
-func TestResumeLauncherCancellationWaitsForCompletionWhenKillFails(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	waitResult := make(chan resumeWaitOutcome, 1)
-	killErr := errors.New("kill failed")
-	runner := &resumeSignalRunnerFake{killErr: killErr}
-	waitErr := errors.New("wait failed")
-	runner.onKill = func() { waitResult <- resumeWaitOutcome{err: waitErr} }
-	launcher := &resumeLauncher{runner: runner, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), killGrace: time.Millisecond}
-	err := launcher.finishContextCancellation(ctx, &exec.Cmd{Process: &os.Process{Pid: 4321}}, waitResult, &limitedWriter{limit: resumeStderrBufferMaxBytes}, recovery.ResumeLaunchParams{TaskID: launchTestID(t)})
-	if !errors.Is(err, context.Canceled) || !errors.Is(err, killErr) || !errors.Is(err, waitErr) {
-		t.Fatalf("error = %v, want cancellation, kill, and wait errors", err)
-	}
-	if !slices.Equal(runner.terminatePIDs, []int{4321}) || !slices.Equal(runner.killPIDs, []int{4321}) {
-		t.Fatalf("terminate pids = %v, kill pids = %v", runner.terminatePIDs, runner.killPIDs)
-	}
-}
-
-func TestResumeLauncherCancellationReturnsReapTimeoutAfterKill(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	waitResult := make(chan resumeWaitOutcome)
 	runner := &resumeSignalRunnerFake{}
+	watcher := &resumeExitWatcherFake{waitErrs: []error{context.DeadlineExceeded, context.DeadlineExceeded}}
+	waiter := &resumeWaiterFake{}
 	launcher := &resumeLauncher{runner: runner, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), killGrace: time.Millisecond}
-	err := launcher.finishContextCancellation(ctx, &exec.Cmd{Process: &os.Process{Pid: 4321}}, waitResult, &limitedWriter{limit: resumeStderrBufferMaxBytes}, recovery.ResumeLaunchParams{TaskID: launchTestID(t)})
+	err := launcher.finishContextCancellation(ctx, 4321, watcher, waiter, &limitedWriter{limit: resumeStderrBufferMaxBytes}, recovery.ResumeLaunchParams{TaskID: launchTestID(t)})
 	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "resume process was not reaped after SIGKILL") {
-		t.Fatalf("error = %v, want cancellation and reap timeout", err)
+		t.Fatalf("error = %v", err)
 	}
-	if !slices.Equal(runner.terminatePIDs, []int{4321}) || !slices.Equal(runner.killPIDs, []int{4321}) {
-		t.Fatalf("terminate pids = %v, kill pids = %v", runner.terminatePIDs, runner.killPIDs)
+	if waiter.calls != 0 {
+		t.Fatalf("Wait calls = %d, want 0", waiter.calls)
+	}
+}
+
+func TestResumeLauncherWatcherFailureRewatchesBeforeReaping(t *testing.T) {
+	watchErr := errors.New("watch failed")
+	replacement := &resumeExitWatcherFake{}
+	runner := &resumeSignalRunnerFake{}
+	waiter := &resumeWaiterFake{}
+	launcher := &resumeLauncher{
+		runner: runner, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), killGrace: time.Millisecond,
+		newExitWatcher: func(int) (proc.ExitWatcher, error) { return replacement, nil },
+	}
+	err := launcher.finishWatcherFailure(4321, waiter, watchErr, false, nil)
+	if !errors.Is(err, watchErr) || waiter.calls != 1 || !slices.Equal(runner.killPIDs, []int{4321}) || replacement.closeCalls != 1 {
+		t.Fatalf("error=%v wait=%d kill=%v close=%d", err, waiter.calls, runner.killPIDs, replacement.closeCalls)
 	}
 }
