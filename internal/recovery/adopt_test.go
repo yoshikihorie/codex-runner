@@ -82,7 +82,10 @@ type adoptionStoreFake struct {
 	saveErr     error
 	saveErrs    []error
 	saved       *domain.TaskSnapshot
+	savedAll    []domain.TaskSnapshot
 	order       *[]string
+	onLoad      func(domain.TaskID)
+	onSave      func(domain.TaskID)
 }
 
 type adoptionLoadResult struct {
@@ -94,6 +97,9 @@ func (f *adoptionStoreFake) ListByStates([]domain.TaskState) ([]domain.TaskSnaps
 	return f.listed, f.listErr
 }
 func (f *adoptionStoreFake) Load(id domain.TaskID) (domain.TaskSnapshot, error) {
+	if f.onLoad != nil {
+		f.onLoad(id)
+	}
 	if results := f.loadResults[id]; len(results) > 0 {
 		result := results[0]
 		f.loadResults[id] = results[1:]
@@ -105,8 +111,12 @@ func (f *adoptionStoreFake) Load(id domain.TaskID) (domain.TaskSnapshot, error) 
 	return f.entries[id], nil
 }
 func (f *adoptionStoreFake) Save(id domain.TaskID, s domain.TaskSnapshot) error {
+	if f.onSave != nil {
+		f.onSave(id)
+	}
 	f.saves++
 	f.saved = &s
+	f.savedAll = append(f.savedAll, s)
 	if f.order != nil {
 		*f.order = append(*f.order, "save")
 	}
@@ -170,6 +180,7 @@ type adoptionWriterFake struct {
 	appendErr        error
 	exitCode         *domain.ExitCode
 	adoptedMarkers   int
+	adoptedMarkerAt  []time.Time
 	recoveredMarkers int
 	exitCodes        int
 	adoptedErr       error
@@ -204,8 +215,9 @@ func (f *adoptionWriterFake) WriteRecoveredMarker(domain.TaskID, time.Time) erro
 	}
 	return f.recoveredErr
 }
-func (f *adoptionWriterFake) WriteAdoptedMarker(domain.TaskID, time.Time) error {
+func (f *adoptionWriterFake) WriteAdoptedMarker(_ domain.TaskID, at time.Time) error {
 	f.adoptedMarkers++
+	f.adoptedMarkerAt = append(f.adoptedMarkerAt, at)
 	if f.order != nil {
 		*f.order = append(*f.order, "adopted-marker")
 	}
@@ -288,12 +300,17 @@ func (f *adoptionTerminationFake) SendAndConfirm(_ context.Context, _ domain.Tas
 }
 
 func TestAdoptionTerminationAuthorityUsesStateAndNilGeneration(t *testing.T) {
-	started := time.Date(2026, time.August, 18, 12, 0, 0, 0, time.UTC)
-	authority := ProcessSignalAuthority{TaskID: adoptionID(t, "authority"), PID: 4321, ProcessStartedAt: started, ExpectedState: domain.StateTimeout}
-	termination := &adoptionTerminationFake{}
-	termination.SendAndConfirm(context.Background(), authority.TaskID, authority, time.Second)
-	if len(termination.authorities) != 1 || termination.authorities[0].LifecycleGeneration != nil || termination.authorities[0].ExpectedState != domain.StateTimeout {
-		t.Fatalf("authorities=%#v", termination.authorities)
+	id := adoptionID(t, "authority")
+	snapshot := adoptionSnapshot(t, id, domain.StateTimeout)
+
+	authority, ok := processSignalAuthority(snapshot)
+	if !ok {
+		t.Fatal("processSignalAuthority returned false")
+	}
+	if authority.TaskID != id || authority.PID != *snapshot.PID ||
+		!authority.ProcessStartedAt.Equal(*snapshot.ProcessStartedAt) ||
+		authority.ExpectedState != domain.StateTimeout || authority.LifecycleGeneration != nil {
+		t.Fatalf("authority=%+v", authority)
 	}
 }
 
@@ -534,13 +551,13 @@ func TestAdoptTimeoutRecoveryReadsClockAfterPathLockRelease(t *testing.T) {
 		}
 	}}
 	resume, _, _, _, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, nil, RecoveryResult{})
-	uc := NewAdoptRunningTasksUseCase(&adoptionStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}, &adoptionLivenessFake{dead: map[domain.TaskID]bool{id: true}}, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, resume, &adoptionSlotsFake{}, &adoptionSlotsFake{}, &adoptionTerminationFake{}, &adoptionKilledFake{}, pathLocks, &PendingReconciliationSet{}, &adoptionMutexFake{}, clock, &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, slog.Default())
+	uc := NewAdoptRunningTasksUseCase(&adoptionStoreFake{listed: []domain.TaskSnapshot{snapshot}, entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}, &adoptionLivenessFake{dead: map[domain.TaskID]bool{id: true}}, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, resume, &adoptionSlotsFake{}, &adoptionSlotsFake{}, &adoptionTerminationFake{}, &adoptionKilledFake{}, pathLocks, &PendingReconciliationSet{}, &adoptionMutexFake{}, clock, &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, slog.Default())
 
-	if got := uc.adoptOne(context.Background(), id, snapshot); got != adoptionOutcomeOrphanRecoveryStarted {
-		t.Fatalf("outcome=%q", got)
+	if out, err := uc.Execute(context.Background()); err != nil || len(out.Outcomes) != 1 || out.Outcomes[0].Outcome != adoptionOutcomeOrphanRecoveryStarted {
+		t.Fatalf("out=(%+v,%v)", out, err)
 	}
-	if pathLocks.calls != 1 || clockCalls != 2 {
-		t.Fatalf("path lock calls=%d clock calls=%d, want 1 and 2", pathLocks.calls, clockCalls)
+	if pathLocks.calls != 1 || clockCalls != 3 {
+		t.Fatalf("path lock calls=%d clock calls=%d, want 1 and 3", pathLocks.calls, clockCalls)
 	}
 }
 
@@ -569,11 +586,11 @@ func TestAdoptOrphanRecoveryUsesRecoveryDispatchTime(t *testing.T) {
 			dispatcher := &adoptionOrphanResumeDispatcherFake{execute: true}
 			uc := NewAdoptRunningTasksUseCase(&adoptionStoreFake{listed: []domain.TaskSnapshot{snapshot}, entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}, &adoptionLivenessFake{dead: map[domain.TaskID]bool{id: true}, err: map[domain.TaskID]error{}}, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, resume, &adoptionSlotsFake{}, &adoptionSlotsFake{}, &adoptionTerminationFake{}, &adoptionKilledFake{}, &adoptionPathLocksFake{}, &PendingReconciliationSet{}, &adoptionMutexFake{}, clock, &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, slog.Default(), orphanResumeDispatcherOption{dispatcher: dispatcher})
 
-			if got := uc.adoptOne(context.Background(), id, snapshot); got != adoptionOutcomeOrphanRecoveryStarted {
-				t.Fatalf("outcome=%q", got)
+			if out, err := uc.Execute(context.Background()); err != nil || len(out.Outcomes) != 1 || out.Outcomes[0].Outcome != adoptionOutcomeOrphanRecoveryStarted {
+				t.Fatalf("out=(%+v,%v)", out, err)
 			}
 			attempted := recoveryEvent[domain.RecoveryAttempted](t, writer.events)
-			if dispatcher.calls != 1 || clockCalls != 2 || !attempted.OccurredAt.Equal(dispatchAt) {
+			if dispatcher.calls != 1 || clockCalls != 3 || !attempted.OccurredAt.Equal(dispatchAt) {
 				t.Fatalf("dispatches=%d clock calls=%d attempted=%+v", dispatcher.calls, clockCalls, attempted)
 			}
 		})
@@ -626,7 +643,7 @@ func TestRecoverOrphanWithoutResumeRemainsError(t *testing.T) {
 			var logs bytes.Buffer
 			uc := newOrphanAdoptionUseCase(t, &adoptionStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{}}, &adoptionLivenessFake{dead: map[domain.TaskID]bool{}, err: map[domain.TaskID]error{}}, reader, finalizer, dispatcher, &adoptionStalledTrackerFake{}, slog.New(slog.NewTextHandler(&logs, nil)))
 			uc.resume = nil
-			if got := uc.recoverOrphan(context.Background(), id, nil, time.Now()); got != adoptionOutcomeError {
+			if got, completed := uc.recoverOrphan(context.Background(), id, nil, time.Now()); !completed || got != adoptionOutcomeError {
 				t.Fatalf("outcome=%q", got)
 			}
 			if reader.calls != 1 || finalizer.calls != 0 || dispatcher.calls != 0 || !strings.Contains(logs.String(), "resume recovery for adopted orphan is unavailable") || strings.Count(logs.String(), "level=ERROR") != 1 {
@@ -1169,17 +1186,15 @@ func TestAdoptRunningTasksRegistersCanonicalPendingDispositions(t *testing.T) {
 	for _, tc := range []struct {
 		name             string
 		state            domain.TaskState
-		dead             bool
-		readerErr        error
 		withoutAuthority bool
 		wantDisposition  PendingSendDisposition
 	}{
-		{"recovering", domain.StateRecovering, false, nil, false, PendingSendConfirmOnly},
-		{"orphaned read error", domain.StateOrphaned, true, errors.New("read"), false, PendingSendConfirmOnly},
-		{"timeout", domain.StateTimeout, false, nil, false, PendingSendUnsent},
-		{"cancelling", domain.StateCancelling, false, nil, false, PendingSendUnsent},
-		{"timeout without process pair", domain.StateTimeout, false, nil, true, PendingSendConfirmOnly},
-		{"cancelling without process pair", domain.StateCancelling, false, nil, true, PendingSendConfirmOnly},
+		{"recovering", domain.StateRecovering, false, PendingSendConfirmOnly},
+		{"orphaned", domain.StateOrphaned, false, PendingSendConfirmOnly},
+		{"timeout", domain.StateTimeout, false, PendingSendUnsent},
+		{"cancelling", domain.StateCancelling, false, PendingSendUnsent},
+		{"timeout without process pair", domain.StateTimeout, true, PendingSendConfirmOnly},
+		{"cancelling without process pair", domain.StateCancelling, true, PendingSendConfirmOnly},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			id := adoptionID(t, "pending-"+tc.name[:1])
@@ -1188,11 +1203,9 @@ func TestAdoptRunningTasksRegistersCanonicalPendingDispositions(t *testing.T) {
 				snapshot.PID = nil
 				snapshot.ProcessStartedAt = nil
 			}
-			tasks := &adoptionStoreFake{listed: []domain.TaskSnapshot{snapshot}, entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}
 			pending := &PendingReconciliationSet{}
-			uc := NewAdoptRunningTasksUseCase(tasks, &adoptionLivenessFake{dead: map[domain.TaskID]bool{id: tc.dead}, err: map[domain.TaskID]error{}}, &adoptionReaderFake{err: tc.readerErr}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), &adoptionSlotsFake{}, &adoptionSlotsFake{}, &adoptionTerminationFake{}, &adoptionKilledFake{}, &adoptionPathLocksFake{}, pending, &adoptionMutexFake{}, domain.ClockFunc(time.Now), &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, slog.Default())
-			_, err := uc.Execute(context.Background())
-			if err != nil {
+			disposition, authority := pendingRegistration(snapshot)
+			if err := pending.Register(id, disposition, authority); err != nil {
 				t.Fatal(err)
 			}
 			entries := pending.List()
@@ -1375,8 +1388,82 @@ func TestAdoptRunningTasksCancellationStopsBeforeNextTask(t *testing.T) {
 
 	out, err := newAdoptionUseCase(tasks, liveness, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), slots, &adoptionMutexFake{}).Execute(ctx)
 
-	if err != nil || len(out.Outcomes) != 1 || out.Outcomes[0].TaskID != first || out.Outcomes[0].Outcome != adoptionOutcomeResumedMonitoring || liveness.calls != 1 || len(slots.resets) != 1 || !reflect.DeepEqual(slots.resets[0], []domain.TaskID{first, second}) || out.ElapsedMillis < 0 {
+	if err != nil || len(out.Outcomes) != 0 || liveness.calls != 1 || len(slots.resets) != 1 || !reflect.DeepEqual(slots.resets[0], []domain.TaskID{first, second}) || out.ElapsedMillis < 0 {
 		t.Fatalf("out=(%+v,%v) liveness=%d resets=%v", out, err, liveness.calls, slots.resets)
+	}
+}
+
+func TestAdoptRunningTasksShutdownAfterLoadStopsCurrentTask(t *testing.T) {
+	id := adoptionID(t, "cancel-load")
+	snapshot := adoptionSnapshot(t, id, domain.StateRunning)
+	ctx, cancel := context.WithCancel(context.Background())
+	tasks := &adoptionStoreFake{listed: []domain.TaskSnapshot{snapshot}, entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}, onLoad: func(domain.TaskID) { cancel() }}
+	liveness := &adoptionLivenessFake{dead: map[domain.TaskID]bool{}, err: map[domain.TaskID]error{}}
+	writer := &adoptionWriterFake{}
+	mutex := &adoptionMutexFake{}
+	out, err := newAdoptionUseCase(tasks, liveness, &adoptionReaderFake{}, writer, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), &adoptionSlotsFake{}, mutex).Execute(ctx)
+	if err != nil || len(out.Outcomes) != 0 || liveness.calls != 0 || tasks.saves != 0 || writer.adoptedMarkers != 0 || len(writer.events) != 0 || mutex.held {
+		t.Fatalf("out=(%+v,%v) liveness=%d saves=%d markers=%d events=%d held=%v", out, err, liveness.calls, tasks.saves, writer.adoptedMarkers, len(writer.events), mutex.held)
+	}
+}
+
+func TestAdoptRunningTasksUsesSingleAdoptionObservedAt(t *testing.T) {
+	first, second := adoptionID(t, "observed-first"), adoptionID(t, "observed-second")
+	one, two := adoptionSnapshot(t, first, domain.StateRunning), adoptionSnapshot(t, second, domain.StateRunning)
+	observedAt := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+	later := observedAt.Add(time.Hour)
+	clockCalls := 0
+	clock := domain.ClockFunc(func() time.Time {
+		clockCalls++
+		if clockCalls == 1 {
+			return observedAt
+		}
+		return later
+	})
+	tasks := &adoptionStoreFake{listed: []domain.TaskSnapshot{one, two}, entries: map[domain.TaskID]domain.TaskSnapshot{first: one, second: two}}
+	writer := &adoptionWriterFake{}
+	uc := NewAdoptRunningTasksUseCase(tasks, &adoptionLivenessFake{dead: map[domain.TaskID]bool{}, err: map[domain.TaskID]error{}}, &adoptionReaderFake{}, writer, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), &adoptionSlotsFake{}, &adoptionSlotsFake{}, &adoptionTerminationFake{}, &adoptionKilledFake{}, &adoptionPathLocksFake{}, &PendingReconciliationSet{}, &adoptionMutexFake{}, clock, &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, slog.Default())
+	out, err := uc.Execute(context.Background())
+	if err != nil || len(out.Outcomes) != 2 || len(tasks.savedAll) != 2 || len(writer.adoptedMarkerAt) != 2 {
+		t.Fatalf("out=(%+v,%v) saves=%d markers=%v", out, err, len(tasks.savedAll), writer.adoptedMarkerAt)
+	}
+	for _, saved := range tasks.savedAll {
+		if !saved.StateUpdatedAt.Equal(observedAt) {
+			t.Fatalf("saved state update=%s want %s", saved.StateUpdatedAt, observedAt)
+		}
+	}
+	for _, at := range writer.adoptedMarkerAt {
+		if !at.Equal(observedAt) {
+			t.Fatalf("marker=%s want %s", at, observedAt)
+		}
+	}
+}
+
+func TestAdoptUnconfirmedTerminationWarns(t *testing.T) {
+	id := adoptionID(t, "unconfirmed-warning")
+	snapshot := adoptionSnapshot(t, id, domain.StateTimeout)
+	authority, ok := processSignalAuthority(snapshot)
+	if !ok {
+		t.Fatal("fixture requires authority")
+	}
+	pending := &PendingReconciliationSet{}
+	if err := pending.Register(id, PendingSendUnsent, &authority); err != nil {
+		t.Fatal(err)
+	}
+	claim, outcome := pending.ClaimForSend(id, authority)
+	if outcome != ClaimAcquired {
+		t.Fatalf("claim outcome=%v", outcome)
+	}
+	var logs bytes.Buffer
+	uc := NewAdoptRunningTasksUseCase(&adoptionStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}, &adoptionLivenessFake{}, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), &adoptionSlotsFake{}, &adoptionSlotsFake{}, &adoptionTerminationFake{}, &adoptionKilledFake{}, &adoptionPathLocksFake{}, pending, &adoptionMutexFake{}, domain.ClockFunc(time.Now), &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, slog.New(slog.NewTextHandler(&logs, nil)))
+	confirmErr := errors.New("confirm failed")
+	uc.handleUnconfirmedTermination(id, claim, TerminationAttemptResult{ConfirmErr: confirmErr})
+	if strings.Count(logs.String(), "adopted task termination remains unconfirmed") != 1 || !strings.Contains(logs.String(), "confirm failed") {
+		t.Fatalf("logs=%q", logs.String())
+	}
+	entries := pending.List()
+	if len(entries) != 1 || pendingDisposition(entries[0]) != PendingSendSent {
+		t.Fatalf("pending=%+v", entries)
 	}
 }
 
@@ -1454,12 +1541,16 @@ func TestAdoptRunningTasksStalledTrackerPreSaveFailures(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			id := adoptionID(t, "pre-save-"+tc.slug)
 			snapshot := adoptionSnapshot(t, id, tc.state)
-			if tc.name == "restore-error" || tc.name == "with-task-error" {
+			clock := domain.Clock(domain.ClockFunc(time.Now))
+			if tc.name == "restore-error" {
 				snapshot = domain.TaskSnapshot{TaskID: id, State: domain.StateStalled}
+			}
+			if tc.name == "with-task-error" {
+				clock = domain.ClockFunc(func() time.Time { return time.Time{} })
 			}
 			tasks := &adoptionStoreFake{listed: []domain.TaskSnapshot{snapshot}, entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}, loadErr: map[domain.TaskID]error{id: tc.loadErr}}
 			tracker := &adoptionStalledTrackerFake{}
-			uc := NewAdoptRunningTasksUseCase(tasks, &adoptionLivenessFake{dead: map[domain.TaskID]bool{}, err: map[domain.TaskID]error{id: tc.liveness}}, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), &adoptionSlotsFake{}, &adoptionSlotsFake{}, &adoptionTerminationFake{}, &adoptionKilledFake{}, &adoptionPathLocksFake{}, &PendingReconciliationSet{}, &adoptionMutexFake{}, domain.ClockFunc(time.Now), tracker, &adoptionMetricsFake{}, slog.Default())
+			uc := NewAdoptRunningTasksUseCase(tasks, &adoptionLivenessFake{dead: map[domain.TaskID]bool{}, err: map[domain.TaskID]error{id: tc.liveness}}, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), &adoptionSlotsFake{}, &adoptionSlotsFake{}, &adoptionTerminationFake{}, &adoptionKilledFake{}, &adoptionPathLocksFake{}, &PendingReconciliationSet{}, &adoptionMutexFake{}, clock, tracker, &adoptionMetricsFake{}, slog.Default())
 			_, _ = uc.Execute(context.Background())
 			if len(tracker.calls) != tc.wantCalls {
 				t.Fatalf("LeaveStalled calls=%d", len(tracker.calls))
@@ -1506,7 +1597,7 @@ func TestAdoptRunningTasksStalledTrackerNeverEntersOrTakes(t *testing.T) {
 	tracker := &adoptionStalledTrackerFake{}
 	uc := NewAdoptRunningTasksUseCase(&adoptionStoreFake{listed: []domain.TaskSnapshot{snapshot}, entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}, &adoptionLivenessFake{dead: map[domain.TaskID]bool{}, err: map[domain.TaskID]error{}}, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), &adoptionSlotsFake{}, &adoptionSlotsFake{}, &adoptionTerminationFake{}, &adoptionKilledFake{}, &adoptionPathLocksFake{}, &PendingReconciliationSet{}, &adoptionMutexFake{}, domain.ClockFunc(time.Now), tracker, &adoptionMetricsFake{}, slog.Default())
 	_, _ = uc.Execute(context.Background())
-	if len(tracker.calls) != 1 {
-		t.Fatalf("LeaveStalled calls=%d, want 1", len(tracker.calls))
+	if len(tracker.calls) != 1 || tracker.takes != 0 {
+		t.Fatalf("LeaveStalled calls=%d, TakeTotal calls=%d; want 1 and 0", len(tracker.calls), tracker.takes)
 	}
 }
