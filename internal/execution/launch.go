@@ -10,8 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
-	"strings"
+	"syscall"
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/contract"
@@ -57,16 +56,19 @@ type ProcessRunner interface {
 }
 
 var launchNewSession = proc.LaunchNewSession
-var terminateProcessGroup = proc.TerminateProcessGroup
 var sendTerminate = proc.SendTerminate
 var sendKill = proc.SendKill
 var now = time.Now
+var newResumeProcessWaiter = func(cmd *exec.Cmd) ProcessWaiter {
+	return &processWaiter{cmd: cmd}
+}
 
 const (
 	scriptBinaryPath = "/usr/bin/script"
 	stdbufBinaryPath = "/usr/bin/stdbuf"
 	// Canonical source: validation-rules.md RESUME_STDERR_BUFFER_MAX_BYTES.
 	resumeStderrBufferMaxBytes = 4096
+	shellSignalExitBase        = 128
 )
 
 func buildLaunchArgs(p LaunchParams) (headProcess string, args []string) {
@@ -89,8 +91,9 @@ type processRunner struct {
 }
 
 type resumeLauncher struct {
-	runner ProcessRunner
-	logger *slog.Logger
+	runner    ProcessRunner
+	logger    *slog.Logger
+	killGrace time.Duration
 }
 
 type resumeWaitOutcome struct {
@@ -107,7 +110,7 @@ func NewResumeLauncher(runner ProcessRunner, loggers ...*slog.Logger) recovery.R
 	if len(loggers) > 0 && loggers[0] != nil {
 		logger = loggers[0]
 	}
-	return &resumeLauncher{runner: runner, logger: logger}
+	return &resumeLauncher{runner: runner, logger: logger, killGrace: TimeoutKillGrace}
 }
 
 func buildResumeArgs(params recovery.ResumeLaunchParams) []string {
@@ -147,7 +150,7 @@ func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.Resu
 		l.logStderr(params, err, &stderr)
 		return err
 	}
-	waiter := &processWaiter{cmd: cmd}
+	waiter := newResumeProcessWaiter(cmd)
 	waitResult := make(chan resumeWaitOutcome, 1)
 	go func() {
 		exitCode, waitErr := waiter.Wait()
@@ -164,52 +167,78 @@ func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.Resu
 		}
 		return nil
 	case <-ctx.Done():
-		terminateErr := terminateProcessGroup(cmd.Process.Pid, TimeoutKillGrace)
-		timer := time.NewTimer(TimeoutKillGrace)
-		defer timer.Stop()
-		select {
-		case outcome := <-waitResult:
-			err := errors.Join(ctx.Err(), terminateErr, outcome.err)
-			l.logStderr(params, err, &stderr)
-			return err
-		case <-timer.C:
-			err := errors.Join(ctx.Err(), terminateErr, fmt.Errorf("resume process did not exit after termination"))
-			l.logStderr(params, err, &stderr)
-			return err
-		}
+		return l.finishContextCancellation(ctx, cmd, waitResult, &stderr, params)
 	}
 }
 
-// ansiEscapePattern follows the canonical ANSI_ESCAPE_PATTERN. It is kept in
-// this package because recovery's equivalent is intentionally unexported.
-var resumeANSISequencePattern = regexp.MustCompile(`\x1b\[[0-?]*[ -/]*[@-~]`)
-
-func sanitizeResumeStderr(raw []byte) string {
-	text := resumeANSISequencePattern.ReplaceAllString(string(raw), "")
-	text = strings.Map(func(r rune) rune {
-		if r < 0x20 && r != '\n' && r != '\t' {
-			return -1
-		}
-		return r
-	}, text)
-	const maxSummaryBytes = 500
-	if len(text) > maxSummaryBytes {
-		return text[:maxSummaryBytes] + "...(truncated)"
+func (l *resumeLauncher) finishContextCancellation(ctx context.Context, cmd *exec.Cmd, waitResult <-chan resumeWaitOutcome, stderr *limitedWriter, params recovery.ResumeLaunchParams) error {
+	// Prefer an already completed wait result so signals are not sent to a reaped PID.
+	select {
+	case outcome := <-waitResult:
+		return l.finishCanceledResumeWait(params, ctx.Err(), outcome, nil, nil, stderr)
+	default:
 	}
-	return text
+
+	terminateErr := l.runner.SendTerminate(cmd.Process.Pid)
+	timer := time.NewTimer(l.killGrace)
+	defer timer.Stop()
+	select {
+	case outcome := <-waitResult:
+		return l.finishCanceledResumeWait(params, ctx.Err(), outcome, terminateErr, nil, stderr)
+	case <-timer.C:
+	}
+
+	// A result may have arrived concurrently with the grace timer firing.
+	select {
+	case outcome := <-waitResult:
+		return l.finishCanceledResumeWait(params, ctx.Err(), outcome, terminateErr, nil, stderr)
+	default:
+	}
+
+	killErr := l.runner.SendKill(cmd.Process.Pid)
+	if killErr != nil {
+		return l.finishCanceledResumeWait(params, ctx.Err(), resumeWaitOutcome{}, terminateErr, killErr, stderr)
+	}
+
+	reapTimer := time.NewTimer(l.killGrace)
+	defer reapTimer.Stop()
+	select {
+	case outcome := <-waitResult:
+		return l.finishCanceledResumeWait(params, ctx.Err(), outcome, terminateErr, nil, stderr)
+	case <-reapTimer.C:
+		return l.finishCanceledResumeWait(
+			params,
+			ctx.Err(),
+			resumeWaitOutcome{err: errors.New("resume process was not reaped after SIGKILL")},
+			terminateErr,
+			nil,
+			stderr,
+		)
+	}
+}
+
+func (l *resumeLauncher) finishCanceledResumeWait(params recovery.ResumeLaunchParams, ctxErr error, outcome resumeWaitOutcome, terminateErr, killErr error, stderr *limitedWriter) error {
+	err := errors.Join(ctxErr, terminateErr, killErr, outcome.err)
+	l.logStderr(params, err, stderr)
+	return err
 }
 
 func (l *resumeLauncher) logStderr(params recovery.ResumeLaunchParams, err error, stderr *limitedWriter) {
-	summary := sanitizeResumeStderr(stderr.buffer.Bytes())
-	if summary == "" {
+	if stderr.Len() == 0 {
 		return
 	}
-	l.logger.Warn("resume process failed", "task_id", params.TaskID.String(), "error", err, "stderr_summary", summary)
+	// stderr_bytes is the captured buffer length, not the child process's total stderr output.
+	l.logger.Warn("resume process failed", "task_id", params.TaskID.String(), "error", err, "stderr_bytes", stderr.Len())
 }
 
 type limitedWriter struct {
 	buffer bytes.Buffer
 	limit  int
+}
+
+// Len returns the number of bytes captured in the bounded buffer.
+func (w *limitedWriter) Len() int {
+	return w.buffer.Len()
 }
 
 func (w *limitedWriter) Write(p []byte) (int, error) {
@@ -228,6 +257,9 @@ func NewProcessRunner(logs executionLogOpener) ProcessRunner {
 }
 
 func (r *processRunner) Launch(ctx context.Context, p LaunchParams) (*LaunchedProcess, error) {
+	if p.LivenessLockFile == nil {
+		return nil, fmt.Errorf("liveness lock file is required")
+	}
 	info, err := os.Stat(p.TaskDirPath)
 	if err != nil || !info.IsDir() {
 		_ = p.LivenessLockFile.Close()
@@ -275,8 +307,14 @@ func (w *processWaiter) Wait() (rawExitCode int, err error) {
 		return w.cmd.ProcessState.ExitCode(), nil
 	}
 	var exitErr *exec.ExitError
-	if errors.As(waitErr, &exitErr) {
-		return exitErr.ExitCode(), nil
+	if !errors.As(waitErr, &exitErr) {
+		return 1, waitErr
 	}
-	return 1, waitErr
+	if code := exitErr.ExitCode(); code >= 0 {
+		return code, nil
+	}
+	if status, ok := exitErr.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		return shellSignalExitBase + int(status.Signal()), nil
+	}
+	return 1, fmt.Errorf("resolve signaled process exit: %w", waitErr)
 }

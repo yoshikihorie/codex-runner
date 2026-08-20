@@ -287,13 +287,7 @@ func (uc *AdoptRunningTasksUseCase) adoptRecovering(ctx context.Context, taskID 
 		return adoptionOutcomeError
 	}
 	uc.taskMu.Unlock(taskID)
-	finalState := domain.StateRecovered
-	if !present {
-		finalState = domain.StateLost
-		if snapshot.RecoveryOrigin != nil && *snapshot.RecoveryOrigin == domain.RecoveryOriginTimeout {
-			finalState = domain.StateTimeoutLost
-		}
-	}
+	finalState := recoveringFinalState(present, snapshot)
 	stalledTotal := uc.stalledTracker.TakeTotal(taskID)
 	uc.metricsRecorder.Execute(ctx, metrics.RecordTaskMetricsInput{TaskID: taskID, FinalState: finalState, Estimated: true, OccurredAt: occurredAt, StalledTotalMs: stalledTotal})
 	uc.slots.ReleaseAndAdvance(ctx, taskID, uc.clock.Now())
@@ -360,6 +354,16 @@ func resolveRecoveringLocked(tasks AdoptionTaskStore, reader contract.ExitCodeRe
 	return nil
 }
 
+func recoveringFinalState(present bool, snapshot domain.TaskSnapshot) domain.TaskState {
+	if present {
+		return domain.StateRecovered
+	}
+	if snapshot.RecoveryOrigin != nil && *snapshot.RecoveryOrigin == domain.RecoveryOriginTimeout {
+		return domain.StateTimeoutLost
+	}
+	return domain.StateLost
+}
+
 func (uc *AdoptRunningTasksUseCase) adoptTimeout(ctx context.Context, taskID domain.TaskID, snapshot domain.TaskSnapshot) string {
 	adoptionObservedAt := uc.clock.Now()
 	// Timeout tasks have already been adopted; retain this independent liveness
@@ -413,7 +417,7 @@ func (uc *AdoptRunningTasksUseCase) confirmTimeoutTermination(ctx context.Contex
 			uc.pending.CompleteSend(claim)
 			return
 		}
-		uc.releaseOrInvalidateSendAfterTerminationError(claim)
+		releaseOrInvalidateSendAfterTerminationError(uc.tasks, uc.pending, uc.taskMu, uc.logger, claim)
 		return
 	}
 	latest, valid := currentClaimAuthority(uc.tasks, uc.taskMu, claim)
@@ -502,7 +506,7 @@ func (uc *AdoptRunningTasksUseCase) confirmCancellationTermination(ctx context.C
 			uc.pending.CompleteSend(claim)
 			return
 		}
-		uc.releaseOrInvalidateSendAfterTerminationError(claim)
+		releaseOrInvalidateSendAfterTerminationError(uc.tasks, uc.pending, uc.taskMu, uc.logger, claim)
 		return
 	}
 	_, valid := currentClaimAuthority(uc.tasks, uc.taskMu, claim)
@@ -593,18 +597,18 @@ func currentClaimAuthorityWithError(tasks AdoptionTaskStore, taskMu TaskMutex, c
 	return snapshot, matchesProcessSignalAuthority(snapshot, claim.Authority), nil
 }
 
-func (uc *AdoptRunningTasksUseCase) releaseOrInvalidateSendAfterTerminationError(claim SendClaim) {
-	_, valid, err := currentClaimAuthorityWithError(uc.tasks, uc.taskMu, claim)
+func releaseOrInvalidateSendAfterTerminationError(tasks AdoptionTaskStore, pending *PendingReconciliationSet, taskMu TaskMutex, logger *slog.Logger, claim SendClaim) {
+	_, valid, err := currentClaimAuthorityWithError(tasks, taskMu, claim)
 	if err != nil && !errors.Is(err, domain.ErrTaskNotFound) {
-		uc.logFailure("load task after termination send failure", claim.TaskID, err)
-		uc.pending.ReleaseSend(claim)
+		logger.Error("load task after termination send failure", "task_id", claim.TaskID.String(), "error", err)
+		pending.ReleaseSend(claim)
 		return
 	}
 	if valid {
-		uc.pending.ReleaseSend(claim)
+		pending.ReleaseSend(claim)
 		return
 	}
-	uc.pending.InvalidateSend(claim)
+	pending.InvalidateSend(claim)
 }
 
 func (uc *AdoptRunningTasksUseCase) registerPending(taskID domain.TaskID, snapshot domain.TaskSnapshot) bool {

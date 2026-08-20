@@ -18,15 +18,22 @@ import (
 
 	"github.com/yoshikihorie/codex-runner/internal/contract"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
+	"github.com/yoshikihorie/codex-runner/internal/metrics"
 )
 
 type reconcileStoreFake struct {
-	mu      sync.Mutex
-	entries map[domain.TaskID]domain.TaskSnapshot
-	loads   int
-	saves   int
-	order   *[]string
-	saveErr error
+	mu          sync.Mutex
+	entries     map[domain.TaskID]domain.TaskSnapshot
+	loads       int
+	saves       int
+	order       *[]string
+	saveErr     error
+	loadResults map[domain.TaskID][]reconcileLoadResult
+}
+
+type reconcileLoadResult struct {
+	snapshot domain.TaskSnapshot
+	err      error
 }
 
 func (f *reconcileStoreFake) Load(id domain.TaskID) (domain.TaskSnapshot, error) {
@@ -34,6 +41,11 @@ func (f *reconcileStoreFake) Load(id domain.TaskID) (domain.TaskSnapshot, error)
 	defer f.mu.Unlock()
 	f.loads++
 	*f.order = append(*f.order, "load")
+	if results := f.loadResults[id]; len(results) > 0 {
+		result := results[0]
+		f.loadResults[id] = results[1:]
+		return result.snapshot, result.err
+	}
 	snapshot, found := f.entries[id]
 	if !found {
 		return domain.TaskSnapshot{}, domain.ErrTaskNotFound
@@ -239,6 +251,35 @@ type reconcileSlotsFake struct {
 	calls int
 }
 
+type reconcileTrackerProbe struct {
+	*adoptionStalledTrackerFake
+	mutex             *reconcileMutexFake
+	calledWhileLocked bool
+	order             *[]string
+}
+
+func (f *reconcileTrackerProbe) TakeTotal(id domain.TaskID) int {
+	f.calledWhileLocked = f.calledWhileLocked || f.mutex.held
+	if f.order != nil {
+		*f.order = append(*f.order, "tracker")
+	}
+	return f.adoptionStalledTrackerFake.TakeTotal(id)
+}
+
+type reconcileMetricsProbe struct {
+	inputs []metrics.RecordTaskMetricsInput
+	record metrics.RecordTaskMetricsOutput
+	order  *[]string
+}
+
+func (f *reconcileMetricsProbe) Execute(_ context.Context, in metrics.RecordTaskMetricsInput) metrics.RecordTaskMetricsOutput {
+	if f.order != nil {
+		*f.order = append(*f.order, "metrics")
+	}
+	f.inputs = append(f.inputs, in)
+	return f.record
+}
+
 func (f *reconcileSlotsFake) ReleaseAndAdvance(context.Context, domain.TaskID, time.Time) {
 	f.calls++
 	*f.order = append(*f.order, "slot")
@@ -278,7 +319,7 @@ func newReconcileFixture(t *testing.T, state domain.TaskState, dead bool, presen
 	pathLocks := &reconcilePathLocksFake{order: &order}
 	slots := &reconcileSlotsFake{order: &order}
 	mutex := &reconcileMutexFake{order: &order}
-	uc := NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{present: present}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, newAdoptionResumeUseCase(t), slots, mutex, domain.ClockFunc(time.Now), time.Nanosecond, 17*time.Second, slog.Default())
+	uc := NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{present: present}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, newAdoptionResumeUseCase(t), slots, mutex, domain.ClockFunc(time.Now), &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, time.Nanosecond, 17*time.Second, slog.Default())
 	return uc, pending, tasks, liveness, writer, termination, killed, pathLocks, slots, mutex, &order
 }
 
@@ -407,6 +448,53 @@ func TestReconcilePendingFailsDeadRecoveringTaskWithoutOutput(t *testing.T) {
 	}
 }
 
+func TestReconcilePendingRecoveringRecordsTerminalMetrics(t *testing.T) {
+	at := time.Date(2026, time.August, 20, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name      string
+		present   bool
+		origin    domain.RecoveryOrigin
+		wantState domain.TaskState
+		recorded  bool
+	}{
+		{"recovered", true, domain.RecoveryOriginTimeout, domain.StateRecovered, true},
+		{"timeout lost", false, domain.RecoveryOriginTimeout, domain.StateTimeoutLost, true},
+		{"lost", false, domain.RecoveryOriginOrphan, domain.StateLost, true},
+		{"metrics fail soft", false, domain.RecoveryOriginOrphan, domain.StateLost, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			uc, pending, tasks, liveness, _, _, _, _, slots, mutex, order := newReconcileFixture(t, domain.StateRecovering, true, tc.present)
+			id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
+			snapshot := adoptionRecoveringSnapshot(t, id, tc.origin)
+			tasks.entries[id] = snapshot
+			tracker := &reconcileTrackerProbe{adoptionStalledTrackerFake: &adoptionStalledTrackerFake{total: 29}, mutex: mutex, order: order}
+			recorder := &reconcileMetricsProbe{record: metrics.RecordTaskMetricsOutput{Recorded: tc.recorded}, order: order}
+			uc.stalledTracker = tracker
+			uc.metricsRecorder = recorder
+			uc.clock = domain.ClockFunc(func() time.Time { return at })
+			registerReconcilePending(t, pending, snapshot, PendingSendConfirmOnly)
+
+			finish := runReconciliation(t, uc, liveness)
+			finish()
+
+			if got := tasks.entries[id].State; got != tc.wantState || !tasks.entries[id].StateUpdatedAt.Equal(at) {
+				t.Fatalf("state=%q occurredAt=%s, want state=%q occurredAt=%s", got, tasks.entries[id].StateUpdatedAt, tc.wantState, at)
+			}
+			if tracker.calledWhileLocked || tracker.takes != 1 || tracker.takeID != id || len(recorder.inputs) != 1 || slots.calls != 1 || len(pending.List()) != 0 {
+				t.Fatalf("tracker=%+v metrics=%+v slots=%d pending=%+v", tracker, recorder.inputs, slots.calls, pending.List())
+			}
+			in := recorder.inputs[0]
+			if in.TaskID != id || in.FinalState != tc.wantState || !in.Estimated || !in.OccurredAt.Equal(at) || in.StalledTotalMs != tracker.total {
+				t.Fatalf("metrics=%+v", in)
+			}
+			wantSuffix := []string{"tracker", "metrics", "slot"}
+			if got := (*order)[len(*order)-len(wantSuffix):]; !reflect.DeepEqual(got, wantSuffix) {
+				t.Fatalf("order suffix=%v, want %v", got, wantSuffix)
+			}
+		})
+	}
+}
+
 func TestReconcilePendingOrphanReadErrorRetriesFromReadLastMessage(t *testing.T) {
 	id := adoptionID(t, "reconcile-orphan-read-retry")
 	snapshot := adoptionSnapshot(t, id, domain.StateOrphaned)
@@ -416,7 +504,7 @@ func TestReconcilePendingOrphanReadErrorRetriesFromReadLastMessage(t *testing.T)
 	tasks := &reconcileStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}, order: &order}
 	reader := &reconcileReaderFake{results: []reconcileReaderResult{{err: errors.New("read")}, {present: true}}}
 	finalizer := &adoptionFinalizerFake{}
-	uc := NewReconcilePendingUseCase(pending, tasks, &reconcileLivenessFake{called: make(chan struct{}), release: make(chan struct{})}, reader, &reconcileWriterFake{order: &order}, finalizer, &reconcileTerminationFake{called: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{})}, &reconcileKilledFake{}, &reconcilePathLocksFake{order: &order}, newAdoptionResumeUseCase(t), &reconcileSlotsFake{order: &order}, &reconcileMutexFake{order: &order}, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+	uc := NewReconcilePendingUseCase(pending, tasks, &reconcileLivenessFake{called: make(chan struct{}), release: make(chan struct{})}, reader, &reconcileWriterFake{order: &order}, finalizer, &reconcileTerminationFake{called: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{})}, &reconcileKilledFake{}, &reconcilePathLocksFake{order: &order}, newAdoptionResumeUseCase(t), &reconcileSlotsFake{order: &order}, &reconcileMutexFake{order: &order}, domain.ClockFunc(time.Now), &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, time.Second, time.Second, slog.Default())
 
 	entries := pending.List()
 	uc.reconcileOne(context.Background(), entries[0])
@@ -465,14 +553,38 @@ func TestReconcilePendingRecoveringNonSaveWriteFailuresAreFailSoft(t *testing.T)
 func TestReconcilePendingRecoveringSaveFailureRetainsPending(t *testing.T) {
 	uc, pending, tasks, liveness, writer, _, _, _, slots, mutex, _ := newReconcileFixture(t, domain.StateRecovering, true, true)
 	id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
+	tracker := &adoptionStalledTrackerFake{}
+	recorder := &adoptionMetricsFake{}
+	uc.stalledTracker = tracker
+	uc.metricsRecorder = recorder
 	tasks.saveErr = errors.New("save")
 	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
 	finish := runReconciliation(t, uc, liveness)
 	finish()
 
 	entries := pending.List()
-	if mutex.held || slots.calls != 0 || tasks.entries[id].State != domain.StateRecovering || len(entries) != 1 || pendingDisposition(entries[0]) != PendingSendConfirmOnly || writer.events != 0 {
-		t.Fatalf("held=%v slots=%d state=%s pending=%+v events=%d", mutex.held, slots.calls, tasks.entries[id].State, entries, writer.events)
+	if mutex.held || slots.calls != 0 || tracker.takes != 0 || len(recorder.inputs) != 0 || tasks.entries[id].State != domain.StateRecovering || len(entries) != 1 || pendingDisposition(entries[0]) != PendingSendConfirmOnly || writer.events != 0 {
+		t.Fatalf("held=%v slots=%d takes=%d metrics=%+v state=%s pending=%+v events=%d", mutex.held, slots.calls, tracker.takes, recorder.inputs, tasks.entries[id].State, entries, writer.events)
+	}
+}
+
+func TestReconcilePendingRecoveringStateConflictDoesNotRecordMetrics(t *testing.T) {
+	uc, pending, tasks, liveness, _, _, _, _, slots, mutex, _ := newReconcileFixture(t, domain.StateRecovering, true, true)
+	id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
+	terminal := tasks.entries[id]
+	terminal.State = domain.StateRecovered
+	tasks.loadResults = map[domain.TaskID][]reconcileLoadResult{id: {{snapshot: terminal}}}
+	tracker := &adoptionStalledTrackerFake{}
+	recorder := &adoptionMetricsFake{}
+	uc.stalledTracker = tracker
+	uc.metricsRecorder = recorder
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
+	liveness.release <- struct{}{}
+
+	uc.reconcileRecovering(context.Background(), id)
+
+	if mutex.held || tracker.takes != 0 || len(recorder.inputs) != 0 || slots.calls != 0 || len(pending.List()) != 0 {
+		t.Fatalf("held=%v takes=%d metrics=%+v slots=%d pending=%+v", mutex.held, tracker.takes, recorder.inputs, slots.calls, pending.List())
 	}
 }
 
@@ -483,7 +595,7 @@ func TestReconcilePendingRecoveringExitCodeMismatchFailsClosed(t *testing.T) {
 	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
 	finish := runReconciliation(t, uc, liveness)
 	finish()
-	if tasks.saves != 0 || writer.exitCodes != 0 || writer.events != 0 || slots.calls != 0 || len(pending.List()) != 1 {
+	if tasks.saves != 0 || writer.adoptedMarkers != 0 || writer.recoveredMarkers != 0 || writer.exitCodes != 0 || writer.events != 0 || slots.calls != 0 || len(pending.List()) != 1 {
 		t.Fatal("recovering reconciliation did not fail closed")
 	}
 }
@@ -495,7 +607,7 @@ func TestReconcilePendingRecoveringExitCodeReadFailureFailsClosed(t *testing.T) 
 	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
 	finish := runReconciliation(t, uc, liveness)
 	finish()
-	if tasks.saves != 0 || writer.exitCodes != 0 || writer.events != 0 || slots.calls != 0 || len(pending.List()) != 1 {
+	if tasks.saves != 0 || writer.adoptedMarkers != 0 || writer.recoveredMarkers != 0 || writer.exitCodes != 0 || writer.events != 0 || slots.calls != 0 || len(pending.List()) != 1 {
 		t.Fatal("recovering reconciliation did not fail closed")
 	}
 }
@@ -510,7 +622,7 @@ func TestNewReconcilePendingUseCasePanicsForNonPositiveTerminationGrace(t *testi
 			}()
 			uc, pending, tasks, liveness, writer, termination, killed, pathLocks, slots, mutex, _ := newReconcileFixture(t, domain.StateRecovering, false, false)
 			_ = uc
-			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, newAdoptionResumeUseCase(t), slots, mutex, domain.ClockFunc(time.Now), time.Second, grace, slog.Default())
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, newAdoptionResumeUseCase(t), slots, mutex, domain.ClockFunc(time.Now), &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, time.Second, grace, slog.Default())
 		})
 	}
 }
@@ -519,49 +631,57 @@ func TestNewReconcilePendingUseCaseRejectsTypedNilDependencies(t *testing.T) {
 	uc, pending, tasks, liveness, writer, termination, killed, pathLocks, slots, mutex, _ := newReconcileFixture(t, domain.StateRecovering, false, false)
 	_ = uc
 	resume := newAdoptionResumeUseCase(t)
+	tracker := &adoptionStalledTrackerFake{}
+	recorder := &adoptionMetricsFake{}
 	for _, tc := range []struct {
 		name string
 		make func()
 	}{
 		{"pending", func() {
-			NewReconcilePendingUseCase((*PendingReconciliationSet)(nil), tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+			NewReconcilePendingUseCase((*PendingReconciliationSet)(nil), tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), tracker, recorder, time.Second, time.Second, slog.Default())
 		}},
 		{"tasks", func() {
-			NewReconcilePendingUseCase(pending, (*reconcileStoreFake)(nil), liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+			NewReconcilePendingUseCase(pending, (*reconcileStoreFake)(nil), liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), tracker, recorder, time.Second, time.Second, slog.Default())
 		}},
 		{"liveness", func() {
-			NewReconcilePendingUseCase(pending, tasks, (*reconcileLivenessFake)(nil), &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+			NewReconcilePendingUseCase(pending, tasks, (*reconcileLivenessFake)(nil), &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), tracker, recorder, time.Second, time.Second, slog.Default())
 		}},
 		{"reader", func() {
-			NewReconcilePendingUseCase(pending, tasks, liveness, (*reconcileReaderFake)(nil), writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+			NewReconcilePendingUseCase(pending, tasks, liveness, (*reconcileReaderFake)(nil), writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), tracker, recorder, time.Second, time.Second, slog.Default())
 		}},
 		{"writer", func() {
-			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, (*reconcileWriterFake)(nil), &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, (*reconcileWriterFake)(nil), &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), tracker, recorder, time.Second, time.Second, slog.Default())
 		}},
 		{"finalizer", func() {
-			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, (*adoptionFinalizerFake)(nil), termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, (*adoptionFinalizerFake)(nil), termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), tracker, recorder, time.Second, time.Second, slog.Default())
 		}},
 		{"termination", func() {
-			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, (*reconcileTerminationFake)(nil), killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, (*reconcileTerminationFake)(nil), killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), tracker, recorder, time.Second, time.Second, slog.Default())
 		}},
 		{"killed", func() {
-			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, (*reconcileKilledFake)(nil), pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, (*reconcileKilledFake)(nil), pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), tracker, recorder, time.Second, time.Second, slog.Default())
 		}},
 		{"path-locks", func() {
-			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, (*reconcilePathLocksFake)(nil), resume, slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, (*reconcilePathLocksFake)(nil), resume, slots, mutex, domain.ClockFunc(time.Now), tracker, recorder, time.Second, time.Second, slog.Default())
 		}},
 		{"resume", func() {
-			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, (*RecoverViaResumeUseCase)(nil), slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, (*RecoverViaResumeUseCase)(nil), slots, mutex, domain.ClockFunc(time.Now), tracker, recorder, time.Second, time.Second, slog.Default())
 		}},
 		{"slots", func() {
-			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, (*reconcileSlotsFake)(nil), mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, (*reconcileSlotsFake)(nil), mutex, domain.ClockFunc(time.Now), tracker, recorder, time.Second, time.Second, slog.Default())
 		}},
 		{"task-mutex", func() {
-			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, (*reconcileMutexFake)(nil), domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, (*reconcileMutexFake)(nil), domain.ClockFunc(time.Now), tracker, recorder, time.Second, time.Second, slog.Default())
 		}},
 		{"clock", func() {
 			var clock domain.ClockFunc
-			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, clock, time.Second, time.Second, slog.Default())
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, clock, tracker, recorder, time.Second, time.Second, slog.Default())
+		}},
+		{"stalled tracker", func() {
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), (*adoptionStalledTrackerFake)(nil), recorder, time.Second, time.Second, slog.Default())
+		}},
+		{"metrics recorder", func() {
+			NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, resume, slots, mutex, domain.ClockFunc(time.Now), tracker, (*adoptionMetricsFake)(nil), time.Second, time.Second, slog.Default())
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -637,6 +757,85 @@ func TestReconcilePendingTimeoutClaimsBeforeSendingAndUsesTerminationGrace(t *te
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("reconciliation did not return after termination send")
+	}
+}
+
+func TestReconcilePendingTerminationSendFailureReleasesOnlyCurrentAuthority(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		loadResult  *reconcileLoadResult
+		mutate      func(*domain.TaskSnapshot)
+		wantOutcome ClaimOutcome
+		wantLog     bool
+	}{
+		{"transient load failure", &reconcileLoadResult{err: errors.New("temporary load failure")}, nil, ClaimAcquired, true},
+		{"current authority", nil, nil, ClaimAcquired, false},
+		{"task not found", &reconcileLoadResult{err: domain.ErrTaskNotFound}, nil, ClaimConfirmOnly, false},
+		{"authority changed", nil, func(snapshot *domain.TaskSnapshot) {
+			pid := 9999
+			snapshot.PID = &pid
+		}, ClaimConfirmOnly, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			uc, pending, tasks, _, _, termination, _, _, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
+			id := adoptionID(t, "reconcile-"+string(domain.StateTimeout))
+			if tc.loadResult != nil {
+				tasks.loadResults = map[domain.TaskID][]reconcileLoadResult{id: {*tc.loadResult}}
+			}
+			var logs bytes.Buffer
+			uc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+			termination.terminateErr = errors.New("send failed")
+			close(termination.release)
+			registerReconcilePending(t, pending, tasks.entries[id], PendingSendUnsent)
+			authority, ok := processSignalAuthority(tasks.entries[id])
+			if !ok {
+				t.Fatal("fixture requires process signal authority")
+			}
+			claim, outcome := pending.ClaimForSend(id, authority)
+			if outcome != ClaimAcquired {
+				t.Fatalf("initial outcome=%v", outcome)
+			}
+			if tc.mutate != nil {
+				updated := tasks.entries[id]
+				tc.mutate(&updated)
+				tasks.entries[id] = updated
+			}
+
+			uc.sendAndReconcile(context.Background(), claim, tasks.entries[id], true)
+
+			if tc.wantLog != (logs.Len() > 0) {
+				t.Fatalf("logs=%q, wantLog=%v", logs.String(), tc.wantLog)
+			}
+			if _, outcome := pending.ClaimForSend(id, authority); outcome != tc.wantOutcome {
+				t.Fatalf("outcome=%v, want %v", outcome, tc.wantOutcome)
+			}
+		})
+	}
+}
+
+func TestReconcilePendingInvalidSignalAuthorityDoesNotReloadTask(t *testing.T) {
+	uc, pending, tasks, _, _, termination, _, _, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
+	id := adoptionID(t, "reconcile-"+string(domain.StateTimeout))
+	snapshot := tasks.entries[id]
+	registerReconcilePending(t, pending, snapshot, PendingSendUnsent)
+	authority, ok := processSignalAuthority(snapshot)
+	if !ok {
+		t.Fatal("fixture requires process signal authority")
+	}
+	claim, outcome := pending.ClaimForSend(id, authority)
+	if outcome != ClaimAcquired {
+		t.Fatalf("initial outcome=%v", outcome)
+	}
+	termination.terminateErr = ErrProcessSignalAuthorityInvalid
+	close(termination.release)
+
+	uc.sendAndReconcile(context.Background(), claim, snapshot, true)
+
+	if tasks.loads != 0 {
+		t.Fatalf("loads=%d, want 0", tasks.loads)
+	}
+	if _, outcome := pending.ClaimForSend(id, authority); outcome != ClaimConfirmOnly {
+		t.Fatalf("outcome=%v, want %v", outcome, ClaimConfirmOnly)
 	}
 }
 
@@ -924,7 +1123,7 @@ func TestReconcilePendingCancellationStopsBeforeNextEntryLoad(t *testing.T) {
 	tasks := &reconcileStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{first: firstSnapshot, second: secondSnapshot}, order: &order}
 	liveness := &reconcileLivenessFake{called: make(chan struct{}), release: make(chan struct{}, 1)}
 	termination := &reconcileTerminationFake{called: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{})}
-	uc := NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, &reconcileWriterFake{order: &order}, &adoptionFinalizerFake{}, termination, &reconcileKilledFake{}, &reconcilePathLocksFake{order: &order}, newAdoptionResumeUseCase(t), &reconcileSlotsFake{order: &order}, &reconcileMutexFake{order: &order}, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+	uc := NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{}, &reconcileWriterFake{order: &order}, &adoptionFinalizerFake{}, termination, &reconcileKilledFake{}, &reconcilePathLocksFake{order: &order}, newAdoptionResumeUseCase(t), &reconcileSlotsFake{order: &order}, &reconcileMutexFake{order: &order}, domain.ClockFunc(time.Now), &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, time.Second, time.Second, slog.Default())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() {
@@ -954,7 +1153,7 @@ func TestReconcilePendingRecoveringCancellationAfterReadStopsBeforeLock(t *testi
 	mutex := &reconcileMutexFake{order: &order}
 	liveness := &reconcileLivenessFake{dead: true, called: make(chan struct{}), release: make(chan struct{}, 1)}
 	liveness.release <- struct{}{}
-	uc := NewReconcilePendingUseCase(pending, tasks, liveness, reader, writer, &adoptionFinalizerFake{}, &reconcileTerminationFake{called: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{})}, &reconcileKilledFake{}, &reconcilePathLocksFake{order: &order}, newAdoptionResumeUseCase(t), slots, mutex, domain.ClockFunc(time.Now), time.Second, time.Second, slog.Default())
+	uc := NewReconcilePendingUseCase(pending, tasks, liveness, reader, writer, &adoptionFinalizerFake{}, &reconcileTerminationFake{called: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{})}, &reconcileKilledFake{}, &reconcilePathLocksFake{order: &order}, newAdoptionResumeUseCase(t), slots, mutex, domain.ClockFunc(time.Now), &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, time.Second, time.Second, slog.Default())
 
 	uc.reconcileRecovering(ctx, id)
 

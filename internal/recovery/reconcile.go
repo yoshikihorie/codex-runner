@@ -8,6 +8,7 @@ import (
 
 	"github.com/yoshikihorie/codex-runner/internal/contract"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
+	"github.com/yoshikihorie/codex-runner/internal/metrics"
 )
 
 const (
@@ -35,6 +36,8 @@ type ReconcilePendingUseCase struct {
 	slots            SlotReleaser
 	taskMu           TaskMutex
 	clock            domain.Clock
+	stalledTracker   stalledTimeTracker
+	metricsRecorder  MetricsRecorder
 	interval         time.Duration
 	terminationGrace time.Duration
 	logger           *slog.Logger
@@ -45,8 +48,8 @@ type reconcileContractReader interface {
 	ReadExitCode(domain.TaskID) (int, bool, error)
 }
 
-func NewReconcilePendingUseCase(pending *PendingReconciliationSet, tasks AdoptionTaskStore, liveness LivenessChecker, reader reconcileContractReader, writer contract.ContractWriter, finalizer OrphanFinalizer, termination TerminationEnsurer, killed KillConfirmer, pathLocks PathLockReleaser, resume *RecoverViaResumeUseCase, slots SlotReleaser, taskMu TaskMutex, clock domain.Clock, interval time.Duration, terminationGrace time.Duration, logger *slog.Logger) *ReconcilePendingUseCase {
-	if isNilAdoptionDependency(pending) || isNilAdoptionDependency(tasks) || isNilAdoptionDependency(liveness) || isNilAdoptionDependency(reader) || isNilAdoptionDependency(writer) || isNilAdoptionDependency(finalizer) || isNilAdoptionDependency(termination) || isNilAdoptionDependency(killed) || isNilAdoptionDependency(pathLocks) || isNilAdoptionDependency(resume) || isNilAdoptionDependency(slots) || isNilAdoptionDependency(taskMu) || isNilAdoptionDependency(clock) {
+func NewReconcilePendingUseCase(pending *PendingReconciliationSet, tasks AdoptionTaskStore, liveness LivenessChecker, reader reconcileContractReader, writer contract.ContractWriter, finalizer OrphanFinalizer, termination TerminationEnsurer, killed KillConfirmer, pathLocks PathLockReleaser, resume *RecoverViaResumeUseCase, slots SlotReleaser, taskMu TaskMutex, clock domain.Clock, stalledTracker stalledTimeTracker, metricsRecorder MetricsRecorder, interval time.Duration, terminationGrace time.Duration, logger *slog.Logger) *ReconcilePendingUseCase {
+	if isNilAdoptionDependency(pending) || isNilAdoptionDependency(tasks) || isNilAdoptionDependency(liveness) || isNilAdoptionDependency(reader) || isNilAdoptionDependency(writer) || isNilAdoptionDependency(finalizer) || isNilAdoptionDependency(termination) || isNilAdoptionDependency(killed) || isNilAdoptionDependency(pathLocks) || isNilAdoptionDependency(resume) || isNilAdoptionDependency(slots) || isNilAdoptionDependency(taskMu) || isNilAdoptionDependency(clock) || isNilAdoptionDependency(stalledTracker) || isNilAdoptionDependency(metricsRecorder) {
 		panic("reconcile pending use case requires non-nil dependencies")
 	}
 	if interval <= 0 {
@@ -58,7 +61,7 @@ func NewReconcilePendingUseCase(pending *PendingReconciliationSet, tasks Adoptio
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &ReconcilePendingUseCase{pending: pending, tasks: tasks, liveness: liveness, reader: reader, writer: writer, finalizer: finalizer, termination: termination, killed: killed, pathLocks: pathLocks, resume: resume, slots: slots, taskMu: taskMu, clock: clock, interval: interval, terminationGrace: terminationGrace, logger: logger}
+	return &ReconcilePendingUseCase{pending: pending, tasks: tasks, liveness: liveness, reader: reader, writer: writer, finalizer: finalizer, termination: termination, killed: killed, pathLocks: pathLocks, resume: resume, slots: slots, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker, metricsRecorder: metricsRecorder, interval: interval, terminationGrace: terminationGrace, logger: logger}
 }
 
 // Run processes a snapshot of the pending set on every interval until ctx ends.
@@ -138,10 +141,11 @@ func (uc *ReconcilePendingUseCase) reconcileRecovering(ctx context.Context, task
 	if ctx.Err() != nil {
 		return
 	}
+	occurredAt := uc.clock.Now()
 	uc.taskMu.Lock(taskID)
 	snapshot, err := uc.tasks.Load(taskID)
 	if err == nil && snapshot.State == domain.StateRecovering {
-		err = resolveRecoveringLocked(uc.tasks, uc.reader, uc.writer, uc.logger, taskID, snapshot, present, uc.clock.Now())
+		err = resolveRecoveringLocked(uc.tasks, uc.reader, uc.writer, uc.logger, taskID, snapshot, present, occurredAt)
 	}
 	uc.taskMu.Unlock(taskID)
 	if err != nil {
@@ -158,6 +162,9 @@ func (uc *ReconcilePendingUseCase) reconcileRecovering(ctx context.Context, task
 	if ctx.Err() != nil {
 		return
 	}
+	finalState := recoveringFinalState(present, snapshot)
+	stalledTotal := uc.stalledTracker.TakeTotal(taskID)
+	uc.metricsRecorder.Execute(ctx, metrics.RecordTaskMetricsInput{TaskID: taskID, FinalState: finalState, Estimated: true, OccurredAt: occurredAt, StalledTotalMs: stalledTotal})
 	uc.slots.ReleaseAndAdvance(ctx, taskID, uc.clock.Now())
 	uc.pending.Remove(taskID)
 }
@@ -232,11 +239,7 @@ func (uc *ReconcilePendingUseCase) sendAndReconcile(ctx context.Context, claim S
 			uc.pending.CompleteSend(claim)
 			return
 		}
-		if _, valid := currentClaimAuthority(uc.tasks, uc.taskMu, claim); valid {
-			uc.pending.ReleaseSend(claim)
-		} else {
-			uc.pending.InvalidateSend(claim)
-		}
+		releaseOrInvalidateSendAfterTerminationError(uc.tasks, uc.pending, uc.taskMu, uc.logger, claim)
 		return
 	}
 	latest, valid := currentClaimAuthority(uc.tasks, uc.taskMu, claim)

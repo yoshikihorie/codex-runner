@@ -238,6 +238,24 @@ func TestProcessRunnerLaunchRejectsMissingTaskDirectoryBeforeDependencies(t *tes
 	}
 }
 
+func TestProcessRunnerLaunchRejectsNilLivenessLockBeforeClosing(t *testing.T) {
+	original := launchNewSession
+	t.Cleanup(func() { launchNewSession = original })
+	called := false
+	launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+		called = true
+		return nil, nil
+	}
+	p := launchTestParams(t, nil)
+	p.TaskDirPath = filepath.Join(t.TempDir(), "missing")
+	if _, err := NewProcessRunner(launchTestLogs{}).Launch(context.Background(), p); err == nil {
+		t.Fatal("nil liveness lock was accepted")
+	}
+	if called {
+		t.Fatal("launch started with a nil liveness lock")
+	}
+}
+
 func TestProcessRunnerLaunchRejectsFileAsTaskDirectory(t *testing.T) {
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })
@@ -287,6 +305,18 @@ func TestProcessWaiterReturnsExitCode(t *testing.T) {
 	code, err := (&processWaiter{cmd: cmd}).Wait()
 	if code != 3 || err != nil {
 		t.Fatalf("code,err = %d,%v", code, err)
+	}
+}
+
+func TestProcessWaiterNormalizesSignaledExitCode(t *testing.T) {
+	cmd := exec.Command("/bin/sh", "-c", "kill -KILL $$")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	code, err := (&processWaiter{cmd: cmd}).Wait()
+	want := shellSignalExitBase + int(syscall.SIGKILL)
+	if code != want || err != nil {
+		t.Fatalf("code,err = %d,%v; want %d,nil", code, err, want)
 	}
 }
 
@@ -593,25 +623,24 @@ func TestResumeLauncherRejectsMarkerInspectionPermissionFailure(t *testing.T) {
 	}
 }
 
-func TestSanitizeResumeStderr(t *testing.T) {
-	if got := sanitizeResumeStderr([]byte("\x1b[31merror\x1b[0m\x01\n")); got != "error\n" {
-		t.Fatalf("sanitized=%q", got)
+func TestLimitedWriterLenReportsCapturedBytesWithinLimit(t *testing.T) {
+	writer := &limitedWriter{limit: resumeStderrBufferMaxBytes}
+	if _, err := writer.Write(bytes.Repeat([]byte("x"), resumeStderrBufferMaxBytes+1)); err != nil {
+		t.Fatal(err)
 	}
-	if got := sanitizeResumeStderr(bytes.Repeat([]byte("x"), 501)); got != strings.Repeat("x", 500)+"...(truncated)" {
-		t.Fatalf("truncated=%q", got)
-	}
-	if got := sanitizeResumeStderr(nil); got != "" {
-		t.Fatalf("empty=%q", got)
+	if got := writer.Len(); got != resumeStderrBufferMaxBytes {
+		t.Fatalf("captured bytes = %d, want %d", got, resumeStderrBufferMaxBytes)
 	}
 }
 
-func TestResumeLauncherLogsSanitizedStderrOnLaunchFailure(t *testing.T) {
+func TestResumeLauncherLogsCapturedStderrMetadataOnLaunchFailure(t *testing.T) {
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })
 	var logOutput bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
+	const sensitiveStderr = "resume-secret-value-7a930b"
 	launchNewSession = func(_ context.Context, _ string, _ []string, _ *os.File, _ io.Writer, stderr io.Writer, _ ...string) (*exec.Cmd, error) {
-		_, _ = stderr.Write([]byte("\x1b[31mresume failure\x1b[0m"))
+		_, _ = stderr.Write([]byte("\x1b[31m" + sensitiveStderr + "\x1b[0m"))
 		return nil, errors.New("launch failed")
 	}
 	id := launchTestID(t)
@@ -631,23 +660,149 @@ func TestResumeLauncherLogsSanitizedStderrOnLaunchFailure(t *testing.T) {
 		t.Fatal("launch failure was accepted")
 	}
 	log := logOutput.String()
-	if !strings.Contains(log, "task_id="+id.String()) || !strings.Contains(log, "stderr_summary=\"resume failure\"") || strings.Contains(log, "\\x1b") {
-		t.Fatalf("log=%q", log)
+	if !strings.Contains(log, "task_id="+id.String()) || !strings.Contains(log, "error=\"launch failed\"") || !strings.Contains(log, "stderr_bytes=") {
+		t.Fatal("operational log is missing resume stderr metadata")
+	}
+	if strings.Contains(log, "stderr_summary=") || strings.Contains(log, sensitiveStderr) || strings.Contains(log, "\\x1b") {
+		t.Fatal("operational log contains captured stderr content")
 	}
 }
 
-func TestResumeLauncherLogsSanitizedStderrForNonZeroExit(t *testing.T) {
+func TestResumeLauncherLogsCapturedStderrMetadataForNonZeroExit(t *testing.T) {
 	var logOutput bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
 	launcher := &resumeLauncher{logger: logger}
 	params := recovery.ResumeLaunchParams{TaskID: launchTestID(t)}
 	stderr := &limitedWriter{limit: resumeStderrBufferMaxBytes}
-	if _, err := stderr.Write([]byte("\x1b[31mnon-zero resume output\x1b[0m")); err != nil {
+	const sensitiveStderr = "non-zero-secret-value-3d5f4e"
+	if _, err := stderr.Write([]byte(sensitiveStderr)); err != nil {
 		t.Fatal(err)
 	}
 	launcher.logStderr(params, errors.New("resume process exited with code 1"), stderr)
 	log := logOutput.String()
-	if !strings.Contains(log, "task_id="+params.TaskID.String()) || !strings.Contains(log, "stderr_summary=\"non-zero resume output\"") || strings.Contains(log, "\\x1b") {
-		t.Fatalf("log=%q", log)
+	if !strings.Contains(log, "task_id="+params.TaskID.String()) || !strings.Contains(log, "stderr_bytes=") {
+		t.Fatal("operational log is missing captured-byte metadata")
+	}
+	if strings.Contains(log, "stderr_summary=") || strings.Contains(log, sensitiveStderr) {
+		t.Fatal("operational log contains captured stderr content")
+	}
+}
+
+func TestResumeLauncherDoesNotLogEmptyCapturedStderr(t *testing.T) {
+	var logOutput bytes.Buffer
+	launcher := &resumeLauncher{logger: slog.New(slog.NewTextHandler(&logOutput, nil))}
+	launcher.logStderr(recovery.ResumeLaunchParams{TaskID: launchTestID(t)}, errors.New("resume failed"), &limitedWriter{limit: resumeStderrBufferMaxBytes})
+	if logOutput.Len() != 0 {
+		t.Fatal("empty captured stderr produced an operational warning")
+	}
+}
+
+type resumeSignalRunnerFake struct {
+	terminatePIDs []int
+	killPIDs      []int
+	terminateErr  error
+	killErr       error
+	onTerminate   func()
+	onKill        func()
+}
+
+func (*resumeSignalRunnerFake) Launch(context.Context, LaunchParams) (*LaunchedProcess, error) {
+	return nil, errors.New("unused")
+}
+
+func (f *resumeSignalRunnerFake) SendTerminate(pid int) error {
+	f.terminatePIDs = append(f.terminatePIDs, pid)
+	if f.onTerminate != nil {
+		f.onTerminate()
+	}
+	return f.terminateErr
+}
+
+func (f *resumeSignalRunnerFake) SendKill(pid int) error {
+	f.killPIDs = append(f.killPIDs, pid)
+	if f.onKill != nil {
+		f.onKill()
+	}
+	return f.killErr
+}
+
+func TestResumeLauncherCancellationPrefersAlreadyCompletedWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	waitResult := make(chan resumeWaitOutcome, 1)
+	waitResult <- resumeWaitOutcome{err: errors.New("wait failed")}
+	runner := &resumeSignalRunnerFake{}
+	launcher := &resumeLauncher{runner: runner, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), killGrace: time.Millisecond}
+	err := launcher.finishContextCancellation(ctx, &exec.Cmd{Process: &os.Process{Pid: 4321}}, waitResult, &limitedWriter{limit: resumeStderrBufferMaxBytes}, recovery.ResumeLaunchParams{TaskID: launchTestID(t)})
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "wait failed") {
+		t.Fatalf("error = %v, want joined cancellation and wait error", err)
+	}
+	if len(runner.terminatePIDs) != 0 || len(runner.killPIDs) != 0 {
+		t.Fatal("signals were sent after a completed wait result")
+	}
+}
+
+func TestResumeLauncherCancellationSkipsKillWhenTerminateCompletesWait(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	waitResult := make(chan resumeWaitOutcome, 1)
+	runner := &resumeSignalRunnerFake{}
+	runner.onTerminate = func() { waitResult <- resumeWaitOutcome{} }
+	launcher := &resumeLauncher{runner: runner, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), killGrace: time.Millisecond}
+	err := launcher.finishContextCancellation(ctx, &exec.Cmd{Process: &os.Process{Pid: 4321}}, waitResult, &limitedWriter{limit: resumeStderrBufferMaxBytes}, recovery.ResumeLaunchParams{TaskID: launchTestID(t)})
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("error = %v, want context.Canceled", err)
+	}
+	if !slices.Equal(runner.terminatePIDs, []int{4321}) || len(runner.killPIDs) != 0 {
+		t.Fatalf("terminate pids = %v, kill pids = %v", runner.terminatePIDs, runner.killPIDs)
+	}
+}
+
+func TestResumeLauncherCancellationKillsOnlyAfterGraceAndWaits(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	waitResult := make(chan resumeWaitOutcome, 1)
+	terminateErr := errors.New("terminate failed")
+	waitErr := errors.New("wait failed")
+	runner := &resumeSignalRunnerFake{terminateErr: terminateErr}
+	runner.onKill = func() { waitResult <- resumeWaitOutcome{err: waitErr} }
+	launcher := &resumeLauncher{runner: runner, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), killGrace: time.Millisecond}
+	err := launcher.finishContextCancellation(ctx, &exec.Cmd{Process: &os.Process{Pid: 4321}}, waitResult, &limitedWriter{limit: resumeStderrBufferMaxBytes}, recovery.ResumeLaunchParams{TaskID: launchTestID(t)})
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, terminateErr) || !errors.Is(err, waitErr) {
+		t.Fatalf("error = %v, want cancellation, terminate, and wait errors", err)
+	}
+	if !slices.Equal(runner.terminatePIDs, []int{4321}) || !slices.Equal(runner.killPIDs, []int{4321}) {
+		t.Fatalf("terminate pids = %v, kill pids = %v", runner.terminatePIDs, runner.killPIDs)
+	}
+}
+
+func TestResumeLauncherCancellationReturnsImmediatelyWhenKillFails(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	waitResult := make(chan resumeWaitOutcome)
+	killErr := errors.New("kill failed")
+	runner := &resumeSignalRunnerFake{killErr: killErr}
+	launcher := &resumeLauncher{runner: runner, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), killGrace: time.Millisecond}
+	err := launcher.finishContextCancellation(ctx, &exec.Cmd{Process: &os.Process{Pid: 4321}}, waitResult, &limitedWriter{limit: resumeStderrBufferMaxBytes}, recovery.ResumeLaunchParams{TaskID: launchTestID(t)})
+	if !errors.Is(err, context.Canceled) || !errors.Is(err, killErr) {
+		t.Fatalf("error = %v, want cancellation and kill error", err)
+	}
+	if !slices.Equal(runner.terminatePIDs, []int{4321}) || !slices.Equal(runner.killPIDs, []int{4321}) {
+		t.Fatalf("terminate pids = %v, kill pids = %v", runner.terminatePIDs, runner.killPIDs)
+	}
+}
+
+func TestResumeLauncherCancellationReturnsReapTimeoutAfterKill(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	waitResult := make(chan resumeWaitOutcome)
+	runner := &resumeSignalRunnerFake{}
+	launcher := &resumeLauncher{runner: runner, logger: slog.New(slog.NewTextHandler(io.Discard, nil)), killGrace: time.Millisecond}
+	err := launcher.finishContextCancellation(ctx, &exec.Cmd{Process: &os.Process{Pid: 4321}}, waitResult, &limitedWriter{limit: resumeStderrBufferMaxBytes}, recovery.ResumeLaunchParams{TaskID: launchTestID(t)})
+	if !errors.Is(err, context.Canceled) || !strings.Contains(err.Error(), "resume process was not reaped after SIGKILL") {
+		t.Fatalf("error = %v, want cancellation and reap timeout", err)
+	}
+	if !slices.Equal(runner.terminatePIDs, []int{4321}) || !slices.Equal(runner.killPIDs, []int{4321}) {
+		t.Fatalf("terminate pids = %v, kill pids = %v", runner.terminatePIDs, runner.killPIDs)
 	}
 }

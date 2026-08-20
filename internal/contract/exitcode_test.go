@@ -53,28 +53,42 @@ func TestWriteExitCodeIdempotently(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	writeFailure := errors.New("write")
 	for _, tc := range []struct {
-		name       string
-		reader     exitCodeReaderFake
-		wantWrites int
-		wantFatal  bool
+		name                    string
+		reader                  exitCodeReaderFake
+		writerErr               error
+		wantWrites              int
+		wantWriteErr            bool
+		wantFatal               bool
+		wantContractWriteFailed bool
 	}{
-		{"missing writes once", exitCodeReaderFake{}, 1, false},
-		{"same value skips write", exitCodeReaderFake{existing: 0, exists: true}, 0, false},
-		{"mismatch fails closed", exitCodeReaderFake{existing: 1, exists: true}, 0, true},
-		{"read failure fails closed", exitCodeReaderFake{err: errors.New("read")}, 0, true},
+		{"missing writes once", exitCodeReaderFake{}, nil, 1, false, false, false},
+		{"same value skips write", exitCodeReaderFake{existing: 0, exists: true}, nil, 0, false, false, false},
+		{"mismatch fails closed", exitCodeReaderFake{existing: 1, exists: true}, nil, 0, false, true, true},
+		{"read failure fails closed", exitCodeReaderFake{err: errors.New("read")}, nil, 0, false, true, true},
+		{"write failure is returned separately", exitCodeReaderFake{}, writeFailure, 1, true, false, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			reader := tc.reader
-			writer := &exitCodeWriterFake{}
+			writer := &exitCodeWriterFake{err: tc.writerErr}
 			writeErr, fatalErr := WriteExitCodeIdempotently(&reader, writer, id, domain.NewExitCode(0))
-			if writer.writes != tc.wantWrites || writeErr != nil || (fatalErr != nil) != tc.wantFatal {
+			if writer.writes != tc.wantWrites || (writeErr != nil) != tc.wantWriteErr || (fatalErr != nil) != tc.wantFatal {
 				t.Fatalf("writes=%d writeErr=%v fatalErr=%v", writer.writes, writeErr, fatalErr)
 			}
+			if tc.writerErr != nil && !errors.Is(writeErr, tc.writerErr) {
+				t.Fatalf("writeErr=%v, want=%v", writeErr, tc.writerErr)
+			}
+			if reader.calls != 1 {
+				t.Fatalf("reader calls=%d, want=1", reader.calls)
+			}
+			if writer.writes > 0 && writer.code.Raw() != 0 {
+				t.Fatalf("written code=%d, want=0", writer.code.Raw())
+			}
+			if errors.Is(fatalErr, domain.ErrContractWriteFailed) != tc.wantContractWriteFailed {
+				t.Fatalf("fatalErr=%v", fatalErr)
+			}
 			if tc.name == "mismatch fails closed" {
-				if !errors.Is(fatalErr, domain.ErrContractWriteFailed) {
-					t.Fatalf("fatalErr=%v", fatalErr)
-				}
 				existing, attempted, ok := ExitCodeMismatch(fatalErr)
 				if !ok || existing != 1 || attempted != 0 {
 					t.Fatalf("mismatch=(%d,%d,%t)", existing, attempted, ok)
