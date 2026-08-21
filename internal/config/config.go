@@ -347,6 +347,11 @@ func defaultSocketPath() (string, error) {
 	return filepath.Join(home, ".claude", "run", "codexd.sock"), nil
 }
 
+// DefaultSocketPath returns the standard daemon socket location.
+func DefaultSocketPath() (string, error) {
+	return defaultSocketPath()
+}
+
 func findCodexBinary() (string, error) {
 	candidates := codexBinaryPathCandidates
 	if home, err := userHomeDir(); err == nil {

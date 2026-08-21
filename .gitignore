@@ -9,7 +9,7 @@ TASK-*.md
 /bin/
 /dist/
 /build/
-codexd
+/codexd
 *.exe
 *.test
 *.out

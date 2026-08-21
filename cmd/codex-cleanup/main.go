@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/yoshikihorie/codex-runner/internal/config"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/execution"
 	"github.com/yoshikihorie/codex-runner/internal/store"
@@ -20,6 +21,11 @@ import (
 type cleanupUseCase interface {
 	Plan(context.Context, execution.EvictWorkDirInput) ([]execution.WorktreeCandidate, []execution.WorktreeSkipped, error)
 	Execute(context.Context, execution.EvictWorkDirInput, []string) (execution.EvictWorkDirOutput, error)
+}
+
+type cleanupLogsUseCase interface {
+	Plan(context.Context, execution.EvictLogsInput) (execution.EvictLogsOutput, error)
+	Execute(context.Context, execution.EvictLogsInput, []execution.LogDeletionCandidate) (execution.EvictLogsOutput, error)
 }
 
 var _ cleanupUseCase = (*execution.EvictWorkDirUseCase)(nil)
@@ -34,11 +40,38 @@ var cleanupMessages = map[string]map[string]string{
 	"ja": {
 		"info.cleanup.confirm":   "{count}件の作業用ディレクトリを削除します。よろしいですか。",
 		"info.cleanup.completed": "{count}件の作業用ディレクトリを削除しました。",
+		// message-catalog.md:172-173（info.cleanup.logsConfirm / info.cleanup.logsCompleted）から転記。
+		"info.cleanup.logsConfirm":   "{count}件のログファイルを削除します。よろしいですか。",
+		"info.cleanup.logsCompleted": "{count}件のログファイルを削除しました。",
 	},
 	"en": {
-		"info.cleanup.confirm":   "This will delete {count} working directories. Continue?",
-		"info.cleanup.completed": "Deleted {count} working directories.",
+		"info.cleanup.confirm":       "This will delete {count} working directories. Continue?",
+		"info.cleanup.completed":     "Deleted {count} working directories.",
+		"info.cleanup.logsConfirm":   "This will delete {count} log files. Continue?",
+		"info.cleanup.logsCompleted": "Deleted {count} log files.",
 	},
+}
+
+func newCleanupLogsUseCase() (*execution.EvictLogsUseCase, error) {
+	cfg, err := config.LoadDefault()
+	if err != nil {
+		return nil, err
+	}
+	paths, err := execution.DefaultLogPaths()
+	if err != nil {
+		return nil, err
+	}
+	paths.SocketPath = cfg.SocketPath()
+	locks := execution.NewCheckLivenessUseCase(domain.LivenessLockFunc(store.TryAcquireLiveness), execution.DefaultLockPathResolver)
+	policy := execution.LogEvictionPolicy{
+		RotationMaxSize:  cfg.LogRotationMaxSizeBytes(),
+		RotationInterval: time.Duration(cfg.LogRotationIntervalSeconds()) * time.Second,
+		RetentionDays:    cfg.LogRotationRetentionDays(),
+		RetentionCount:   cfg.LogRotationRetentionCount(),
+		Compress:         cfg.LogRotationCompress(),
+		MetricsRetention: cfg.MetricsRetentionMonths(),
+	}
+	return execution.NewEvictLogsUseCase(store.NewFileLogStore(nil), locks, policy, paths)
 }
 
 func newCleanupUseCase() (*execution.EvictWorkDirUseCase, error) {
@@ -54,6 +87,10 @@ func newCleanupUseCase() (*execution.EvictWorkDirUseCase, error) {
 }
 
 func runCleanup(ctx context.Context, uc cleanupUseCase, args []string, stdin io.Reader, stdout io.Writer, now func() time.Time) (execution.EvictWorkDirOutput, error) {
+	return runCleanupWithReader(ctx, uc, args, bufio.NewReader(stdin), stdout, now)
+}
+
+func runCleanupWithReader(ctx context.Context, uc cleanupUseCase, args []string, stdin *bufio.Reader, stdout io.Writer, now func() time.Time) (execution.EvictWorkDirOutput, error) {
 	flags := flag.NewFlagSet("codex-cleanup", flag.ContinueOnError)
 	flags.SetOutput(io.Discard)
 	force := flags.Bool("force", false, "include changed working directories")
@@ -80,7 +117,7 @@ func runCleanup(ctx context.Context, uc cleanupUseCase, args []string, stdin io.
 	if _, err := fmt.Fprintf(stdout, "%s [y/N] ", formatCleanupMessage(locale, "info.cleanup.confirm", len(candidates))); err != nil {
 		return execution.EvictWorkDirOutput{}, fmt.Errorf("write cleanup confirmation: %w", err)
 	}
-	confirmed, err := readConfirmation(stdin)
+	confirmed, err := readConfirmationReader(stdin)
 	if err != nil {
 		return execution.EvictWorkDirOutput{}, err
 	}
@@ -102,18 +139,81 @@ func runCleanup(ctx context.Context, uc cleanupUseCase, args []string, stdin io.
 	return out, nil
 }
 
-func readConfirmation(r io.Reader) (bool, error) {
-	limited := io.LimitReader(r, maxConfirmationInputBytes)
-	line, err := bufio.NewReader(limited).ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
-		return false, fmt.Errorf("read cleanup confirmation: %w", err)
+func runCleanupLogs(ctx context.Context, uc cleanupLogsUseCase, stdout io.Writer, stdin *bufio.Reader, now func() time.Time) (execution.EvictLogsOutput, error) {
+	in := execution.EvictLogsInput{Trigger: execution.TriggerExplicit, OccurredAt: now()}
+	planned, err := uc.Plan(ctx, in)
+	if err != nil {
+		return execution.EvictLogsOutput{}, err
 	}
-	if errors.Is(err, io.EOF) && line == "" {
+	locale := resolveCleanupLocale()
+	if _, err := fmt.Fprintf(stdout, "%s [y/N] ", formatCleanupMessage(locale, "info.cleanup.logsConfirm", len(planned.Candidates))); err != nil {
+		return execution.EvictLogsOutput{}, fmt.Errorf("write logs cleanup confirmation: %w", err)
+	}
+	confirmed, err := readConfirmationReader(stdin)
+	if err != nil {
+		return execution.EvictLogsOutput{}, err
+	}
+	if !confirmed {
+		return planned, nil
+	}
+	out, err := uc.Execute(ctx, in, planned.Candidates)
+	if err != nil {
+		return out, err
+	}
+	if _, err := fmt.Fprintln(stdout, formatCleanupMessage(locale, "info.cleanup.logsCompleted", len(out.Deleted))); err != nil {
+		return execution.EvictLogsOutput{}, fmt.Errorf("write logs cleanup completion: %w", err)
+	}
+	return out, nil
+}
+
+func readConfirmation(r io.Reader) (bool, error) {
+	return readConfirmationReader(bufio.NewReader(r))
+}
+
+func readConfirmationReader(r *bufio.Reader) (bool, error) {
+	line := make([]byte, 0, maxConfirmationInputBytes)
+	tooLong := false
+
+	for {
+		fragment, err := r.ReadSlice('\n')
+
+		if !tooLong {
+			if len(line)+len(fragment) > maxConfirmationInputBytes {
+				tooLong = true
+			} else {
+				line = append(line, fragment...)
+			}
+		}
+
+		switch {
+		case err == nil:
+			goto done
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case errors.Is(err, io.EOF):
+			goto done
+		default:
+			return false, fmt.Errorf("read cleanup confirmation: %w", err)
+		}
+	}
+
+done:
+	if tooLong || len(line) == 0 {
 		return false, nil
 	}
-	line = strings.TrimSuffix(line, "\n")
-	line = strings.TrimSuffix(line, "\r")
-	return line == "y", nil
+	value := strings.TrimSuffix(string(line), "\n")
+	value = strings.TrimSuffix(value, "\r")
+	return value == "y", nil
+}
+
+func runCleanupWithLogs(ctx context.Context, worktrees cleanupUseCase, logs cleanupLogsUseCase, args []string, stdin io.Reader, stdout io.Writer, now func() time.Time) (execution.EvictWorkDirOutput, execution.EvictLogsOutput, error) {
+	reader := bufio.NewReader(stdin)
+	worktreeOutput, err := runCleanupWithReader(ctx, worktrees, args, reader, stdout, now)
+	if err != nil {
+		return worktreeOutput, execution.EvictLogsOutput{}, err
+	}
+	logOutput, err := runCleanupLogs(ctx, logs, stdout, reader, now)
+	return worktreeOutput, logOutput, err
 }
 
 func resolveCleanupLocale() string {
@@ -144,5 +244,14 @@ func main() {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	os.Exit(runMain(context.Background(), uc, os.Args[1:], os.Stdin, os.Stdout, os.Stderr, time.Now))
+	logs, err := newCleanupLogsUseCase()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if _, _, err := runCleanupWithLogs(context.Background(), uc, logs, os.Args[1:], os.Stdin, os.Stdout, time.Now); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	os.Exit(0)
 }

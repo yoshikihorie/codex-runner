@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -22,6 +23,23 @@ type fakeCleanupUseCase struct {
 	planInputs     []execution.EvictWorkDirInput
 	executeInputs  []execution.EvictWorkDirInput
 	confirmedPaths [][]string
+}
+
+type fakeCleanupLogsUseCase struct {
+	planOutput    execution.EvictLogsOutput
+	planErr       error
+	executeOutput execution.EvictLogsOutput
+	executeErr    error
+	confirmed     [][]execution.LogDeletionCandidate
+}
+
+func (f *fakeCleanupLogsUseCase) Plan(_ context.Context, _ execution.EvictLogsInput) (execution.EvictLogsOutput, error) {
+	return f.planOutput, f.planErr
+}
+
+func (f *fakeCleanupLogsUseCase) Execute(_ context.Context, _ execution.EvictLogsInput, candidates []execution.LogDeletionCandidate) (execution.EvictLogsOutput, error) {
+	f.confirmed = append(f.confirmed, append([]execution.LogDeletionCandidate(nil), candidates...))
+	return f.executeOutput, f.executeErr
 }
 
 func (f *fakeCleanupUseCase) Plan(_ context.Context, in execution.EvictWorkDirInput) ([]execution.WorktreeCandidate, []execution.WorktreeSkipped, error) {
@@ -115,6 +133,20 @@ func TestReadConfirmation(t *testing.T) {
 	}
 	if _, err := readConfirmation(errorReader{err: errors.New("read failed")}); err == nil {
 		t.Fatal("readConfirmation() error = nil, want error")
+	}
+}
+
+func TestReadConfirmationReaderDiscardsOverlongLineBeforeNextConfirmation(t *testing.T) {
+	input := strings.Repeat("x", maxConfirmationInputBytes+bufio.MaxScanTokenSize) + "\n" + "y\n"
+	reader := bufio.NewReader(strings.NewReader(input))
+
+	first, err := readConfirmationReader(reader)
+	if err != nil || first {
+		t.Fatalf("first confirmation = %v, %v; want false, nil", first, err)
+	}
+	second, err := readConfirmationReader(reader)
+	if err != nil || !second {
+		t.Fatalf("second confirmation = %v, %v; want true, nil", second, err)
 	}
 }
 
@@ -229,6 +261,33 @@ func TestRunCleanupRejectsPositionalArguments(t *testing.T) {
 	_, err := runCleanup(context.Background(), uc, []string{"extra-arg"}, strings.NewReader("y\n"), io.Discard, fixedNow)
 	if err == nil || len(uc.executeInputs) != 0 {
 		t.Fatalf("error = %v, Execute calls = %d", err, len(uc.executeInputs))
+	}
+}
+
+func TestRunCleanupWithLogsSharesConfirmationReader(t *testing.T) {
+	t.Setenv("CODEX_RUNNER_LANG", "en")
+	worktrees := &fakeCleanupUseCase{planCandidates: candidates("/tmp/a"), executeOutput: execution.EvictWorkDirOutput{Deleted: []string{"/tmp/a"}}}
+	logs := &fakeCleanupLogsUseCase{
+		planOutput:    execution.EvictLogsOutput{Candidates: []execution.LogDeletionCandidate{{Path: "/tmp/log", Category: execution.LogCategoryMonthlyMetrics}}},
+		executeOutput: execution.EvictLogsOutput{Deleted: []string{"/tmp/log"}},
+	}
+	var stdout bytes.Buffer
+	_, logOutput, err := runCleanupWithLogs(context.Background(), worktrees, logs, nil, strings.NewReader("y\ny\n"), &stdout, fixedNow)
+	if err != nil || len(logs.confirmed) != 1 || len(logOutput.Deleted) != 1 {
+		t.Fatalf("error = %v, confirmed = %#v, logs = %#v", err, logs.confirmed, logOutput)
+	}
+	if !strings.Contains(stdout.String(), "This will delete 1 log files. Continue?") {
+		t.Fatalf("stdout = %q", stdout.String())
+	}
+}
+
+func TestRunCleanupLogsCancelsUnlessResponseIsExactY(t *testing.T) {
+	for _, response := range []string{"n\n", "\n", ""} {
+		logs := &fakeCleanupLogsUseCase{planOutput: execution.EvictLogsOutput{Candidates: []execution.LogDeletionCandidate{{Path: "/tmp/log", Category: execution.LogCategoryMonthlyMetrics}}}}
+		_, err := runCleanupLogs(context.Background(), logs, io.Discard, bufio.NewReader(strings.NewReader(response)), fixedNow)
+		if err != nil || len(logs.confirmed) != 0 {
+			t.Fatalf("response %q: error = %v, confirmed = %#v", response, err, logs.confirmed)
+		}
 	}
 }
 
