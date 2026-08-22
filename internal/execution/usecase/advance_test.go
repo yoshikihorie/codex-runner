@@ -58,7 +58,7 @@ func (q *advanceQueueFake) Restore(payload execution.TaskLaunchPayload, index in
 }
 
 type advanceRegistryFake struct {
-	ids         map[domain.TaskID]struct{}
+	ids         map[domain.TaskID]domain.Subcommand
 	addCalls    int
 	removeCalls int
 	addHook     func()
@@ -66,9 +66,18 @@ type advanceRegistryFake struct {
 }
 
 func (r *advanceRegistryFake) Size() int { return len(r.ids) }
-func (r *advanceRegistryFake) Add(id domain.TaskID) {
+func (r *advanceRegistryFake) ImplSize() int {
+	count := 0
+	for _, subcommand := range r.ids {
+		if subcommand == domain.SubcommandImpl {
+			count++
+		}
+	}
+	return count
+}
+func (r *advanceRegistryFake) Add(id domain.TaskID, subcommand domain.Subcommand) {
 	r.addCalls++
-	r.ids[id] = struct{}{}
+	r.ids[id] = subcommand
 	if r.addHook != nil {
 		r.addHook()
 	}
@@ -80,10 +89,10 @@ func (r *advanceRegistryFake) Remove(id domain.TaskID) {
 		r.removeHook()
 	}
 }
-func (r *advanceRegistryFake) Reset(ids []domain.TaskID) {
-	r.ids = make(map[domain.TaskID]struct{}, len(ids))
-	for _, id := range ids {
-		r.ids[id] = struct{}{}
+func (r *advanceRegistryFake) Reset(reservations map[domain.TaskID]domain.Subcommand) {
+	r.ids = make(map[domain.TaskID]domain.Subcommand, len(reservations))
+	for id, subcommand := range reservations {
+		r.ids[id] = subcommand
 	}
 }
 
@@ -113,7 +122,7 @@ func (r *advanceLaunchingFake) Lookup(id domain.TaskID) (domain.TaskSnapshot, bo
 func TestAdvanceQueueUseCaseDequeuesFIFOAndReleasesSlot(t *testing.T) {
 	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
 	launching := execution.NewLaunchingTaskRegistry()
-	admit := NewAdmitTaskUseCase(queue, registry, launching, mutex, 1, 2)
+	admit := NewAdmitTaskUseCase(queue, registry, launching, mutex, 1, 1, 2)
 	active := testAdmissionInput(t, domain.SubcommandImpl, "active")
 	if _, err := admit.Execute(context.Background(), active); err != nil {
 		t.Fatal(err)
@@ -122,7 +131,7 @@ func TestAdvanceQueueUseCaseDequeuesFIFOAndReleasesSlot(t *testing.T) {
 	if _, err := admit.Execute(context.Background(), waiting); err != nil {
 		t.Fatal(err)
 	}
-	payload, found, err := NewAdvanceQueueUseCase(queue, registry, launching, mutex, 1).Execute(context.Background(), active.TaskID, time.Now())
+	payload, found, err := NewAdvanceQueueUseCase(queue, registry, launching, mutex, 1, 1).Execute(context.Background(), active.TaskID, time.Now())
 	if err != nil || !found || payload.Task.ID() != waiting.TaskID || registry.Size() != 1 {
 		t.Fatalf("payload=%#v found=%t err=%v size=%d", payload, found, err, registry.Size())
 	}
@@ -132,7 +141,7 @@ func TestAdvanceQueueUseCaseDequeuesFIFOAndReleasesSlot(t *testing.T) {
 }
 
 func TestAdvanceQueueUseCaseEmptyQueue(t *testing.T) {
-	payload, found, err := NewAdvanceQueueUseCase(execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1).Execute(context.Background(), domain.TaskID{}, time.Now())
+	payload, found, err := NewAdvanceQueueUseCase(execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1, 1).Execute(context.Background(), domain.TaskID{}, time.Now())
 	if err != nil || found || payload.Task != nil || payload.Model != "" || payload.WorkingDir != nil {
 		t.Fatalf("payload=%#v found=%t err=%v", payload, found, err)
 	}
@@ -142,8 +151,8 @@ func TestAdvanceQueueRejectsDequeuedNonQueuedPayloadWithoutReindex(t *testing.T)
 	invalid := execution.TaskLaunchPayload{Task: advanceNonQueuedTask(t, "advance-invalid")}
 	next := execution.TaskLaunchPayload{Task: queueTask(t, "advance-next")}
 	queue := &advanceQueueFake{payloads: []execution.TaskLaunchPayload{invalid, next}}
-	registry := &advanceRegistryFake{ids: map[domain.TaskID]struct{}{}}
-	payload, found, err := NewAdvanceQueueUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1).Execute(context.Background(), domain.TaskID{}, time.Now())
+	registry := &advanceRegistryFake{ids: map[domain.TaskID]domain.Subcommand{}}
+	payload, found, err := NewAdvanceQueueUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1, 1).Execute(context.Background(), domain.TaskID{}, time.Now())
 	if err != domain.ErrInvalidStateTransition || found || payload.Task != nil || queue.reindexCalls != 0 || len(queue.payloads) != 1 || queue.payloads[0].Task.ID() != next.Task.ID() {
 		t.Fatalf("payload=%#v found=%t err=%v queue=%#v reindex=%d", payload, found, err, queue.payloads, queue.reindexCalls)
 	}
@@ -152,12 +161,25 @@ func TestAdvanceQueueRejectsDequeuedNonQueuedPayloadWithoutReindex(t *testing.T)
 func TestAdvanceQueuePrependsWhenSlotBecomesUnavailable(t *testing.T) {
 	payload := execution.TaskLaunchPayload{Task: queueTask(t, "advance-race")}
 	queue := &advanceQueueFake{payloads: []execution.TaskLaunchPayload{payload}}
-	registry := &advanceRegistryFake{ids: map[domain.TaskID]struct{}{}}
+	registry := &advanceRegistryFake{ids: map[domain.TaskID]domain.Subcommand{}}
 	// Size becomes full after the completed task is removed, simulating a competing reservation.
-	registry.ids[queueTask(t, "advance-other").ID()] = struct{}{}
-	got, found, err := NewAdvanceQueueUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1).Execute(context.Background(), domain.TaskID{}, time.Now())
+	registry.ids[queueTask(t, "advance-other").ID()] = domain.SubcommandReview
+	got, found, err := NewAdvanceQueueUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1, 1).Execute(context.Background(), domain.TaskID{}, time.Now())
 	if err != nil || found || got.Task != nil || queue.prependCalls != 1 || queue.reindexCalls != 0 || registry.addCalls != 0 || len(queue.payloads) != 1 || queue.payloads[0].Task.ID() != payload.Task.ID() {
 		t.Fatalf("payload=%#v found=%t err=%v queue=%#v", got, found, err, queue.payloads)
+	}
+}
+
+func TestAdvanceQueueDoesNotBypassImplHeadAtImplLimit(t *testing.T) {
+	impl := advanceQueuedPayload(t, "impl-head-blocked")
+	reviewInput := testAdmissionInput(t, domain.SubcommandReview, "review-behind-impl")
+	review := execution.TaskLaunchPayload{Task: taskFromAdmissionInput(t, reviewInput), Model: reviewInput.Model, PromptText: reviewInput.PromptText, ResolvedTimeout: reviewInput.ResolvedTimeout, SandboxMode: reviewInput.SandboxMode, SourceWorkingDir: reviewInput.SourceWorkingDir}
+	activeID := queueTask(t, "impl-active").ID()
+	queue := &advanceQueueFake{payloads: []execution.TaskLaunchPayload{impl, review}}
+	registry := &advanceRegistryFake{ids: map[domain.TaskID]domain.Subcommand{activeID: domain.SubcommandImpl}}
+	payload, found, err := NewAdvanceQueueUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 3, 1).Execute(context.Background(), domain.TaskID{}, time.Now())
+	if err != nil || found || payload.Task != nil || queue.prependCalls != 1 || queue.reindexCalls != 0 || len(queue.payloads) != 2 || queue.payloads[0].Task.ID() != impl.Task.ID() || queue.payloads[1].Task.ID() != review.Task.ID() {
+		t.Fatalf("payload=%#v found=%t err=%v queue=%#v prepend=%d reindex=%d", payload, found, err, queue.payloads, queue.prependCalls, queue.reindexCalls)
 	}
 }
 
@@ -168,9 +190,9 @@ func TestAdvanceQueueRemoveUnknownIDStillAdvances(t *testing.T) {
 	payload := execution.TaskLaunchPayload{Task: queueTask(t, "advance-unknown"), Model: input.Model, ReasoningEffort: &effort, PromptText: input.PromptText, NormalizedPaths: paths, ResolvedTimeout: input.ResolvedTimeout, SandboxMode: input.SandboxMode, SourceWorkingDir: input.SourceWorkingDir, WorkingDir: &workingDir}
 	remaining := execution.TaskLaunchPayload{Task: queueTask(t, "advance-remaining")}
 	queue := &advanceQueueFake{payloads: []execution.TaskLaunchPayload{payload, remaining}}
-	registry := &advanceRegistryFake{ids: map[domain.TaskID]struct{}{queueTask(t, "advance-active").ID(): {}}}
+	registry := &advanceRegistryFake{ids: map[domain.TaskID]domain.Subcommand{queueTask(t, "advance-active").ID(): domain.SubcommandReview}}
 	launching := execution.NewLaunchingTaskRegistry()
-	got, found, err := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 2).Execute(context.Background(), domain.TaskID{}, time.Now())
+	got, found, err := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 2, 2).Execute(context.Background(), domain.TaskID{}, time.Now())
 	if err != nil || !found || got.Task.ID() != payload.Task.ID() || got.Model != payload.Model || got.PromptText != payload.PromptText || got.ReasoningEffort == nil || *got.ReasoningEffort != *payload.ReasoningEffort || len(got.NormalizedPaths) != 1 || got.NormalizedPaths[0] != payload.NormalizedPaths[0] || got.SandboxMode != payload.SandboxMode || got.SourceWorkingDir != payload.SourceWorkingDir || got.WorkingDir == nil || *got.WorkingDir != *payload.WorkingDir || registry.addCalls != 1 || queue.reindexCalls != 1 || len(queue.payloads) != 1 || queue.payloads[0].Task.ID() != remaining.Task.ID() {
 		t.Fatalf("payload=%#v found=%t err=%v add=%d reindex=%d", got, found, err, registry.addCalls, queue.reindexCalls)
 	}
@@ -182,9 +204,9 @@ func TestAdvanceQueueRemoveUnknownIDStillAdvances(t *testing.T) {
 func TestAdvanceQueueRestoresPayloadWhenSnapshotConstructionFails(t *testing.T) {
 	payload := execution.TaskLaunchPayload{Task: queueTask(t, "advance-invalid-snapshot")}
 	queue := &advanceQueueFake{payloads: []execution.TaskLaunchPayload{payload}}
-	registry := &advanceRegistryFake{ids: map[domain.TaskID]struct{}{}}
+	registry := &advanceRegistryFake{ids: map[domain.TaskID]domain.Subcommand{}}
 	launching := execution.NewLaunchingTaskRegistry()
-	got, found, err := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1).Execute(context.Background(), domain.TaskID{}, time.Now())
+	got, found, err := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1, 1).Execute(context.Background(), domain.TaskID{}, time.Now())
 	if err == nil || found || got.Task != nil || queue.prependCalls != 1 || queue.reindexCalls != 0 || registry.addCalls != 0 || len(queue.payloads) != 1 || queue.payloads[0].Task.ID() != payload.Task.ID() {
 		t.Fatalf("payload=%#v found=%t err=%v queue=%#v", got, found, err, queue.payloads)
 	}
@@ -252,13 +274,13 @@ func TestAdvanceQueueUseCaseCancellationCompensatesEachPromotionCheckpoint(t *te
 		t.Run(tc.name, func(t *testing.T) {
 			payload := advanceQueuedPayload(t, "advance-cancel-"+tc.slug)
 			queue := &advanceQueueFake{payloads: []execution.TaskLaunchPayload{payload}}
-			registry := &advanceRegistryFake{ids: map[domain.TaskID]struct{}{}}
+			registry := &advanceRegistryFake{ids: map[domain.TaskID]domain.Subcommand{}}
 			launching := &advanceLaunchingFake{snapshots: map[domain.TaskID]domain.TaskSnapshot{}}
 			ctx, cancel := context.WithCancel(context.Background())
 			defer cancel()
 			tc.cancel(cancel, queue, registry, launching)
 
-			got, found, err := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1).Execute(ctx, domain.TaskID{}, time.Now())
+			got, found, err := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1, 1).Execute(ctx, domain.TaskID{}, time.Now())
 			if !errors.Is(err, context.Canceled) || found || got.Task != nil {
 				t.Fatalf("payload=%#v found=%t err=%v", got, found, err)
 			}
@@ -270,9 +292,9 @@ func TestAdvanceQueueUseCaseCancellationCompensatesEachPromotionCheckpoint(t *te
 func TestAdvanceQueueCommitStartRemovesPromotionAndMakesCompensationANoop(t *testing.T) {
 	payload := advanceQueuedPayload(t, "advance-commit")
 	queue := &advanceQueueFake{payloads: []execution.TaskLaunchPayload{payload}}
-	registry := &advanceRegistryFake{ids: map[domain.TaskID]struct{}{}}
+	registry := &advanceRegistryFake{ids: map[domain.TaskID]domain.Subcommand{}}
 	launching := execution.NewLaunchingTaskRegistry()
-	useCase := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1)
+	useCase := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1, 1)
 
 	got, found, err := useCase.Execute(context.Background(), domain.TaskID{}, time.Now())
 	if err != nil || !found {
@@ -294,9 +316,9 @@ func TestAdvanceQueueCommitStartRemovesPromotionAndMakesCompensationANoop(t *tes
 func TestAdvanceQueueIgnoresUnregisteredPromotion(t *testing.T) {
 	payload := advanceQueuedPayload(t, "advance-unregistered-zero-promotion")
 	queue := &advanceQueueFake{payloads: []execution.TaskLaunchPayload{payload}}
-	registry := &advanceRegistryFake{ids: map[domain.TaskID]struct{}{}}
+	registry := &advanceRegistryFake{ids: map[domain.TaskID]domain.Subcommand{}}
 	launching := execution.NewLaunchingTaskRegistry()
-	useCase := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1)
+	useCase := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1, 1)
 
 	got, found, err := useCase.Execute(context.Background(), domain.TaskID{}, time.Now())
 	if err != nil || !found {
@@ -318,9 +340,9 @@ func TestAdvanceQueueIgnoresUnregisteredPromotion(t *testing.T) {
 func TestAdvanceQueueIgnoresStalePromotionCompensation(t *testing.T) {
 	payload := advanceQueuedPayload(t, "advance-stale-promotion")
 	queue := &advanceQueueFake{payloads: []execution.TaskLaunchPayload{payload}}
-	registry := &advanceRegistryFake{ids: map[domain.TaskID]struct{}{}}
+	registry := &advanceRegistryFake{ids: map[domain.TaskID]domain.Subcommand{}}
 	launching := execution.NewLaunchingTaskRegistry()
-	useCase := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1)
+	useCase := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1, 1)
 
 	first, found, err := useCase.Execute(context.Background(), domain.TaskID{}, time.Now())
 	if err != nil || !found {

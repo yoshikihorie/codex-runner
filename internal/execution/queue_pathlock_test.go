@@ -46,7 +46,7 @@ type pathLockIntegrationFixture struct {
 	submit    *transportusecase.SubmitTaskUseCase
 }
 
-func newPathLockIntegrationFixture(t *testing.T, maxConcurrent int, liveness domain.LivenessLock) pathLockIntegrationFixture {
+func newPathLockIntegrationFixture(t *testing.T, maxConcurrent int, maxConcurrentImpl int, liveness domain.LivenessLock) pathLockIntegrationFixture {
 	t.Helper()
 	tasksRoot, lockRoot, mutexRoot := t.TempDir(), t.TempDir(), t.TempDir()
 	tasks, err := store.NewFileTaskStore(tasksRoot)
@@ -58,7 +58,7 @@ func newPathLockIntegrationFixture(t *testing.T, maxConcurrent int, liveness dom
 	releaser := execution.NewReleasePathLockUseCase(pathStore, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	queue, registry := execution.NewTaskQueue(), execution.NewActiveTaskRegistry()
 	const queueMaxDepth = 10
-	recordingAdmit := &recordingAdmitter{inner: executionusecase.NewAdmitTaskUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, maxConcurrent, queueMaxDepth)}
+	recordingAdmit := &recordingAdmitter{inner: executionusecase.NewAdmitTaskUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, maxConcurrent, maxConcurrentImpl, queueMaxDepth)}
 	starter := &queueIntegrationStarter{}
 	recordingAcquire := &recordingPathLockAcquirer{inner: acquire}
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
@@ -102,7 +102,7 @@ func requirePublicError(t *testing.T, response transport.Response, code, key str
 
 // SCN-proto-01-14 and SCN-proto-01-15.
 func TestSubmitPathLockIntegrationRejectsConflictingPath(t *testing.T) {
-	fixture := newPathLockIntegrationFixture(t, 2, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }))
+	fixture := newPathLockIntegrationFixture(t, 2, 2, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }))
 	path := t.TempDir()
 	normalized, err := store.NormalizePath(path, true)
 	if err != nil {
@@ -130,7 +130,7 @@ func TestSubmitPathLockIntegrationRejectsConflictingPath(t *testing.T) {
 
 // SCN-queue-01-12.
 func TestSubmitPathLockIntegrationSucceedsAfterReleaseAndRetry(t *testing.T) {
-	fixture := newPathLockIntegrationFixture(t, 2, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }))
+	fixture := newPathLockIntegrationFixture(t, 2, 2, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }))
 	path := t.TempDir()
 	normalized, err := store.NormalizePath(path, true)
 	if err != nil {
@@ -160,7 +160,7 @@ func TestSubmitPathLockIntegrationSucceedsAfterReleaseAndRetry(t *testing.T) {
 
 // SCN-queue-01-13.
 func TestSubmitPathLockIntegrationRunsNonOverlappingTasksWithinLimit(t *testing.T) {
-	fixture := newPathLockIntegrationFixture(t, 2, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }))
+	fixture := newPathLockIntegrationFixture(t, 2, 2, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }))
 	firstPath, secondPath := t.TempDir(), t.TempDir()
 	first, err := fixture.submit.Execute(context.Background(), implInput(t, "first", firstPath))
 	if err != nil {
@@ -187,7 +187,7 @@ func TestSubmitPathLockIntegrationMapsLivenessFailureToPublicResponse(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture := newPathLockIntegrationFixture(t, 2, domain.LivenessLockFunc(func(string) (bool, error) { return false, errors.New("liveness check failure") }))
+	fixture := newPathLockIntegrationFixture(t, 2, 2, domain.LivenessLockFunc(func(string) (bool, error) { return false, errors.New("liveness check failure") }))
 	path := t.TempDir()
 	normalized, err := store.NormalizePath(path, true)
 	if err != nil {
@@ -212,7 +212,7 @@ func TestSubmitPathLockIntegrationMapsLivenessFailureToPublicResponse(t *testing
 }
 
 func TestSubmitPathLockIntegrationKeepsQueuedOwnerWithoutTaskLock(t *testing.T) {
-	fixture := newPathLockIntegrationFixture(t, 1, domain.LivenessLockFunc(func(string) (bool, error) { return false, os.ErrNotExist }))
+	fixture := newPathLockIntegrationFixture(t, 1, 1, domain.LivenessLockFunc(func(string) (bool, error) { return false, os.ErrNotExist }))
 	owner, err := domain.NewTaskID("impl-20260809-120000-a1b2-queued-owner")
 	if err != nil {
 		t.Fatal(err)

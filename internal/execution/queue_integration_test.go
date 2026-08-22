@@ -69,7 +69,7 @@ type queueIntegrationFixture struct {
 	submit    *transportusecase.SubmitTaskUseCase
 }
 
-func newQueueIntegrationFixture(t *testing.T, maxConcurrent int, options queueIntegrationOptions) queueIntegrationFixture {
+func newQueueIntegrationFixture(t *testing.T, maxConcurrent int, maxConcurrentImpl int, options queueIntegrationOptions) queueIntegrationFixture {
 	t.Helper()
 	tasksRoot := t.TempDir()
 	tasks, err := store.NewFileTaskStore(tasksRoot)
@@ -79,7 +79,7 @@ func newQueueIntegrationFixture(t *testing.T, maxConcurrent int, options queueIn
 	queue, registry := execution.NewTaskQueue(), execution.NewActiveTaskRegistry()
 	const queueMaxDepth = 10
 	launching := execution.NewLaunchingTaskRegistry()
-	admit := executionusecase.NewAdmitTaskUseCase(queue, registry, launching, &sync.Mutex{}, maxConcurrent, queueMaxDepth)
+	admit := executionusecase.NewAdmitTaskUseCase(queue, registry, launching, &sync.Mutex{}, maxConcurrent, maxConcurrentImpl, queueMaxDepth)
 	recording := &recordingAdmitter{inner: admit}
 	starter := &queueIntegrationStarter{}
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
@@ -159,7 +159,7 @@ func requireQueuedOnly(t *testing.T, events []domain.Event) {
 
 // SCN-proto-01-16.
 func TestSubmitQueueIntegrationStartsQueuedTaskImmediatelyWhenSlotIsAvailable(t *testing.T) {
-	fixture := newQueueIntegrationFixture(t, 1, queueIntegrationOptions{model: "gpt-5.6-terra"})
+	fixture := newQueueIntegrationFixture(t, 1, 1, queueIntegrationOptions{model: "gpt-5.6-terra"})
 	out, err := fixture.submit.Execute(context.Background(), queueIntegrationInput(t, "immediate"))
 	if err != nil || out.State != domain.StateQueued || out.QueuePosition != nil {
 		t.Fatal("unexpected immediate submit result")
@@ -184,12 +184,12 @@ func TestSubmitQueueIntegrationStartsQueuedTaskImmediatelyWhenSlotIsAvailable(t 
 
 // SCN-proto-01-17.
 func TestSubmitQueueIntegrationEnqueuesWhenSlotsAreFull(t *testing.T) {
-	fixture := newQueueIntegrationFixture(t, 1, queueIntegrationOptions{model: "gpt-5.6-terra"})
+	fixture := newQueueIntegrationFixture(t, 1, 1, queueIntegrationOptions{model: "gpt-5.6-terra"})
 	active, err := domain.NewTaskID("review-20260809-120000-a1b2-active")
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture.registry.Add(active)
+	fixture.registry.Add(active, domain.SubcommandImpl)
 	out, err := fixture.submit.Execute(context.Background(), queueIntegrationInput(t, "queued"))
 	if err != nil || out.QueuePosition == nil || *out.QueuePosition < 1 || len(fixture.starter.payloads) != 0 || fixture.queue.Len() != 1 {
 		t.Fatal("expected queued admission")
@@ -212,7 +212,7 @@ func TestSubmitQueueIntegrationEnqueuesWhenSlotsAreFull(t *testing.T) {
 
 // SCN-proto-01-19.
 func TestSubmitQueueIntegrationKeepsRepeatedSubmissionsDistinct(t *testing.T) {
-	fixture := newQueueIntegrationFixture(t, 2, queueIntegrationOptions{model: "gpt-5.6-terra"})
+	fixture := newQueueIntegrationFixture(t, 2, 2, queueIntegrationOptions{model: "gpt-5.6-terra"})
 	first, err := fixture.submit.Execute(context.Background(), queueIntegrationInput(t, "repeat"))
 	if err != nil {
 		t.Fatal(err)
@@ -232,7 +232,7 @@ func TestSubmitQueueIntegrationKeepsRepeatedSubmissionsDistinct(t *testing.T) {
 
 // SCN-proto-01-22.
 func TestSubmitQueueIntegrationCarriesResolvedModelToStarter(t *testing.T) {
-	fixture := newQueueIntegrationFixture(t, 1, queueIntegrationOptions{model: "gpt-5.6-sol"})
+	fixture := newQueueIntegrationFixture(t, 1, 1, queueIntegrationOptions{model: "gpt-5.6-sol"})
 	out, err := fixture.submit.Execute(context.Background(), queueIntegrationInput(t, "model"))
 	if err != nil || len(fixture.admitter.records) != 1 || len(fixture.starter.payloads) != 1 {
 		t.Fatal("model integration submit failed")
@@ -247,7 +247,7 @@ func TestSubmitQueueIntegrationCarriesResolvedModelToStarter(t *testing.T) {
 func TestSubmitQueueIntegrationCarriesResolvedReasoningEffortToStarter(t *testing.T) {
 	t.Run("resolved", func(t *testing.T) {
 		effort := "high"
-		fixture := newQueueIntegrationFixture(t, 1, queueIntegrationOptions{model: "gpt-5.6-terra", effort: &effort})
+		fixture := newQueueIntegrationFixture(t, 1, 1, queueIntegrationOptions{model: "gpt-5.6-terra", effort: &effort})
 		_, err := fixture.submit.Execute(context.Background(), queueIntegrationInput(t, "effort"))
 		if err != nil || len(fixture.admitter.records) != 1 || len(fixture.starter.payloads) != 1 {
 			t.Fatal("reasoning effort integration submit failed")
@@ -258,7 +258,7 @@ func TestSubmitQueueIntegrationCarriesResolvedReasoningEffortToStarter(t *testin
 		}
 	})
 	t.Run("unspecified", func(t *testing.T) {
-		fixture := newQueueIntegrationFixture(t, 1, queueIntegrationOptions{model: "gpt-5.6-terra"})
+		fixture := newQueueIntegrationFixture(t, 1, 1, queueIntegrationOptions{model: "gpt-5.6-terra"})
 		_, err := fixture.submit.Execute(context.Background(), queueIntegrationInput(t, "no-effort"))
 		if err != nil || fixture.admitter.records[0].input.ReasoningEffort != nil || fixture.admitter.records[0].result.LaunchPayload.ReasoningEffort != nil || fixture.starter.payloads[0].ReasoningEffort != nil {
 			t.Fatal("unspecified reasoning effort was not preserved as nil")
@@ -267,12 +267,12 @@ func TestSubmitQueueIntegrationCarriesResolvedReasoningEffortToStarter(t *testin
 }
 
 func TestSubmitQueueIntegrationQueueFullIncludesConfiguredDepth(t *testing.T) {
-	fixture := newQueueIntegrationFixture(t, 1, queueIntegrationOptions{model: "gpt-5.6-terra"})
+	fixture := newQueueIntegrationFixture(t, 1, 1, queueIntegrationOptions{model: "gpt-5.6-terra"})
 	active, err := domain.NewTaskID("review-20260809-120000-a1b2-active")
 	if err != nil {
 		t.Fatal(err)
 	}
-	fixture.registry.Add(active)
+	fixture.registry.Add(active, domain.SubcommandImpl)
 	const queueMaxDepth = 10
 	for index := 0; index < queueMaxDepth; index++ {
 		if _, err := fixture.submit.Execute(context.Background(), queueIntegrationInput(t, "full")); err != nil {

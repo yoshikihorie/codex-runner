@@ -9,12 +9,17 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/yoshikihorie/codex-runner/internal/domain"
 )
 
 func noOpTailHandler(context.Context, Request, io.Writer) error { return nil }
+
+const protocolLineMaxBytesForTest = 1048576
 
 type transientAcceptListener struct {
 	accepted chan struct{}
@@ -168,6 +173,142 @@ func TestHandleConnWaitsForSplitLine(t *testing.T) {
 	}
 	client.Close()
 	wg.Wait()
+}
+
+func TestHandleConnRequestLineBoundary(t *testing.T) {
+	for name, size := range map[string]int{
+		"at maximum":    protocolLineMaxBytesForTest,
+		"above maximum": protocolLineMaxBytesForTest + 1,
+	} {
+		name, size := name, size
+		t.Run(name, func(t *testing.T) {
+			server, client := net.Pipe()
+			defer client.Close()
+			var wg sync.WaitGroup
+			calls := 0
+			wg.Add(1)
+			go handleConn(context.Background(), server, func(req Request) Response {
+				calls++
+				return Response{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, OK: true, Result: json.RawMessage(`{}`)}
+			}, noOpTailHandler, &wg, NewTailConnRegistry())
+
+			line := append(requestLineOfSize(t, size), '\n')
+			writeDone := make(chan error, 1)
+			go func() {
+				_, err := client.Write(line)
+				writeDone <- err
+			}()
+
+			if size == protocolLineMaxBytesForTest {
+				var response Response
+				if err := json.NewDecoder(client).Decode(&response); err != nil {
+					t.Fatal(err)
+				}
+				if !response.OK || response.RequestID != "line-limit" || calls != 1 {
+					t.Fatalf("response=%#v calls=%d", response, calls)
+				}
+				select {
+				case err := <-writeDone:
+					if err != nil {
+						t.Fatal(err)
+					}
+				case <-time.After(time.Second):
+					t.Fatal("maximum-size request write did not finish")
+				}
+				_ = client.Close()
+				waitForHandlers(t, &wg)
+				return
+			}
+
+			assertConnectionClosed(t, client)
+			if calls != 0 {
+				t.Fatalf("dispatch calls = %d, want 0", calls)
+			}
+			select {
+			case <-writeDone:
+			case <-time.After(time.Second):
+				t.Fatal("oversize request write did not finish")
+			}
+			waitForHandlers(t, &wg)
+		})
+	}
+}
+
+func TestHandleConnRejectsUnterminatedOversizeRequestLine(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	var wg sync.WaitGroup
+	calls := 0
+	wg.Add(1)
+	go handleConn(context.Background(), server, func(Request) Response {
+		calls++
+		return Response{}
+	}, noOpTailHandler, &wg, NewTailConnRegistry())
+
+	line := requestLineOfSize(t, protocolLineMaxBytesForTest+1)
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := client.Write(line)
+		writeDone <- err
+	}()
+
+	assertConnectionClosed(t, client)
+	if calls != 0 {
+		t.Fatalf("dispatch calls = %d, want 0", calls)
+	}
+	select {
+	case <-writeDone:
+	case <-time.After(time.Second):
+		t.Fatal("unterminated oversize request write did not finish")
+	}
+	waitForHandlers(t, &wg)
+}
+
+func requestLineOfSize(t *testing.T, size int) []byte {
+	t.Helper()
+
+	req := Request{
+		ProtocolVersion: ProtocolVersion,
+		Verb:            string(domain.ProtocolVerbPing),
+		RequestID:       "line-limit",
+		Params:          json.RawMessage(`{"padding":""}`),
+	}
+	empty, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Params = json.RawMessage(`{"padding":"` + strings.Repeat("x", size-len(empty)) + `"}`)
+	line, err := json.Marshal(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(line) != size {
+		t.Fatalf("line length = %d, want %d", len(line), size)
+	}
+	return line
+}
+
+func assertConnectionClosed(t *testing.T, conn net.Conn) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	var b [1]byte
+	if n, err := conn.Read(b[:]); n != 0 || err == nil {
+		t.Fatalf("response bytes=%d err=%v, want closed connection without response", n, err)
+	}
+}
+
+func waitForHandlers(t *testing.T, wg *sync.WaitGroup) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("connection handler did not exit")
+	}
 }
 
 func TestServeSocketPermissionsAndCancellation(t *testing.T) {
@@ -395,7 +536,7 @@ func TestHandleConnUnblocksReadWhenShutdownBegins(t *testing.T) {
 	select {
 	case <-completed:
 	case <-time.After(time.Second):
-		t.Fatal("connection handler remained blocked in ReadBytes")
+		t.Fatal("connection handler remained blocked reading a line")
 	}
 	_ = client.Close()
 }

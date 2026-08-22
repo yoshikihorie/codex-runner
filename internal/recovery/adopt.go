@@ -162,19 +162,19 @@ func (uc *AdoptRunningTasksUseCase) Execute(ctx context.Context) (AdoptRunningTa
 		return uc.cancelledAdoptionOutput(startedAt), nil
 	}
 
-	taskIDs := make([]domain.TaskID, 0, len(snapshots))
+	reservations := make(map[domain.TaskID]domain.Subcommand, len(snapshots))
 	for _, snapshot := range snapshots {
-		taskIDs = append(taskIDs, snapshot.TaskID)
+		reservations[snapshot.TaskID] = snapshot.Subcommand
 	}
 	if ctx.Err() != nil {
 		return uc.cancelledAdoptionOutput(startedAt), nil
 	}
-	uc.resetter.Reset(taskIDs)
+	uc.resetter.Reset(reservations)
 	if ctx.Err() != nil {
 		return uc.cancelledAdoptionOutput(startedAt), nil
 	}
 
-	out := AdoptRunningTasksOutput{Outcomes: make([]AdoptionOutcome, 0, len(taskIDs))}
+	out := AdoptRunningTasksOutput{Outcomes: make([]AdoptionOutcome, 0, len(snapshots))}
 	for _, snapshot := range snapshots {
 		if ctx.Err() != nil {
 			break

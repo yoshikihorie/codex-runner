@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -19,9 +20,15 @@ import (
 const (
 	protocolUnknownVerbCode       = "PROTOCOL_UNKNOWN_VERB"
 	protocolUnknownVerbMessageKey = "error.protocol.unknownVerb"
+
+	// Canonical source: validation-rules.md PROTOCOL_LINE_MAX_BYTES.
+	protocolLineMaxBytes = 1048576
 )
 
-var listenUnix = net.Listen
+var (
+	listenUnix              = net.Listen
+	errRequestNotTerminated = errors.New("request line is not newline terminated")
+)
 
 // Request is a client protocol envelope.
 type Request struct {
@@ -149,15 +156,17 @@ func handleConn(ctx context.Context, conn net.Conn, dispatch func(Request) Respo
 	}()
 	stop := context.AfterFunc(ctx, func() { _ = conn.SetReadDeadline(time.Now()) })
 	defer stop()
-	reader := bufio.NewReader(conn)
+	scanner := bufio.NewScanner(conn)
+	// Reserve one byte so Scanner can inspect the terminating newline.
+	scanner.Buffer(make([]byte, 64*1024), protocolLineMaxBytes+1)
+	scanner.Split(jsonLineSplit)
 	encoder := json.NewEncoder(conn)
 	for {
 		if ctx.Err() != nil {
 			return
 		}
-		line, err := reader.ReadBytes('\n')
-		if err != nil {
-			if err == io.EOF && len(line) == 0 {
+		if !scanner.Scan() {
+			if scanner.Err() != nil {
 				return
 			}
 			return
@@ -166,7 +175,7 @@ func handleConn(ctx context.Context, conn net.Conn, dispatch func(Request) Respo
 			return
 		}
 		var req Request
-		if json.Unmarshal(line, &req) != nil {
+		if json.Unmarshal(scanner.Bytes(), &req) != nil {
 			return
 		}
 		if resp, result := validateEnvelope(req); result != envelopeValid {
@@ -189,6 +198,19 @@ func handleConn(ctx context.Context, conn net.Conn, dispatch func(Request) Respo
 		}
 	}
 }
+
+func jsonLineSplit(data []byte, atEOF bool) (advance int, token []byte, err error) {
+	for index, value := range data {
+		if value == '\n' {
+			return index + 1, data[:index], nil
+		}
+	}
+	if atEOF && len(data) > 0 {
+		return 0, nil, errRequestNotTerminated
+	}
+	return 0, nil, nil
+}
+
 func validateEnvelope(req Request) (Response, envelopeResult) {
 	if req.RequestID == "" {
 		return Response{}, envelopeDisconnect

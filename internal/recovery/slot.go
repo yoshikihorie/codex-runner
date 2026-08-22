@@ -12,5 +12,5 @@ type SlotReleaser interface {
 }
 
 type SlotResetter interface {
-	Reset(taskIDs []domain.TaskID)
+	Reset(reservations map[domain.TaskID]domain.Subcommand)
 }

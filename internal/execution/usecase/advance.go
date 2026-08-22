@@ -11,11 +11,12 @@ import (
 
 // AdvanceQueueUseCase releases a completed reservation and selects the next queued task.
 type AdvanceQueueUseCase struct {
-	queue              execution.TaskQueue
-	registry           execution.ActiveTaskRegistry
-	launching          execution.LaunchingTaskRegistry
-	queueMu            *sync.Mutex
-	maxConcurrentTasks int
+	queue                  execution.TaskQueue
+	registry               execution.ActiveTaskRegistry
+	launching              execution.LaunchingTaskRegistry
+	queueMu                *sync.Mutex
+	maxConcurrentTasks     int
+	maxConcurrentImplTasks int
 	// promotions records the one unresolved promotion for each task ID. A queued
 	// task ID is removed atomically before promotion and can be reinserted only
 	// after that promotion is resolved, so a task ID cannot have concurrent
@@ -23,11 +24,11 @@ type AdvanceQueueUseCase struct {
 	promotions map[domain.TaskID]struct{}
 }
 
-func NewAdvanceQueueUseCase(queue execution.TaskQueue, registry execution.ActiveTaskRegistry, launching execution.LaunchingTaskRegistry, queueMu *sync.Mutex, maxConcurrentTasks int) *AdvanceQueueUseCase {
+func NewAdvanceQueueUseCase(queue execution.TaskQueue, registry execution.ActiveTaskRegistry, launching execution.LaunchingTaskRegistry, queueMu *sync.Mutex, maxConcurrentTasks int, maxConcurrentImplTasks int) *AdvanceQueueUseCase {
 	if queue == nil || registry == nil || launching == nil || queueMu == nil {
 		panic("advance queue use case requires non-nil dependencies")
 	}
-	return &AdvanceQueueUseCase{queue: queue, registry: registry, launching: launching, queueMu: queueMu, maxConcurrentTasks: maxConcurrentTasks, promotions: make(map[domain.TaskID]struct{})}
+	return &AdvanceQueueUseCase{queue: queue, registry: registry, launching: launching, queueMu: queueMu, maxConcurrentTasks: maxConcurrentTasks, maxConcurrentImplTasks: maxConcurrentImplTasks, promotions: make(map[domain.TaskID]struct{})}
 }
 
 func (u *AdvanceQueueUseCase) Execute(ctx context.Context, taskID domain.TaskID, now time.Time) (execution.TaskLaunchPayload, bool, error) {
@@ -51,7 +52,9 @@ func (u *AdvanceQueueUseCase) Execute(ctx context.Context, taskID domain.TaskID,
 		// The invalid payload has been removed; specification requires no Reindex here.
 		return execution.TaskLaunchPayload{}, false, domain.ErrInvalidStateTransition
 	}
-	if u.registry.Size() >= u.maxConcurrentTasks {
+	globalAvailable := u.registry.Size() < u.maxConcurrentTasks
+	implAvailable := payload.Task.Subcommand() != domain.SubcommandImpl || u.registry.ImplSize() < u.maxConcurrentImplTasks
+	if !globalAvailable || !implAvailable {
 		u.queue.Prepend(payload)
 		return execution.TaskLaunchPayload{}, false, nil
 	}
@@ -64,7 +67,7 @@ func (u *AdvanceQueueUseCase) Execute(ctx context.Context, taskID domain.TaskID,
 		u.queue.Prepend(payload)
 		return execution.TaskLaunchPayload{}, false, err
 	}
-	u.registry.Add(payload.Task.ID())
+	u.registry.Add(payload.Task.ID(), payload.Task.Subcommand())
 	if err := ctx.Err(); err != nil {
 		u.registry.Remove(payload.Task.ID())
 		u.queue.Prepend(payload)

@@ -591,7 +591,7 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 		return daemonDependencies{}, err
 	}
 	starter := execution.TaskLifecycleStarter(starterConcrete)
-	advance := usecase.NewAdvanceQueueUseCase(queue, registry, launching, queueMu, cfg.MaxConcurrentTasks())
+	advance := usecase.NewAdvanceQueueUseCase(queue, registry, launching, queueMu, cfg.MaxConcurrentTasks(), cfg.MaxConcurrentImplTasks())
 	slots := usecase.NewSlotReleaser(advance, starter, logger)
 	partial := recovery.NewSavePartialOutputUseCase(reader, writer, logger)
 	resume := recovery.NewRecoverViaResumeUseCase(tasks, writer, recovery.NewResumeRecoverer(execution.NewResumeLauncher(processRunner, logger), reader, cfg.CodexBinaryPath(), clock), partial, slots, metricRecorder, stalled, taskMu, clock, logger)
@@ -616,7 +616,7 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 		return daemonDependencies{}, err
 	}
 	runner.target = orchestrator
-	admit := usecase.NewAdmitTaskUseCase(queue, registry, launching, queueMu, cfg.MaxConcurrentTasks(), cfg.QueueMaxDepth())
+	admit := usecase.NewAdmitTaskUseCase(queue, registry, launching, queueMu, cfg.MaxConcurrentTasks(), cfg.MaxConcurrentImplTasks(), cfg.QueueMaxDepth())
 	provider := execution.NewTaskSnapshotProvider(tasks, launching, queue, queueMu)
 	submit := transportusecase.NewSubmitTaskUseCase(tasks, pathAcquire, pathRelease, admit, cfg.QueueMaxDepth(), starter, cfg, clock, logger)
 	status := transportusecase.NewGetTaskStatusUseCase(provider, clock, logger)

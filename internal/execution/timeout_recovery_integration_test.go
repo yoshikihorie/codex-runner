@@ -46,9 +46,8 @@ const (
 )
 
 type metricsAcceptanceSlots struct {
-	mu       sync.Mutex
-	calls    int
-	resetIDs [][]domain.TaskID
+	mu    sync.Mutex
+	calls int
 }
 
 func (s *metricsAcceptanceSlots) ReleaseAndAdvance(context.Context, domain.TaskID, time.Time) {
@@ -56,10 +55,7 @@ func (s *metricsAcceptanceSlots) ReleaseAndAdvance(context.Context, domain.TaskI
 	defer s.mu.Unlock()
 	s.calls++
 }
-func (s *metricsAcceptanceSlots) Reset(ids []domain.TaskID) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.resetIDs = append(s.resetIDs, append([]domain.TaskID(nil), ids...))
+func (s *metricsAcceptanceSlots) Reset(reservations map[domain.TaskID]domain.Subcommand) {
 }
 func (s *metricsAcceptanceSlots) count() int { s.mu.Lock(); defer s.mu.Unlock(); return s.calls }
 

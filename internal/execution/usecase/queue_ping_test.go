@@ -13,7 +13,7 @@ import (
 
 func TestPingRemainsResponsiveWhileQueueMutexIsHeld(t *testing.T) {
 	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
-	admit := NewAdmitTaskUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), mutex, 1, 1)
+	admit := NewAdmitTaskUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), mutex, 1, 1, 1)
 	if _, err := admit.Execute(context.Background(), testAdmissionInput(t, domain.SubcommandImpl, "ping-active")); err != nil {
 		t.Fatal(err)
 	}

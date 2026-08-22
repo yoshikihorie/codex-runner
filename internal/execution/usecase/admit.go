@@ -11,19 +11,20 @@ import (
 
 // AdmitTaskUseCase decides whether a task reserves a slot immediately or waits in FIFO order.
 type AdmitTaskUseCase struct {
-	queue              execution.TaskQueue
-	registry           execution.ActiveTaskRegistry
-	launching          execution.LaunchingTaskRegistry
-	queueMu            *sync.Mutex
-	maxConcurrentTasks int
-	queueMaxDepth      int
+	queue                  execution.TaskQueue
+	registry               execution.ActiveTaskRegistry
+	launching              execution.LaunchingTaskRegistry
+	queueMu                *sync.Mutex
+	maxConcurrentTasks     int
+	maxConcurrentImplTasks int
+	queueMaxDepth          int
 }
 
-func NewAdmitTaskUseCase(queue execution.TaskQueue, registry execution.ActiveTaskRegistry, launching execution.LaunchingTaskRegistry, queueMu *sync.Mutex, maxConcurrentTasks int, queueMaxDepth int) *AdmitTaskUseCase {
+func NewAdmitTaskUseCase(queue execution.TaskQueue, registry execution.ActiveTaskRegistry, launching execution.LaunchingTaskRegistry, queueMu *sync.Mutex, maxConcurrentTasks int, maxConcurrentImplTasks int, queueMaxDepth int) *AdmitTaskUseCase {
 	if queue == nil || registry == nil || launching == nil || queueMu == nil {
 		panic("admit task use case requires non-nil dependencies")
 	}
-	return &AdmitTaskUseCase{queue: queue, registry: registry, launching: launching, queueMu: queueMu, maxConcurrentTasks: maxConcurrentTasks, queueMaxDepth: queueMaxDepth}
+	return &AdmitTaskUseCase{queue: queue, registry: registry, launching: launching, queueMu: queueMu, maxConcurrentTasks: maxConcurrentTasks, maxConcurrentImplTasks: maxConcurrentImplTasks, queueMaxDepth: queueMaxDepth}
 }
 
 func (u *AdmitTaskUseCase) Execute(_ context.Context, input execution.TaskAdmissionInput) (execution.TaskAdmissionResult, error) {
@@ -32,8 +33,11 @@ func (u *AdmitTaskUseCase) Execute(_ context.Context, input execution.TaskAdmiss
 	}
 	u.queueMu.Lock()
 	defer u.queueMu.Unlock()
-	activeCount := u.registry.Size()
-	if activeCount >= u.maxConcurrentTasks && u.queue.Len() >= u.queueMaxDepth {
+	globalAvailable := u.registry.Size() < u.maxConcurrentTasks
+	implAvailable := input.Subcommand != domain.SubcommandImpl || u.registry.ImplSize() < u.maxConcurrentImplTasks
+	fifoAvailable := u.queue.Len() == 0
+	immediate := globalAvailable && implAvailable && fifoAvailable
+	if !immediate && u.queue.Len() >= u.queueMaxDepth {
 		return execution.TaskAdmissionResult{}, domain.ErrQueueFull
 	}
 	initialQueuePosition := u.queue.Len() + 1
@@ -50,12 +54,12 @@ func (u *AdmitTaskUseCase) Execute(_ context.Context, input execution.TaskAdmiss
 		workingDir := input.SourceWorkingDir
 		payload.WorkingDir = &workingDir
 	}
-	if activeCount < u.maxConcurrentTasks {
+	if immediate {
 		snapshot, snapshotErr := domain.NewTaskSnapshotFromAdmission(task, input.ResolvedTimeout, input.Model, input.ReasoningEffort, domain.ExecutionRouteDaemon, task.RequestedAt())
 		if snapshotErr != nil {
 			return execution.TaskAdmissionResult{}, snapshotErr
 		}
-		u.registry.Add(task.ID())
+		u.registry.Add(task.ID(), input.Subcommand)
 		u.launching.Register(task.ID(), snapshot)
 		return execution.TaskAdmissionResult{State: domain.StateQueued, Events: events, LaunchPayload: &payload}, nil
 	}

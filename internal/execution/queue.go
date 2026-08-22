@@ -62,12 +62,14 @@ type TaskQueueReader interface {
 	QueuePosition(taskID domain.TaskID) (position int, found bool, err error)
 }
 
-// ActiveTaskRegistry tracks task IDs which currently reserve an execution slot.
+// ActiveTaskRegistry tracks execution-slot reservations by task ID and subcommand,
+// allowing ImplSize to count reservations for impl tasks.
 type ActiveTaskRegistry interface {
 	Size() int
-	Add(taskID domain.TaskID)
+	ImplSize() int
+	Add(taskID domain.TaskID, subcommand domain.Subcommand)
 	Remove(taskID domain.TaskID)
-	Reset(taskIDs []domain.TaskID)
+	Reset(reservations map[domain.TaskID]domain.Subcommand)
 }
 
 type taskQueue struct {

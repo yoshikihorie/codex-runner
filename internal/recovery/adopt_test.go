@@ -251,13 +251,17 @@ func (f *adoptionFinalizerFake) Finalize(id domain.TaskID, raw int, estimated, a
 }
 
 type adoptionSlotsFake struct {
-	resets    [][]domain.TaskID
+	resets    []map[domain.TaskID]domain.Subcommand
 	releases  int
 	onRelease func()
 }
 
-func (f *adoptionSlotsFake) Reset(ids []domain.TaskID) {
-	f.resets = append(f.resets, append([]domain.TaskID(nil), ids...))
+func (f *adoptionSlotsFake) Reset(reservations map[domain.TaskID]domain.Subcommand) {
+	copy := make(map[domain.TaskID]domain.Subcommand, len(reservations))
+	for id, subcommand := range reservations {
+		copy[id] = subcommand
+	}
+	f.resets = append(f.resets, copy)
 }
 func (f *adoptionSlotsFake) ReleaseAndAdvance(context.Context, domain.TaskID, time.Time) {
 	if f.onRelease != nil {
@@ -356,10 +360,14 @@ func adoptionID(t *testing.T, suffix string) domain.TaskID {
 }
 
 func adoptionSnapshot(t *testing.T, id domain.TaskID, state domain.TaskState) domain.TaskSnapshot {
+	return adoptionSnapshotWithSubcommand(t, id, domain.SubcommandImpl, state)
+}
+
+func adoptionSnapshotWithSubcommand(t *testing.T, id domain.TaskID, subcommand domain.Subcommand, state domain.TaskState) domain.TaskSnapshot {
 	t.Helper()
 	at := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
 	slug, _ := domain.NewSlug("adopt")
-	task, _, err := domain.NewTask(id, domain.SubcommandImpl, slug, nil, at, 1)
+	task, _, err := domain.NewTask(id, subcommand, slug, nil, at, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -767,6 +775,28 @@ func TestAdoptRunningTasksZeroAndEnumerationFailure(t *testing.T) {
 				t.Fatalf("out=%+v calls=%d resets=%v", out, live.calls, slots.resets)
 			}
 		})
+	}
+}
+
+func TestAdoptRunningTasksResetsImplAndReviewReservations(t *testing.T) {
+	firstImpl := adoptionID(t, "reset-first")
+	secondImpl := adoptionID(t, "reset-second")
+	review, err := domain.NewTaskID("review-20260814-120000-abcd-reset-review")
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := adoptionSnapshot(t, firstImpl, domain.StateRunning)
+	second := adoptionSnapshot(t, secondImpl, domain.StateRunning)
+	third := adoptionSnapshotWithSubcommand(t, review, domain.SubcommandReview, domain.StateRunning)
+	tasks := &adoptionStoreFake{
+		listed:  []domain.TaskSnapshot{first, second, third},
+		entries: map[domain.TaskID]domain.TaskSnapshot{firstImpl: first, secondImpl: second, review: third},
+	}
+	slots := &adoptionSlotsFake{}
+	out, err := newAdoptionUseCase(tasks, &adoptionLivenessFake{dead: map[domain.TaskID]bool{}, err: map[domain.TaskID]error{}}, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), slots, &adoptionMutexFake{}).Execute(context.Background())
+	want := map[domain.TaskID]domain.Subcommand{firstImpl: domain.SubcommandImpl, secondImpl: domain.SubcommandImpl, review: domain.SubcommandReview}
+	if err != nil || len(out.Outcomes) != 3 || len(slots.resets) != 1 || !reflect.DeepEqual(slots.resets[0], want) {
+		t.Fatalf("out=(%+v,%v) resets=%v", out, err, slots.resets)
 	}
 }
 
@@ -1388,7 +1418,8 @@ func TestAdoptRunningTasksCancellationStopsBeforeNextTask(t *testing.T) {
 
 	out, err := newAdoptionUseCase(tasks, liveness, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), slots, &adoptionMutexFake{}).Execute(ctx)
 
-	if err != nil || len(out.Outcomes) != 0 || liveness.calls != 1 || len(slots.resets) != 1 || !reflect.DeepEqual(slots.resets[0], []domain.TaskID{first, second}) || out.ElapsedMillis < 0 {
+	want := map[domain.TaskID]domain.Subcommand{first: domain.SubcommandImpl, second: domain.SubcommandImpl}
+	if err != nil || len(out.Outcomes) != 0 || liveness.calls != 1 || len(slots.resets) != 1 || !reflect.DeepEqual(slots.resets[0], want) || out.ElapsedMillis < 0 {
 		t.Fatalf("out=(%+v,%v) liveness=%d resets=%v", out, err, liveness.calls, slots.resets)
 	}
 }

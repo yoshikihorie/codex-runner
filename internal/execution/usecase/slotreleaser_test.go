@@ -31,9 +31,9 @@ func (f *lifecycleStarterFake) Start(payload execution.TaskLaunchPayload) bool {
 func TestSlotFinalizerCommitsAcceptedStart(t *testing.T) {
 	payload := advanceQueuedPayload(t, "slot-commit")
 	queue := &advanceQueueFake{payloads: []execution.TaskLaunchPayload{payload}}
-	registry := &advanceRegistryFake{ids: map[domain.TaskID]struct{}{}}
+	registry := &advanceRegistryFake{ids: map[domain.TaskID]domain.Subcommand{}}
 	launching := execution.NewLaunchingTaskRegistry()
-	advance := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1)
+	advance := NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1, 1)
 	starter := &lifecycleStarterFake{accepted: true}
 
 	NewSlotReleaser(advance, starter).ReleaseAndAdvance(context.Background(), domain.TaskID{}, time.Now())
@@ -53,7 +53,7 @@ func (f *lifecycleRunnerFake) Run(ctx context.Context, input TaskLifecycleInput)
 func TestSlotFinalizerStartsLifecycleWithBaseContextChild(t *testing.T) {
 	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
 	launching := execution.NewLaunchingTaskRegistry()
-	admit := NewAdmitTaskUseCase(queue, registry, launching, mutex, 1, 1)
+	admit := NewAdmitTaskUseCase(queue, registry, launching, mutex, 1, 1, 1)
 	active := testAdmissionInput(t, domain.SubcommandImpl, "active-slot")
 	if _, err := admit.Execute(context.Background(), active); err != nil {
 		t.Fatal(err)
@@ -67,7 +67,7 @@ func TestSlotFinalizerStartsLifecycleWithBaseContextChild(t *testing.T) {
 	runner := &lifecycleRunnerFake{called: make(chan struct{})}
 	now := time.Now()
 	starter := newLifecycleStarterForTest(t, runner, baseCtx, domain.ClockFunc(func() time.Time { return now }))
-	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(queue, registry, launching, mutex, 1), starter)
+	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(queue, registry, launching, mutex, 1, 1), starter)
 	releaser.ReleaseAndAdvance(context.Background(), active.TaskID, now)
 	select {
 	case <-runner.called:
@@ -84,9 +84,34 @@ func TestSlotFinalizerStartsLifecycleWithBaseContextChild(t *testing.T) {
 	}
 }
 
+func TestSlotFinalizerPromotesMultipleTasksAfterImplSlotRelease(t *testing.T) {
+	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
+	launching := execution.NewLaunchingTaskRegistry()
+	admit := NewAdmitTaskUseCase(queue, registry, launching, mutex, 4, 2, 4)
+	firstActive := testAdmissionInput(t, domain.SubcommandImpl, "scn25-first-active")
+	secondActive := testAdmissionInput(t, domain.SubcommandImpl, "scn25-second-active")
+	queuedImpl := testAdmissionInput(t, domain.SubcommandImpl, "scn25-queued-impl")
+	queuedReviewFirst := testAdmissionInput(t, domain.SubcommandReview, "scn25-queued-review-first")
+	queuedReviewSecond := testAdmissionInput(t, domain.SubcommandReview, "scn25-queued-review-second")
+	for _, input := range []execution.TaskAdmissionInput{firstActive, secondActive, queuedImpl, queuedReviewFirst, queuedReviewSecond} {
+		if _, err := admit.Execute(context.Background(), input); err != nil {
+			t.Fatal(err)
+		}
+	}
+	starter := &lifecycleStarterFake{accepted: true}
+	NewSlotReleaser(NewAdvanceQueueUseCase(queue, registry, launching, mutex, 4, 2), starter).ReleaseAndAdvance(context.Background(), firstActive.TaskID, time.Now())
+
+	if len(starter.started) != 3 || starter.started[0].Task.ID() != queuedImpl.TaskID || starter.started[1].Task.ID() != queuedReviewFirst.TaskID || starter.started[2].Task.ID() != queuedReviewSecond.TaskID {
+		t.Fatalf("started=%#v", starter.started)
+	}
+	if registry.Size() != 4 || registry.ImplSize() != 2 {
+		t.Fatalf("size=%d impl_size=%d", registry.Size(), registry.ImplSize())
+	}
+}
+
 func TestSlotFinalizerDoesNotStartLifecycleWhenQueueIsEmpty(t *testing.T) {
 	runner := &lifecycleRunnerFake{called: make(chan struct{})}
-	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1), newLifecycleStarterForTest(t, runner, context.Background(), domain.ClockFunc(time.Now)))
+	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1, 1), newLifecycleStarterForTest(t, runner, context.Background(), domain.ClockFunc(time.Now)))
 	releaser.ReleaseAndAdvance(context.Background(), domain.TaskID{}, time.Now())
 	select {
 	case <-runner.called:
@@ -100,7 +125,7 @@ func TestSlotFinalizerLogsAdvanceErrorAndDoesNotStartLifecycle(t *testing.T) {
 	var logs bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
 	runner := &lifecycleRunnerFake{called: make(chan struct{})}
-	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(invalidQueue, &advanceRegistryFake{ids: map[domain.TaskID]struct{}{}}, execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1), newLifecycleStarterForTest(t, runner, context.Background(), domain.ClockFunc(time.Now)), logger)
+	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(invalidQueue, &advanceRegistryFake{ids: map[domain.TaskID]domain.Subcommand{}}, execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1, 1), newLifecycleStarterForTest(t, runner, context.Background(), domain.ClockFunc(time.Now)), logger)
 	taskID := testAdmissionInput(t, domain.SubcommandImpl, "finalizer-release").TaskID
 	releaser.ReleaseAndAdvance(context.Background(), taskID, time.Now())
 	if !bytes.Contains(logs.Bytes(), []byte("WARN")) || !bytes.Contains(logs.Bytes(), []byte(taskID.String())) || !bytes.Contains(logs.Bytes(), []byte(domain.ErrInvalidStateTransition.Error())) {
@@ -113,24 +138,43 @@ func TestSlotFinalizerLogsAdvanceErrorAndDoesNotStartLifecycle(t *testing.T) {
 	}
 }
 
+func TestSlotFinalizerDoesNotRetryAfterSnapshotFailure(t *testing.T) {
+	payload := execution.TaskLaunchPayload{Task: queueTask(t, "finalizer-invalid-snapshot")}
+	queue := &advanceQueueFake{payloads: []execution.TaskLaunchPayload{payload}}
+	registry := &advanceRegistryFake{ids: map[domain.TaskID]domain.Subcommand{}}
+	starter := &lifecycleStarterFake{accepted: true}
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	taskID := testAdmissionInput(t, domain.SubcommandImpl, "finalizer-snapshot-failure").TaskID
+
+	NewSlotReleaser(NewAdvanceQueueUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1, 1), starter, logger).ReleaseAndAdvance(context.Background(), taskID, time.Now())
+
+	if queue.dequeueCalls != 1 || queue.prependCalls != 1 || len(queue.payloads) != 1 || queue.payloads[0].Task.ID() != payload.Task.ID() || len(starter.started) != 0 || registry.addCalls != 0 {
+		t.Fatalf("dequeue=%d prepend=%d queue=%#v starts=%d add=%d", queue.dequeueCalls, queue.prependCalls, queue.payloads, len(starter.started), registry.addCalls)
+	}
+	if !bytes.Contains(logs.Bytes(), []byte("WARN")) || !bytes.Contains(logs.Bytes(), []byte(taskID.String())) || !bytes.Contains(logs.Bytes(), []byte("task snapshot invalid")) {
+		t.Fatalf("logs=%q", logs.String())
+	}
+}
+
 func TestSlotFinalizerDoesNotStartLifecycleAfterAdvanceCancellation(t *testing.T) {
 	payload := advanceQueuedPayload(t, "slot-cancel")
 	queue := &advanceQueueFake{payloads: []execution.TaskLaunchPayload{payload}}
-	registry := &advanceRegistryFake{ids: map[domain.TaskID]struct{}{}}
+	registry := &advanceRegistryFake{ids: map[domain.TaskID]domain.Subcommand{}}
 	launching := &advanceLaunchingFake{snapshots: map[domain.TaskID]domain.TaskSnapshot{}}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	registry.removeHook = cancel
 	starter := &lifecycleStarterFake{accepted: true}
 
-	NewSlotReleaser(NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1), starter).ReleaseAndAdvance(ctx, domain.TaskID{}, time.Now())
+	NewSlotReleaser(NewAdvanceQueueUseCase(queue, registry, launching, &sync.Mutex{}, 1, 1), starter).ReleaseAndAdvance(ctx, domain.TaskID{}, time.Now())
 	if len(starter.started) != 0 || queue.dequeueCalls != 0 || registry.addCalls != 0 || launching.registerCalls != 0 {
 		t.Fatalf("starts=%d dequeue=%d add=%d register=%d", len(starter.started), queue.dequeueCalls, registry.addCalls, launching.registerCalls)
 	}
 }
 
 func TestNewSlotReleaserRejectsNilStarter(t *testing.T) {
-	advance := NewAdvanceQueueUseCase(execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1)
+	advance := NewAdvanceQueueUseCase(execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1, 1)
 	for _, tc := range []struct {
 		name    string
 		starter execution.TaskLifecycleStarter
@@ -155,7 +199,7 @@ func TestSlotFinalizerRunnerReceivesOnlyBaseContextValues(t *testing.T) {
 	callCtx := context.WithValue(context.Background(), key("call"), "call-value")
 	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
 	launching := execution.NewLaunchingTaskRegistry()
-	admit := NewAdmitTaskUseCase(queue, registry, launching, mutex, 1, 1)
+	admit := NewAdmitTaskUseCase(queue, registry, launching, mutex, 1, 1, 1)
 	active := testAdmissionInput(t, domain.SubcommandImpl, "context-active")
 	if _, err := admit.Execute(context.Background(), active); err != nil {
 		t.Fatal(err)
@@ -164,7 +208,7 @@ func TestSlotFinalizerRunnerReceivesOnlyBaseContextValues(t *testing.T) {
 		t.Fatal(err)
 	}
 	runner := &lifecycleRunnerFake{called: make(chan struct{})}
-	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(queue, registry, launching, mutex, 1), newLifecycleStarterForTest(t, runner, baseCtx, domain.ClockFunc(time.Now)))
+	releaser := NewSlotReleaser(NewAdvanceQueueUseCase(queue, registry, launching, mutex, 1, 1), newLifecycleStarterForTest(t, runner, baseCtx, domain.ClockFunc(time.Now)))
 	releaser.ReleaseAndAdvance(callCtx, active.TaskID, time.Now())
 	select {
 	case <-runner.called:
