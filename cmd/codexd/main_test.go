@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -500,12 +501,73 @@ func TestNewEvictLogsUseCaseBuildsConfiguredDaemonPaths(t *testing.T) {
 	liveness := execution.NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) {
 		return false, nil
 	}), execution.DefaultLockPathResolver)
-	evictLogs, err := newEvictLogsUseCase(cfg, root, filepath.Join(root, "logs"), liveness, slog.Default())
+	evictLogs, err := newEvictLogsUseCase(cfg, root, filepath.Join(root, "logs"), func(string) error { return nil }, liveness, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
 	if evictLogs == nil {
 		t.Fatal("newEvictLogsUseCase returned nil")
+	}
+}
+
+func TestNewEvictLogsUseCaseReopensDaemonLogAfterAutomaticRotation(t *testing.T) {
+	root := t.TempDir()
+	configPath := writeTestConfig(t, root)
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents = append(contents, []byte("log_rotation_max_size_bytes = 1\n")...)
+	if err := os.WriteFile(configPath, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadExplicit(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logsDir := filepath.Join(root, "logs")
+	if err := os.Mkdir(logsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, ".claude", "run"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	writer, err := openDaemonLog(logsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if _, err := writer.Write([]byte("seed\n")); err != nil {
+		t.Fatal(err)
+	}
+	liveness := execution.NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) {
+		return false, nil
+	}), execution.DefaultLockPathResolver)
+	evictLogs, err := newEvictLogsUseCase(cfg, root, logsDir, writer.Reopen, liveness, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := evictLogs.Plan(context.Background(), execution.EvictLogsInput{Trigger: execution.TriggerAutomatic, OccurredAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.RotatedDaemonWide) != 1 || out.RotatedDaemonWide[0] != filepath.Join(logsDir, daemonLogFileName) {
+		t.Fatalf("RotatedDaemonWide=%#v", out.RotatedDaemonWide)
+	}
+	for _, skipped := range out.Skipped {
+		if skipped.Path == filepath.Join(logsDir, daemonLogFileName) && skipped.Reason == execution.LogSkipRotationFailed {
+			t.Fatalf("daemon log reopen failed: %#v", skipped)
+		}
+	}
+	if _, err := writer.Write([]byte("after-rotation\n")); err != nil {
+		t.Fatal(err)
+	}
+	contents, err = os.ReadFile(filepath.Join(logsDir, daemonLogFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "after-rotation\n" {
+		t.Fatalf("active log contents=%q", contents)
 	}
 }
 
@@ -664,12 +726,12 @@ func TestLoadConfigArguments(t *testing.T) {
 
 func TestOpenDaemonLogIsPrivate(t *testing.T) {
 	root := t.TempDir()
-	file, err := openDaemonLog(root)
+	writer, err := openDaemonLog(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer file.Close()
-	info, err := file.Stat()
+	defer writer.Close()
+	info, err := os.Stat(filepath.Join(root, daemonLogFileName))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -679,6 +741,113 @@ func TestOpenDaemonLogIsPrivate(t *testing.T) {
 	if _, err := fs.Stat(os.DirFS(root), "codexd.log"); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestDaemonLogWriterWriteReopenAndClose(t *testing.T) {
+	root := t.TempDir()
+	path := filepath.Join(root, daemonLogFileName)
+	writer, err := openDaemonLog(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if _, err := writer.Write([]byte("before\n")); err != nil {
+		t.Fatal(err)
+	}
+	rotated := path + ".1"
+	if err := os.Rename(path, rotated); err != nil {
+		t.Fatal(err)
+	}
+	oldContents, err := os.ReadFile(rotated)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(oldContents) != "before\n" {
+		t.Fatalf("rotated log contents=%q, want before write", oldContents)
+	}
+	if err := writer.Reopen(path); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := writer.Write([]byte("after\n")); err != nil {
+		t.Fatal(err)
+	}
+	if contents, err := os.ReadFile(rotated); err != nil {
+		t.Fatal(err)
+	} else if string(contents) != string(oldContents) {
+		t.Fatalf("rotated log changed after reopen: %q", contents)
+	}
+	if contents, err := os.ReadFile(path); err != nil {
+		t.Fatal(err)
+	} else if string(contents) != "after\n" {
+		t.Fatalf("active log contents=%q, want after write", contents)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o600 {
+		t.Fatalf("reopened log mode=%#o", info.Mode().Perm())
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatalf("second Close() error = %v", err)
+	}
+}
+
+func TestDaemonLogWriterReopenFailureKeepsActiveHandle(t *testing.T) {
+	root := t.TempDir()
+	writer, err := openDaemonLog(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	if err := writer.Reopen(filepath.Join(root, "missing", daemonLogFileName)); err == nil {
+		t.Fatal("Reopen() error = nil, want error")
+	}
+	if _, err := writer.Write([]byte("still-open\n")); err != nil {
+		t.Fatalf("Write() after failed reopen error = %v", err)
+	}
+	contents, err := os.ReadFile(filepath.Join(root, daemonLogFileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(contents) != "still-open\n" {
+		t.Fatalf("active log contents=%q", contents)
+	}
+}
+
+func TestDaemonLogWriterConcurrentWriteAndReopen(t *testing.T) {
+	root := t.TempDir()
+	writer, err := openDaemonLog(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer writer.Close()
+	path := filepath.Join(root, daemonLogFileName)
+	var writers sync.WaitGroup
+	for range 8 {
+		writers.Add(1)
+		go func() {
+			defer writers.Done()
+			for range 100 {
+				if _, err := writer.Write([]byte("log\n")); err != nil {
+					t.Errorf("Write() error = %v", err)
+					return
+				}
+			}
+		}()
+	}
+	for generation := range 10 {
+		if err := os.Rename(path, path+fmt.Sprintf(".%d", generation)); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Reopen(path); err != nil {
+			t.Fatal(err)
+		}
+	}
+	writers.Wait()
 }
 
 func TestAcquireDaemonInstanceLeaseRejectsHeldLock(t *testing.T) {

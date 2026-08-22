@@ -454,12 +454,12 @@ func runMain(ctx context.Context, args []string, stderr io.Writer) error {
 	if err := ensureManagedPrivateDir(logsDir); err != nil {
 		return err
 	}
-	logFile, err := openDaemonLog(logsDir)
+	logWriter, err := openDaemonLog(logsDir)
 	if err != nil {
 		return err
 	}
-	defer logFile.Close()
-	logger := slog.New(slog.NewJSONHandler(logFile, nil))
+	defer logWriter.Close()
+	logger := slog.New(slog.NewJSONHandler(logWriter, nil))
 	restoreDefaultLogger := installDefaultLogger(logger)
 	defer restoreDefaultLogger()
 
@@ -490,7 +490,7 @@ func runMain(ctx context.Context, args []string, stderr io.Writer) error {
 	shutdownCtx, stopSignals := proc.NewShutdownContext(ctx)
 	defer stopSignals()
 	baseCtx, cancelBase := context.WithCancel(shutdownCtx)
-	deps, err := buildDependencies(baseCtx, cfg, home, logsDir, logger)
+	deps, err := buildDependencies(baseCtx, cfg, home, logsDir, logWriter.Reopen, logger)
 	if err != nil {
 		cancelBase()
 		return err
@@ -549,7 +549,7 @@ type daemonDependencies struct {
 
 // buildDependencies constructs every stateful collaborator once and shares the
 // resulting instance through each use case that needs it.
-func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir string, logger *slog.Logger) (daemonDependencies, error) {
+func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir string, reopenLog func(string) error, logger *slog.Logger) (daemonDependencies, error) {
 	clock := domain.ClockFunc(time.Now)
 	notifier := execution.NewTaskChangeNotifier()
 	rawTasks, err := store.NewFileTaskStore(taskPlacementRoot)
@@ -574,7 +574,7 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	pathStore := store.NewPathLockFileStore(pathLocksDir)
 	livenessLock := domain.LivenessLockFunc(store.TryAcquireLiveness)
 	liveness := execution.NewCheckLivenessUseCase(livenessLock, execution.DefaultLockPathResolver)
-	evictLogs, err := newEvictLogsUseCase(cfg, home, logsDir, liveness, logger)
+	evictLogs, err := newEvictLogsUseCase(cfg, home, logsDir, reopenLog, liveness, logger)
 	if err != nil {
 		return daemonDependencies{}, err
 	}
@@ -642,7 +642,7 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	return daemonDependencies{adoption: adoption, stall: stall, reconcile: reconcile, evictLogs: evictLogs, watcher: watcher, starter: starter, shutdownStarter: starterConcrete.Shutdown, finalizer: transport.NewShutdownFinalizer(connections, tailConns, acceptDone), serve: serve}, nil
 }
 
-func newEvictLogsUseCase(cfg config.Config, home, logsDir string, liveness *execution.CheckLivenessUseCase, logger *slog.Logger) (*execution.EvictLogsUseCase, error) {
+func newEvictLogsUseCase(cfg config.Config, home, logsDir string, reopenLog func(string) error, liveness *execution.CheckLivenessUseCase, logger *slog.Logger) (*execution.EvictLogsUseCase, error) {
 	policy := execution.LogEvictionPolicy{
 		RotationMaxSize:  cfg.LogRotationMaxSizeBytes(),
 		RotationInterval: time.Duration(cfg.LogRotationIntervalSeconds()) * time.Second,
@@ -659,7 +659,7 @@ func newEvictLogsUseCase(cfg config.Config, home, logsDir string, liveness *exec
 		SocketPath:    cfg.SocketPath(),
 		LockPath:      filepath.Join(home, ".claude", "run", logEvictionLockFileName),
 	}
-	return execution.NewEvictLogsUseCase(store.NewFileLogStore(nil), liveness, policy, paths, logger)
+	return execution.NewEvictLogsUseCase(store.NewFileLogStore(reopenLog), liveness, policy, paths, logger)
 }
 
 func waitForContext(ctx context.Context, delay time.Duration) {
@@ -712,8 +712,20 @@ func parseDaemonConfigArgs(args []string) (daemonConfigArgs, error) {
 	return daemonConfigArgs{configPath: args[1]}, nil
 }
 
-func openDaemonLog(logsDir string) (*os.File, error) {
-	path := filepath.Join(logsDir, daemonLogFileName)
+type daemonLogWriter struct {
+	mu   sync.RWMutex
+	file *os.File
+}
+
+func openDaemonLog(logsDir string) (*daemonLogWriter, error) {
+	file, err := openDaemonLogFile(filepath.Join(logsDir, daemonLogFileName))
+	if err != nil {
+		return nil, err
+	}
+	return &daemonLogWriter{file: file}, nil
+}
+
+func openDaemonLogFile(path string) (*os.File, error) {
 	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY|syscall.O_NOFOLLOW, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("open daemon log: %w", err)
@@ -723,6 +735,41 @@ func openDaemonLog(logsDir string) (*os.File, error) {
 		return nil, fmt.Errorf("secure daemon log: %w", err)
 	}
 	return file, nil
+}
+
+func (w *daemonLogWriter) Write(p []byte) (int, error) {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.file == nil {
+		return 0, os.ErrClosed
+	}
+	return w.file.Write(p)
+}
+
+func (w *daemonLogWriter) Reopen(path string) error {
+	file, err := openDaemonLogFile(path)
+	if err != nil {
+		return err
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	old := w.file
+	w.file = file
+	if old == nil {
+		return nil
+	}
+	return old.Close()
+}
+
+func (w *daemonLogWriter) Close() error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.file == nil {
+		return nil
+	}
+	err := w.file.Close()
+	w.file = nil
+	return err
 }
 
 func installDefaultLogger(logger *slog.Logger) func() {
