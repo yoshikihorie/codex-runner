@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -37,9 +38,11 @@ import (
 var daemonVersion = "development"
 
 var (
-	runDaemonMode    = runMain
-	newClientRequest = client.NewRequest
-	dialAndSend      = client.DialAndSend
+	runDaemonMode         = runMain
+	newClientRequest      = client.NewRequest
+	dialAndSend           = client.DialAndSend
+	statsUserHomeDir      = os.UserHomeDir
+	newStatsMetricsReader = func() store.MetricsReader { return store.NewFileMetricsReader() }
 )
 
 const (
@@ -49,6 +52,11 @@ const (
 	logEvictionLockFileName    = "log-eviction.lock"
 	codexVersionProbeTimeout   = 5 * time.Second
 	daemonInstanceLockFilePerm = 0o600
+)
+
+const (
+	machineCodeStatsInvalidDateRange        = "STATS_INVALID_DATE_RANGE"
+	machineCodeStatsInvalidSubcommandFilter = "STATS_INVALID_SUBCOMMAND_FILTER"
 )
 
 const (
@@ -223,11 +231,157 @@ func runEntrypoint(ctx context.Context, args []string, stdin io.Reader, stdout, 
 	if len(args) > 0 && args[0] == "client" {
 		return runClient(ctx, args[1:], stdin, stdout, stderr)
 	}
+	if len(args) > 0 && args[0] == "stats" {
+		return runStats(ctx, args[1:], stdout, stderr)
+	}
 	if err := runDaemonMode(ctx, args, stderr); err != nil {
 		reportMainError(stderr, err)
 		return 1
 	}
 	return 0
+}
+
+func runStats(ctx context.Context, args []string, stdout, stderr io.Writer) int {
+	_ = ctx
+	flags := flag.NewFlagSet("stats", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	since := flags.String("since", "", "start month (YYYY-MM)")
+	until := flags.String("until", "", "end month (YYYY-MM)")
+	subcommand := flags.String("subcommand", "", "subcommand")
+	jsonOut := flags.Bool("json", false, "output JSON")
+	if err := flags.Parse(args); err != nil {
+		return 1
+	}
+	if len(flags.Args()) != 0 {
+		fmt.Fprintf(stderr, "stats: unexpected positional arguments: %v\n", flags.Args())
+		return 1
+	}
+	query := buildStatsQueryFromFlags(optionalStatsFlag(since, specifiedFlags(flags)["since"]), optionalStatsFlag(until, specifiedFlags(flags)["until"]), optionalStatsFlag(subcommand, specifiedFlags(flags)["subcommand"]), *jsonOut)
+	if !validStatsMonth(query.Since) || !validStatsMonth(query.Until) || (query.Since != nil && query.Until != nil && *query.Until < *query.Since) {
+		fmt.Fprintf(stderr, "%s %s\n", machineCodeStatsInvalidDateRange, metrics.MessageKeyStatsInvalidDateRange)
+		return 1
+	}
+	if query.SubcommandFilter != nil && !isStatsSubcommand(*query.SubcommandFilter) {
+		fmt.Fprintf(stderr, "%s %s\n", machineCodeStatsInvalidSubcommandFilter, metrics.MessageKeyStatsInvalidSubcommand)
+		return 1
+	}
+	home, err := statsUserHomeDir()
+	if err != nil {
+		reportMainError(stderr, err)
+		return 1
+	}
+	report, err := metrics.NewComputeTaskStatsUseCase(newStatsMetricsReader(), filepath.Join(home, ".claude", "logs")).Execute(query)
+	if err != nil {
+		reportMainError(stderr, err)
+		return 1
+	}
+	if query.JSON {
+		encoded, err := json.Marshal(report)
+		if err == nil {
+			_, err = fmt.Fprintln(stdout, string(encoded))
+		}
+		if err != nil {
+			reportMainError(stderr, err)
+			return 1
+		}
+		return 0
+	}
+	if err := writeStatsText(stdout, report); err != nil {
+		reportMainError(stderr, err)
+		return 1
+	}
+	return 0
+}
+
+func optionalStatsFlag(value *string, specified bool) *string {
+	if !specified {
+		return nil
+	}
+	return value
+}
+
+func buildStatsQueryFromFlags(since, until, subcommand *string, jsonOut bool) metrics.StatsQuery {
+	query := metrics.StatsQuery{Since: since, Until: until, JSON: jsonOut}
+	if subcommand != nil {
+		value := domain.Subcommand(*subcommand)
+		query.SubcommandFilter = &value
+	}
+	return query
+}
+
+func validStatsMonth(value *string) bool {
+	if value == nil || len(*value) != len("2006-01") || (*value)[4] != '-' {
+		return value == nil
+	}
+	for _, index := range []int{0, 1, 2, 3} {
+		if (*value)[index] < '0' || (*value)[index] > '9' {
+			return false
+		}
+	}
+	return ((*value)[5] == '0' && (*value)[6] >= '1' && (*value)[6] <= '9') || ((*value)[5] == '1' && (*value)[6] >= '0' && (*value)[6] <= '2')
+}
+
+func isStatsSubcommand(value domain.Subcommand) bool {
+	switch value {
+	case domain.SubcommandImpl, domain.SubcommandReview, domain.SubcommandPlan, domain.SubcommandResearch, domain.SubcommandRead, domain.SubcommandStatus, domain.SubcommandLogs, domain.SubcommandCancel, domain.SubcommandDoctor, domain.SubcommandCleanup, domain.SubcommandStats:
+		return true
+	default:
+		return false
+	}
+}
+
+func writeStatsText(out io.Writer, report metrics.StatsReport) error {
+	lines := []string{
+		fmt.Sprintf("matched_files: %d", report.MatchedFiles), fmt.Sprintf("total_records: %d", report.TotalRecords),
+		"queue_wait_median: " + statsInt(report.QueueWaitMedian), "queue_wait_p95: " + statsInt(report.QueueWaitP95),
+		"startup_median: " + statsInt(report.StartupMedian), "startup_p95: " + statsInt(report.StartupP95),
+		"execution_median: " + statsInt(report.ExecutionMedian), "execution_p95: " + statsInt(report.ExecutionP95),
+		"prompt_length_to_output_length_correlation: " + statsFloat(report.PromptLengthToOutputLengthCorrelation), "prompt_length_to_output_tokens_correlation: " + statsFloat(report.PromptLengthToOutputTokensCorrelation),
+		"max_event_gap_median: " + statsFloat(report.MaxEventGapMedian), "max_event_gap_p95: " + statsFloat(report.MaxEventGapP95), "max_event_gap_max: " + statsFloat(report.MaxEventGapMax),
+		fmt.Sprintf("timeout_count: %d", report.TimeoutCount), fmt.Sprintf("recovery_attempted_count: %d", report.RecoveryAttemptedCount), fmt.Sprintf("recovery_succeeded_count: %d", report.RecoverySucceededCount), "recovery_success_rate: " + statsFloat(report.RecoverySuccessRate),
+		"success_rate_by_subcommand:",
+	}
+	keys := make([]string, 0, len(report.SuccessRateBySubcommand))
+	for key := range report.SuccessRateBySubcommand {
+		keys = append(keys, string(key))
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		lines = append(lines, fmt.Sprintf("  %s: %s", key, statsSuccess(report.SuccessRateBySubcommand[domain.Subcommand(key)])))
+	}
+	lines = append(lines, "success_rate_by_model:")
+	keys = keys[:0]
+	for key := range report.SuccessRateByModel {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		lines = append(lines, fmt.Sprintf("  %s: %s", key, statsSuccess(report.SuccessRateByModel[key])))
+	}
+	if report.SkippedLines > 0 {
+		lines = append(lines, fmt.Sprintf("%s: %d", metrics.MessageKeyStatsSkippedLines, report.SkippedLines))
+	}
+	for _, line := range lines {
+		if _, err := fmt.Fprintln(out, line); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+func statsInt(value *int) string {
+	if value == nil {
+		return "null"
+	}
+	return fmt.Sprintf("%d", *value)
+}
+func statsFloat(value *float64) string {
+	if value == nil {
+		return "null"
+	}
+	return fmt.Sprintf("%v", *value)
+}
+func statsSuccess(value metrics.SuccessStat) string {
+	return fmt.Sprintf("total=%d success=%d rate=%s", value.Total, value.Success, statsFloat(value.Rate))
 }
 
 type clientConfig struct {

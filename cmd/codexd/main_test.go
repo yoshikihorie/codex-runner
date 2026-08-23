@@ -19,10 +19,143 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/config"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/execution"
+	"github.com/yoshikihorie/codex-runner/internal/metrics"
 	"github.com/yoshikihorie/codex-runner/internal/proc"
+	"github.com/yoshikihorie/codex-runner/internal/store"
 	"github.com/yoshikihorie/codex-runner/internal/transport"
 	"github.com/yoshikihorie/codex-runner/internal/transport/client"
 )
+
+type statsReaderFake struct {
+	list func(string, *string, *string) ([]string, error)
+	open func(string) (io.ReadCloser, error)
+}
+
+func (r statsReaderFake) ListMonthlyFiles(dir string, since, until *string) ([]string, error) {
+	return r.list(dir, since, until)
+}
+func (r statsReaderFake) OpenMonthlyFile(path string) (io.ReadCloser, error) { return r.open(path) }
+
+type statsFailWriter struct{}
+
+func (statsFailWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
+
+func withStatsDependencies(t *testing.T, home string, reader store.MetricsReader) {
+	t.Helper()
+	oldHome, oldReader := statsUserHomeDir, newStatsMetricsReader
+	statsUserHomeDir = func() (string, error) { return home, nil }
+	newStatsMetricsReader = func() store.MetricsReader { return reader }
+	t.Cleanup(func() { statsUserHomeDir, newStatsMetricsReader = oldHome, oldReader })
+}
+
+func TestRunStatsValidationTC1TC2TC3TC8(t *testing.T) {
+	reader := statsReaderFake{list: func(string, *string, *string) ([]string, error) { t.Fatal("list called"); return nil, nil }, open: func(string) (io.ReadCloser, error) { t.Fatal("open called"); return nil, nil }}
+	withStatsDependencies(t, t.TempDir(), reader)
+	for _, args := range [][]string{{"--since", "2026-13"}, {"--since", "2026-1"}, {"--since", "abc"}, {"--since", ""}, {"--until", "😀"}, {"--since", "2026-08", "--until", "2026-07"}} {
+		var err bytes.Buffer
+		if got := runStats(context.Background(), args, io.Discard, &err); got != 1 || !strings.Contains(err.String(), machineCodeStatsInvalidDateRange) {
+			t.Fatalf("args=%v code=%d stderr=%q", args, got, err.String())
+		}
+	}
+	var err bytes.Buffer
+	if got := runStats(context.Background(), []string{"--subcommand", "unknown"}, io.Discard, &err); got != 1 || !strings.Contains(err.String(), machineCodeStatsInvalidSubcommandFilter) {
+		t.Fatalf("code=%d stderr=%q", got, err.String())
+	}
+}
+
+func TestRunStatsTC4TC5TC9TC17(t *testing.T) {
+	withStatsDependencies(t, t.TempDir(), store.NewFileMetricsReader())
+	for _, subcommand := range []string{"", "stats", "logs", "doctor", "cleanup"} {
+		args := []string{"--json"}
+		if subcommand != "" {
+			args = append(args, "--subcommand", subcommand)
+		}
+		var out, err bytes.Buffer
+		if got := runStats(context.Background(), args, &out, &err); got != 0 {
+			t.Fatalf("args=%v code=%d stderr=%s", args, got, err.String())
+		}
+		var report metrics.StatsReport
+		if json.Unmarshal(out.Bytes(), &report) != nil || report.MatchedFiles != 0 || report.TotalRecords != 0 || len(report.SuccessRateBySubcommand) != 0 || len(report.SuccessRateByModel) != 0 || report.QueueWaitMedian != nil || report.RecoverySuccessRate != nil {
+			t.Fatalf("unexpected report: %s", out.String())
+		}
+	}
+	var text bytes.Buffer
+	if runStats(context.Background(), nil, &text, io.Discard) != 0 || strings.Contains(text.String(), metrics.MessageKeyStatsSkippedLines) {
+		t.Fatalf("text=%q", text.String())
+	}
+}
+
+func TestRunStatsTC6TC7TC10TC11TC18(t *testing.T) {
+	home := t.TempDir()
+	logs := filepath.Join(home, ".claude", "logs")
+	if err := os.MkdirAll(logs, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(logs, "task-metrics-2026-08.jsonl")
+	if err := os.WriteFile(path, []byte("{}\nnot-json\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withStatsDependencies(t, home, store.NewFileMetricsReader())
+	var jsonOut, text bytes.Buffer
+	if runStats(context.Background(), []string{"--json"}, &jsonOut, io.Discard) != 0 || runStats(context.Background(), nil, &text, io.Discard) != 0 {
+		t.Fatal("stats failed")
+	}
+	if !strings.Contains(text.String(), metrics.MessageKeyStatsSkippedLines) || !strings.Contains(text.String(), "matched_files: 1") {
+		t.Fatalf("text=%q", text.String())
+	}
+	if runStats(context.Background(), []string{"--json"}, io.Discard, io.Discard) != 0 {
+		t.Fatal("second call failed")
+	}
+	after, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(before, after) || !info.ModTime().Equal(afterInfo.ModTime()) {
+		t.Fatal("stats changed metrics file")
+	}
+}
+
+func TestRunStatsTC12TC13TC14TC15TC16(t *testing.T) {
+	oldHome := statsUserHomeDir
+	statsUserHomeDir = func() (string, error) { return "", errors.New("home failed") }
+	t.Cleanup(func() { statsUserHomeDir = oldHome })
+	var err bytes.Buffer
+	if runStats(context.Background(), nil, io.Discard, &err) != 1 || !strings.Contains(err.String(), "home failed") {
+		t.Fatalf("stderr=%q", err.String())
+	}
+	withStatsDependencies(t, t.TempDir(), statsReaderFake{list: func(string, *string, *string) ([]string, error) { return nil, errors.New("list failed") }, open: func(string) (io.ReadCloser, error) { return nil, nil }})
+	err.Reset()
+	if runStats(context.Background(), nil, io.Discard, &err) != 1 || !strings.Contains(err.String(), "list failed") {
+		t.Fatalf("stderr=%q", err.String())
+	}
+	newStatsMetricsReader = func() store.MetricsReader { return store.NewFileMetricsReader() }
+	err.Reset()
+	if runStats(context.Background(), []string{"--json"}, statsFailWriter{}, &err) != 1 || !strings.Contains(err.String(), "write failed") {
+		t.Fatalf("stderr=%q", err.String())
+	}
+	for _, args := range [][]string{{"--wat"}, {"--since"}, {"extra"}} {
+		if runStats(context.Background(), args, io.Discard, io.Discard) != 1 {
+			t.Fatalf("args=%v", args)
+		}
+	}
+	since, until, subcommand := "2026-01", "2026-02", "stats"
+	query := buildStatsQueryFromFlags(&since, &until, &subcommand, true)
+	if query.Since == nil || *query.Since != since || query.Until == nil || *query.Until != until || query.SubcommandFilter == nil || *query.SubcommandFilter != domain.SubcommandStats || !query.JSON {
+		t.Fatalf("query=%#v", query)
+	}
+}
 
 type terminatorRunnerFake struct {
 	killCalls int
