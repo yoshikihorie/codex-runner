@@ -54,19 +54,26 @@ type RecoveryAttempt struct {
 	CodexBinaryPath string
 }
 
+func failureExitCodeFor(origin domain.RecoveryOrigin) domain.ExitCode {
+	if origin == domain.RecoveryOriginTimeout {
+		return domain.NewExitCode(6)
+	}
+	return domain.NewExitCode(1)
+}
+
 func (r *RecoveryAttempt) Attempt(ctx context.Context, launcher ResumeLauncher, reader ContractReader) (RecoveryResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, resumeRecoveryTimeout)
 	defer cancel()
 	params := ResumeLaunchParams{TaskID: r.TaskID, CodexBinaryPath: r.CodexBinaryPath, SessionID: r.SessionRef.SessionID(), OutputLastMessagePath: filepath.Join(recoveryTaskPlacementRoot, r.TaskID.String(), "last-message.md")}
 	if err := launcher.LaunchAndWait(ctx, params); err != nil {
-		return RecoveryResult{ExitCode: domain.NewExitCode(1)}, err
+		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, err
 	}
 	present, err := reader.ReadLastMessage(r.TaskID)
 	if err != nil {
-		return RecoveryResult{ExitCode: domain.NewExitCode(1)}, err
+		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, err
 	}
 	if !present {
-		return RecoveryResult{ExitCode: domain.NewExitCode(1)}, nil
+		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, nil
 	}
 	return RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)}, nil
 }
@@ -139,7 +146,7 @@ func (uc *RecoverViaResumeUseCase) Execute(ctx context.Context, in RecoverViaRes
 	if err != nil {
 		return RecoverViaResumeOutput{}, err
 	}
-	result := RecoveryResult{ExitCode: domain.NewExitCode(1)}
+	result := RecoveryResult{ExitCode: failureExitCodeFor(origin)}
 	if in.SessionRef != nil {
 		resumeResult, resumeErr := uc.recoverer.Resume(ctx, in.TaskID, in.SessionRef, origin)
 		if resumeErr != nil {

@@ -69,6 +69,32 @@ func TestRecoveryAttemptDoesNotReadOutputAfterLaunchFailure(t *testing.T) {
 	}
 }
 
+func TestRecoveryAttemptFailureExitCodeDependsOnOrigin(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		origin    domain.RecoveryOrigin
+		launcher  *resumeLauncherFake
+		reader    *resumeReaderFake
+		wantCode  int
+		wantClass domain.ExitCodeClass
+		wantErr   bool
+	}{
+		{name: "timeout launch error", origin: domain.RecoveryOriginTimeout, launcher: &resumeLauncherFake{err: errors.New("launch failed")}, reader: &resumeReaderFake{}, wantCode: 6, wantClass: domain.ExitCodeClassTimeout, wantErr: true},
+		{name: "timeout read error", origin: domain.RecoveryOriginTimeout, launcher: &resumeLauncherFake{}, reader: &resumeReaderFake{err: errors.New("read failed")}, wantCode: 6, wantClass: domain.ExitCodeClassTimeout, wantErr: true},
+		{name: "timeout missing last message", origin: domain.RecoveryOriginTimeout, launcher: &resumeLauncherFake{}, reader: &resumeReaderFake{}, wantCode: 6, wantClass: domain.ExitCodeClassTimeout},
+		{name: "orphan launch error", origin: domain.RecoveryOriginOrphan, launcher: &resumeLauncherFake{err: errors.New("launch failed")}, reader: &resumeReaderFake{}, wantCode: 1, wantClass: domain.ExitCodeClassFailure, wantErr: true},
+		{name: "orphan read error", origin: domain.RecoveryOriginOrphan, launcher: &resumeLauncherFake{}, reader: &resumeReaderFake{err: errors.New("read failed")}, wantCode: 1, wantClass: domain.ExitCodeClassFailure, wantErr: true},
+		{name: "orphan missing last message", origin: domain.RecoveryOriginOrphan, launcher: &resumeLauncherFake{}, reader: &resumeReaderFake{}, wantCode: 1, wantClass: domain.ExitCodeClassFailure},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := (&RecoveryAttempt{TaskID: recoveryTestTaskID(t), Origin: tc.origin, SessionRef: recoveryTestSession(t), CodexBinaryPath: "/usr/local/bin/codex"}).Attempt(context.Background(), tc.launcher, tc.reader)
+			if (err != nil) != tc.wantErr || result.ExitCode.Raw() != tc.wantCode || result.ExitCode.Class() != tc.wantClass {
+				t.Fatalf("result=(%+v, %v), want code=%d class=%q err=%t", result, err, tc.wantCode, tc.wantClass, tc.wantErr)
+			}
+		})
+	}
+}
+
 func TestRecoveryAttemptAppliesResumeRecoveryTimeout(t *testing.T) {
 	id := recoveryTestTaskID(t)
 	session := recoveryTestSession(t)
@@ -518,7 +544,7 @@ func TestRecoverViaResumeUseCaseFailureUsesDomainOrigin(t *testing.T) {
 func TestRecoverViaResumeUseCaseNilSessionTransitionsToTimeoutLostWithoutResume(t *testing.T) {
 	uc, store, writer, recoverer, recorded, slots, mutex := newRecoveryUseCaseFixture(t, domain.StateTimeout, nil, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
 	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
-	if err != nil || out.Succeeded || out.FinalState != domain.StateTimeoutLost || recoverer.calls != 0 || slots.calls != 1 || mutex.locks != 2 || mutex.unlocks != 2 {
+	if err != nil || out.Succeeded || out.ExitCode.Raw() != 6 || out.FinalState != domain.StateTimeoutLost || recoverer.calls != 0 || slots.calls != 1 || mutex.locks != 2 || mutex.unlocks != 2 {
 		t.Fatalf("result=(%+v, %v), resume=%d slots=%d locks=%d unlocks=%d", out, err, recoverer.calls, slots.calls, mutex.locks, mutex.unlocks)
 	}
 	if store.snapshot.SessionRef != nil || len(writer.events) != 2 || len(recorded.inputs) != 1 {
@@ -528,6 +554,32 @@ func TestRecoverViaResumeUseCaseNilSessionTransitionsToTimeoutLostWithoutResume(
 	failed := recoveryEvent[domain.RecoveryFailed](t, writer.events)
 	if attempted.SessionRef != nil || failed.Origin != domain.RecoveryOriginTimeout {
 		t.Fatalf("attempted=%#v failed=%#v", attempted, failed)
+	}
+}
+
+func TestRecoverViaResumeUseCaseOrphanFailureKeepsFailureExitCode(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		session bool
+	}{
+		{name: "nil session"},
+		{name: "resume error", session: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var session *domain.SessionRef
+			if tc.session {
+				value := recoveryTestSession(t)
+				session = &value
+			}
+			uc, _, writer, recoverer, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateOrphaned, session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+			if tc.session {
+				recoverer.err = errors.New("resume failed")
+			}
+			out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: session, Origin: domain.RecoveryOriginOrphan, OccurredAt: time.Now()})
+			if err != nil || out.Succeeded || out.ExitCode.Raw() != 1 || writer.exitCode.Raw() != 1 {
+				t.Fatalf("result=(%+v, %v), writer code=%d", out, err, writer.exitCode.Raw())
+			}
+		})
 	}
 }
 
@@ -568,7 +620,7 @@ func TestRecoverViaResumeUseCaseTimeoutDuringResumeFailsTerminally(t *testing.T)
 	if failed := recoveryEvent[domain.RecoveryFailed](t, writer.events); !failed.PartialOutputSaved {
 		t.Fatalf("failed event=%#v", failed)
 	}
-	if writer.exitCodeCalls != 1 || writer.exitCode.Raw() != 1 {
+	if writer.exitCodeCalls != 1 || writer.exitCode.Raw() != 6 {
 		t.Fatalf("exit code writes=%d code=%d", writer.exitCodeCalls, writer.exitCode.Raw())
 	}
 }
