@@ -30,6 +30,7 @@ const (
 	defaultTaskPlacementRetentionDays           = 14
 	defaultTotalTaskDiskBudgetMB                = 5_000
 	defaultModel                                = "gpt-5.6-terra"
+	readOnlyModel                               = "gpt-5.6-luna"
 	defaultPtyEnabled                           = false
 	maxConcurrentTasksMin                       = 1
 	maxConcurrentTasksMax                       = 16
@@ -39,7 +40,7 @@ var (
 	ErrInvalidConfig          = errors.New("config: invalid value")
 	ErrExplicitConfigNotFound = errors.New("config: explicit config file not found")
 
-	allowedModels           = []string{"gpt-5.6-terra", "gpt-5.6-sol"}
+	allowedModels           = []string{"gpt-5.6-terra", "gpt-5.6-sol", readOnlyModel}
 	allowedReasoningEfforts = []string{"low", "medium", "high", "xhigh"}
 
 	// This is a variable so package tests can replace the candidates safely.
@@ -408,7 +409,22 @@ func (c Config) ResolveModel(subcommand domain.Subcommand, requested *string) (s
 	if requested != nil {
 		model = *requested
 	}
-	return model, IsModelAllowed(model)
+	return model, isModelAllowedForSubcommand(subcommand, model)
+}
+
+func isModelAllowedForSubcommand(subcommand domain.Subcommand, model string) bool {
+	if !IsModelAllowed(model) {
+		return false
+	}
+
+	switch subcommand {
+	case domain.SubcommandRead:
+		return true
+	case domain.SubcommandImpl, domain.SubcommandReview, domain.SubcommandPlan, domain.SubcommandResearch:
+		return model != readOnlyModel
+	default:
+		return false
+	}
 }
 
 // ResolveReasoningEffort applies request, subcommand, then global defaults.

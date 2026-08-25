@@ -42,6 +42,61 @@ func TestResolveSubmitOptions(t *testing.T) {
 	}
 }
 
+func TestResolveModelAllowsLunaOnlyForRead(t *testing.T) {
+	requested := "gpt-5.6-luna"
+	c := Config{}
+
+	tests := []struct {
+		name       string
+		subcommand domain.Subcommand
+		wantOK     bool
+	}{
+		{name: "read", subcommand: domain.SubcommandRead, wantOK: true},
+		{name: "impl", subcommand: domain.SubcommandImpl, wantOK: false},
+		{name: "review", subcommand: domain.SubcommandReview, wantOK: false},
+		{name: "plan", subcommand: domain.SubcommandPlan, wantOK: false},
+		{name: "research", subcommand: domain.SubcommandResearch, wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model, ok := c.ResolveModel(tt.subcommand, &requested)
+			if model != requested || ok != tt.wantOK {
+				t.Fatalf("ResolveModel(%q, %q) = %q, %t; want %q, %t", tt.subcommand, requested, model, ok, requested, tt.wantOK)
+			}
+		})
+	}
+}
+
+func TestResolveModelRejectsNonSubmittableSubcommand(t *testing.T) {
+	requested := "gpt-5.6-terra"
+	if model, ok := (Config{}).ResolveModel(domain.SubcommandStatus, &requested); ok || model != requested {
+		t.Fatalf("ResolveModel(%q, %q) = %q, %t; want %q, false", domain.SubcommandStatus, requested, model, ok, requested)
+	}
+}
+
+func TestResolveModelAppliesSubcommandPolicyToConfiguredValues(t *testing.T) {
+	tests := []struct {
+		name       string
+		config     Config
+		subcommand domain.Subcommand
+		wantOK     bool
+	}{
+		{name: "global default allowed for read", config: Config{model: "gpt-5.6-luna"}, subcommand: domain.SubcommandRead, wantOK: true},
+		{name: "global default rejected for impl", config: Config{model: "gpt-5.6-luna"}, subcommand: domain.SubcommandImpl, wantOK: false},
+		{name: "override rejected for review", config: Config{model: "gpt-5.6-terra", modelOverrides: map[domain.Subcommand]string{domain.SubcommandReview: "gpt-5.6-luna"}}, subcommand: domain.SubcommandReview, wantOK: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			model, ok := tt.config.ResolveModel(tt.subcommand, nil)
+			if model != "gpt-5.6-luna" || ok != tt.wantOK {
+				t.Fatalf("ResolveModel(%q, nil) = %q, %t; want gpt-5.6-luna, %t", tt.subcommand, model, ok, tt.wantOK)
+			}
+		})
+	}
+}
+
 func TestLoadExplicitDefaultsAndOverrides(t *testing.T) {
 	codex := filepath.Join(t.TempDir(), "codex")
 	if err := os.WriteFile(codex, []byte(""), 0o755); err != nil {
@@ -344,7 +399,7 @@ func TestOverrideAccessorsReturnCopies(t *testing.T) {
 }
 
 func TestAllowedValues(t *testing.T) {
-	if !IsModelAllowed("gpt-5.6-terra") || !IsModelAllowed("gpt-5.6-sol") || IsModelAllowed("other") {
+	if !IsModelAllowed("gpt-5.6-terra") || !IsModelAllowed("gpt-5.6-sol") || !IsModelAllowed("gpt-5.6-luna") || IsModelAllowed("other") {
 		t.Fatal("model allowlist is incorrect")
 	}
 	if !IsReasoningEffortAllowed("low") || !IsReasoningEffortAllowed("medium") || !IsReasoningEffortAllowed("high") || !IsReasoningEffortAllowed("xhigh") || IsReasoningEffortAllowed("other") {
