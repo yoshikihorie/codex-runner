@@ -755,7 +755,11 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	finalize := execution.NewFinalizeTaskUseCase(tasks, writer, reader, clock, taskMu, slots, watcher, metricRecorder, stalled, logger)
 	killed := execution.NewConfirmTaskKilledUseCase(tasks, writer, reader, taskMu, watcher, pathRelease, slots, clock, metricRecorder, stalled, pending, logger)
 	failLaunch := usecase.NewFailTaskLaunchUseCase(tasks, taskMu, writer, reader, slots, usecase.NewPathLockReleaser(pathRelease), clock, logger)
-	worktree, err := execution.NewCreateWorktreeUseCase(store.NewWorktreeFileStore(), filepath.Join(home, ".codex-worktrees-cli"))
+	worktreeRoot, err := execution.DefaultWorktreeRoot()
+	if err != nil {
+		return daemonDependencies{}, fmt.Errorf("build daemon worktree dependency: %w", err)
+	}
+	worktree, err := execution.NewCreateWorktreeUseCase(store.NewWorktreeFileStore(), worktreeRoot)
 	if err != nil {
 		return daemonDependencies{}, err
 	}

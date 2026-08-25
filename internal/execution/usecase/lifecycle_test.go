@@ -45,23 +45,36 @@ func (f *lifecycleRecordingAcquireForChild) Acquire(path string) (*os.File, erro
 }
 
 type lifecycleRecordingRecordStarting struct {
-	calls int
-	err   error
-	trace *[]string
+	calls   int
+	prompts []string
+	err     error
+	trace   *[]string
 }
 
-func (f *lifecycleRecordingRecordStarting) Execute(_ context.Context, _ *domain.Task, _ domain.Timeout, _ string, _ *string, _ domain.ExecutionRoute, _ string, _ time.Time) error {
+func (f *lifecycleRecordingRecordStarting) Execute(_ context.Context, _ *domain.Task, _ domain.Timeout, _ string, _ *string, _ domain.ExecutionRoute, prompt string, _ time.Time) error {
 	f.calls++
+	f.prompts = append(f.prompts, prompt)
 	appendLifecycleTrace(f.trace, "record-starting")
 	return f.err
 }
 
 type lifecycleRecordingCreateWorktree struct {
-	calls  int
-	inputs []execution.CreateWorktreeInput
-	output execution.CreateWorktreeOutput
-	err    error
-	trace  *[]string
+	resolveCalls   int
+	resolveTaskIDs []domain.TaskID
+	resolved       string
+	resolveErr     error
+	calls          int
+	inputs         []execution.CreateWorktreeInput
+	output         execution.CreateWorktreeOutput
+	err            error
+	trace          *[]string
+}
+
+func (f *lifecycleRecordingCreateWorktree) ResolveWorkingDir(taskID domain.TaskID) (string, error) {
+	f.resolveCalls++
+	f.resolveTaskIDs = append(f.resolveTaskIDs, taskID)
+	appendLifecycleTrace(f.trace, "resolve-working-dir")
+	return f.resolved, f.resolveErr
 }
 
 func (f *lifecycleRecordingCreateWorktree) Execute(_ context.Context, input execution.CreateWorktreeInput) (execution.CreateWorktreeOutput, error) {
@@ -852,7 +865,7 @@ func newLifecycleFixture(t *testing.T) *lifecycleFixture {
 	f.input = TaskLifecycleInput{TaskLaunchPayload: execution.TaskLaunchPayload{Task: task, Model: "gpt-5", PromptText: "prompt", ResolvedTimeout: timeout, SandboxMode: "workspace-write", SourceWorkingDir: "/private/tmp/source"}, TaskDirPath: "/private/tmp/task", Now: testLifecycleTime}
 	f.acquire = &lifecycleRecordingAcquireForChild{file: file, trace: &f.trace}
 	f.starting = &lifecycleRecordingRecordStarting{trace: &f.trace}
-	f.worktree = &lifecycleRecordingCreateWorktree{output: execution.CreateWorktreeOutput{WorkingDir: "/private/tmp/worktree"}, trace: &f.trace}
+	f.worktree = &lifecycleRecordingCreateWorktree{resolved: "/private/tmp/worktree", output: execution.CreateWorktreeOutput{WorkingDir: "/private/tmp/worktree"}, trace: &f.trace}
 	f.waiter = &lifecycleRecordingWaiter{raw: 23, trace: &f.trace}
 	f.launch = &lifecycleRecordingLauncher{launched: &execution.LaunchedProcess{Handle: &domain.ProcessHandle{PID: 42, ProcessStartedAt: testLifecycleTime.Add(time.Minute)}, Waiter: f.waiter}, trace: &f.trace}
 	f.process = &lifecycleRecordingRecordProcess{trace: &f.trace}
@@ -935,11 +948,11 @@ func TestTaskLifecycleInputCarriesTaskScopedFields(t *testing.T) {
 func TestTaskLifecycleRunImplSuccessOrdersLaunchAndFinalization(t *testing.T) {
 	f := newLifecycleFixture(t)
 	f.run()
-	want := []string{"acquire-for-child", "record-starting", "create-worktree", "task-lock", "load-final", "task-unlock", "launch", "task-lock", "load-final", "record-process", "task-unlock", "confirm-running", "timeout-arm", "open-stdout", "monitor", "wait", "clock-now", "load-final", "task-lock", "load-final", "finalize", "task-unlock", "release-after-finalization", "launching-unregister"}
+	want := []string{"acquire-for-child", "resolve-working-dir", "record-starting", "create-worktree", "task-lock", "load-final", "task-unlock", "launch", "task-lock", "load-final", "record-process", "task-unlock", "confirm-running", "timeout-arm", "open-stdout", "monitor", "wait", "clock-now", "load-final", "task-lock", "load-final", "finalize", "task-unlock", "release-after-finalization", "launching-unregister"}
 	if !reflect.DeepEqual(f.trace[1:len(f.trace)-1], want) {
 		t.Fatalf("trace=%v", f.trace)
 	}
-	if f.ownership.acquireCalls != 1 || f.ownership.releaseCalls != 1 || f.launching.unregisterCalls != 1 || f.acquire.calls != 1 || f.starting.calls != 1 || f.worktree.calls != 1 || f.launch.calls != 1 || f.process.calls != 1 || f.confirmLock.calls != 1 || f.timeout.calls != 1 || f.monitor.calls != 1 || f.waiter.calls != 1 || len(f.finalizer.calls) != 1 || len(f.killed.calls) != 0 || f.pending.calls != 0 || f.terminator.calls != 0 || f.termination.confirmCalls != 0 || f.termination.sendCalls != 0 {
+	if f.ownership.acquireCalls != 1 || f.ownership.releaseCalls != 1 || f.launching.unregisterCalls != 1 || f.acquire.calls != 1 || f.starting.calls != 1 || f.worktree.resolveCalls != 1 || len(f.worktree.resolveTaskIDs) != 1 || f.worktree.resolveTaskIDs[0] != f.input.Task.ID() || f.worktree.calls != 1 || f.launch.calls != 1 || f.process.calls != 1 || f.confirmLock.calls != 1 || f.timeout.calls != 1 || f.monitor.calls != 1 || f.waiter.calls != 1 || len(f.finalizer.calls) != 1 || len(f.killed.calls) != 0 || f.pending.calls != 0 || f.terminator.calls != 0 || f.termination.confirmCalls != 0 || f.termination.sendCalls != 0 {
 		t.Fatalf("unexpected call counts: %+v", f.trace)
 	}
 	p := f.launch.params[0]
@@ -948,6 +961,84 @@ func TestTaskLifecycleRunImplSuccessOrdersLaunchAndFinalization(t *testing.T) {
 	}
 	if f.timeout.deadlines[0] != f.launch.launched.Handle.ProcessStartedAt.Add(1800*time.Second) || f.finalizer.calls[0].adoptedAfterRestart || f.finalizer.calls[0].now != f.clock.now {
 		t.Fatalf("terminal values=%+v", f.finalizer.calls[0])
+	}
+}
+
+func TestTaskLifecycleRunImplRewritesPromptBeforeRecordingAndLaunch(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.input.PromptText = "edit /private/tmp/source/a.go and verify /private/tmp/source/b.go"
+
+	f.run()
+
+	want := "edit /private/tmp/worktree/a.go and verify /private/tmp/worktree/b.go"
+	if len(f.starting.prompts) != 1 || f.starting.prompts[0] != want {
+		t.Fatalf("RecordStarting prompts=%q, want %q", f.starting.prompts, want)
+	}
+	if len(f.launch.params) != 1 || f.launch.params[0].PromptText != want {
+		t.Fatalf("Launch prompt=%q, want %q", f.launch.params[0].PromptText, want)
+	}
+	if !lifecycleTraceSubsequence(f.trace, "resolve-working-dir", "record-starting", "create-worktree", "launch") {
+		t.Fatalf("prompt preparation order=%v", f.trace)
+	}
+}
+
+func TestTaskLifecycleRunImplRewritesOnlySourceWorkingDirPathBoundaries(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.input.PromptText = "edit /private/tmp/source/file.go, keep /private/tmp/source-backup/file.go, root /private/tmp/source"
+
+	f.run()
+
+	want := "edit /private/tmp/worktree/file.go, keep /private/tmp/source-backup/file.go, root /private/tmp/worktree"
+	if len(f.starting.prompts) != 1 || f.starting.prompts[0] != want {
+		t.Fatalf("RecordStarting prompts=%q, want %q", f.starting.prompts, want)
+	}
+	if len(f.launch.params) != 1 || f.launch.params[0].PromptText != want {
+		t.Fatalf("Launch prompt=%q, want %q", f.launch.params[0].PromptText, want)
+	}
+}
+
+func TestTaskLifecycleRunRejectsUnexpectedCreatedWorktreeDestination(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.worktree.output.WorkingDir = "/private/tmp/worktree-other"
+	f.failStore.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateStarting)}}
+
+	f.run()
+
+	if f.worktree.resolveCalls != 1 || f.worktree.calls != 1 || f.launch.calls != 0 {
+		t.Fatalf("unexpected worktree or launch calls: trace=%v", f.trace)
+	}
+	if f.failStore.saveCalls != 1 || f.failStore.saved[0].State != domain.StateFailed || f.failLocks.calls != 1 || f.failSlots.calls != 1 {
+		t.Fatalf("unexpected failure handling: trace=%v", f.trace)
+	}
+	if _, err := f.acquire.file.Stat(); err == nil {
+		t.Fatal("liveness lock remained open after worktree destination mismatch")
+	}
+}
+
+func TestTaskLifecycleRunNonImplKeepsOriginalPromptAndWorkingDir(t *testing.T) {
+	f := newLifecycleFixture(t)
+	task := lifecycleTask(t, domain.SubcommandReview)
+	workingDir := "/private/tmp/review"
+	f.input.Task = task
+	f.input.PromptText = "review /private/tmp/source without rewriting"
+	f.input.WorkingDir = &workingDir
+	runningSnapshot := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandReview), domain.StateRunning)
+	f.tasks.loads = []lifecycleLoadResult{{snapshot: runningSnapshot}, {snapshot: runningSnapshot}, {snapshot: runningSnapshot}, {snapshot: runningSnapshot}}
+	f.confirmTasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandReview), domain.StateStarting)}}
+
+	f.run()
+
+	if f.worktree.resolveCalls != 0 || f.worktree.calls != 0 {
+		t.Fatalf("non-impl used worktree: trace=%v", f.trace)
+	}
+	if len(f.starting.prompts) != 1 || f.starting.prompts[0] != f.input.PromptText {
+		t.Fatalf("RecordStarting prompts=%q", f.starting.prompts)
+	}
+	if len(f.launch.params) != 1 || f.launch.params[0].PromptText != f.input.PromptText || f.launch.params[0].WorkingDir != workingDir {
+		t.Fatalf("Launch params=%+v", f.launch.params)
+	}
+	if !lifecycleTraceSubsequence(f.trace, "record-starting", "launch") {
+		t.Fatalf("non-impl launch order=%v", f.trace)
 	}
 }
 
@@ -1082,21 +1173,22 @@ func TestTaskLifecycleRunRejectsDuplicateOwnershipBeforeLaunch(t *testing.T) {
 }
 func TestTaskLifecycleRunLaunchPreparationFailuresFailAndStop(t *testing.T) {
 	cases := []struct {
-		name      string
-		configure func(*lifecycleFixture)
-	}{{"starting", func(f *lifecycleFixture) { f.starting.err = errors.New("starting") }}, {"worktree", func(f *lifecycleFixture) {
+		name       string
+		configure  func(*lifecycleFixture)
+		wantLaunch int
+	}{{name: "missing worktree", configure: func(f *lifecycleFixture) { f.orchestrator.deps.CreateWorktree = nil }}, {name: "resolve worktree", configure: func(f *lifecycleFixture) { f.worktree.resolveErr = errors.New("resolve worktree") }}, {name: "starting", configure: func(f *lifecycleFixture) { f.starting.err = errors.New("starting") }}, {name: "worktree", configure: func(f *lifecycleFixture) {
 		f.worktree.err = errors.New("worktree")
 		f.failStore.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateStarting)}}
-	}}, {"launch", func(f *lifecycleFixture) {
+	}}, {name: "launch", configure: func(f *lifecycleFixture) {
 		f.launch.err = errors.New("launch")
 		f.failStore.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateStarting)}}
-	}}}
+	}, wantLaunch: 1}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newLifecycleFixture(t)
 			tc.configure(f)
 			f.run()
-			if f.process.calls != 0 || f.confirmLock.calls != 0 || f.timeout.calls != 0 || f.monitor.calls != 0 || f.waiter.calls != 0 || len(f.finalizer.calls) != 0 || len(f.killed.calls) != 0 || f.failStore.saveCalls != 1 || f.failStore.saved[0].State != domain.StateFailed || f.failSlots.calls != 1 || f.launching.unregisterCalls != 1 || f.ownership.releaseCalls != 1 {
+			if f.launch.calls != tc.wantLaunch || f.process.calls != 0 || f.confirmLock.calls != 0 || f.timeout.calls != 0 || f.monitor.calls != 0 || f.waiter.calls != 0 || len(f.finalizer.calls) != 0 || len(f.killed.calls) != 0 || f.failStore.saveCalls != 1 || f.failStore.saved[0].State != domain.StateFailed || f.failSlots.calls != 1 || f.launching.unregisterCalls != 1 || f.ownership.releaseCalls != 1 {
 				t.Fatalf("failure handling mismatch: %+v", f.trace)
 			}
 		})

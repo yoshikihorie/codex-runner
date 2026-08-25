@@ -108,6 +108,94 @@ func TestCreateWorktreeUseCaseDerivesDestinationAndRejectsUnsafePaths(t *testing
 	}
 }
 
+func TestCreateWorktreeUseCaseResolveWorkingDirHasNoSideEffects(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "missing", "worktrees")
+	creator := &createWorktreeRecorder{}
+	uc, err := NewCreateWorktreeUseCase(creator, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := domain.NewTaskID("impl-20260825-120000-a1b2-resolve")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := uc.ResolveWorkingDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(root, id.String())
+	if got != want || !filepath.IsAbs(got) || filepath.Clean(got) != got {
+		t.Fatalf("ResolveWorkingDir() = %q, want normalized absolute path %q", got, want)
+	}
+	if _, err := os.Lstat(root); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("ResolveWorkingDir created or inspected root: %v", err)
+	}
+	if creator.calls != 0 {
+		t.Fatalf("ResolveWorkingDir called creator %d times", creator.calls)
+	}
+}
+
+func TestCreateWorktreeUseCaseResolveAndExecuteDestinationsMatch(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "worktrees")
+	source := t.TempDir()
+	creator := &createWorktreeRecorder{}
+	uc, err := NewCreateWorktreeUseCase(creator, root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id, err := domain.NewTaskID("impl-20260825-120001-a1b2-consistent")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	planned, err := uc.ResolveWorkingDir(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := uc.Execute(context.Background(), CreateWorktreeInput{TaskID: id, SourceWorkingDir: source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out.WorkingDir != planned || creator.destination != planned {
+		t.Fatalf("planned=%q output=%q creator destination=%q", planned, out.WorkingDir, creator.destination)
+	}
+}
+
+func TestCreateWorktreeUseCaseResolveWorkingDirRejectsEmptyTaskID(t *testing.T) {
+	creator := &createWorktreeRecorder{}
+	uc, err := NewCreateWorktreeUseCase(creator, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := uc.ResolveWorkingDir(domain.TaskID{}); err == nil {
+		t.Fatal("ResolveWorkingDir accepted empty task ID")
+	}
+	if creator.calls != 0 {
+		t.Fatalf("ResolveWorkingDir called creator %d times", creator.calls)
+	}
+}
+
+func TestDefaultWorktreeRootUsesDaemonNamespace(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DefaultWorktreeRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	sharedRoot := filepath.Join(home, worktreeRootDirName)
+	want := filepath.Join(sharedRoot, "daemon")
+	if got != want {
+		t.Fatalf("DefaultWorktreeRoot() = %q, want %q", got, want)
+	}
+	if got == sharedRoot {
+		t.Fatal("DefaultWorktreeRoot returned the legacy shared root")
+	}
+}
+
 const testWorktreeTaskID = "impl-20260808-120000-abcd-cleanup"
 
 type fakeWorktreeStore struct {

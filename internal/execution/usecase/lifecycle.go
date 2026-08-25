@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
@@ -30,6 +31,7 @@ type lifecycleRecordStarting interface {
 	Execute(context.Context, *domain.Task, domain.Timeout, string, *string, domain.ExecutionRoute, string, time.Time) error
 }
 type lifecycleWorktree interface {
+	ResolveWorkingDir(domain.TaskID) (string, error)
 	Execute(context.Context, execution.CreateWorktreeInput) (execution.CreateWorktreeOutput, error)
 }
 type lifecycleLauncher interface {
@@ -136,29 +138,44 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		_ = lock.Close()
 		return
 	}
-	if err = o.deps.RecordStarting.Execute(ctx, input.Task, input.ResolvedTimeout, input.Model, input.ReasoningEffort, domain.ExecutionRouteDaemon, input.PromptText, input.Now); err != nil {
-		_ = lock.Close()
-		o.fail(ctx, input, 130, true)
-		return
-	}
+	launchPrompt := input.PromptText
 	workingDir := input.WorkingDir
+	plannedWorkingDir := ""
 	if input.Task.Subcommand() == domain.SubcommandImpl {
 		if isNilValue(o.deps.CreateWorktree) {
 			_ = lock.Close()
 			o.fail(ctx, input, 130, true)
 			return
 		}
+		plannedWorkingDir, err = o.deps.CreateWorktree.ResolveWorkingDir(taskID)
+		if err != nil {
+			_ = lock.Close()
+			o.fail(ctx, input, 130, true)
+			return
+		}
+		launchPrompt = replaceSourceWorkingDir(input.PromptText, input.SourceWorkingDir, plannedWorkingDir)
+		workingDir = &plannedWorkingDir
+	}
+	if o.stopForCancellation(ctx) {
+		_ = lock.Close()
+		return
+	}
+	if err = o.deps.RecordStarting.Execute(ctx, input.Task, input.ResolvedTimeout, input.Model, input.ReasoningEffort, domain.ExecutionRouteDaemon, launchPrompt, input.Now); err != nil {
+		_ = lock.Close()
+		o.fail(ctx, input, 130, true)
+		return
+	}
+	if input.Task.Subcommand() == domain.SubcommandImpl {
 		if o.stopForCancellation(ctx) {
 			_ = lock.Close()
 			return
 		}
 		out, createErr := o.deps.CreateWorktree.Execute(ctx, execution.CreateWorktreeInput{TaskID: taskID, SourceWorkingDir: input.SourceWorkingDir})
-		if createErr != nil {
+		if createErr != nil || out.WorkingDir != plannedWorkingDir {
 			_ = lock.Close()
 			o.fail(ctx, input, 130, true)
 			return
 		}
-		workingDir = &out.WorkingDir
 	}
 	if workingDir == nil {
 		_ = lock.Close()
@@ -174,7 +191,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		return
 	}
 	launchCtx := context.WithoutCancel(ctx)
-	launched, err := o.deps.Launch.Execute(launchCtx, execution.LaunchParams{TaskID: taskID, Subcommand: input.Task.Subcommand(), Model: input.Model, SandboxMode: input.SandboxMode, WorkingDir: *workingDir, PromptText: input.PromptText, TaskDirPath: input.TaskDirPath, AllowResume: true, LivenessLockFile: lock, PTYEnabled: o.launchConfig.PTYEnabled, CodexBinaryPath: o.launchConfig.CodexBinaryPath, ReasoningEffort: input.ReasoningEffort})
+	launched, err := o.deps.Launch.Execute(launchCtx, execution.LaunchParams{TaskID: taskID, Subcommand: input.Task.Subcommand(), Model: input.Model, SandboxMode: input.SandboxMode, WorkingDir: *workingDir, PromptText: launchPrompt, TaskDirPath: input.TaskDirPath, AllowResume: true, LivenessLockFile: lock, PTYEnabled: o.launchConfig.PTYEnabled, CodexBinaryPath: o.launchConfig.CodexBinaryPath, ReasoningEffort: input.ReasoningEffort})
 	if ctx.Err() != nil {
 		return
 	}
@@ -221,6 +238,31 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		return
 	}
 	o.monitorAndFinalize(ctx, input, launched)
+}
+
+func replaceSourceWorkingDir(prompt, sourceWorkingDir, plannedWorkingDir string) string {
+	if sourceWorkingDir == "" {
+		return prompt
+	}
+
+	var rewritten strings.Builder
+	remaining := prompt
+	for {
+		match := strings.Index(remaining, sourceWorkingDir)
+		if match < 0 {
+			rewritten.WriteString(remaining)
+			return rewritten.String()
+		}
+
+		rewritten.WriteString(remaining[:match])
+		afterMatch := match + len(sourceWorkingDir)
+		if afterMatch == len(remaining) || remaining[afterMatch] == '/' {
+			rewritten.WriteString(plannedWorkingDir)
+		} else {
+			rewritten.WriteString(sourceWorkingDir)
+		}
+		remaining = remaining[afterMatch:]
+	}
 }
 
 func (o *TaskLifecycleOrchestrator) stopForCancellation(ctx context.Context) bool {

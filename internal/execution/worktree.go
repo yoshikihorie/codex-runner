@@ -20,6 +20,7 @@ const (
 	cleanupMaxAgeMinDays         = 1
 	cleanupMaxAgeMaxDays         = 365
 	worktreeRootDirName          = ".codex-worktrees-cli"
+	daemonNamespace              = "daemon"
 
 	TriggerExplicit  = "explicit"
 	TriggerAutomatic = "automatic"
@@ -64,11 +65,23 @@ func NewCreateWorktreeUseCase(creator WorktreeCreator, root string) (*CreateWork
 	return &CreateWorktreeUseCase{creator: creator, root: root}, nil
 }
 
+// ResolveWorkingDir returns the deterministic destination without touching the filesystem.
+func (uc *CreateWorktreeUseCase) ResolveWorkingDir(taskID domain.TaskID) (string, error) {
+	if taskID.String() == "" {
+		return "", fmt.Errorf("worktree task ID is required")
+	}
+	return filepath.Join(uc.root, taskID.String()), nil
+}
+
 func (uc *CreateWorktreeUseCase) Execute(ctx context.Context, in CreateWorktreeInput) (CreateWorktreeOutput, error) {
 	if err := ctx.Err(); err != nil {
 		return CreateWorktreeOutput{}, err
 	}
-	if in.TaskID.String() == "" || in.SourceWorkingDir == "" || !filepath.IsAbs(in.SourceWorkingDir) || filepath.Clean(in.SourceWorkingDir) != in.SourceWorkingDir {
+	destination, err := uc.ResolveWorkingDir(in.TaskID)
+	if err != nil {
+		return CreateWorktreeOutput{}, err
+	}
+	if in.SourceWorkingDir == "" || !filepath.IsAbs(in.SourceWorkingDir) || filepath.Clean(in.SourceWorkingDir) != in.SourceWorkingDir {
 		return CreateWorktreeOutput{}, fmt.Errorf("worktree source and task ID are required")
 	}
 	if err := os.Mkdir(uc.root, worktreeRootPermission); err != nil && !errors.Is(err, fs.ErrExist) {
@@ -88,7 +101,6 @@ func (uc *CreateWorktreeUseCase) Execute(ctx context.Context, in CreateWorktreeI
 	if sourceInfo.Mode()&os.ModeSymlink != 0 || !sourceInfo.IsDir() {
 		return CreateWorktreeOutput{}, fmt.Errorf("worktree source must be a directory and not a symlink")
 	}
-	destination := filepath.Join(uc.root, in.TaskID.String())
 	if err := uc.creator.Create(ctx, in.SourceWorkingDir, destination); err != nil {
 		return CreateWorktreeOutput{}, err
 	}
@@ -162,13 +174,15 @@ func NewEvictWorkDirUseCase(store WorktreeStore, locks *CheckLivenessUseCase, ro
 	return &EvictWorkDirUseCase{store: store, locks: locks, root: root, logger: logger}, nil
 }
 
-// DefaultWorktreeRoot resolves the conventional worktree placement root.
+// DefaultWorktreeRoot resolves the daemon-owned worktree placement root.
+// Existing worktrees directly under the former shared root are intentionally
+// not enumerated, migrated, or removed by this resolver.
 func DefaultWorktreeRoot() (string, error) {
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("resolve user home directory: %w", err)
 	}
-	return filepath.Join(home, worktreeRootDirName), nil
+	return filepath.Join(home, worktreeRootDirName, daemonNamespace), nil
 }
 
 func validateCommonInput(in EvictWorkDirInput) error {
