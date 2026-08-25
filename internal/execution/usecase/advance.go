@@ -14,21 +14,17 @@ type AdvanceQueueUseCase struct {
 	queue                  execution.TaskQueue
 	registry               execution.ActiveTaskRegistry
 	launching              execution.LaunchingTaskRegistry
+	promotions             *execution.PromotionRegistry
 	queueMu                *sync.Mutex
 	maxConcurrentTasks     int
 	maxConcurrentImplTasks int
-	// promotions records the one unresolved promotion for each task ID. A queued
-	// task ID is removed atomically before promotion and can be reinserted only
-	// after that promotion is resolved, so a task ID cannot have concurrent
-	// generations whose compensation could be confused.
-	promotions map[domain.TaskID]struct{}
 }
 
-func NewAdvanceQueueUseCase(queue execution.TaskQueue, registry execution.ActiveTaskRegistry, launching execution.LaunchingTaskRegistry, queueMu *sync.Mutex, maxConcurrentTasks int, maxConcurrentImplTasks int) *AdvanceQueueUseCase {
-	if queue == nil || registry == nil || launching == nil || queueMu == nil {
+func NewAdvanceQueueUseCase(queue execution.TaskQueue, registry execution.ActiveTaskRegistry, launching execution.LaunchingTaskRegistry, promotions *execution.PromotionRegistry, queueMu *sync.Mutex, maxConcurrentTasks int, maxConcurrentImplTasks int) *AdvanceQueueUseCase {
+	if queue == nil || registry == nil || launching == nil || promotions == nil || queueMu == nil {
 		panic("advance queue use case requires non-nil dependencies")
 	}
-	return &AdvanceQueueUseCase{queue: queue, registry: registry, launching: launching, queueMu: queueMu, maxConcurrentTasks: maxConcurrentTasks, maxConcurrentImplTasks: maxConcurrentImplTasks, promotions: make(map[domain.TaskID]struct{})}
+	return &AdvanceQueueUseCase{queue: queue, registry: registry, launching: launching, promotions: promotions, queueMu: queueMu, maxConcurrentTasks: maxConcurrentTasks, maxConcurrentImplTasks: maxConcurrentImplTasks}
 }
 
 func (u *AdvanceQueueUseCase) Execute(ctx context.Context, taskID domain.TaskID, now time.Time) (execution.TaskLaunchPayload, bool, error) {
@@ -82,7 +78,7 @@ func (u *AdvanceQueueUseCase) Execute(ctx context.Context, taskID domain.TaskID,
 		u.queue.Reindex(now)
 		return execution.TaskLaunchPayload{}, false, err
 	}
-	u.promotions[payload.Task.ID()] = struct{}{}
+	u.promotions.Reserve(payload.Task.ID())
 	u.queue.Reindex(now)
 	return payload, true, nil
 }
@@ -94,10 +90,9 @@ func (u *AdvanceQueueUseCase) CompensateRejectedStart(payload execution.TaskLaun
 	}
 	u.queueMu.Lock()
 	defer u.queueMu.Unlock()
-	if _, promoted := u.promotions[payload.Task.ID()]; !promoted {
+	if !u.promotions.Resolve(payload.Task.ID()) {
 		return
 	}
-	delete(u.promotions, payload.Task.ID())
 	u.launching.Unregister(payload.Task.ID())
 	u.registry.Remove(payload.Task.ID())
 	u.queue.Prepend(payload)
@@ -111,8 +106,5 @@ func (u *AdvanceQueueUseCase) CommitStart(payload execution.TaskLaunchPayload) {
 	}
 	u.queueMu.Lock()
 	defer u.queueMu.Unlock()
-	if _, promoted := u.promotions[payload.Task.ID()]; !promoted {
-		return
-	}
-	delete(u.promotions, payload.Task.ID())
+	u.promotions.Resolve(payload.Task.ID())
 }

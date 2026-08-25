@@ -17,7 +17,14 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/transport"
 )
 
-const taskIDGenerationMaxAttempts = 10
+const (
+	taskIDGenerationMaxAttempts = 10
+
+	// Confirmed implementation identifiers pending registration in the canonical
+	// error-code and message catalogs.
+	admissionUnavailableCode       = "ADMISSION_UNAVAILABLE"
+	admissionUnavailableMessageKey = "error.admission.unavailable"
+)
 
 type SubmitTaskStore interface {
 	Reserve(domain.TaskID) error
@@ -208,7 +215,7 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 				}
 			}
 			uc.releaseReservation(id)
-			return SubmitTaskOutput{}, &submitError{code: "TASK_DIR_CREATE_FAILED", message: "error.taskDir.createFailed", cause: context.Canceled}
+			return SubmitTaskOutput{}, &submitError{code: admissionUnavailableCode, message: admissionUnavailableMessageKey, cause: context.Canceled}
 		}
 	}
 	return SubmitTaskOutput{TaskID: id, State: domain.StateQueued, QueuePosition: result.QueuePosition, Events: result.Events}, nil

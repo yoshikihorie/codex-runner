@@ -264,6 +264,72 @@ func TestHandleConnRejectsUnterminatedOversizeRequestLine(t *testing.T) {
 	waitForHandlers(t, &wg)
 }
 
+func TestHandleConnClosesBeforeWritingOversizeResponseOrProcessingNextRequest(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	var wg sync.WaitGroup
+	calls := 0
+	wg.Add(1)
+	go handleConn(context.Background(), server, func(Request) Response {
+		calls++
+		return responseLineOfSize(t, protocolLineMaxBytesForTest+1)
+	}, noOpTailHandler, &wg, NewTailConnRegistry())
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := client.Write([]byte("{\"verb\":\"ping\",\"request_id\":\"first\"}\n{\"verb\":\"ping\",\"request_id\":\"second\"}\n"))
+		writeDone <- err
+	}()
+
+	assertConnectionEOF(t, client)
+	if calls != 1 {
+		t.Fatalf("dispatch calls = %d, want 1", calls)
+	}
+	select {
+	case <-writeDone:
+	case <-time.After(time.Second):
+		t.Fatal("request write did not finish")
+	}
+	waitForHandlers(t, &wg)
+}
+
+func TestHandleConnClosesBeforeWritingOversizeTailResponseOrProcessingNextRequest(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	var wg sync.WaitGroup
+	dispatchCalls := 0
+	tailErr := make(chan error, 1)
+	wg.Add(1)
+	go handleConn(context.Background(), server, func(Request) Response {
+		dispatchCalls++
+		return Response{}
+	}, func(_ context.Context, _ Request, out io.Writer) error {
+		_, err := io.WriteString(out, strings.Repeat("x", protocolLineMaxBytesForTest+1)+"\n")
+		tailErr <- err
+		return err
+	}, &wg, NewTailConnRegistry())
+
+	writeDone := make(chan error, 1)
+	go func() {
+		_, err := client.Write([]byte("{\"verb\":\"tail\",\"request_id\":\"tail\"}\n{\"verb\":\"ping\",\"request_id\":\"next\"}\n"))
+		writeDone <- err
+	}()
+
+	assertConnectionEOF(t, client)
+	if err := <-tailErr; !errors.Is(err, errProtocolLineTooLong) {
+		t.Fatalf("tail error = %v", err)
+	}
+	if dispatchCalls != 0 {
+		t.Fatalf("dispatch calls = %d, want 0", dispatchCalls)
+	}
+	select {
+	case <-writeDone:
+	case <-time.After(time.Second):
+		t.Fatal("request write did not finish")
+	}
+	waitForHandlers(t, &wg)
+}
+
 func requestLineOfSize(t *testing.T, size int) []byte {
 	t.Helper()
 
@@ -294,6 +360,15 @@ func assertConnectionClosed(t *testing.T, conn net.Conn) {
 	var b [1]byte
 	if n, err := conn.Read(b[:]); n != 0 || err == nil {
 		t.Fatalf("response bytes=%d err=%v, want closed connection without response", n, err)
+	}
+}
+
+func assertConnectionEOF(t *testing.T, conn net.Conn) {
+	t.Helper()
+	_ = conn.SetReadDeadline(time.Now().Add(time.Second))
+	var b [1]byte
+	if n, err := conn.Read(b[:]); n != 0 || !errors.Is(err, io.EOF) {
+		t.Fatalf("response bytes=%d err=%v, want EOF without response", n, err)
 	}
 }
 

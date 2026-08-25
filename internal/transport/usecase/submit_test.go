@@ -341,8 +341,20 @@ func TestSubmitTaskUseCaseCompensatesRejectedLifecycleStart(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err=%v", err)
 	}
+	assertSubmitError(t, err, "ADMISSION_UNAVAILABLE", "error.admission.unavailable", nil)
 	if len(fixture.starter.payloads) != 1 || len(fixture.admitter.compensated) != 1 || len(fixture.store.released) != 1 || fixture.releaser.calls != 1 {
 		t.Fatalf("starts=%d compensations=%d reservations=%d path_locks=%d", len(fixture.starter.payloads), len(fixture.admitter.compensated), len(fixture.store.released), fixture.releaser.calls)
+	}
+
+	handleFixture := newSubmitFixture()
+	handleFixture.starter.rejected = true
+	handleFixture.admitter.result.LaunchPayload = &execution.TaskLaunchPayload{Model: "payload"}
+	response := handleFixture.uc.Handle(transport.Request{
+		RequestID: "request",
+		Params:    json.RawMessage(fmt.Sprintf(`{"subcommand":"review","slug":"valid-slug","prompt":"safe","working_dir":%q}`, t.TempDir())),
+	})
+	if response.OK || response.Error == nil || response.Error.Code != "ADMISSION_UNAVAILABLE" || response.Error.MessageKey != "error.admission.unavailable" {
+		t.Fatalf("response=%#v", response)
 	}
 }
 

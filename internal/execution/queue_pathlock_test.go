@@ -58,7 +58,7 @@ func newPathLockIntegrationFixture(t *testing.T, maxConcurrent int, maxConcurren
 	releaser := execution.NewReleasePathLockUseCase(pathStore, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	queue, registry := execution.NewTaskQueue(), execution.NewActiveTaskRegistry()
 	const queueMaxDepth = 10
-	recordingAdmit := &recordingAdmitter{inner: executionusecase.NewAdmitTaskUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, maxConcurrent, maxConcurrentImpl, queueMaxDepth)}
+	recordingAdmit := &recordingAdmitter{inner: executionusecase.NewAdmitTaskUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), execution.NewPromotionRegistry(), &sync.Mutex{}, maxConcurrent, maxConcurrentImpl, queueMaxDepth)}
 	starter := &queueIntegrationStarter{}
 	recordingAcquire := &recordingPathLockAcquirer{inner: acquire}
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)

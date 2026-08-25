@@ -2,6 +2,7 @@ package execution_test
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -79,7 +80,8 @@ func newQueueIntegrationFixture(t *testing.T, maxConcurrent int, maxConcurrentIm
 	queue, registry := execution.NewTaskQueue(), execution.NewActiveTaskRegistry()
 	const queueMaxDepth = 10
 	launching := execution.NewLaunchingTaskRegistry()
-	admit := executionusecase.NewAdmitTaskUseCase(queue, registry, launching, &sync.Mutex{}, maxConcurrent, maxConcurrentImpl, queueMaxDepth)
+	promotions := execution.NewPromotionRegistry()
+	admit := executionusecase.NewAdmitTaskUseCase(queue, registry, launching, promotions, &sync.Mutex{}, maxConcurrent, maxConcurrentImpl, queueMaxDepth)
 	recording := &recordingAdmitter{inner: admit}
 	starter := &queueIntegrationStarter{}
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
@@ -88,6 +90,61 @@ func newQueueIntegrationFixture(t *testing.T, maxConcurrent int, maxConcurrentIm
 		domain.ClockFunc(func() time.Time { return now }), slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	)
 	return queueIntegrationFixture{tasksRoot: tasksRoot, queue: queue, registry: registry, launching: launching, admitter: recording, starter: starter, submit: submit}
+}
+
+func TestQueuePromotionReservationPreventsAdmissionOverflowUntilCompensated(t *testing.T) {
+	queue := execution.NewTaskQueue()
+	registry := execution.NewActiveTaskRegistry()
+	launching := execution.NewLaunchingTaskRegistry()
+	promotions := execution.NewPromotionRegistry()
+	queueMu := &sync.Mutex{}
+	admit := executionusecase.NewAdmitTaskUseCase(queue, registry, launching, promotions, queueMu, 1, 1, 1)
+	advance := executionusecase.NewAdvanceQueueUseCase(queue, registry, launching, promotions, queueMu, 1, 1)
+
+	activeInput := promotionAdmissionInput(t, "active")
+	active, err := admit.Execute(context.Background(), activeInput)
+	if err != nil || active.LaunchPayload == nil {
+		t.Fatalf("active=%#v err=%v", active, err)
+	}
+	waitingInput := promotionAdmissionInput(t, "waiting")
+	waiting, err := admit.Execute(context.Background(), waitingInput)
+	if err != nil || waiting.QueuePosition == nil || queue.Len() != 1 {
+		t.Fatalf("waiting=%#v err=%v queue=%d", waiting, err, queue.Len())
+	}
+
+	payload, found, err := advance.Execute(context.Background(), activeInput.TaskID, time.Now())
+	if err != nil || !found || payload.Task.ID() != waitingInput.TaskID || queue.Len() != 0 || promotions.Len() != 1 {
+		t.Fatalf("payload=%#v found=%t err=%v queue=%d promotions=%d", payload, found, err, queue.Len(), promotions.Len())
+	}
+	result, err := admit.Execute(context.Background(), promotionAdmissionInput(t, "overflow"))
+	if !errors.Is(err, domain.ErrQueueFull) || result.State != "" || queue.Len() != 0 || promotions.Len() != 1 {
+		t.Fatalf("result=%#v err=%v queue=%d promotions=%d", result, err, queue.Len(), promotions.Len())
+	}
+
+	advance.CompensateRejectedStart(payload, time.Now())
+	if queue.Len() != 1 || promotions.Len() != 0 {
+		t.Fatalf("queue=%d promotions=%d", queue.Len(), promotions.Len())
+	}
+}
+
+func promotionAdmissionInput(t *testing.T, suffix string) execution.TaskAdmissionInput {
+	t.Helper()
+	taskID, err := domain.NewTaskID("review-20260825-120000-a1b2-promotion-" + suffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	slug, err := domain.NewSlug("promotion-" + suffix)
+	if err != nil {
+		t.Fatal(err)
+	}
+	timeout, err := domain.NewTimeout(nil, 1800)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return execution.TaskAdmissionInput{
+		TaskID: taskID, Subcommand: domain.SubcommandReview, Slug: slug, RequestedAt: time.Now(),
+		PromptText: "prompt", ResolvedTimeout: timeout, Model: "model", SandboxMode: "read-only", SourceWorkingDir: "/private/tmp/source",
+	}
 }
 
 func queueIntegrationInput(t *testing.T, slug string) transportusecase.SubmitTaskInput {

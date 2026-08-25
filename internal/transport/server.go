@@ -160,7 +160,6 @@ func handleConn(ctx context.Context, conn net.Conn, dispatch func(Request) Respo
 	// Reserve one byte so Scanner can inspect the terminating newline.
 	scanner.Buffer(make([]byte, 64*1024), protocolLineMaxBytes+1)
 	scanner.Split(jsonLineSplit)
-	encoder := json.NewEncoder(conn)
 	for {
 		if ctx.Err() != nil {
 			return
@@ -182,20 +181,29 @@ func handleConn(ctx context.Context, conn net.Conn, dispatch func(Request) Respo
 			if result == envelopeDisconnect {
 				return
 			}
-			if encoder.Encode(resp) != nil {
+			if err := writeResponseLine(conn, resp); err != nil {
+				logProtocolResponseWriteError(err)
 				return
 			}
 			continue
 		}
 		if req.Verb == string(domain.ProtocolVerbTail) {
 			if err := handleTail(ctx, conn, req, tailHandler, tailConns); err != nil {
+				logProtocolResponseWriteError(err)
 				return
 			}
 			continue
 		}
-		if encoder.Encode(dispatch(req)) != nil {
+		if err := writeResponseLine(conn, dispatch(req)); err != nil {
+			logProtocolResponseWriteError(err)
 			return
 		}
+	}
+}
+
+func logProtocolResponseWriteError(err error) {
+	if errors.Is(err, errProtocolLineTooLong) {
+		slog.Error("protocol response line exceeds maximum", "max_bytes", protocolLineMaxBytes)
 	}
 }
 
@@ -242,5 +250,5 @@ func handleTail(parentCtx context.Context, conn net.Conn, req Request, tailHandl
 	}
 	defer cancel()
 	defer tailConns.remove(conn)
-	return tailHandler(tailCtx, req, conn)
+	return tailHandler(tailCtx, req, newProtocolLineWriter(conn))
 }

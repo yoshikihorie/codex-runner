@@ -32,10 +32,14 @@ func testAdmissionInput(t *testing.T, subcommand domain.Subcommand, suffix strin
 	}
 }
 
+func newAdmitTaskUseCaseForTest(queue execution.TaskQueue, registry execution.ActiveTaskRegistry, launching execution.LaunchingTaskRegistry, queueMu *sync.Mutex, maxConcurrentTasks int, maxConcurrentImplTasks int, queueMaxDepth int) *AdmitTaskUseCase {
+	return NewAdmitTaskUseCase(queue, registry, launching, execution.NewPromotionRegistry(), queueMu, maxConcurrentTasks, maxConcurrentImplTasks, queueMaxDepth)
+}
+
 func TestAdmitTaskUseCaseImmediateAndQueuedResults(t *testing.T) {
 	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
 	launching := execution.NewLaunchingTaskRegistry()
-	useCase := NewAdmitTaskUseCase(queue, registry, launching, mutex, 1, 1, 2)
+	useCase := newAdmitTaskUseCaseForTest(queue, registry, launching, mutex, 1, 1, 2)
 	immediate, err := useCase.Execute(context.Background(), testAdmissionInput(t, domain.SubcommandReview, "immediate"))
 	if err != nil || immediate.QueuePosition != nil || immediate.LaunchPayload == nil || immediate.LaunchPayload.WorkingDir == nil {
 		t.Fatalf("immediate=%#v err=%v", immediate, err)
@@ -52,7 +56,7 @@ func TestAdmitTaskUseCaseImmediateAndQueuedResults(t *testing.T) {
 func TestAdmitTaskUseCaseAdmitsUpToMaxConcurrentTasksRegardlessOfSubcommandMix(t *testing.T) {
 	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
 	launching := execution.NewLaunchingTaskRegistry()
-	useCase := NewAdmitTaskUseCase(queue, registry, launching, mutex, 4, 4, 10)
+	useCase := newAdmitTaskUseCaseForTest(queue, registry, launching, mutex, 4, 4, 10)
 	inputs := []execution.TaskAdmissionInput{
 		testAdmissionInput(t, domain.SubcommandImpl, "immediate-impl-first"),
 		testAdmissionInput(t, domain.SubcommandReview, "immediate-review"),
@@ -78,7 +82,7 @@ func TestAdmitTaskUseCaseAdmitsUpToMaxConcurrentTasksRegardlessOfSubcommandMix(t
 
 func TestAdmitTaskUseCaseQueuesImplAtImplLimitAndPreservesFIFO(t *testing.T) {
 	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
-	useCase := NewAdmitTaskUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), mutex, 2, 1, 3)
+	useCase := newAdmitTaskUseCaseForTest(queue, registry, execution.NewLaunchingTaskRegistry(), mutex, 2, 1, 3)
 	first, err := useCase.Execute(context.Background(), testAdmissionInput(t, domain.SubcommandImpl, "impl-limit-active"))
 	if err != nil || first.LaunchPayload == nil || registry.Size() != 1 || registry.ImplSize() != 1 {
 		t.Fatalf("first=%#v err=%v size=%d impl=%d", first, err, registry.Size(), registry.ImplSize())
@@ -97,7 +101,7 @@ func TestAdmitTaskUseCaseRejectsFullQueueBeforeTaskCreation(t *testing.T) {
 	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
 	registry.Add(testAdmissionInput(t, domain.SubcommandImpl, "active").TaskID, domain.SubcommandImpl)
 	queuedTask := testAdmissionInput(t, domain.SubcommandImpl, "waiting")
-	first := NewAdmitTaskUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), mutex, 1, 1, 1)
+	first := newAdmitTaskUseCaseForTest(queue, registry, execution.NewLaunchingTaskRegistry(), mutex, 1, 1, 1)
 	if _, err := first.Execute(context.Background(), queuedTask); err != nil {
 		t.Fatal(err)
 	}
@@ -107,10 +111,26 @@ func TestAdmitTaskUseCaseRejectsFullQueueBeforeTaskCreation(t *testing.T) {
 	}
 }
 
+func TestAdmitTaskUseCaseCountsUnresolvedPromotionsAtQueueDepthBoundary(t *testing.T) {
+	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
+	promotions := execution.NewPromotionRegistry()
+	registry.Add(testAdmissionInput(t, domain.SubcommandReview, "promotion-active").TaskID, domain.SubcommandReview)
+	promotions.Reserve(testAdmissionInput(t, domain.SubcommandReview, "promotion-reserved").TaskID)
+	useCase := NewAdmitTaskUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), promotions, mutex, 1, 1, 1)
+
+	result, err := useCase.Execute(context.Background(), testAdmissionInput(t, domain.SubcommandReview, "promotion-full"))
+	if !errors.Is(err, domain.ErrQueueFull) || result.State != "" || result.QueuePosition != nil || len(result.Events) != 0 || result.LaunchPayload != nil {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+	if queue.Len() != 0 || promotions.Len() != 1 {
+		t.Fatalf("queue=%d promotions=%d", queue.Len(), promotions.Len())
+	}
+}
+
 func TestAdmitTaskUseCaseValidatesRequiredFields(t *testing.T) {
 	input := testAdmissionInput(t, domain.SubcommandImpl, "invalid")
 	input.Model = ""
-	result, err := NewAdmitTaskUseCase(execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1, 1, 1).Execute(context.Background(), input)
+	result, err := newAdmitTaskUseCaseForTest(execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1, 1, 1).Execute(context.Background(), input)
 	if err == nil || result.State != "" || result.QueuePosition != nil || len(result.Events) != 0 || result.LaunchPayload != nil {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
@@ -135,7 +155,7 @@ func TestAdmitTaskUseCaseValidatesEveryRequiredFieldWithoutMutation(t *testing.T
 			queue, registry := execution.NewTaskQueue(), execution.NewActiveTaskRegistry()
 			input := testAdmissionInput(t, domain.SubcommandImpl, "required-"+strings.ReplaceAll(field.name, "_", "-"))
 			field.clear(&input)
-			result, err := NewAdmitTaskUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1, 1, 1).Execute(context.Background(), input)
+			result, err := newAdmitTaskUseCaseForTest(queue, registry, execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1, 1, 1).Execute(context.Background(), input)
 			if err == nil || result.State != "" || result.QueuePosition != nil || len(result.Events) != 0 || result.LaunchPayload != nil || queue.Len() != 0 || registry.Size() != 0 {
 				t.Fatalf("result=%#v err=%v queue=%d registry=%d", result, err, queue.Len(), registry.Size())
 			}
@@ -150,7 +170,7 @@ func TestAdmitTaskUseCaseCopiesQueuedPayloadReferences(t *testing.T) {
 	paths := []domain.NormalizedPath{mustNormalizedPath(t, "/private/tmp/a"), mustNormalizedPath(t, "/private/tmp/b")}
 	input := testAdmissionInput(t, domain.SubcommandReview, "copy-waiting")
 	input.ReasoningEffort, input.NormalizedPaths = &value, paths
-	result, err := NewAdmitTaskUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), mutex, 1, 1, 2).Execute(context.Background(), input)
+	result, err := newAdmitTaskUseCaseForTest(queue, registry, execution.NewLaunchingTaskRegistry(), mutex, 1, 1, 2).Execute(context.Background(), input)
 	if err != nil || result.QueuePosition == nil {
 		t.Fatalf("result=%#v err=%v", result, err)
 	}
@@ -179,7 +199,7 @@ func TestAdmitTaskUseCaseEmitsOneQueuedEventAndHonorsCapacityBoundary(t *testing
 				registry.Add(testAdmissionInput(t, domain.SubcommandImpl, suffix+string(rune('a'+index))).TaskID, domain.SubcommandImpl)
 			}
 			input := testAdmissionInput(t, domain.SubcommandReview, "capacity-"+suffix)
-			result, err := NewAdmitTaskUseCase(queue, registry, execution.NewLaunchingTaskRegistry(), mutex, tc.maximum, tc.maximum, 10).Execute(context.Background(), input)
+			result, err := newAdmitTaskUseCaseForTest(queue, registry, execution.NewLaunchingTaskRegistry(), mutex, tc.maximum, tc.maximum, 10).Execute(context.Background(), input)
 			if err != nil || len(result.Events) != 1 {
 				t.Fatalf("result=%#v err=%v", result, err)
 			}
