@@ -248,6 +248,10 @@ func renamexNPExclusive(source, destination string) error {
 
 // ListTopLevel returns normalized absolute paths for root's direct children only.
 func (s *WorktreeFileStore) ListTopLevel(root string) ([]string, error) {
+	if !filepath.IsAbs(root) {
+		return nil, fmt.Errorf("worktree root must be an absolute path: %q", root)
+	}
+	root = filepath.Clean(root)
 	entries, err := os.ReadDir(root)
 	if err != nil {
 		return nil, fmt.Errorf("read worktree root: %w", err)

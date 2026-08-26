@@ -400,6 +400,36 @@ func TestWorktreeFileStoreFilesystemOperations(t *testing.T) {
 	}
 }
 
+func TestWorktreeFileStoreListTopLevelRejectsNonAbsoluteRoot(t *testing.T) {
+	store := NewWorktreeFileStore()
+	for _, root := range []string{"relative", "", "."} {
+		t.Run(root, func(t *testing.T) {
+			paths, err := store.ListTopLevel(root)
+			if paths != nil {
+				t.Fatalf("ListTopLevel(%q) paths = %v, want nil", root, paths)
+			}
+			if err == nil || !strings.Contains(err.Error(), "worktree root must be an absolute path") {
+				t.Fatalf("ListTopLevel(%q) error = %v, want absolute path error", root, err)
+			}
+		})
+	}
+}
+
+func TestWorktreeFileStoreListTopLevelAcceptsRoot(t *testing.T) {
+	paths, err := NewWorktreeFileStore().ListTopLevel("/")
+	if err != nil {
+		t.Fatalf("ListTopLevel(\"/\") error = %v", err)
+	}
+	for _, path := range paths {
+		if !filepath.IsAbs(path) {
+			t.Errorf("ListTopLevel(\"/\") path = %q, want absolute path", path)
+		}
+		if path == "/" {
+			t.Errorf("ListTopLevel(\"/\") included root")
+		}
+	}
+}
+
 func TestRunGitIgnoresAmbientPathAndUsesSafeEnvironment(t *testing.T) {
 	repo := newGitTestRepository(t, "main")
 	fakeDir := t.TempDir()
