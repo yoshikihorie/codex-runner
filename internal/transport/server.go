@@ -24,6 +24,10 @@ const (
 
 	// Canonical source: validation-rules.md PROTOCOL_LINE_MAX_BYTES.
 	protocolLineMaxBytes = 1048576
+
+	// Canonical source: 20-codexd-additional-preexisting-bugs.md HIGH Accept retry requirements.
+	initialAcceptRetryDelay = 5 * time.Millisecond
+	maxAcceptRetryDelay     = time.Second
 )
 
 var (
@@ -165,19 +169,45 @@ func Serve(ctx context.Context, socketPath string, dispatch func(Request) Respon
 }
 
 func serveAcceptLoop(ctx context.Context, listener net.Listener, dispatch func(Request) Response, tailHandler TailHandler, wg *sync.WaitGroup, tailConns *tailConnRegistry) error {
+	retryDelay := initialAcceptRetryDelay
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
 			if ctx.Err() != nil {
 				return nil
 			}
+			if errors.Is(err, net.ErrClosed) {
+				return fmt.Errorf("accept closed listener: %w", err)
+			}
 			slog.Error("accept failed", "error", err)
-			continue
+			timer := time.NewTimer(retryDelay)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					select {
+					case <-timer.C:
+					default:
+					}
+				}
+				return nil
+			case <-timer.C:
+				retryDelay = nextAcceptRetryDelay(retryDelay)
+				continue
+			}
 		}
+		retryDelay = initialAcceptRetryDelay
 		wg.Add(1)
 		go handleConn(ctx, conn, dispatch, tailHandler, wg, tailConns)
 	}
 }
+
+func nextAcceptRetryDelay(delay time.Duration) time.Duration {
+	if delay >= maxAcceptRetryDelay/2 {
+		return maxAcceptRetryDelay
+	}
+	return delay * 2
+}
+
 func handleConn(ctx context.Context, conn net.Conn, dispatch func(Request) Response, tailHandler TailHandler, wg *sync.WaitGroup, tailConns *tailConnRegistry) {
 	defer wg.Done()
 	defer conn.Close()

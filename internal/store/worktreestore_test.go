@@ -437,6 +437,20 @@ func TestWorktreeFileStoreHasGitChanges(t *testing.T) {
 			t.Fatalf("HasGitChanges() = %v, %v", changed, err)
 		}
 	})
+	t.Run("reverted commits ahead of base branch", func(t *testing.T) {
+		repo := newGitTestRepository(t, "main")
+		runGitForTest(t, repo, "checkout", "-b", "feature")
+		if err := os.WriteFile(filepath.Join(repo, "feature.txt"), []byte("feature"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		runGitForTest(t, repo, "add", "feature.txt")
+		runGitForTest(t, repo, "commit", "-m", "feature")
+		runGitForTest(t, repo, "revert", "--no-edit", "HEAD")
+		changed, err := store.HasGitChanges(repo)
+		if err != nil || !changed {
+			t.Fatalf("HasGitChanges() = %v, %v", changed, err)
+		}
+	})
 	t.Run("no known base branch retains worktree", func(t *testing.T) {
 		repo := newGitTestRepository(t, "other")
 		changed, err := store.HasGitChanges(repo)
@@ -450,6 +464,34 @@ func TestWorktreeFileStoreHasGitChanges(t *testing.T) {
 			t.Fatalf("HasGitChanges() = %v, %v", changed, err)
 		}
 	})
+}
+
+func TestWorktreeFileStoreHasGitChangesReturnsErrorForInvalidRevListOutput(t *testing.T) {
+	originalFindGitBinary := findGitBinary
+	fakeGit := filepath.Join(t.TempDir(), "git")
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    status) exit 0 ;;\n    merge-base) printf 'base\\n'; exit 0 ;;\n    rev-list) printf 'not-a-number\\n'; exit 0 ;;\n  esac\ndone\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	findGitBinary = func() (string, error) { return fakeGit, nil }
+	t.Cleanup(func() { findGitBinary = originalFindGitBinary })
+	changed, err := NewWorktreeFileStore().HasGitChanges(t.TempDir())
+	if err == nil || changed {
+		t.Fatalf("HasGitChanges() = %v, %v", changed, err)
+	}
+}
+
+func TestWorktreeFileStoreHasGitChangesReturnsErrorForRevListFailure(t *testing.T) {
+	originalFindGitBinary := findGitBinary
+	fakeGit := filepath.Join(t.TempDir(), "git")
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nfor arg in \"$@\"; do\n  case \"$arg\" in\n    status) exit 0 ;;\n    merge-base) printf 'base\\n'; exit 0 ;;\n    rev-list) exit 1 ;;\n  esac\ndone\nexit 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	findGitBinary = func() (string, error) { return fakeGit, nil }
+	t.Cleanup(func() { findGitBinary = originalFindGitBinary })
+	changed, err := NewWorktreeFileStore().HasGitChanges(t.TempDir())
+	if err == nil || changed {
+		t.Fatalf("HasGitChanges() = %v, %v", changed, err)
+	}
 }
 
 func newGitTestRepository(t *testing.T, branch string) string {

@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -239,11 +240,15 @@ func (s *WorktreeFileStore) HasGitChanges(path string) (bool, error) {
 		if err != nil {
 			continue
 		}
-		diff, err := runGit(path, "diff", "--name-only", string(bytes.TrimSpace(mergeBase))+"..HEAD")
+		count, err := runGit(path, "rev-list", "--count", string(bytes.TrimSpace(mergeBase))+"..HEAD")
 		if err != nil {
-			return false, fmt.Errorf("git diff from %s: %w", base, err)
+			return false, fmt.Errorf("git rev-list count from %s: %w", base, err)
 		}
-		return len(bytes.TrimSpace(diff)) != 0, nil
+		commitCount, err := strconv.ParseUint(string(bytes.TrimSpace(count)), 10, 64)
+		if err != nil {
+			return false, fmt.Errorf("parse git rev-list count from %s: %w", base, err)
+		}
+		return commitCount > 0, nil
 	}
 	// Without a known base branch, conservatively retain the worktree.
 	return true, nil

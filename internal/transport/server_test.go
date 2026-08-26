@@ -45,6 +45,48 @@ func (l *transientAcceptListener) Close() error {
 
 func (l *transientAcceptListener) Addr() net.Addr { return &net.UnixAddr{Name: "test", Net: "unix"} }
 
+type scriptedAcceptListener struct {
+	mu       sync.Mutex
+	errors   []error
+	calls    []time.Time
+	accepted chan struct{}
+	closed   chan struct{}
+	once     sync.Once
+}
+
+func (l *scriptedAcceptListener) Accept() (net.Conn, error) {
+	l.mu.Lock()
+	l.calls = append(l.calls, time.Now())
+	index := len(l.calls) - 1
+	if index < len(l.errors) {
+		err := l.errors[index]
+		l.mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		server, client := net.Pipe()
+		_ = client.Close()
+		return server, nil
+	}
+	l.mu.Unlock()
+	close(l.accepted)
+	<-l.closed
+	return nil, net.ErrClosed
+}
+
+func (l *scriptedAcceptListener) Close() error {
+	l.once.Do(func() { close(l.closed) })
+	return nil
+}
+
+func (l *scriptedAcceptListener) Addr() net.Addr { return &net.UnixAddr{Name: "test", Net: "unix"} }
+
+func (l *scriptedAcceptListener) callTimes() []time.Time {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return append([]time.Time(nil), l.calls...)
+}
+
 func TestValidateEnvelope(t *testing.T) {
 	for _, tc := range []struct {
 		name string
@@ -545,6 +587,124 @@ func TestServeContinuesAfterTransientAcceptError(t *testing.T) {
 	_ = listener.Close()
 	if err := <-done; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestServeAcceptLoopBacksOffAfterContinuousErrors(t *testing.T) {
+	listener := &scriptedAcceptListener{
+		errors:   []error{errors.New("temporary accept error"), errors.New("temporary accept error"), errors.New("temporary accept error")},
+		accepted: make(chan struct{}),
+		closed:   make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan error, 1)
+	go func() {
+		done <- serveAcceptLoop(ctx, listener, func(Request) Response { return Response{} }, noOpTailHandler, &sync.WaitGroup{}, NewTailConnRegistry())
+	}()
+	select {
+	case <-listener.accepted:
+	case <-time.After(time.Second):
+		t.Fatal("Accept retries did not reach the blocking call")
+	}
+	calls := listener.callTimes()
+	if len(calls) != 4 {
+		t.Fatalf("Accept calls = %d, want 4", len(calls))
+	}
+	if elapsed := calls[1].Sub(calls[0]); elapsed < initialAcceptRetryDelay {
+		t.Fatalf("first retry after %v, want at least %v", elapsed, initialAcceptRetryDelay)
+	}
+	if elapsed := calls[2].Sub(calls[1]); elapsed < nextAcceptRetryDelay(initialAcceptRetryDelay) {
+		t.Fatalf("second retry after %v, want at least %v", elapsed, nextAcceptRetryDelay(initialAcceptRetryDelay))
+	}
+	cancel()
+	_ = listener.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("serveAcceptLoop() error = %v", err)
+	}
+}
+
+func TestServeAcceptLoopCancellationInterruptsBackoff(t *testing.T) {
+	listener := &scriptedAcceptListener{
+		errors:   []error{errors.New("temporary accept error")},
+		accepted: make(chan struct{}),
+		closed:   make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() {
+		done <- serveAcceptLoop(ctx, listener, func(Request) Response { return Response{} }, noOpTailHandler, &sync.WaitGroup{}, NewTailConnRegistry())
+	}()
+	time.Sleep(time.Millisecond)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serveAcceptLoop() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("context cancellation did not interrupt retry backoff")
+	}
+}
+
+func TestServeAcceptLoopReturnsClosedListenerError(t *testing.T) {
+	listener := &scriptedAcceptListener{
+		errors:   []error{net.ErrClosed},
+		accepted: make(chan struct{}),
+		closed:   make(chan struct{}),
+	}
+	err := serveAcceptLoop(context.Background(), listener, func(Request) Response { return Response{} }, noOpTailHandler, &sync.WaitGroup{}, NewTailConnRegistry())
+	if !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("serveAcceptLoop() error = %v, want net.ErrClosed", err)
+	}
+	if calls := listener.callTimes(); len(calls) != 1 {
+		t.Fatalf("Accept calls = %d, want 1", len(calls))
+	}
+}
+
+func TestServeAcceptLoopResetsBackoffAfterSuccessfulAccept(t *testing.T) {
+	temporary := errors.New("temporary accept error")
+	listener := &scriptedAcceptListener{
+		errors:   []error{temporary, temporary, nil, temporary},
+		accepted: make(chan struct{}),
+		closed:   make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var wg sync.WaitGroup
+	done := make(chan error, 1)
+	go func() {
+		done <- serveAcceptLoop(ctx, listener, func(Request) Response { return Response{} }, noOpTailHandler, &wg, NewTailConnRegistry())
+	}()
+	select {
+	case <-listener.accepted:
+	case <-time.After(time.Second):
+		t.Fatal("Accept retries did not reach the blocking call")
+	}
+	calls := listener.callTimes()
+	if len(calls) != 5 {
+		t.Fatalf("Accept calls = %d, want 5", len(calls))
+	}
+	if elapsed := calls[4].Sub(calls[3]); elapsed < initialAcceptRetryDelay {
+		t.Fatalf("retry after successful Accept took %v, want at least %v", elapsed, initialAcceptRetryDelay)
+	}
+	if elapsed := calls[4].Sub(calls[3]); elapsed >= nextAcceptRetryDelay(initialAcceptRetryDelay) {
+		t.Fatalf("retry after successful Accept took %v, want less than %v", elapsed, nextAcceptRetryDelay(initialAcceptRetryDelay))
+	}
+	cancel()
+	_ = listener.Close()
+	if err := <-done; err != nil {
+		t.Fatalf("serveAcceptLoop() error = %v", err)
+	}
+	wg.Wait()
+}
+
+func TestNextAcceptRetryDelayCapsAtMaximum(t *testing.T) {
+	if got := nextAcceptRetryDelay(maxAcceptRetryDelay); got != maxAcceptRetryDelay {
+		t.Fatalf("nextAcceptRetryDelay(maximum) = %v, want %v", got, maxAcceptRetryDelay)
+	}
+	if got := nextAcceptRetryDelay(maxAcceptRetryDelay / 2); got != maxAcceptRetryDelay {
+		t.Fatalf("nextAcceptRetryDelay(half maximum) = %v, want %v", got, maxAcceptRetryDelay)
 	}
 }
 
