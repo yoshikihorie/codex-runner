@@ -219,12 +219,13 @@ func (f *reconcileTerminationFake) SendAndConfirm(_ context.Context, _ domain.Ta
 type reconcileKilledFake struct {
 	calls       int
 	rawExitCode int
+	err         error
 }
 
 func (f *reconcileKilledFake) ConfirmKilled(_ context.Context, _ domain.TaskID, rawExitCode int, _ bool, _ time.Time) error {
 	f.calls++
 	f.rawExitCode = rawExitCode
-	return nil
+	return f.err
 }
 
 type reconcilePathLocksFake struct {
@@ -871,6 +872,64 @@ func TestReconcilePendingTimeoutOnlyConfirmsAfterSignalWasSent(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("reconciliation did not return after termination confirmation")
+	}
+}
+
+func TestSCNDaemon0124AlreadyClaimedSkipsConfirmationAndRecovery(t *testing.T) {
+	uc, pending, tasks, _, _, termination, killed, pathLocks, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
+	id := adoptionID(t, "reconcile-"+string(domain.StateTimeout))
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendUnsent)
+	authority, ok := processSignalAuthority(tasks.entries[id])
+	if !ok {
+		t.Fatal("fixture requires process signal authority")
+	}
+	if _, outcome := pending.ClaimForSend(id, authority); outcome != ClaimAcquired {
+		t.Fatalf("claim outcome=%v", outcome)
+	}
+
+	uc.reconcileOne(context.Background(), pending.List()[0])
+	if termination.send != 0 || termination.confirm != 0 || pathLocks.calls != 0 || killed.calls != 0 {
+		t.Fatalf("send=%d confirm=%d pathLocks=%d killed=%d", termination.send, termination.confirm, pathLocks.calls, killed.calls)
+	}
+}
+
+func TestSCNDaemon0129DeadResultWinsOverTerminationError(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		killedErr error
+	}{
+		{name: "kill confirmation succeeds"},
+		{name: "kill confirmation fails", killedErr: errors.New("confirm killed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			uc, pending, tasks, _, _, termination, killed, _, _, _, _ := newReconcileFixture(t, domain.StateCancelling, false, false)
+			id := adoptionID(t, "reconcile-"+string(domain.StateCancelling))
+			registerReconcilePending(t, pending, tasks.entries[id], PendingSendUnsent)
+			authority, ok := processSignalAuthority(tasks.entries[id])
+			if !ok {
+				t.Fatal("fixture requires process signal authority")
+			}
+			claim, outcome := pending.ClaimForSend(id, authority)
+			if outcome != ClaimAcquired {
+				t.Fatalf("claim outcome=%v", outcome)
+			}
+			termination.sendDead = true
+			termination.terminateErr = errors.New("termination reported an error")
+			killed.err = tc.killedErr
+			close(termination.release)
+
+			uc.sendAndReconcile(context.Background(), claim, tasks.entries[id], false)
+			entries := pending.List()
+			if killed.calls != 1 {
+				t.Fatalf("killed=%d, want 1", killed.calls)
+			}
+			if tc.killedErr == nil && len(entries) != 0 {
+				t.Fatalf("pending=%+v, want removed", entries)
+			}
+			if tc.killedErr != nil && (len(entries) != 1 || entries[0].state != pendingConfirmOnly) {
+				t.Fatalf("pending=%+v, want confirm-only", entries)
+			}
+		})
 	}
 }
 

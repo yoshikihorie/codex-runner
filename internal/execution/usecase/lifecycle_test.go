@@ -177,6 +177,7 @@ type lifecycleRecordingFinalizer struct {
 	allowPrepare    chan struct{}
 	prepareReturned chan struct{}
 	onExecuteLocked func()
+	lockedResult    *execution.LockedFinalizeResult
 }
 
 func (f *lifecycleRecordingFinalizer) Prepare(ctx context.Context, in execution.FinalizeTaskInput) (execution.PreparedFinalizeTask, error) {
@@ -216,6 +217,9 @@ func (f *lifecycleRecordingFinalizer) ExecuteLocked(_ context.Context, _ executi
 	appendLifecycleTrace(f.trace, "finalize")
 	if f.onExecuteLocked != nil {
 		f.onExecuteLocked()
+	}
+	if f.lockedResult != nil {
+		return *f.lockedResult, f.err
 	}
 	return execution.LockedFinalizeResult{RecordExited: true}, f.err
 }
@@ -1508,7 +1512,7 @@ func TestTaskLifecycleCancellationConfirmationDoesNotRereleaseAfterConfirmedPers
 	f.killed.lockedResults = []execution.LockedKillResult{{Confirmed: true}, {}}
 	f.killed.lockedErrors = []error{errors.New("persistence"), errors.New("reevaluation")}
 
-	f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
+	f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 0, nil)
 	if f.killed.releaseCalls != 1 || f.pending.calls != 0 {
 		t.Fatalf("first confirmation release=%d pending=%d", f.killed.releaseCalls, f.pending.calls)
 	}
@@ -1813,13 +1817,46 @@ func TestTaskLifecycleConfirmTerminalNonCancellingPreparesOnce(t *testing.T) {
 	running := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateRunning)
 	f.tasks.loads = []lifecycleLoadResult{{snapshot: running}, {snapshot: running}}
 
-	f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 23, nil)
+	f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 0, nil)
 
-	if f.finalizer.prepareCalls != 1 || len(f.finalizer.calls) != 1 || f.killed.lockedCalls != 0 {
+	if f.finalizer.prepareCalls != 1 || len(f.finalizer.calls) != 1 || f.killed.lockedCalls != 0 || f.finalizer.releaseCalls != 1 {
 		t.Fatalf("Prepare=%d Finalize=%d ConfirmKilled=%d", f.finalizer.prepareCalls, len(f.finalizer.calls), f.killed.lockedCalls)
+	}
+	prepared, finalized := f.finalizer.prepared, f.finalizer.calls[0]
+	if prepared.taskID != f.input.Task.ID() || finalized.taskID != f.input.Task.ID() || prepared.rawExitCode != 0 || finalized.rawExitCode != 0 || prepared.estimated || finalized.estimated || prepared.adoptedAfterRestart || finalized.adoptedAfterRestart {
+		t.Fatalf("prepared=%+v finalized=%+v", prepared, finalized)
 	}
 	if f.taskMu.lockCalls != f.taskMu.unlockCalls {
 		t.Fatalf("task mutex lock=%d unlock=%d", f.taskMu.lockCalls, f.taskMu.unlockCalls)
+	}
+}
+
+func TestTaskLifecycleConfirmTerminalTimeoutWinsRejectsFinalizeWithoutRelease_SCNExec0709(t *testing.T) {
+	f := newLifecycleFixture(t)
+	var logBuffer bytes.Buffer
+	f.orchestrator.logger = slog.New(slog.NewTextHandler(&logBuffer, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	running := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateRunning)
+	timedOut := lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateRunning)
+	task, err := timedOut.Restore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = task.MarkTimedOut(nil, testLifecycleTime); err != nil {
+		t.Fatal(err)
+	}
+	timedOut, err = timedOut.WithTask(task, testLifecycleTime)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.tasks.loads = []lifecycleLoadResult{{snapshot: running}, {snapshot: timedOut}}
+	f.finalizer.err = domain.ErrInvalidStateTransition
+	f.finalizer.lockedResult = &execution.LockedFinalizeResult{}
+	f.orchestrator.confirmTerminal(context.Background(), f.input.Task.ID(), 0, nil)
+	if f.finalizer.prepareCalls != 1 || len(f.finalizer.calls) != 1 || f.finalizer.releaseCalls != 0 {
+		t.Fatalf("Prepare=%d Finalize=%d release=%d", f.finalizer.prepareCalls, len(f.finalizer.calls), f.finalizer.releaseCalls)
+	}
+	if !strings.Contains(logBuffer.String(), "terminal lifecycle confirmation") || !strings.Contains(logBuffer.String(), f.input.Task.ID().String()) || !strings.Contains(logBuffer.String(), domain.ErrInvalidStateTransition.Error()) {
+		t.Fatalf("log=%q", logBuffer.String())
 	}
 }
 

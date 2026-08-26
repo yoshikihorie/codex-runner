@@ -158,6 +158,22 @@ func TestProcessRunnerLaunchMapsErrorsAndClosesLock(t *testing.T) {
 	}
 }
 
+func TestProcessRunnerPTYMissingCodexStillReturnsLaunchedProcess_SCNExec0103(t *testing.T) {
+	params := launchTestParams(t, launchTestLock(t))
+	params.PTYEnabled = true
+	params.CodexBinaryPath = filepath.Join(t.TempDir(), "missing-codex")
+	launched, err := NewProcessRunner(launchTestLogs{logs: launchTestLogsFor(t)}).Launch(context.Background(), params)
+	if err != nil || launched == nil || launched.Handle == nil || launched.Handle.PID <= 0 {
+		t.Fatalf("Launch=(%+v,%v)", launched, err)
+	}
+	if errors.Is(err, domain.ErrChildProcessLaunchFailed) || errors.Is(err, domain.ErrPTYAllocationFailed) {
+		t.Fatalf("launch classified as failure: %v", err)
+	}
+	if _, waitErr := launched.Waiter.Wait(); waitErr != nil {
+		t.Fatalf("Wait cleanup: %v", waitErr)
+	}
+}
+
 func TestProcessRunnerLaunchDetachesLaunchContext(t *testing.T) {
 	type contextKey struct{}
 

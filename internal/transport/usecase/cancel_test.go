@@ -275,6 +275,78 @@ func (f *cancelPendingRegistrarFake) RemoveClaim(claim recovery.SendClaim) bool 
 
 var _ recovery.PendingRegistrar = (*cancelPendingRegistrarFake)(nil)
 
+type cancelTrackedTaskMutex struct {
+	mu     sync.Mutex
+	state  sync.Mutex
+	locked bool
+}
+
+func (m *cancelTrackedTaskMutex) Lock(domain.TaskID) {
+	m.mu.Lock()
+	m.state.Lock()
+	m.locked = true
+	m.state.Unlock()
+}
+
+func (m *cancelTrackedTaskMutex) Unlock(domain.TaskID) {
+	m.state.Lock()
+	m.locked = false
+	m.state.Unlock()
+	m.mu.Unlock()
+}
+
+func (m *cancelTrackedTaskMutex) IsLocked() bool {
+	m.state.Lock()
+	defer m.state.Unlock()
+	return m.locked
+}
+
+type cancelBarrierPendingRegistrar struct {
+	set                    recovery.PendingReconciliationSet
+	arrived                chan struct{}
+	release                <-chan struct{}
+	taskMu                 *cancelTrackedTaskMutex
+	mu                     sync.Mutex
+	taskMutexHeldAtInitial bool
+}
+
+func (*cancelBarrierPendingRegistrar) Register(domain.TaskID, recovery.PendingSendDisposition, *recovery.ProcessSignalAuthority) error {
+	return nil
+}
+func (p *cancelBarrierPendingRegistrar) ClaimForSend(id domain.TaskID, authority recovery.ProcessSignalAuthority) (recovery.SendClaim, recovery.ClaimOutcome) {
+	return p.set.ClaimForSend(id, authority)
+}
+func (p *cancelBarrierPendingRegistrar) ClaimInitialSend(id domain.TaskID, authority recovery.ProcessSignalAuthority) (recovery.SendClaim, recovery.ClaimOutcome) {
+	if p.taskMu.IsLocked() {
+		p.mu.Lock()
+		p.taskMutexHeldAtInitial = true
+		p.mu.Unlock()
+	}
+	p.arrived <- struct{}{}
+	<-p.release
+	return p.set.ClaimInitialSend(id, authority)
+}
+
+func (p *cancelBarrierPendingRegistrar) SawTaskMutexDuringInitialClaim() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.taskMutexHeldAtInitial
+}
+func (p *cancelBarrierPendingRegistrar) CompleteSend(claim recovery.SendClaim) bool {
+	return p.set.CompleteSend(claim)
+}
+func (p *cancelBarrierPendingRegistrar) ReleaseSend(claim recovery.SendClaim) bool {
+	return p.set.ReleaseSend(claim)
+}
+func (p *cancelBarrierPendingRegistrar) InvalidateSend(claim recovery.SendClaim) bool {
+	return p.set.InvalidateSend(claim)
+}
+func (p *cancelBarrierPendingRegistrar) RemoveClaim(claim recovery.SendClaim) bool {
+	return p.set.RemoveClaim(claim)
+}
+
+var _ recovery.PendingRegistrar = (*cancelBarrierPendingRegistrar)(nil)
+
 func (f *cancelDisarmerFake) Disarm(domain.TaskID) {
 	f.calls++
 	if f.order != nil {
@@ -533,6 +605,118 @@ func TestCancelTaskExecute_PersistedRunningStalledAndAdoptedTerminateBeforeDisar
 				t.Fatalf("out=%#v err=%v termination=%#v terminator=%#v pending=%#v disarmer=%#v order=%#v", out, err, termination, terminator, pending, disarmer, order)
 			}
 		})
+	}
+}
+
+func TestCancelTaskExecute_RunningCompletesKilledInSingleCall(t *testing.T) {
+	payload := cancelQueuedPayload(t)
+	tasks := &cancelStoreFake{reserved: true, snapshot: cancelPersistedSnapshot(t, domain.StateRunning, true)}
+	queueMu := &sync.Mutex{}
+	events := &cancelEventsFake{}
+	disarmer := &cancelDisarmerFake{}
+	termination := &cancelTerminationEnsurerFake{result: recovery.TerminationAttemptResult{Dead: true}}
+	writer := &cancelWriterFake{}
+	pending := &cancelPendingRegistrarFake{}
+	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, writer, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, pending)
+	uc := NewCancelTaskUseCase(tasks, &cancelQueueFake{payload: payload, queueMu: queueMu}, queueMu, store.NewTaskMutex(), events, &cancelTerminatorFake{}, termination, pending, disarmer, confirmer, &cancelStalledTrackerFake{}, &cancelOwnershipFake{}, domain.ClockFunc(time.Now))
+	out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+	if err != nil || out.State != domain.StateCancelling || tasks.snapshot.State != domain.StateKilled || termination.calls != 1 || disarmer.calls != 1 {
+		t.Fatalf("out=%#v err=%v snapshot=%#v termination=%#v disarmer=%#v", out, err, tasks.snapshot, termination, disarmer)
+	}
+	if len(events.events) != 1 || len(writer.events) != 1 {
+		t.Fatalf("cancel events=%#v killed events=%#v", events.events, writer.events)
+	}
+	if _, ok := events.events[0].(domain.TaskCancelRequested); !ok {
+		t.Fatalf("cancel event=%T", events.events[0])
+	}
+	if _, ok := writer.events[0].(domain.TaskKilled); !ok {
+		t.Fatalf("killed event=%T", writer.events[0])
+	}
+}
+
+func TestCancelTaskExecute_StartingConcurrentInitialSendClaimsConvergeToOneSender(t *testing.T) {
+	payload := cancelQueuedPayload(t)
+	tasks := &cancelStoreFake{reserved: true, snapshot: cancelPersistedSnapshot(t, domain.StateStarting, true)}
+	taskMu := &cancelTrackedTaskMutex{}
+	queueMu := &sync.Mutex{}
+	release := make(chan struct{})
+	pending := &cancelBarrierPendingRegistrar{arrived: make(chan struct{}, 3), release: release, taskMu: taskMu}
+	terminator := &cancelTerminatorFake{}
+	disarmer := &cancelDisarmerFake{}
+	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, pending)
+	uc := NewCancelTaskUseCase(tasks, &cancelQueueFake{payload: payload, queueMu: queueMu}, queueMu, taskMu, &cancelEventsFake{}, terminator, &cancelTerminationEnsurerFake{}, pending, disarmer, confirmer, &cancelStalledTrackerFake{}, &cancelOwnershipFake{}, domain.ClockFunc(time.Now))
+	startedAt := *tasks.snapshot.ProcessStartedAt
+	generation := domain.LifecycleGeneration(1)
+	authority := recovery.ProcessSignalAuthority{TaskID: payload.Task.ID(), PID: *tasks.snapshot.PID, ProcessStartedAt: startedAt, ExpectedState: domain.StateCancelling, LifecycleGeneration: &generation}
+	type result struct {
+		outcome recovery.ClaimOutcome
+		err     error
+	}
+	completed := make(chan result, 3)
+	go func() {
+		out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+		if err == nil && out.TerminationTriggered {
+			completed <- result{outcome: recovery.ClaimAcquired}
+			return
+		}
+		completed <- result{err: err}
+	}()
+	for range 2 {
+		go func() {
+			claim, outcome := pending.ClaimInitialSend(payload.Task.ID(), authority)
+			if outcome == recovery.ClaimAcquired {
+				taskMu.Lock(payload.Task.ID())
+				tasks.snapshot.State = domain.StateCancelling
+				taskMu.Unlock(payload.Task.ID())
+				_ = terminator.SendTerminate(claim.Authority.PID)
+			}
+			completed <- result{outcome: outcome}
+		}()
+	}
+	for range 3 {
+		select {
+		case <-pending.arrived:
+		case <-time.After(time.Second):
+			t.Fatal("ClaimInitialSend callers did not reach the barrier")
+		}
+	}
+	close(release)
+	acquired := 0
+	for range 3 {
+		select {
+		case result := <-completed:
+			if result.err != nil {
+				t.Fatal(result.err)
+			}
+			if result.outcome == recovery.ClaimAcquired {
+				acquired++
+			}
+		case <-time.After(time.Second):
+			t.Fatal("concurrent cancel callers did not complete")
+		}
+	}
+	if acquired != 1 || terminator.calls != 1 || pending.SawTaskMutexDuringInitialClaim() || tasks.snapshot.State != domain.StateCancelling {
+		t.Fatalf("acquired=%d terminator=%#v taskMuAtClaim=%t snapshot=%#v", acquired, terminator, pending.SawTaskMutexDuringInitialClaim(), tasks.snapshot)
+	}
+}
+
+func TestCancelTaskExecute_AlreadyExitedProcessStillConfirmsKilled(t *testing.T) {
+	payload := cancelQueuedPayload(t)
+	tasks := &cancelStoreFake{reserved: true, snapshot: cancelPersistedSnapshot(t, domain.StateRunning, true)}
+	queueMu := &sync.Mutex{}
+	events := &cancelEventsFake{}
+	disarmer := &cancelDisarmerFake{}
+	termination := &cancelTerminationEnsurerFake{result: recovery.TerminationAttemptResult{TerminateErr: nil, Dead: true}}
+	writer := &cancelWriterFake{}
+	pending := &cancelPendingRegistrarFake{}
+	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, writer, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, pending)
+	uc := NewCancelTaskUseCase(tasks, &cancelQueueFake{payload: payload, queueMu: queueMu}, queueMu, store.NewTaskMutex(), events, &cancelTerminatorFake{}, termination, pending, disarmer, confirmer, &cancelStalledTrackerFake{}, &cancelOwnershipFake{}, domain.ClockFunc(time.Now))
+	out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+	if err != nil || out.State != domain.StateCancelling || tasks.snapshot.State != domain.StateKilled || termination.calls != 1 || disarmer.calls != 1 || len(events.events) != 1 || len(writer.events) != 1 {
+		t.Fatalf("out=%#v err=%v snapshot=%#v termination=%#v disarmer=%#v events=%#v killed=%#v", out, err, tasks.snapshot, termination, disarmer, events.events, writer.events)
+	}
+	if _, ok := writer.events[0].(domain.TaskKilled); !ok {
+		t.Fatalf("killed event=%T", writer.events[0])
 	}
 }
 

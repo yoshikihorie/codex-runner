@@ -291,6 +291,8 @@ type adoptionTerminationFake struct {
 	sendDead     bool
 	terminateErr error
 	confirmErr   error
+	started      chan struct{}
+	release      chan struct{}
 }
 
 func (f *adoptionTerminationFake) Confirm(context.Context, domain.TaskID) (bool, error) {
@@ -300,6 +302,12 @@ func (f *adoptionTerminationFake) Confirm(context.Context, domain.TaskID) (bool,
 func (f *adoptionTerminationFake) SendAndConfirm(_ context.Context, _ domain.TaskID, authority ProcessSignalAuthority, _ time.Duration) TerminationAttemptResult {
 	f.calls++
 	f.authorities = append(f.authorities, authority)
+	if f.started != nil {
+		close(f.started)
+	}
+	if f.release != nil {
+		<-f.release
+	}
 	return TerminationAttemptResult{Dead: f.sendDead, TerminateErr: f.terminateErr, ConfirmErr: f.confirmErr}
 }
 
@@ -1325,6 +1333,60 @@ func TestAdoptRunningTasksContinuesAfterLivenessAndLoadFailures(t *testing.T) {
 	if err != nil || len(out.Outcomes) != 2 || out.Outcomes[0].Outcome != "error" || out.Outcomes[1].Outcome != "resumed-monitoring" {
 		t.Fatalf("out=(%+v,%v)", out, err)
 	}
+}
+
+func TestSCNDaemon0106DeadTimeoutRecoveryDoesNotDelayAdoption(t *testing.T) {
+	id := adoptionID(t, "scn-0106")
+	snapshot := adoptionSnapshot(t, id, domain.StateTimeout)
+	startedAt := time.Date(2026, time.August, 26, 12, 0, 0, 0, time.UTC)
+	clockCalls := 0
+	clock := domain.ClockFunc(func() time.Time {
+		clockCalls++
+		if clockCalls == 1 {
+			return startedAt
+		}
+		return startedAt.Add(5 * time.Second)
+	})
+	tasks := &adoptionStoreFake{listed: []domain.TaskSnapshot{snapshot}, entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}
+	pathLocks := &adoptionPathLocksFake{}
+	uc := NewAdoptRunningTasksUseCase(tasks, &adoptionLivenessFake{dead: map[domain.TaskID]bool{id: true}}, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), &adoptionSlotsFake{}, &adoptionSlotsFake{}, &adoptionTerminationFake{}, &adoptionKilledFake{}, pathLocks, &PendingReconciliationSet{}, &adoptionMutexFake{}, clock, &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, slog.Default())
+
+	out, err := uc.Execute(context.Background())
+	if err != nil || len(out.Outcomes) != 1 || out.Outcomes[0].Outcome != adoptionOutcomeOrphanRecoveryStarted || out.ElapsedMillis != 5000 || pathLocks.calls != 1 {
+		t.Fatalf("out=(%+v,%v) pathLocks=%d", out, err, pathLocks.calls)
+	}
+}
+
+func TestSCNDaemon0108LivenessErrorLogsAndContinues(t *testing.T) {
+	first, second := adoptionID(t, "scn-0108-first"), adoptionID(t, "scn-0108-second")
+	one, two := adoptionSnapshot(t, first, domain.StateRunning), adoptionSnapshot(t, second, domain.StateRunning)
+	tasks := &adoptionStoreFake{listed: []domain.TaskSnapshot{one, two}, entries: map[domain.TaskID]domain.TaskSnapshot{first: one, second: two}}
+	var logs bytes.Buffer
+	uc := newAdoptionUseCase(tasks, &adoptionLivenessFake{dead: map[domain.TaskID]bool{}, err: map[domain.TaskID]error{first: errors.New("liveness I/O")}}, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), &adoptionSlotsFake{}, &adoptionMutexFake{})
+	uc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+
+	out, err := uc.Execute(context.Background())
+	if err != nil || len(out.Outcomes) != 2 || out.Outcomes[0].Outcome != adoptionOutcomeError || out.Outcomes[1].Outcome != adoptionOutcomeResumedMonitoring || !strings.Contains(logs.String(), "check task liveness for adoption failed") {
+		t.Fatalf("out=(%+v,%v) logs=%q", out, err, logs.String())
+	}
+}
+
+func TestSCNDaemon0110LiveTimeoutDefersWhileTerminationRunsAsynchronously(t *testing.T) {
+	id := adoptionID(t, "scn-0110")
+	snapshot := adoptionSnapshot(t, id, domain.StateTimeout)
+	termination := &adoptionTerminationFake{started: make(chan struct{}), release: make(chan struct{})}
+	uc := NewAdoptRunningTasksUseCase(&adoptionStoreFake{listed: []domain.TaskSnapshot{snapshot}, entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}, &adoptionLivenessFake{dead: map[domain.TaskID]bool{id: false}}, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), &adoptionSlotsFake{}, &adoptionSlotsFake{}, termination, &adoptionKilledFake{}, &adoptionPathLocksFake{}, &PendingReconciliationSet{}, &adoptionMutexFake{}, domain.ClockFunc(time.Now), &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, slog.Default())
+
+	out, err := uc.Execute(context.Background())
+	if err != nil || len(out.Outcomes) != 1 || out.Outcomes[0].Outcome != adoptionOutcomeDeferred {
+		t.Fatalf("out=(%+v,%v)", out, err)
+	}
+	select {
+	case <-termination.started:
+	case <-time.After(time.Second):
+		t.Fatal("asynchronous SendAndConfirm did not start")
+	}
+	close(termination.release)
 }
 
 func TestAdoptRunningTasksRegistersListedSnapshotAfterTransientLoadFailure(t *testing.T) {

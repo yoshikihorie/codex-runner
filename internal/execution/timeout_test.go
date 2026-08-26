@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -19,6 +22,52 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/recovery"
 	"github.com/yoshikihorie/codex-runner/internal/store"
 )
+
+const timeoutTestWait = 5 * time.Second
+
+// timeoutSequenceStore makes pre-commit load failures deterministic for watcher tests.
+type timeoutSequenceStore struct {
+	mu              sync.Mutex
+	snapshots       []domain.TaskSnapshot
+	errs            []error
+	loads           int
+	blockedLoad     int
+	loadStarted     chan struct{}
+	allowLoad       <-chan struct{}
+	loadStartedOnce sync.Once
+}
+
+func (s *timeoutSequenceStore) Load(domain.TaskID) (domain.TaskSnapshot, error) {
+	s.mu.Lock()
+	i := s.loads
+	s.loads++
+	block := s.blockedLoad == s.loads && s.loadStarted != nil
+	loadStarted, allowLoad := s.loadStarted, s.allowLoad
+	if i >= len(s.errs) {
+		i = len(s.errs) - 1
+	}
+	err := s.errs[i]
+	var snapshot domain.TaskSnapshot
+	if i >= len(s.snapshots) {
+		i = len(s.snapshots) - 1
+	}
+	if err == nil {
+		snapshot = s.snapshots[i]
+	}
+	s.mu.Unlock()
+	if block {
+		s.loadStartedOnce.Do(func() { close(loadStarted) })
+		<-allowLoad
+	}
+	return snapshot, err
+}
+func (*timeoutSequenceStore) Save(domain.TaskID, domain.TaskSnapshot) error { return nil }
+func (*timeoutSequenceStore) ListByStates([]domain.TaskState) ([]domain.TaskSnapshot, error) {
+	return nil, nil
+}
+func (*timeoutSequenceStore) Reserve(domain.TaskID) error            { return nil }
+func (*timeoutSequenceStore) Release(domain.TaskID) error            { return nil }
+func (*timeoutSequenceStore) IsReserved(domain.TaskID) (bool, error) { return true, nil }
 
 type timeoutStalledTrackerFake struct {
 	calls []struct {
@@ -66,6 +115,11 @@ func (f *timeoutTimerFake) AfterFunc(d time.Duration, callback func()) CancelFun
 }
 func (f *timeoutTimerFake) fire(index int) {
 	f.mu.Lock()
+	if f.stopped[index] {
+		f.mu.Unlock()
+		return
+	}
+	f.stopped[index] = true
 	callback := f.callbacks[index]
 	f.mu.Unlock()
 	callback()
@@ -168,13 +222,14 @@ func (f *timeoutProcessFake) SendKill(pid int) error {
 }
 
 type timeoutRecoveryFake struct {
-	mu      sync.Mutex
-	calls   int
-	ctx     context.Context
-	input   recovery.RecoverViaResumeInput
-	err     error
-	started chan struct{}
-	release <-chan struct{}
+	mu        sync.Mutex
+	calls     int
+	ctx       context.Context
+	input     recovery.RecoverViaResumeInput
+	err       error
+	started   chan struct{}
+	release   <-chan struct{}
+	onExecute func()
 }
 
 func (f *timeoutRecoveryFake) Execute(ctx context.Context, in recovery.RecoverViaResumeInput) (recovery.RecoverViaResumeOutput, error) {
@@ -184,6 +239,9 @@ func (f *timeoutRecoveryFake) Execute(ctx context.Context, in recovery.RecoverVi
 	f.input = in
 	started, release, err := f.started, f.release, f.err
 	f.mu.Unlock()
+	if onExecute := f.onExecute; onExecute != nil {
+		onExecute()
+	}
 	if started != nil {
 		close(started)
 	}
@@ -191,6 +249,23 @@ func (f *timeoutRecoveryFake) Execute(ctx context.Context, in recovery.RecoverVi
 		<-release
 	}
 	return recovery.RecoverViaResumeOutput{}, err
+}
+
+func newTimeoutWatcherForStore(t *testing.T, tasks store.TaskStore, factory *timeoutTimerFake, logger *slog.Logger) (*TimeoutWatcher, *timeoutRecoveryFake) {
+	t.Helper()
+	proc := &timeoutProcessFake{}
+	recoverer := &timeoutRecoveryFake{}
+	pending := &timeoutPendingFake{}
+	paths := &timeoutPathStoreFake{}
+	taskMu := store.NewTaskMutex()
+	validator := recovery.NewProcessSignalAuthorityValidator(tasks, taskMu, timeoutAuthorityOwnershipFake{})
+	ensurer := NewTerminationEnsurer(timeoutLiveness(struct {
+		dead bool
+		err  error
+	}{dead: true}), proc, domain.ClockFunc(time.Now), func(context.Context, time.Duration) {}, validator)
+	uc := NewEnforceTaskTimeoutUseCase(tasks, &timeoutWriterFake{}, proc, recoverer, ensurer, validator, pending, NewReleasePathLockUseCase(paths), taskMu, domain.ClockFunc(time.Now), &timeoutStalledTrackerFake{})
+	now := time.Date(2026, time.August, 10, 12, 0, 0, 0, time.UTC)
+	return NewTimeoutWatcher(uc, domain.ClockFunc(func() time.Time { return now }), factory, context.Background(), logger), recoverer
 }
 
 type timeoutPendingFake struct {
@@ -273,6 +348,26 @@ func (timeoutAuthorityOwnershipFake) WithCurrent(_ domain.TaskID, _ domain.Lifec
 	return true, action()
 }
 
+type timeoutCurrentAuthorityOwnershipFake struct {
+	mu      sync.Mutex
+	current domain.LifecycleGeneration
+}
+
+func (f *timeoutCurrentAuthorityOwnershipFake) WithCurrent(_ domain.TaskID, generation domain.LifecycleGeneration, action func() error) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.current != generation {
+		return false, nil
+	}
+	return true, action()
+}
+
+func (f *timeoutCurrentAuthorityOwnershipFake) setCurrent(generation domain.LifecycleGeneration) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.current = generation
+}
+
 type timeoutAuthorityStoreFake struct{}
 
 func (timeoutAuthorityStoreFake) Load(id domain.TaskID) (domain.TaskSnapshot, error) {
@@ -287,6 +382,24 @@ func (timeoutAuthorityStoreFake) ListByStates([]domain.TaskState) ([]domain.Task
 func (timeoutAuthorityStoreFake) Reserve(domain.TaskID) error            { return nil }
 func (timeoutAuthorityStoreFake) Release(domain.TaskID) error            { return nil }
 func (timeoutAuthorityStoreFake) IsReserved(domain.TaskID) (bool, error) { return true, nil }
+
+type timeoutMutableAuthorityStore struct {
+	mu       sync.Mutex
+	snapshot domain.TaskSnapshot
+}
+
+func (s *timeoutMutableAuthorityStore) Load(domain.TaskID) (domain.TaskSnapshot, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.snapshot, nil
+}
+func (*timeoutMutableAuthorityStore) Save(domain.TaskID, domain.TaskSnapshot) error { return nil }
+func (*timeoutMutableAuthorityStore) ListByStates([]domain.TaskState) ([]domain.TaskSnapshot, error) {
+	return nil, nil
+}
+func (*timeoutMutableAuthorityStore) Reserve(domain.TaskID) error            { return nil }
+func (*timeoutMutableAuthorityStore) Release(domain.TaskID) error            { return nil }
+func (*timeoutMutableAuthorityStore) IsReserved(domain.TaskID) (bool, error) { return true, nil }
 
 func timeoutTestValidator() *recovery.ProcessSignalAuthorityValidator {
 	return recovery.NewProcessSignalAuthorityValidator(timeoutAuthorityStoreFake{}, store.NewTaskMutex(), timeoutAuthorityOwnershipFake{})
@@ -1218,6 +1331,257 @@ func TestEnforceTaskTimeoutConstructorRejectsNilStalledTimeTracker(t *testing.T)
 				dead bool
 				err  error
 			}{dead: true}), timeoutTestValidator(), &timeoutPendingFake{}, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), store.NewTaskMutex(), domain.ClockFunc(time.Now), tracker)
+		})
+	}
+}
+
+func TestTimeoutWatcherRetriesRetryableLoadErrorWithSameGeneration_SCNExec0611(t *testing.T) {
+	snapshot := timeoutSnapshot(t, domain.StateRunning, domain.SubcommandReview, nil)
+	retryable := &os.PathError{Op: "read", Path: "task.json", Err: syscall.EAGAIN}
+	tasks := &timeoutSequenceStore{snapshots: []domain.TaskSnapshot{snapshot, snapshot}, errs: []error{retryable, nil}}
+	factory := &timeoutTimerFake{}
+	watcher, recoverer := newTimeoutWatcherForStore(t, tasks, factory, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	now := time.Date(2026, time.August, 10, 12, 0, 0, 0, time.UTC)
+	watcher.Arm(snapshot.TaskID, now, 1800, 17)
+	factory.fire(0)
+	factory.mu.Lock()
+	if len(factory.callbacks) != 2 || factory.durations[1] != 10*time.Second {
+		t.Fatalf("timers=%d durations=%v", len(factory.callbacks), factory.durations)
+	}
+	factory.mu.Unlock()
+	watcher.mu.Lock()
+	entry := watcher.timers[snapshot.TaskID]
+	watcher.mu.Unlock()
+	if entry.generation != 1 || entry.lifecycleGeneration != 17 || !entry.deadline.Equal(now) || entry.retryAttempts != 1 {
+		t.Fatalf("retry entry=%+v", entry)
+	}
+	factory.fire(1)
+	recoverer.mu.Lock()
+	calls := recoverer.calls
+	recoverer.mu.Unlock()
+	watcher.mu.Lock()
+	_, armed := watcher.timers[snapshot.TaskID]
+	watcher.mu.Unlock()
+	if calls != 1 || armed {
+		t.Fatalf("recovery calls=%d armed=%v", calls, armed)
+	}
+}
+
+func TestTimeoutWatcherStopsAfterSixRetriesAndLogsExhaustion_SCNExec0612(t *testing.T) {
+	snapshot := timeoutSnapshot(t, domain.StateRunning, domain.SubcommandReview, nil)
+	retryable := &os.PathError{Op: "read", Path: "task.json", Err: syscall.EAGAIN}
+	tasks := &timeoutSequenceStore{snapshots: []domain.TaskSnapshot{snapshot}, errs: []error{retryable}}
+	factory := &timeoutTimerFake{}
+	var logs bytes.Buffer
+	watcher, _ := newTimeoutWatcherForStore(t, tasks, factory, slog.New(slog.NewJSONHandler(&logs, nil)))
+	watcher.Arm(snapshot.TaskID, time.Date(2026, time.August, 10, 12, 0, 0, 0, time.UTC), 1800, 1)
+	for i := 0; i < 7; i++ {
+		factory.fire(i)
+	}
+	factory.mu.Lock()
+	timers := len(factory.callbacks)
+	factory.mu.Unlock()
+	tasks.mu.Lock()
+	loads := tasks.loads
+	tasks.mu.Unlock()
+	watcher.mu.Lock()
+	_, armed := watcher.timers[snapshot.TaskID]
+	watcher.mu.Unlock()
+	var record map[string]any
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var candidate map[string]any
+		_ = json.Unmarshal([]byte(line), &candidate)
+		if candidate["msg"] == "timeout enforcement retries exhausted" {
+			record = candidate
+		}
+	}
+	if timers != 7 || loads != 7 || armed || record == nil || record["task_id"] != snapshot.TaskID.String() || record["stage"] != "load" || record["attempts"] != float64(6) {
+		t.Fatalf("timers=%d loads=%d armed=%v exhaustion=%v", timers, loads, armed, record)
+	}
+}
+
+func TestTimeoutWatcherCloseRacingRetryCallbackDoesNotRearmOrExecute_SCNExec0613(t *testing.T) {
+	snapshot := timeoutSnapshot(t, domain.StateRunning, domain.SubcommandReview, nil)
+	retryable := &os.PathError{Op: "read", Path: "task.json", Err: syscall.EAGAIN}
+	loadStarted := make(chan struct{})
+	allowLoad := make(chan struct{})
+	tasks := &timeoutSequenceStore{
+		snapshots:   []domain.TaskSnapshot{snapshot},
+		errs:        []error{retryable},
+		blockedLoad: 2,
+		loadStarted: loadStarted,
+		allowLoad:   allowLoad,
+	}
+	factory := &timeoutTimerFake{}
+	watcher, _ := newTimeoutWatcherForStore(t, tasks, factory, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	watcher.Arm(snapshot.TaskID, time.Date(2026, time.August, 10, 12, 0, 0, 0, time.UTC), 1800, 1)
+	factory.fire(0)
+	factory.mu.Lock()
+	timers := len(factory.callbacks)
+	factory.mu.Unlock()
+	if timers != 2 {
+		t.Fatalf("timers=%d", timers)
+	}
+	retryDone := make(chan struct{})
+	go func() {
+		factory.fire(1)
+		close(retryDone)
+	}()
+	select {
+	case <-loadStarted:
+	case <-time.After(timeoutTestWait):
+		t.Fatal("retry callback did not begin its second Load")
+	}
+	closeStarted := make(chan struct{})
+	closeDone := make(chan error, 1)
+	go func() {
+		close(closeStarted)
+		closeDone <- watcher.Close()
+	}()
+	select {
+	case <-closeStarted:
+	case <-time.After(timeoutTestWait):
+		t.Fatal("Close goroutine did not start")
+	}
+	closeDeadline := time.After(timeoutTestWait)
+	for {
+		watcher.mu.Lock()
+		closed := watcher.closed
+		watcher.mu.Unlock()
+		if closed {
+			break
+		}
+		select {
+		case <-closeDeadline:
+			t.Fatal("Close did not set closed=true")
+		default:
+			runtime.Gosched()
+		}
+	}
+	select {
+	case err := <-closeDone:
+		t.Fatalf("Close returned before the running callback completed: %v", err)
+	default:
+	}
+	close(allowLoad)
+	select {
+	case <-retryDone:
+	case <-time.After(timeoutTestWait):
+		t.Fatal("retry callback did not complete")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(timeoutTestWait):
+		t.Fatal("Close did not complete")
+	}
+	factory.mu.Lock()
+	timers = len(factory.callbacks)
+	factory.mu.Unlock()
+	if timers != 2 {
+		t.Fatalf("timers=%d", timers)
+	}
+	watcher.mu.Lock()
+	_, armed := watcher.timers[snapshot.TaskID]
+	watcher.mu.Unlock()
+	if armed {
+		t.Fatal("retry rearmed after Close")
+	}
+	tasks.mu.Lock()
+	loads := tasks.loads
+	tasks.mu.Unlock()
+	if loads != 2 {
+		t.Fatalf("loads=%d", loads)
+	}
+}
+
+func TestEnforceTaskTimeoutReconcilesRecoveryErrorAgainstReloadedState_SCNExec0614(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		terminal    bool
+		wantPending int
+	}{
+		{name: "non-terminal-timeout-registers-confirm-only", wantPending: 1},
+		{name: "terminal-state-does-not-reregister-or-rerun-recovery", terminal: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := timeoutSnapshot(t, domain.StateRunning, domain.SubcommandImpl, nil)
+			uc, tasks, _, _, recoverer, pending, paths := timeoutUseCase(t, snapshot, struct {
+				dead bool
+				err  error
+			}{dead: true})
+			recoverer.err = errors.New("recovery failed")
+			if tc.terminal {
+				recoverer.onExecute = func() { tasks.mu.Lock(); tasks.snapshot.State = domain.StateCompleted; tasks.mu.Unlock() }
+			}
+			out, err := uc.Execute(context.Background(), EnforceTaskTimeoutInput{TaskID: snapshot.TaskID, ResolvedTimeoutSeconds: snapshot.ResolvedTimeoutSeconds, Generation: 1, OccurredAt: snapshot.RequestedAt})
+			if err == nil || out.Outcome != "timed-out" {
+				t.Fatalf("out=%+v err=%v", out, err)
+			}
+			pending.mu.Lock()
+			calls, disposition := pending.calls, pending.disposition
+			pending.mu.Unlock()
+			recoverer.mu.Lock()
+			recoveryCalls := recoverer.calls
+			recoverer.mu.Unlock()
+			paths.mu.Lock()
+			releases := len(paths.deleted)
+			paths.mu.Unlock()
+			if calls != tc.wantPending || recoveryCalls != 1 || releases != 1 {
+				t.Fatalf("pending=%d recovery=%d releases=%d", calls, recoveryCalls, releases)
+			}
+			if calls == 1 && disposition != recovery.PendingSendConfirmOnly {
+				t.Fatalf("disposition=%q", disposition)
+			}
+		})
+	}
+}
+
+func TestTerminationEnsurerSuppressesKillWhenAuthorityChangesDuringGrace_SCNExec0615(t *testing.T) {
+	id := timeoutID(t, "authority-grace")
+	started := time.Date(2026, time.August, 10, 12, 0, 0, 0, time.UTC)
+	pid := 321
+	for _, tc := range []struct {
+		name   string
+		mutate func(*timeoutMutableAuthorityStore, *timeoutCurrentAuthorityOwnershipFake)
+	}{
+		{name: "lifecycle-generation-changed", mutate: func(_ *timeoutMutableAuthorityStore, ownership *timeoutCurrentAuthorityOwnershipFake) {
+			ownership.setCurrent(2)
+		}},
+		{name: "expected-state-changed-with-same-pid-pair", mutate: func(s *timeoutMutableAuthorityStore, _ *timeoutCurrentAuthorityOwnershipFake) {
+			s.snapshot.State = domain.StateRunning
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tasks := &timeoutMutableAuthorityStore{snapshot: domain.TaskSnapshot{TaskID: id, PID: &pid, ProcessStartedAt: &started, State: domain.StateTimeout}}
+			proc := &timeoutProcessFake{}
+			ownership := &timeoutCurrentAuthorityOwnershipFake{current: 1}
+			validator := recovery.NewProcessSignalAuthorityValidator(tasks, store.NewTaskMutex(), ownership)
+			ensurer := NewTerminationEnsurer(timeoutLiveness(struct {
+				dead bool
+				err  error
+			}{}, struct {
+				dead bool
+				err  error
+			}{dead: true}), proc, domain.ClockFunc(time.Now), func(context.Context, time.Duration) { tasks.mu.Lock(); tc.mutate(tasks, ownership); tasks.mu.Unlock() }, validator)
+			generation := domain.LifecycleGeneration(1)
+			result := ensurer.SendAndConfirm(context.Background(), id, recovery.ProcessSignalAuthority{TaskID: id, PID: pid, ProcessStartedAt: started, ExpectedState: domain.StateTimeout, LifecycleGeneration: &generation}, TimeoutKillGrace)
+			proc.mu.Lock()
+			terms, kills := len(proc.termPIDs), len(proc.killPIDs)
+			proc.mu.Unlock()
+			if terms != 1 || kills != 0 || !errors.Is(result.TerminateErr, recovery.ErrProcessSignalAuthorityInvalid) {
+				t.Fatalf("terms=%d kills=%d result=%+v", terms, kills, result)
+			}
+			if tc.name == "lifecycle-generation-changed" {
+				tasks.mu.Lock()
+				state := tasks.snapshot.State
+				tasks.mu.Unlock()
+				if state != domain.StateTimeout {
+					t.Fatalf("state=%s", state)
+				}
+			}
 		})
 	}
 }

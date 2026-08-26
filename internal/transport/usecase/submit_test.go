@@ -15,8 +15,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yoshikihorie/codex-runner/internal/contract"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/execution"
+	executionusecase "github.com/yoshikihorie/codex-runner/internal/execution/usecase"
+	"github.com/yoshikihorie/codex-runner/internal/store"
 	"github.com/yoshikihorie/codex-runner/internal/transport"
 )
 
@@ -113,6 +116,34 @@ func (f *submitStarterFake) Start(p execution.TaskLaunchPayload) bool {
 }
 
 func (*submitStarterFake) Shutdown(context.Context) {}
+
+type submitLifecycleAdmitter struct {
+	input execution.TaskAdmissionInput
+}
+
+func (a *submitLifecycleAdmitter) Admit(input execution.TaskAdmissionInput) (execution.TaskAdmissionResult, error) {
+	a.input = input
+	task, events, err := domain.NewTask(input.TaskID, input.Subcommand, input.Slug, input.RequestedTimeout, input.RequestedAt, 1)
+	if err != nil {
+		return execution.TaskAdmissionResult{}, err
+	}
+	workingDir := input.SourceWorkingDir
+	payload := execution.TaskLaunchPayload{Task: task, Model: input.Model, ReasoningEffort: input.ReasoningEffort, PromptText: input.PromptText, ResolvedTimeout: input.ResolvedTimeout, SandboxMode: input.SandboxMode, SourceWorkingDir: input.SourceWorkingDir, WorkingDir: &workingDir}
+	return execution.TaskAdmissionResult{State: domain.StateQueued, Events: events, LaunchPayload: &payload}, nil
+}
+
+func (*submitLifecycleAdmitter) CompensateRejectedStart(domain.TaskID) error { return nil }
+
+type submitSynchronousStarter struct {
+	start func(execution.TaskLaunchPayload)
+}
+
+func (s *submitSynchronousStarter) Start(payload execution.TaskLaunchPayload) bool {
+	s.start(payload)
+	return true
+}
+
+func (*submitSynchronousStarter) Shutdown(context.Context) {}
 
 type submitOptionsFake struct {
 	model, effort     string
@@ -225,6 +256,77 @@ func TestSubmitHandleAcceptsOptionalNullAndUnknownFields(t *testing.T) {
 				t.Fatalf("response=%#v", resp)
 			}
 		})
+	}
+}
+
+func TestSubmitHandle_EmptyPromptReturnsPromptEmpty(t *testing.T) {
+	fixture := newSubmitFixture()
+	response := fixture.uc.Handle(transport.Request{RequestID: "request", Params: json.RawMessage(fmt.Sprintf(`{"subcommand":"review","slug":"valid-slug","prompt":"","working_dir":%q}`, t.TempDir()))})
+	if response.OK || response.Error == nil || response.Error.Code != "PROMPT_EMPTY" || response.Error.MessageKey != "error.prompt.empty" {
+		t.Fatalf("response=%#v", response)
+	}
+	if len(fixture.store.reserved) != 0 || fixture.admitter.calls != 0 || len(fixture.starter.payloads) != 0 {
+		t.Fatalf("side effects: reserve=%v admit=%d starter=%v", fixture.store.reserved, fixture.admitter.calls, fixture.starter.payloads)
+	}
+}
+
+func newSubmitLifecycleFixture(t *testing.T, model string, effort *string) (*SubmitTaskUseCase, *submitLifecycleAdmitter, *store.FileTaskStore, string) {
+	t.Helper()
+	root := t.TempDir()
+	tasks, err := store.NewFileTaskStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitter := &submitLifecycleAdmitter{}
+	clock := domain.ClockFunc(func() time.Time { return time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC) })
+	writer := contract.NewFileContractWriter(root, clock)
+	recordStarting := executionusecase.NewRecordTaskStartingUseCase(tasks, writer)
+	starter := &submitSynchronousStarter{start: func(payload execution.TaskLaunchPayload) {
+		taskJSON := filepath.Join(root, payload.Task.ID().String(), "task.json")
+		if _, err := os.Stat(taskJSON); !os.IsNotExist(err) {
+			t.Fatalf("task.json before Task.Start: err=%v", err)
+		}
+		if err := recordStarting.Execute(context.Background(), payload.Task, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, domain.ExecutionRouteDaemon, payload.PromptText, clock.Now()); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	options := submitOptionsFake{model: model, modelOK: true, effortOK: true, effortValue: effort}
+	uc := NewSubmitTaskUseCase(tasks, nil, nil, admitter, 10, starter, options, clock, nil)
+	uc.random = &submitByteReader{bytes: []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24}}
+	return uc, admitter, tasks, root
+}
+
+func TestSubmitExecute_ExplicitModelPersistsAfterTaskStart(t *testing.T) {
+	const model = "requested-model"
+	uc, admitter, tasks, root := newSubmitLifecycleFixture(t, model, nil)
+	in := validSubmitInput(t)
+	in.Model = ptrString(model)
+	out, err := uc.Execute(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(filepath.Join(root, out.TaskID.String()))
+	if err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("task dir info=%v err=%v", info, err)
+	}
+	snapshot, err := tasks.Load(out.TaskID)
+	if err != nil || snapshot.State != domain.StateStarting || snapshot.Model != model || admitter.input.Model != model {
+		t.Fatalf("err=%v snapshot=%#v admission=%#v", err, snapshot, admitter.input)
+	}
+}
+
+func TestSubmitExecute_ExplicitReasoningEffortPersistsAfterTaskStart(t *testing.T) {
+	const effort = "high"
+	uc, admitter, tasks, _ := newSubmitLifecycleFixture(t, "test-model", ptrString(effort))
+	in := validSubmitInput(t)
+	in.ReasoningEffort = ptrString(effort)
+	out, err := uc.Execute(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := tasks.Load(out.TaskID)
+	if err != nil || admitter.input.ReasoningEffort == nil || *admitter.input.ReasoningEffort != effort || snapshot.ReasoningEffort == nil || *snapshot.ReasoningEffort != effort {
+		t.Fatalf("err=%v snapshot=%#v admission=%#v", err, snapshot, admitter.input)
 	}
 }
 
@@ -498,7 +600,8 @@ func TestSubmitExecuteAdmissionFailureCompensatesWithoutCancelledContext(t *test
 func mapSubmitMessage(code string) string {
 	return map[string]string{"SLUG_INVALID_FORMAT": "error.slug.invalidFormat", "TIMEOUT_BELOW_MINIMUM": "error.timeout.belowMinimum", "PROMPT_EMPTY": "error.prompt.empty", "SUBCOMMAND_NOT_SUBMITTABLE": "error.subcommand.notSubmittable", "MODEL_NOT_ALLOWED": "error.model.notAllowed", "REASONING_EFFORT_NOT_ALLOWED": "error.reasoningEffort.notAllowed", "WORKING_DIR_NOT_ABSOLUTE": "error.workingDir.notAbsolute", "PATHS_NOT_ABSOLUTE": "error.paths.notAbsolute"}[code]
 }
-func intPtr(value int) *int { return &value }
+func intPtr(value int) *int          { return &value }
+func ptrString(value string) *string { return &value }
 func boolCount(value bool) int {
 	if value {
 		return 1

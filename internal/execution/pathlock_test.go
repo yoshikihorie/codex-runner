@@ -7,13 +7,34 @@ import (
 	"io/fs"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/store"
 )
+
+func pathLockIDs(t *testing.T) (domain.TaskID, domain.TaskID) {
+	t.Helper()
+	owner, err := domain.NewTaskID("impl-20260809-120000-a1b2-owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	requester, err := domain.NewTaskID("impl-20260809-120001-a1b2-requester")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return owner, requester
+}
+
+func livePathLockAcquirer(locks PathLockStore) *AcquirePathLockUseCase {
+	return NewAcquirePathLockUseCase(&pathLockTestMutex{}, locks, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), store.NormalizePath, pathLockTaskStateReaderFake{})
+}
 
 type pathLockTestMutex struct {
 	locked, unlocked   bool
@@ -89,6 +110,185 @@ func TestAcquirePathLockUseCaseDisambiguatesMissingTaskLockWithTaskState(t *test
 				t.Fatal("stale path lock was not deleted")
 			}
 		})
+	}
+}
+
+func TestAcquirePathLockSymlinkConflictWithLiveOwner_SCNLock0105(t *testing.T) {
+	owner, requester := pathLockIDs(t)
+	root := t.TempDir()
+	realDir := filepath.Join(root, "real")
+	if err := os.Mkdir(realDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	realFile := filepath.Join(realDir, "file.go")
+	if err := os.WriteFile(realFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	alias := filepath.Join(root, "alias")
+	if err := os.Symlink(realDir, alias); err != nil {
+		t.Fatal(err)
+	}
+	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{realFile}}}}
+	out, err := livePathLockAcquirer(locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{filepath.Join(alias, "file.go")}})
+	if err != nil || out.Acquired || out.ConflictingTaskID == nil || *out.ConflictingTaskID != owner || locks.saved || len(locks.deleted) != 0 {
+		t.Fatalf("out=%+v err=%v store=%+v", out, err, locks)
+	}
+}
+
+func TestAcquirePathLockTrailingSeparatorConflictWithLiveOwner_SCNLock0106(t *testing.T) {
+	owner, requester := pathLockIDs(t)
+	dir := filepath.Join(t.TempDir(), "source")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{dir + string(filepath.Separator)}}}}
+	out, err := livePathLockAcquirer(locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{dir}})
+	if err != nil || out.Acquired || locks.saved || len(locks.deleted) != 0 {
+		t.Fatalf("out=%+v err=%v store=%+v", out, err, locks)
+	}
+}
+
+func TestAcquirePathLockMacOSCaseFoldConflictWithLiveOwner_SCNLock0107(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Fatalf("SCN-lock-01-07 requires darwin, got %s", runtime.GOOS)
+	}
+	owner, requester := pathLockIDs(t)
+	root := t.TempDir()
+	upper := filepath.Join(root, "Source")
+	if err := os.Mkdir(upper, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	upperFile := filepath.Join(upper, "A.GO")
+	if err := os.WriteFile(upperFile, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	lowerFile := filepath.Join(root, "source", "a.go")
+	if _, err := os.Stat(lowerFile); err != nil {
+		if err := os.Mkdir(filepath.Join(root, "source"), 0o700); err != nil && !os.IsExist(err) {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(lowerFile, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{upperFile}}}}
+	out, err := livePathLockAcquirer(locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{lowerFile}})
+	if err != nil || out.Acquired || locks.saved || len(locks.deleted) != 0 {
+		t.Fatalf("out=%+v err=%v store=%+v", out, err, locks)
+	}
+}
+
+type pathLockConcurrentStore struct {
+	mu             sync.Mutex
+	saved          []domain.TaskID
+	firstSave      chan struct{}
+	allowFirstSave chan struct{}
+}
+
+func (s *pathLockConcurrentStore) List() ([]PathLockSnapshot, error) { return nil, nil }
+func (s *pathLockConcurrentStore) Save(id domain.TaskID, _ []domain.NormalizedPath) error {
+	s.mu.Lock()
+	first := len(s.saved) == 0
+	s.saved = append(s.saved, id)
+	s.mu.Unlock()
+	if first {
+		close(s.firstSave)
+		<-s.allowFirstSave
+	}
+	return nil
+}
+func (*pathLockConcurrentStore) Delete(domain.TaskID) error { return nil }
+
+type pathLockNotifyingMutex struct {
+	mutex     PathLockMutex
+	attempted chan struct{}
+	once      sync.Once
+}
+
+func (m *pathLockNotifyingMutex) Lock() error {
+	m.once.Do(func() { close(m.attempted) })
+	return m.mutex.Lock()
+}
+
+func (m *pathLockNotifyingMutex) Unlock() error { return m.mutex.Unlock() }
+
+func TestAcquirePathLockConcurrentDisjointRequestsSerializeAndBothSucceed_SCNLock0108(t *testing.T) {
+	root := t.TempDir()
+	firstPath, secondPath := filepath.Join(root, "one"), filepath.Join(root, "two")
+	if err := os.Mkdir(firstPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(secondPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	owner, requester := pathLockIDs(t)
+	locks := &pathLockConcurrentStore{firstSave: make(chan struct{}), allowFirstSave: make(chan struct{})}
+	mutexPath := filepath.Join(root, "path-locks.lock")
+	first := NewAcquirePathLockUseCase(store.NewFileMutex(mutexPath), locks, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), store.NormalizePath, pathLockTaskStateReaderFake{})
+	secondMutex := &pathLockNotifyingMutex{mutex: store.NewFileMutex(mutexPath), attempted: make(chan struct{})}
+	second := NewAcquirePathLockUseCase(secondMutex, locks, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), store.NormalizePath, pathLockTaskStateReaderFake{})
+	results := make(chan AcquirePathLockOutput, 2)
+	errs := make(chan error, 2)
+	go func() {
+		out, err := first.Execute(context.Background(), AcquirePathLockInput{TaskID: owner, RequestedPaths: []string{firstPath}})
+		results <- out
+		errs <- err
+	}()
+	select {
+	case <-locks.firstSave:
+	case <-time.After(timeoutTestWait):
+		t.Fatal("first Save did not begin")
+	}
+	secondStarted := make(chan struct{})
+	go func() {
+		close(secondStarted)
+		out, err := second.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{secondPath}})
+		results <- out
+		errs <- err
+	}()
+	select {
+	case <-secondStarted:
+	case <-time.After(timeoutTestWait):
+		t.Fatal("second Execute goroutine did not start")
+	}
+	select {
+	case <-secondMutex.attempted:
+	case <-time.After(timeoutTestWait):
+		t.Fatal("second Execute did not attempt PathLockMutex.Lock")
+	}
+	for i := 0; i < 100; i++ {
+		runtime.Gosched()
+		locks.mu.Lock()
+		before := len(locks.saved)
+		locks.mu.Unlock()
+		if before != 1 {
+			t.Fatalf("second Save entered before first released: %d", before)
+		}
+	}
+	close(locks.allowFirstSave)
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-errs:
+			if err != nil {
+				t.Fatal(err)
+			}
+		case <-time.After(timeoutTestWait):
+			t.Fatal("AcquirePathLock Execute did not return an error result")
+		}
+		select {
+		case out := <-results:
+			if !out.Acquired {
+				t.Fatal("acquire rejected")
+			}
+		case <-time.After(timeoutTestWait):
+			t.Fatal("AcquirePathLock Execute did not return a result")
+		}
+	}
+	locks.mu.Lock()
+	saved := len(locks.saved)
+	locks.mu.Unlock()
+	if saved != 2 {
+		t.Fatalf("saved=%d", saved)
 	}
 }
 

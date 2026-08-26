@@ -229,7 +229,9 @@ func (uc *EvictLogsUseCase) execute(ctx context.Context, in EvictLogsInput, conf
 	if err := uc.validateDeletionCandidates(confirmed); err != nil {
 		return out, fmt.Errorf("invalid confirmed candidate: %w", err)
 	}
-	out.Candidates = append([]LogDeletionCandidate(nil), confirmed...)
+	out.RotatedDaemonWide = []string{}
+	out.Candidates = []LogDeletionCandidate{}
+	out.Candidates = append(out.Candidates, confirmed...)
 	deleted, skipped, err := uc.deleteCandidates(ctx, confirmed)
 	out.Deleted, out.Skipped = deleted, skipped
 	return out, err
@@ -398,6 +400,8 @@ func (uc *EvictLogsUseCase) rotateIfNeeded(ctx context.Context, in EvictLogsInpu
 }
 
 func (uc *EvictLogsUseCase) deleteCandidates(ctx context.Context, candidates []LogDeletionCandidate) (deleted []string, skipped []LogSkipped, err error) {
+	deleted = []string{}
+	skipped = []LogSkipped{}
 	if err := uc.validateDeletionCandidates(candidates); err != nil {
 		return deleted, skipped, err
 	}
