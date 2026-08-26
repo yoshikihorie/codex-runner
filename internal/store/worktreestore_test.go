@@ -97,6 +97,65 @@ func temporaryWorktreeSibling(t *testing.T, parent string) string {
 	return ""
 }
 
+func openWorktreeFileDescriptorCount(t *testing.T) int {
+	t.Helper()
+	count := 0
+	for fd := 0; fd < syscall.Getdtablesize(); fd++ {
+		_, _, errno := syscall.Syscall(syscall.SYS_FCNTL, uintptr(fd), syscall.F_GETFD, 0)
+		if errno != syscall.EBADF {
+			count++
+		}
+	}
+	return count
+}
+
+func TestWorktreeFileStoreCreateClosesDirectoriesAfterCopyFailureOrCancellation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hook func(context.CancelFunc) error
+	}{
+		{
+			name: "copy failure",
+			hook: func(context.CancelFunc) error {
+				return errors.New("copy failed")
+			},
+		},
+		{
+			name: "cancellation",
+			hook: func(cancel context.CancelFunc) error {
+				cancel()
+				return nil
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := t.TempDir()
+			if err := os.MkdirAll(filepath.Join(source, "first", "second"), 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(source, "first", "second", "file"), []byte("content"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			originalHook := afterWorktreeFileCopy
+			ctx, cancel := context.WithCancel(context.Background())
+			afterWorktreeFileCopy = func(string) error { return tc.hook(cancel) }
+			t.Cleanup(func() {
+				afterWorktreeFileCopy = originalHook
+				cancel()
+			})
+
+			before := openWorktreeFileDescriptorCount(t)
+			err := NewWorktreeFileStore().Create(ctx, source, filepath.Join(t.TempDir(), "published"))
+			if err == nil {
+				t.Fatal("Create() error = nil")
+			}
+			if after := openWorktreeFileDescriptorCount(t); after != before {
+				t.Fatalf("open file descriptors after Create() = %d, want %d", after, before)
+			}
+		})
+	}
+}
+
 func TestWorktreeFileStoreCreateCancelsDuringDirectoryPermissionRestore(t *testing.T) {
 	source := t.TempDir()
 	parent := t.TempDir()
@@ -220,21 +279,141 @@ func TestWorktreeFileStoreCreateRejectsNonDirectoryOrSymlinkSource(t *testing.T)
 }
 
 func TestWorktreeFileStoreCreateJoinsCleanupErrors(t *testing.T) {
-	originalChmod := chmodWorktreePath
-	originalRemoveAll := removeWorktreeTree
-	chmodErr := errors.New("chmod cleanup failed")
+	originalRemove := removeWorktreeTreeAtFn
+	originalHook := afterWorktreeFileCopy
 	removeErr := errors.New("remove cleanup failed")
-	chmodWorktreePath = func(string, os.FileMode) error { return chmodErr }
-	removeWorktreeTree = func(string) error { return removeErr }
+	removeWorktreeTreeAtFn = func(uintptr, string, uintptr) error { return removeErr }
+	afterWorktreeFileCopy = func(string) error { return errors.New("copy failed") }
 	t.Cleanup(func() {
-		chmodWorktreePath = originalChmod
-		removeWorktreeTree = originalRemoveAll
+		removeWorktreeTreeAtFn = originalRemove
+		afterWorktreeFileCopy = originalHook
 	})
 	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	destination := filepath.Join(t.TempDir(), "published")
 	err := NewWorktreeFileStore().Create(context.Background(), source, destination)
-	if !errors.Is(err, chmodErr) || !errors.Is(err, removeErr) {
-		t.Fatalf("Create() error=%v, want both cleanup errors", err)
+	if !errors.Is(err, removeErr) {
+		t.Fatalf("Create() error=%v, want cleanup error", err)
+	}
+}
+
+func TestWorktreeFileStoreCreateRejectsSourceChangedDuringCopy(t *testing.T) {
+	source := t.TempDir()
+	parent := t.TempDir()
+	destination := filepath.Join(parent, "published")
+	sourceFile := filepath.Join(source, "source-file")
+	if err := os.WriteFile(sourceFile, []byte("original contents"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalHook := afterWorktreeFileCopy
+	afterWorktreeFileCopy = func(path string) error {
+		if path != sourceFile {
+			return nil
+		}
+		return os.WriteFile(sourceFile, []byte("changed"), 0o600)
+	}
+	t.Cleanup(func() { afterWorktreeFileCopy = originalHook })
+	err := NewWorktreeFileStore().Create(context.Background(), source, destination)
+	if err == nil || !strings.Contains(err.Error(), "worktree source changed during copy") {
+		t.Fatalf("Create() error=%v, want source change detection", err)
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("destination was published: %v", err)
+	}
+	if temporary := temporaryWorktreeSibling(t, parent); temporary != "" {
+		t.Fatalf("temporary copy was not removed: %s", temporary)
+	}
+}
+
+func TestWorktreeFileStoreCreateDoesNotCreateTemporaryInReplacedParent(t *testing.T) {
+	source := t.TempDir()
+	root := t.TempDir()
+	parent := filepath.Join(root, "parent")
+	replacedParent := filepath.Join(root, "replaced-parent")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(replacedParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(parent, "published")
+	originalHook := beforeWorktreeTemporaryCreate
+	beforeWorktreeTemporaryCreate = func() error {
+		if err := os.Rename(parent, parent+".original"); err != nil {
+			return err
+		}
+		return os.Symlink(replacedParent, parent)
+	}
+	t.Cleanup(func() { beforeWorktreeTemporaryCreate = originalHook })
+	if err := NewWorktreeFileStore().Create(context.Background(), source, destination); err == nil {
+		t.Fatal("Create() succeeded after destination parent replacement")
+	}
+	if temporary := temporaryWorktreeSibling(t, replacedParent); temporary != "" {
+		t.Fatalf("temporary copy was created in replacement parent: %s", temporary)
+	}
+	if _, err := os.Stat(filepath.Join(replacedParent, "published")); !os.IsNotExist(err) {
+		t.Fatalf("destination was published in replacement parent: %v", err)
+	}
+}
+
+func TestWorktreeFileStoreCreateRejectsParentReplacedBeforePublish(t *testing.T) {
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	parent := filepath.Join(root, "parent")
+	replacedParent := filepath.Join(root, "replaced-parent")
+	if err := os.Mkdir(parent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(replacedParent, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	destination := filepath.Join(parent, "published")
+	originalHook := beforeWorktreePublish
+	beforeWorktreePublish = func() error {
+		if err := os.Rename(parent, parent+".original"); err != nil {
+			return err
+		}
+		return os.Symlink(replacedParent, parent)
+	}
+	t.Cleanup(func() { beforeWorktreePublish = originalHook })
+	err := NewWorktreeFileStore().Create(context.Background(), source, destination)
+	if err == nil || !strings.Contains(err.Error(), "worktree destination parent changed") {
+		t.Fatalf("Create() error=%v, want parent-change detection", err)
+	}
+	if _, err := os.Stat(filepath.Join(replacedParent, "published")); !os.IsNotExist(err) {
+		t.Fatalf("destination was published in replacement parent: %v", err)
+	}
+	if temporary := temporaryWorktreeSibling(t, parent+".original"); temporary != "" {
+		t.Fatalf("temporary copy was not removed from checked parent: %s", temporary)
+	}
+}
+
+func TestCreateWorktreeTemporaryUsesPrivatePermissions(t *testing.T) {
+	parent := t.TempDir()
+	parentFile, err := os.Open(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer parentFile.Close()
+	name, temporary, err := createWorktreeTemporary(parentFile.Fd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer temporary.Close()
+	info, err := temporary.Stat()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode().Perm() != 0o700 {
+		t.Fatalf("temporary permissions=%#o, want 0700", info.Mode().Perm())
+	}
+	if err := removeWorktreeTreeAt(parentFile.Fd(), name, temporary.Fd()); err != nil {
+		t.Fatal(err)
 	}
 }
 

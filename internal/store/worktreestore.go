@@ -3,6 +3,9 @@ package store
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
@@ -20,11 +23,13 @@ import (
 )
 
 var (
-	findGitBinary      = proc.FindGitBinary
-	openWorktreeFile   = os.Open
-	chmodWorktreePath  = os.Chmod
-	removeWorktreeTree = os.RemoveAll
-	gitCommandTimeout  = 30 * time.Second
+	findGitBinary                 = proc.FindGitBinary
+	openWorktreeFile              = os.Open
+	beforeWorktreeTemporaryCreate = func() error { return nil }
+	beforeWorktreePublish         = func() error { return nil }
+	afterWorktreeFileCopy         = func(string) error { return nil }
+	removeWorktreeTreeAtFn        = removeWorktreeTreeAt
+	gitCommandTimeout             = 30 * time.Second
 )
 
 // WorktreeFileStore provides filesystem-backed worktree operations.
@@ -33,6 +38,17 @@ type WorktreeFileStore struct{}
 const renameExclusive = 0x00000004   // Darwin RENAME_EXCL.
 const sysRenameatxNP = 488           // Darwin SYS_RENAMEATX_NP.
 const atFileSystemRoot = ^uintptr(1) // Darwin AT_FDCWD.
+
+const (
+	sysOpenat         = 463 // Darwin SYS_OPENAT.
+	sysFchmodat       = 467 // Darwin SYS_FCHMODAT.
+	sysFstatat        = 470 // Darwin SYS_FSTATAT64 (the inode64 ABI used by Go's Stat_t).
+	sysUnlinkat       = 472 // Darwin SYS_UNLINKAT.
+	sysSymlinkat      = 474 // Darwin SYS_SYMLINKAT.
+	sysMkdirat        = 475 // Darwin SYS_MKDIRAT.
+	atRemoveDir       = 0x0080
+	atSymlinkNoFollow = 0x0020
+)
 
 // NewWorktreeFileStore constructs a filesystem-backed worktree store.
 func NewWorktreeFileStore() *WorktreeFileStore { return &WorktreeFileStore{} }
@@ -54,62 +70,68 @@ func (s *WorktreeFileStore) Create(ctx context.Context, sourceDir string, destin
 	} else if !os.IsNotExist(statErr) {
 		return statErr
 	}
-	parent := filepath.Dir(destinationDir)
-	if err := rejectWorktreeDestinationWithinSource(sourceDir, parent); err != nil {
+	parentPath := filepath.Dir(destinationDir)
+	parent, err := openWorktreeDirectory(parentPath)
+	if err != nil {
+		return fmt.Errorf("open worktree destination parent: %w", err)
+	}
+	defer parent.Close()
+	if err := rejectWorktreeDestinationWithinSource(sourceDir, parentPath); err != nil {
 		return err
 	}
-	temporary, err := os.MkdirTemp(parent, ".worktree-copy-")
+	if err := beforeWorktreeTemporaryCreate(); err != nil {
+		return err
+	}
+	temporaryName, temporary, err := createWorktreeTemporary(parent.Fd())
 	if err != nil {
 		return fmt.Errorf("create worktree temporary directory: %w", err)
 	}
+	defer temporary.Close()
 	defer func() {
 		if err == nil {
 			return
 		}
-		cleanupErr := errors.Join(makeWorktreeTreeRemovable(temporary), removeWorktreeTree(temporary))
+		cleanupErr := removeWorktreeTreeAtFn(parent.Fd(), temporaryName, temporary.Fd())
 		if cleanupErr != nil {
 			err = errors.Join(err, cleanupErr)
 		}
 	}()
-	directories, err := copyWorktreeTree(ctx, sourceDir, temporary)
+	directories, err := copyWorktreeTree(ctx, sourceDir, int(temporary.Fd()))
 	if err != nil {
+		closeWorktreeDirectories(directories)
 		return err
 	}
+	defer closeWorktreeDirectories(directories)
 	for index := len(directories) - 1; index >= 0; index-- {
 		if err = ctx.Err(); err != nil {
 			return err
 		}
-		if err = chmodWorktreePath(directories[index].path, directories[index].mode); err != nil {
+		if err = syscall.Fchmod(directories[index].fd, uint32(directories[index].mode)); err != nil {
 			return fmt.Errorf("restore worktree directory permissions: %w", err)
 		}
 	}
 	if err = ctx.Err(); err != nil {
 		return err
 	}
-	if err = RenameExclusive(temporary, destinationDir); err != nil {
+	if err = beforeWorktreePublish(); err != nil {
+		return err
+	}
+	currentParent, err := openWorktreeDirectory(parentPath)
+	if err != nil {
+		return fmt.Errorf("worktree destination parent changed: %w", err)
+	}
+	defer currentParent.Close()
+	if !sameWorktreeDirectory(parent, currentParent) {
+		return fmt.Errorf("worktree destination parent changed")
+	}
+	if err = renameAtExclusive(parent.Fd(), temporaryName, filepath.Base(destinationDir)); err != nil {
 		return fmt.Errorf("publish worktree: %w", err)
 	}
 	return nil
 }
 
-func makeWorktreeTreeRemovable(root string) error {
-	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if !entry.IsDir() {
-			return nil
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		return chmodWorktreePath(path, info.Mode().Perm()|0o700)
-	})
-}
-
 type worktreeDirectoryMode struct {
-	path string
+	fd   int
 	mode os.FileMode
 }
 
@@ -144,9 +166,14 @@ func rejectWorktreeDestinationWithinSource(source, destinationParent string) err
 	return nil
 }
 
-func copyWorktreeTree(ctx context.Context, source, destination string) ([]worktreeDirectoryMode, error) {
+func copyWorktreeTree(ctx context.Context, source string, temporaryFD int) ([]worktreeDirectoryMode, error) {
 	directories := make([]worktreeDirectoryMode, 0)
-	err := filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+	rootFD, err := syscall.Dup(temporaryFD)
+	if err != nil {
+		return nil, err
+	}
+	directories = append(directories, worktreeDirectoryMode{fd: rootFD})
+	err = filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -162,10 +189,15 @@ func copyWorktreeTree(ctx context.Context, source, destination string) ([]worktr
 			if err != nil {
 				return err
 			}
-			directories = append(directories, worktreeDirectoryMode{destination, info.Mode().Perm()})
+			directories[0].mode = info.Mode().Perm()
 			return nil
 		}
-		target := filepath.Join(destination, rel)
+		parentFD, err := worktreeOutputParent(temporaryFD, filepath.Dir(rel))
+		if err != nil {
+			return err
+		}
+		defer syscall.Close(parentFD)
+		name := filepath.Base(rel)
 		info, err := entry.Info()
 		if err != nil {
 			return err
@@ -177,10 +209,17 @@ func copyWorktreeTree(ctx context.Context, source, destination string) ([]worktr
 			if err != nil {
 				return err
 			}
-			return os.Symlink(link, target)
+			return symlinkAt(link, parentFD, name)
 		case mode.IsDir():
-			directories = append(directories, worktreeDirectoryMode{target, mode.Perm()})
-			return os.Mkdir(target, mode.Perm()|0o700)
+			if err := mkdirAt(parentFD, name, mode.Perm()|0o700); err != nil {
+				return err
+			}
+			fd, err := openAt(parentFD, name, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+			if err != nil {
+				return err
+			}
+			directories = append(directories, worktreeDirectoryMode{fd: fd, mode: mode.Perm()})
+			return nil
 		case mode.IsRegular():
 			from, err := openWorktreeFile(path)
 			if err != nil {
@@ -196,27 +235,247 @@ func copyWorktreeTree(ctx context.Context, source, destination string) ([]worktr
 				return fmt.Errorf("worktree source changed while opening: %s", path)
 			}
 			defer from.Close()
-			to, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm())
+			toFD, err := openAt(parentFD, name, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW, uint32(mode.Perm()))
 			if err != nil {
 				return err
 			}
-			_, copyErr := io.Copy(to, contextReader{ctx: ctx, r: from})
-			closeErr := to.Close()
+			to := os.NewFile(uintptr(toFD), name)
+			defer to.Close()
+			copyDigest := sha256.New()
+			_, copyErr := io.Copy(io.MultiWriter(to, copyDigest), contextReader{ctx: ctx, r: from})
 			if copyErr != nil {
+				_ = to.Close()
 				return copyErr
-			}
-			if closeErr != nil {
-				return closeErr
 			}
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			return chmodWorktreePath(target, mode.Perm())
+			if err := afterWorktreeFileCopy(path); err != nil {
+				return err
+			}
+			if _, err := from.Seek(0, io.SeekStart); err != nil {
+				return err
+			}
+			verifyDigest := sha256.New()
+			if _, err := io.Copy(verifyDigest, contextReader{ctx: ctx, r: from}); err != nil {
+				return err
+			}
+			finalInfo, err := from.Stat()
+			if err != nil {
+				return err
+			}
+			if !finalInfo.Mode().IsRegular() || !os.SameFile(openedInfo, finalInfo) || openedInfo.Size() != finalInfo.Size() || !openedInfo.ModTime().Equal(finalInfo.ModTime()) || !bytes.Equal(copyDigest.Sum(nil), verifyDigest.Sum(nil)) {
+				_ = to.Close()
+				return fmt.Errorf("worktree source changed during copy: %s", path)
+			}
+			if err := syscall.Fchmod(toFD, uint32(mode.Perm())); err != nil {
+				_ = to.Close()
+				return err
+			}
+			return to.Close()
 		default:
 			return fmt.Errorf("unsupported worktree file type: %s", path)
 		}
 	})
 	return directories, err
+}
+
+func closeWorktreeDirectories(directories []worktreeDirectoryMode) {
+	for _, directory := range directories {
+		_ = syscall.Close(directory.fd)
+	}
+}
+
+func openWorktreeDirectory(path string) (*os.File, error) {
+	return os.OpenFile(path, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+}
+
+func sameWorktreeDirectory(left, right *os.File) bool {
+	leftInfo, leftErr := left.Stat()
+	rightInfo, rightErr := right.Stat()
+	return leftErr == nil && rightErr == nil && os.SameFile(leftInfo, rightInfo)
+}
+
+func createWorktreeTemporary(parentFD uintptr) (string, *os.File, error) {
+	for attempts := 0; attempts < 100; attempts++ {
+		name, err := worktreeTemporaryName()
+		if err != nil {
+			return "", nil, err
+		}
+		if err := mkdirAt(int(parentFD), name, 0o700); err != nil {
+			if errors.Is(err, syscall.EEXIST) {
+				continue
+			}
+			return "", nil, err
+		}
+		fd, err := openAt(int(parentFD), name, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+		if err != nil {
+			return "", nil, err
+		}
+		var named syscall.Stat_t
+		var opened syscall.Stat_t
+		if err := fstatAt(int(parentFD), name, &named, atSymlinkNoFollow); err != nil {
+			_ = syscall.Close(fd)
+			return "", nil, err
+		}
+		if err := syscall.Fstat(fd, &opened); err != nil || named.Dev != opened.Dev || named.Ino != opened.Ino {
+			_ = syscall.Close(fd)
+			if err != nil {
+				return "", nil, err
+			}
+			return "", nil, fmt.Errorf("worktree temporary changed while opening")
+		}
+		return name, os.NewFile(uintptr(fd), name), nil
+	}
+	return "", nil, fmt.Errorf("create unique worktree temporary directory")
+}
+
+func worktreeTemporaryName() (string, error) {
+	bytes := make([]byte, 12)
+	if _, err := rand.Read(bytes); err != nil {
+		return "", err
+	}
+	return ".worktree-copy-" + hex.EncodeToString(bytes), nil
+}
+
+func worktreeOutputParent(rootFD int, relativeDirectory string) (int, error) {
+	if relativeDirectory == "." {
+		fd, err := syscall.Dup(rootFD)
+		return fd, err
+	}
+	fd, err := syscall.Dup(rootFD)
+	if err != nil {
+		return 0, err
+	}
+	for _, component := range strings.Split(relativeDirectory, string(filepath.Separator)) {
+		next, err := openAt(fd, component, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+		_ = syscall.Close(fd)
+		if err != nil {
+			return 0, err
+		}
+		fd = next
+	}
+	return fd, nil
+}
+
+func openAt(dirFD int, name string, flags int, mode uint32) (int, error) {
+	path, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return 0, err
+	}
+	r0, _, errno := syscall.Syscall6(sysOpenat, uintptr(dirFD), uintptr(unsafe.Pointer(path)), uintptr(flags), uintptr(mode), 0, 0)
+	if errno != 0 {
+		return 0, errno
+	}
+	return int(r0), nil
+}
+
+func mkdirAt(dirFD int, name string, mode os.FileMode) error {
+	path, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return err
+	}
+	_, _, errno := syscall.Syscall(sysMkdirat, uintptr(dirFD), uintptr(unsafe.Pointer(path)), uintptr(mode))
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func fstatAt(dirFD int, name string, stat *syscall.Stat_t, flags int) error {
+	path, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return err
+	}
+	_, _, errno := syscall.Syscall6(sysFstatat, uintptr(dirFD), uintptr(unsafe.Pointer(path)), uintptr(unsafe.Pointer(stat)), uintptr(flags), 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func symlinkAt(target string, dirFD int, name string) error {
+	link, err := syscall.BytePtrFromString(target)
+	if err != nil {
+		return err
+	}
+	path, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return err
+	}
+	_, _, errno := syscall.Syscall6(sysSymlinkat, uintptr(unsafe.Pointer(link)), uintptr(dirFD), uintptr(unsafe.Pointer(path)), 0, 0, 0)
+	if errno != 0 {
+		return errno
+	}
+	return nil
+}
+
+func renameAtExclusive(parentFD uintptr, source, destination string) error {
+	from, err := syscall.BytePtrFromString(source)
+	if err != nil {
+		return err
+	}
+	to, err := syscall.BytePtrFromString(destination)
+	if err != nil {
+		return err
+	}
+	_, _, errno := syscall.Syscall6(sysRenameatxNP, parentFD, uintptr(unsafe.Pointer(from)), parentFD, uintptr(unsafe.Pointer(to)), uintptr(renameExclusive), 0)
+	if errno == 0 {
+		return nil
+	}
+	if errors.Is(errno, syscall.EEXIST) {
+		return fs.ErrExist
+	}
+	return errno
+}
+
+func removeWorktreeTreeAt(parentFD uintptr, name string, rootFD uintptr) error {
+	if err := syscall.Fchmod(int(rootFD), 0o700); err != nil {
+		return err
+	}
+	readFD, err := syscall.Dup(int(rootFD))
+	if err != nil {
+		return err
+	}
+	root := os.NewFile(uintptr(readFD), name)
+	entries, err := root.ReadDir(-1)
+	closeErr := root.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			childFD, openErr := openAt(int(rootFD), entry.Name(), syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+			if openErr != nil {
+				return openErr
+			}
+			if removeErr := removeWorktreeTreeAt(uintptr(rootFD), entry.Name(), uintptr(childFD)); removeErr != nil {
+				_ = syscall.Close(childFD)
+				return removeErr
+			}
+			_ = syscall.Close(childFD)
+			continue
+		}
+		if unlinkErr := unlinkAt(int(rootFD), entry.Name(), 0); unlinkErr != nil {
+			return unlinkErr
+		}
+	}
+	return unlinkAt(int(parentFD), name, atRemoveDir)
+}
+
+func unlinkAt(dirFD int, name string, flags int) error {
+	path, err := syscall.BytePtrFromString(name)
+	if err != nil {
+		return err
+	}
+	_, _, errno := syscall.Syscall(sysUnlinkat, uintptr(dirFD), uintptr(unsafe.Pointer(path)), uintptr(flags))
+	if errno != 0 {
+		return errno
+	}
+	return nil
 }
 
 // RenameExclusive atomically moves source to destination only when destination
