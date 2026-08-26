@@ -151,54 +151,29 @@ func TestWorktreeFileStoreCreateCancelsImmediatelyBeforeRename(t *testing.T) {
 	source := t.TempDir()
 	parent := t.TempDir()
 	destination := filepath.Join(parent, "published")
-	directory := filepath.Join(source, "copied")
-	if err := os.Mkdir(directory, 0o700); err != nil {
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("content"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(directory, "file"), []byte("content"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Chmod(directory, 0o555); err != nil {
+	if err := os.Chmod(source, 0o555); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() {
-		if err := os.Chmod(directory, 0o700); err != nil {
-			t.Errorf("restore copied directory permissions: %v", err)
+		if err := os.Chmod(source, 0o700); err != nil {
+			t.Errorf("restore source directory permissions: %v", err)
 		}
 	})
 	base, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var observed string
-	t.Cleanup(func() {
-		if observed == "" {
-			return
-		}
-		if err := filepath.Walk(observed, func(path string, info os.FileInfo, walkErr error) error {
-			if walkErr != nil {
-				return walkErr
-			}
-			if info.IsDir() {
-				return os.Chmod(path, 0o700)
-			}
-			return nil
-		}); err != nil && !os.IsNotExist(err) {
-			t.Errorf("restore temporary worktree permissions: %v", err)
-		}
-		if err := os.RemoveAll(observed); err != nil && !os.IsNotExist(err) {
-			t.Errorf("remove temporary worktree: %v", err)
-		}
-	})
 	ctx := &observingWorktreeContext{Context: base, cancel: cancel, onErr: func() {
 		temporary := temporaryWorktreeSibling(t, parent)
 		if temporary == "" {
 			return
 		}
-		info, statErr := os.Stat(filepath.Join(temporary, "copied"))
+		info, statErr := os.Stat(temporary)
 		if statErr == nil && info.Mode().Perm() == 0o555 {
-			if _, fileErr := os.Stat(filepath.Join(temporary, "copied", "file")); fileErr == nil {
-				observed = temporary
-				cancel()
-			}
+			observed = temporary
+			cancel()
 		}
 	}}
 	if err := NewWorktreeFileStore().Create(ctx, source, destination); !errors.Is(err, context.Canceled) {
@@ -209,6 +184,93 @@ func TestWorktreeFileStoreCreateCancelsImmediatelyBeforeRename(t *testing.T) {
 	}
 	if _, err := os.Stat(destination); !os.IsNotExist(err) {
 		t.Fatalf("destination was published: %v", err)
+	}
+	if _, err := os.Stat(observed); !os.IsNotExist(err) {
+		t.Fatalf("temporary copy was not removed: %v", err)
+	}
+}
+
+func TestWorktreeFileStoreCreateRejectsNonDirectoryOrSymlinkSource(t *testing.T) {
+	parent := t.TempDir()
+	regularFile := filepath.Join(parent, "source-file")
+	if err := os.WriteFile(regularFile, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	directory := filepath.Join(parent, "source-directory")
+	if err := os.Mkdir(directory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	symlink := filepath.Join(parent, "source-link")
+	if err := os.Symlink(directory, symlink); err != nil {
+		t.Fatal(err)
+	}
+	for _, source := range []string{regularFile, symlink} {
+		destinationParent := t.TempDir()
+		destination := filepath.Join(destinationParent, "published")
+		if err := NewWorktreeFileStore().Create(context.Background(), source, destination); err == nil {
+			t.Fatalf("Create(%q) accepted invalid source", source)
+		}
+		if _, err := os.Stat(destination); !os.IsNotExist(err) {
+			t.Fatalf("destination was created for %q: %v", source, err)
+		}
+		if temporary := temporaryWorktreeSibling(t, destinationParent); temporary != "" {
+			t.Fatalf("temporary copy was created for %q: %s", source, temporary)
+		}
+	}
+}
+
+func TestWorktreeFileStoreCreateJoinsCleanupErrors(t *testing.T) {
+	originalChmod := chmodWorktreePath
+	originalRemoveAll := removeWorktreeTree
+	chmodErr := errors.New("chmod cleanup failed")
+	removeErr := errors.New("remove cleanup failed")
+	chmodWorktreePath = func(string, os.FileMode) error { return chmodErr }
+	removeWorktreeTree = func(string) error { return removeErr }
+	t.Cleanup(func() {
+		chmodWorktreePath = originalChmod
+		removeWorktreeTree = originalRemoveAll
+	})
+	source := t.TempDir()
+	destination := filepath.Join(t.TempDir(), "published")
+	err := NewWorktreeFileStore().Create(context.Background(), source, destination)
+	if !errors.Is(err, chmodErr) || !errors.Is(err, removeErr) {
+		t.Fatalf("Create() error=%v, want both cleanup errors", err)
+	}
+}
+
+func TestWorktreeFileStoreCreateRejectsFileReplacedWithSymlinkBeforeOpen(t *testing.T) {
+	source := t.TempDir()
+	destinationParent := t.TempDir()
+	destination := filepath.Join(destinationParent, "published")
+	sourceFile := filepath.Join(source, "source-file")
+	externalFile := filepath.Join(t.TempDir(), "external-file")
+	if err := os.WriteFile(sourceFile, []byte("source"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(externalFile, []byte("external"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalOpen := openWorktreeFile
+	openWorktreeFile = func(path string) (*os.File, error) {
+		if path == sourceFile {
+			if err := os.Rename(sourceFile, sourceFile+".original"); err != nil {
+				return nil, err
+			}
+			if err := os.Symlink(externalFile, sourceFile); err != nil {
+				return nil, err
+			}
+		}
+		return originalOpen(path)
+	}
+	t.Cleanup(func() { openWorktreeFile = originalOpen })
+	if err := NewWorktreeFileStore().Create(context.Background(), source, destination); err == nil {
+		t.Fatal("Create() succeeded after source file replacement")
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("destination was published: %v", err)
+	}
+	if temporary := temporaryWorktreeSibling(t, destinationParent); temporary != "" {
+		t.Fatalf("temporary copy was not removed: %s", temporary)
 	}
 }
 
@@ -374,6 +436,29 @@ func TestRunGitIgnoresAmbientPathAndUsesSafeEnvironment(t *testing.T) {
 	}
 	if !strings.Contains(string(output), "HOME="+os.Getenv("HOME")) {
 		t.Fatalf("runGit environment did not include HOME: %q", output)
+	}
+}
+
+func TestRunGitReturnsDeadlineExceededWhenCommandTimesOut(t *testing.T) {
+	originalFindGitBinary := findGitBinary
+	originalTimeout := gitCommandTimeout
+	fakeGit := filepath.Join(t.TempDir(), "git")
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nexec /bin/sleep 1\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	findGitBinary = func() (string, error) { return fakeGit, nil }
+	gitCommandTimeout = 20 * time.Millisecond
+	t.Cleanup(func() {
+		findGitBinary = originalFindGitBinary
+		gitCommandTimeout = originalTimeout
+	})
+	started := time.Now()
+	_, err := runGit(t.TempDir(), "status", "--porcelain")
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("runGit() error=%v, want context.DeadlineExceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed >= time.Second {
+		t.Fatalf("runGit() timed out after %v, want less than one second", elapsed)
 	}
 }
 

@@ -19,7 +19,13 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/proc"
 )
 
-var findGitBinary = proc.FindGitBinary
+var (
+	findGitBinary      = proc.FindGitBinary
+	openWorktreeFile   = os.Open
+	chmodWorktreePath  = os.Chmod
+	removeWorktreeTree = os.RemoveAll
+	gitCommandTimeout  = 30 * time.Second
+)
 
 // WorktreeFileStore provides filesystem-backed worktree operations.
 type WorktreeFileStore struct{}
@@ -36,6 +42,13 @@ func (s *WorktreeFileStore) Create(ctx context.Context, sourceDir string, destin
 	if sourceDir == "" || destinationDir == "" || !filepath.IsAbs(sourceDir) || !filepath.IsAbs(destinationDir) {
 		return fmt.Errorf("worktree source and destination must be absolute paths")
 	}
+	sourceInfo, statErr := os.Lstat(sourceDir)
+	if statErr != nil {
+		return fmt.Errorf("lstat worktree source: %w", statErr)
+	}
+	if sourceInfo.Mode()&os.ModeSymlink != 0 || !sourceInfo.IsDir() {
+		return fmt.Errorf("worktree source must be a directory and not a symbolic link: %s", sourceDir)
+	}
 	if info, statErr := os.Lstat(destinationDir); statErr == nil || info != nil {
 		return fmt.Errorf("%w: worktree destination already exists: %s", fs.ErrExist, destinationDir)
 	} else if !os.IsNotExist(statErr) {
@@ -50,8 +63,12 @@ func (s *WorktreeFileStore) Create(ctx context.Context, sourceDir string, destin
 		return fmt.Errorf("create worktree temporary directory: %w", err)
 	}
 	defer func() {
-		if err != nil {
-			_ = os.RemoveAll(temporary)
+		if err == nil {
+			return
+		}
+		cleanupErr := errors.Join(makeWorktreeTreeRemovable(temporary), removeWorktreeTree(temporary))
+		if cleanupErr != nil {
+			err = errors.Join(err, cleanupErr)
 		}
 	}()
 	directories, err := copyWorktreeTree(ctx, sourceDir, temporary)
@@ -62,7 +79,7 @@ func (s *WorktreeFileStore) Create(ctx context.Context, sourceDir string, destin
 		if err = ctx.Err(); err != nil {
 			return err
 		}
-		if err = os.Chmod(directories[index].path, directories[index].mode); err != nil {
+		if err = chmodWorktreePath(directories[index].path, directories[index].mode); err != nil {
 			return fmt.Errorf("restore worktree directory permissions: %w", err)
 		}
 	}
@@ -73,6 +90,22 @@ func (s *WorktreeFileStore) Create(ctx context.Context, sourceDir string, destin
 		return fmt.Errorf("publish worktree: %w", err)
 	}
 	return nil
+}
+
+func makeWorktreeTreeRemovable(root string) error {
+	return filepath.WalkDir(root, func(path string, entry os.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if !entry.IsDir() {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		return chmodWorktreePath(path, info.Mode().Perm()|0o700)
+	})
 }
 
 type worktreeDirectoryMode struct {
@@ -149,9 +182,18 @@ func copyWorktreeTree(ctx context.Context, source, destination string) ([]worktr
 			directories = append(directories, worktreeDirectoryMode{target, mode.Perm()})
 			return os.Mkdir(target, mode.Perm()|0o700)
 		case mode.IsRegular():
-			from, err := os.Open(path)
+			from, err := openWorktreeFile(path)
 			if err != nil {
 				return err
+			}
+			openedInfo, statErr := from.Stat()
+			if statErr != nil {
+				_ = from.Close()
+				return statErr
+			}
+			if !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
+				_ = from.Close()
+				return fmt.Errorf("worktree source changed while opening: %s", path)
 			}
 			defer from.Close()
 			to, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm())
@@ -169,7 +211,7 @@ func copyWorktreeTree(ctx context.Context, source, destination string) ([]worktr
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			return os.Chmod(target, mode.Perm())
+			return chmodWorktreePath(target, mode.Perm())
 		default:
 			return fmt.Errorf("unsupported worktree file type: %s", path)
 		}
@@ -260,9 +302,14 @@ func runGit(path string, args ...string) ([]byte, error) {
 		return nil, err
 	}
 	commandArgs := append([]string{"-C", path}, args...)
-	cmd := exec.Command(gitPath, commandArgs...)
+	ctx, cancel := context.WithTimeout(context.Background(), gitCommandTimeout)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, gitPath, commandArgs...)
 	cmd.Env = proc.SafeChildEnv()
 	output, err := cmd.Output()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return nil, fmt.Errorf("git command timed out: %w", ctx.Err())
+	}
 	if err != nil {
 		return nil, err
 	}

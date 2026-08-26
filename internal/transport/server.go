@@ -244,29 +244,31 @@ func handleConn(ctx context.Context, conn net.Conn, dispatch func(Request) Respo
 				return
 			}
 			if err := writeResponseLine(conn, resp); err != nil {
-				logProtocolResponseWriteError(err)
+				logProtocolResponseError("envelope response", err)
 				return
 			}
 			continue
 		}
 		if req.Verb == string(domain.ProtocolVerbTail) {
 			if err := handleTail(ctx, conn, req, tailHandler, tailConns); err != nil {
-				logProtocolResponseWriteError(err)
+				logProtocolResponseError("tail handler", err)
 				return
 			}
 			continue
 		}
 		if err := writeResponseLine(conn, dispatch(req)); err != nil {
-			logProtocolResponseWriteError(err)
+			logProtocolResponseError("dispatch response", err)
 			return
 		}
 	}
 }
 
-func logProtocolResponseWriteError(err error) {
+func logProtocolResponseError(operation string, err error) {
 	if errors.Is(err, errProtocolLineTooLong) {
-		slog.Error("protocol response line exceeds maximum", "max_bytes", protocolLineMaxBytes)
+		slog.Error("protocol response line exceeds maximum", "operation", operation, "max_bytes", protocolLineMaxBytes)
+		return
 	}
+	slog.Error("protocol response failed", "operation", operation, "error", err)
 }
 
 func jsonLineSplit(data []byte, atEOF bool) (advance int, token []byte, err error) {

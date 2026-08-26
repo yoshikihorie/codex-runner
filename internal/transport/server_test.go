@@ -1,11 +1,13 @@
 package transport
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -953,6 +955,38 @@ func TestHandleConnClosesAfterTailHandlerError(t *testing.T) {
 	registry.mu.Unlock()
 	if remaining != 0 {
 		t.Fatalf("tail connection registry entries = %d", remaining)
+	}
+}
+
+func TestHandleConnLogsTailHandlerError(t *testing.T) {
+	var logs bytes.Buffer
+	originalLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(originalLogger) })
+	server, client := net.Pipe()
+	var wg sync.WaitGroup
+	sentinel := errors.New("tail handler failed")
+	wg.Add(1)
+	go handleConn(context.Background(), server, func(Request) Response { return Response{} }, func(context.Context, Request, io.Writer) error { return sentinel }, &wg, NewTailConnRegistry())
+	if _, err := client.Write([]byte(`{"verb":"tail","request_id":"tail-1"}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	assertConnectionClosed(t, client)
+	_ = client.Close()
+	wg.Wait()
+	if !strings.Contains(logs.String(), `"msg":"protocol response failed"`) || !strings.Contains(logs.String(), `"operation":"tail handler"`) || !strings.Contains(logs.String(), sentinel.Error()) {
+		t.Fatalf("tail error log = %s", logs.String())
+	}
+}
+
+func TestLogProtocolResponseErrorPreservesLineTooLongMessage(t *testing.T) {
+	var logs bytes.Buffer
+	originalLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(originalLogger) })
+	logProtocolResponseError("tail handler", errProtocolLineTooLong)
+	if !strings.Contains(logs.String(), `"msg":"protocol response line exceeds maximum"`) || !strings.Contains(logs.String(), `"operation":"tail handler"`) || !strings.Contains(logs.String(), `"max_bytes":1048576`) || strings.Contains(logs.String(), `"msg":"protocol response failed"`) {
+		t.Fatalf("line-too-long log = %s", logs.String())
 	}
 }
 
