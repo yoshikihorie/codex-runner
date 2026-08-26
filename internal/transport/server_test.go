@@ -393,18 +393,20 @@ func TestServeSocketPermissionsAndCancellation(t *testing.T) {
 	}
 	defer os.RemoveAll(dir)
 	path := filepath.Join(dir, "codexd.sock")
-	if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
-		t.Fatal(err)
-	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var wg sync.WaitGroup
 	done := make(chan error, 1)
+	ready := make(chan error, 1)
 	go func() {
-		done <- Serve(ctx, path, func(req Request) Response {
+		_, err := Serve(ctx, path, func(req Request) Response {
 			return Response{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, OK: true, Result: json.RawMessage(`{}`)}
-		}, noOpTailHandler, &wg, &tailConnRegistry{}, make(chan struct{}))
+		}, noOpTailHandler, &wg, &tailConnRegistry{}, make(chan struct{}), ready)
+		done <- err
 	}()
+	if err := <-ready; err != nil {
+		t.Fatal(err)
+	}
 	var conn net.Conn
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
@@ -436,25 +438,98 @@ func TestServeSocketPermissionsAndCancellation(t *testing.T) {
 	wg.Wait()
 }
 
-func TestServeContinuesAfterTransientAcceptError(t *testing.T) {
-	dir := t.TempDir()
-	path := filepath.Join(dir, "codexd.sock")
-	listener := &transientAcceptListener{accepted: make(chan struct{}), closed: make(chan struct{})}
-	originalListenUnix := listenUnix
-	listenUnix = func(_, address string) (net.Listener, error) {
-		if err := os.WriteFile(address, nil, 0o600); err != nil {
-			return nil, err
-		}
-		return listener, nil
+func TestServeRejectsPreexistingSocketPathWithoutRemovingIt(t *testing.T) {
+	for _, kind := range []string{"file", "directory", "symlink", "socket"} {
+		t.Run(kind, func(t *testing.T) {
+			dir, err := os.MkdirTemp("/tmp", "codexd-preexisting-*")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(dir) })
+			path := filepath.Join(dir, "codexd.sock")
+			var listener *net.UnixListener
+			switch kind {
+			case "file":
+				if err := os.WriteFile(path, []byte("preserve"), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			case "directory":
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			case "symlink":
+				if err := os.Symlink("target", path); err != nil {
+					t.Fatal(err)
+				}
+			case "socket":
+				var err error
+				listener, err = net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+				if err != nil {
+					t.Fatal(err)
+				}
+				listener.SetUnlinkOnClose(false)
+				t.Cleanup(func() { _ = listener.Close() })
+			}
+			ready := make(chan error, 1)
+			var wg sync.WaitGroup
+			_, err = Serve(context.Background(), path, func(Request) Response { return Response{} }, noOpTailHandler, &wg, NewTailConnRegistry(), make(chan struct{}), ready)
+			if err == nil || err.Error() != fmt.Sprintf("socket path already exists; refusing to remove unverified entry: %s; stop its owner, verify the path, remove it manually, and restart codexd", path) {
+				t.Fatalf("error = %v", err)
+			}
+			if readyErr := <-ready; readyErr == nil || readyErr.Error() != err.Error() {
+				t.Fatalf("ready error = %v", readyErr)
+			}
+			if _, statErr := os.Lstat(path); statErr != nil {
+				t.Fatalf("preexisting entry was removed: %v", statErr)
+			}
+		})
 	}
-	t.Cleanup(func() { listenUnix = originalListenUnix })
+}
+
+func TestServeCloseDoesNotUnlinkReplacement(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "codexd-replacement-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "codexd.sock")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ready := make(chan error, 1)
+	done := make(chan error, 1)
+	var wg sync.WaitGroup
+	go func() {
+		_, err := Serve(ctx, path, func(Request) Response { return Response{} }, noOpTailHandler, &wg, NewTailConnRegistry(), make(chan struct{}), ready)
+		done <- err
+	}()
+	if err := <-ready; err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(path, filepath.Join(dir, "original.sock")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil || string(contents) != "replacement" {
+		t.Fatalf("replacement was not preserved: %q, %v", contents, err)
+	}
+}
+
+func TestServeContinuesAfterTransientAcceptError(t *testing.T) {
+	listener := &transientAcceptListener{accepted: make(chan struct{}), closed: make(chan struct{})}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	var wg sync.WaitGroup
 	done := make(chan error, 1)
 	go func() {
-		done <- Serve(ctx, path, func(Request) Response { return Response{} }, noOpTailHandler, &wg, &tailConnRegistry{}, make(chan struct{}))
+		done <- serveAcceptLoop(ctx, listener, func(Request) Response { return Response{} }, noOpTailHandler, &wg, &tailConnRegistry{})
 	}()
 	select {
 	case <-listener.accepted:
@@ -467,6 +542,7 @@ func TestServeContinuesAfterTransientAcceptError(t *testing.T) {
 	case <-time.After(50 * time.Millisecond):
 	}
 	cancel()
+	_ = listener.Close()
 	if err := <-done; err != nil {
 		t.Fatal(err)
 	}
@@ -474,7 +550,8 @@ func TestServeContinuesAfterTransientAcceptError(t *testing.T) {
 
 func TestServeRejectsBindFailure(t *testing.T) {
 	var wg sync.WaitGroup
-	if err := Serve(context.Background(), "/dev/null/socket", func(Request) Response { return Response{} }, noOpTailHandler, &wg, &tailConnRegistry{}, make(chan struct{})); err == nil {
+	ready := make(chan error, 1)
+	if _, err := Serve(context.Background(), "/dev/null/socket", func(Request) Response { return Response{} }, noOpTailHandler, &wg, &tailConnRegistry{}, make(chan struct{}), ready); err == nil {
 		t.Fatal("expected bind error")
 	}
 }
@@ -637,9 +714,14 @@ func TestServeKeepsTailContextAliveUntilRegistryShutdown(t *testing.T) {
 	var wg sync.WaitGroup
 	acceptLoopDone := make(chan struct{})
 	serveDone := make(chan error, 1)
+	ready := make(chan error, 1)
 	go func() {
-		serveDone <- Serve(ctx, path, func(Request) Response { return Response{} }, tailHandler, &wg, registry, acceptLoopDone)
+		_, err := Serve(ctx, path, func(Request) Response { return Response{} }, tailHandler, &wg, registry, acceptLoopDone, ready)
+		serveDone <- err
 	}()
+	if err := <-ready; err != nil {
+		t.Fatal(err)
+	}
 
 	var client net.Conn
 	deadline := time.Now().Add(time.Second)

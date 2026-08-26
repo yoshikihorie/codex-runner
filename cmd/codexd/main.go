@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -10,7 +11,6 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
-	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -69,9 +69,10 @@ const (
 )
 
 const (
-	taskPlacementRoot = "/tmp/codex-tasks"
-	reconcileInterval = time.Minute
-	shutdownGrace     = 5 * time.Second
+	taskPlacementRoot  = "/tmp/codex-tasks"
+	reconcileInterval  = time.Minute
+	shutdownGrace      = 5 * time.Second
+	serverCleanupGrace = shutdownGrace
 )
 
 type versionResolver func(context.Context, string) (*string, error)
@@ -160,6 +161,8 @@ type serveResult struct {
 	serveErr        error
 	socketRemoveErr error
 }
+
+var errServerCleanupTimeout = errors.New("server cleanup timed out")
 
 // daemonInstanceLease exclusively identifies the foreground daemon process.
 // It uses a non-blocking flock so a duplicate invocation fails instead of
@@ -655,12 +658,13 @@ func runMain(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 	startCodexVersionProbe(baseCtx, cfg.CodexBinaryPath(), logger)
 
+	ready := make(chan error, 1)
 	serveResultCh := make(chan serveResult, 1)
-	go func() { serveResultCh <- deps.serve(baseCtx) }()
-	if err := waitForUnixListener(baseCtx, cfg.SocketPath(), serveResultCh); err != nil {
+	go func() { serveResultCh <- deps.serve(baseCtx, ready) }()
+	if err := waitForServerReady(baseCtx, ready); err != nil {
 		cancelBase()
-		result := <-serveResultCh
-		return errors.Join(err, result.serveErr, result.socketRemoveErr, deps.watcher.Close())
+		result, _, cleanupErr := waitForServeResult(serveResultCh, serverCleanupGrace, err)
+		return errors.Join(cleanupErr, result.serveErr, result.socketRemoveErr, deps.watcher.Close())
 	}
 	var background sync.WaitGroup
 	startBackground := func(run func(context.Context)) {
@@ -683,7 +687,12 @@ func runMain(ctx context.Context, args []string, stderr io.Writer) error {
 	cancelBase()
 	deps.finalizer.Finalize(shutdownGrace)
 	if !serveReturned {
-		result = <-serveResultCh
+		var cleanupErr error
+		result, _, cleanupErr = waitForServeResult(serveResultCh, serverCleanupGrace, nil)
+		if cleanupErr != nil {
+			background.Wait()
+			return errors.Join(cleanupErr, deps.watcher.Close())
+		}
 	}
 	background.Wait()
 	return errors.Join(result.serveErr, result.socketRemoveErr, deps.watcher.Close())
@@ -698,7 +707,7 @@ type daemonDependencies struct {
 	starter         execution.TaskLifecycleStarter
 	shutdownStarter func(context.Context)
 	finalizer       transport.ShutdownFinalizer
-	serve           func(context.Context) serveResult
+	serve           func(context.Context, chan<- error) serveResult
 }
 
 // buildDependencies constructs every stateful collaborator once and shares the
@@ -791,11 +800,10 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	tailConns := transport.NewTailConnRegistry()
 	acceptDone := make(chan struct{})
 	tail := transportusecase.NewTailTaskUseCase(provider, events, notifier)
-	serve := func(ctx context.Context) serveResult {
-		result := serveResult{serveErr: transport.Serve(ctx, cfg.SocketPath(), dispatch.Dispatch, tail.Handle, connections, tailConns, acceptDone)}
-		if err := os.Remove(cfg.SocketPath()); !errors.Is(err, fs.ErrNotExist) {
-			result.socketRemoveErr = err
-		}
+	serve := func(ctx context.Context, ready chan<- error) serveResult {
+		expected, serveErr := transport.Serve(ctx, cfg.SocketPath(), dispatch.Dispatch, tail.Handle, connections, tailConns, acceptDone, ready)
+		result := serveResult{serveErr: serveErr}
+		result.socketRemoveErr = removeOwnedSocket(cfg.SocketPath(), expected)
 		return result
 	}
 	return daemonDependencies{adoption: adoption, stall: stall, reconcile: reconcile, evictLogs: evictLogs, watcher: watcher, starter: starter, shutdownStarter: starterConcrete.Shutdown, finalizer: transport.NewShutdownFinalizer(connections, tailConns, acceptDone), serve: serve}, nil
@@ -830,24 +838,66 @@ func waitForContext(ctx context.Context, delay time.Duration) {
 	}
 }
 
-// waitForUnixListener is the post-Serve synchronization gate. It observes both
-// cancellation and a server that failed before publishing its listener.
-func waitForUnixListener(ctx context.Context, socketPath string, served chan serveResult) error {
-	for {
-		conn, err := net.DialTimeout("unix", socketPath, 25*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
+func waitForServerReady(ctx context.Context, ready <-chan error) error {
+	select {
+	case err := <-ready:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func waitForServeResult(served <-chan serveResult, cleanupGrace time.Duration, readyErr error) (serveResult, bool, error) {
+	timer := time.NewTimer(cleanupGrace)
+	defer timer.Stop()
+	select {
+	case result := <-served:
+		return result, true, errors.Join(readyErr, result.serveErr, result.socketRemoveErr)
+	case <-timer.C:
+		return serveResult{}, false, errors.Join(readyErr, errServerCleanupTimeout)
+	}
+}
+
+func removeOwnedSocket(socketPath string, expected os.FileInfo) error {
+	if expected == nil {
+		return nil
+	}
+	for attempt := 0; attempt < 10; attempt++ {
+		quarantine, err := socketQuarantinePath(socketPath)
+		if err != nil {
+			return err
+		}
+		if err := os.Rename(socketPath, quarantine); err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return fmt.Errorf("quarantine socket %s: %w", socketPath, err)
+		}
+		info, inspectErr := os.Lstat(quarantine)
+		if inspectErr == nil && info.Mode()&os.ModeSocket != 0 && os.SameFile(expected, info) {
+			if err := os.Remove(quarantine); err != nil {
+				return fmt.Errorf("remove quarantined socket %s: %w", quarantine, err)
+			}
 			return nil
 		}
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		case result := <-served:
-			served <- result
-			return errors.Join(result.serveErr, result.socketRemoveErr)
-		case <-time.After(10 * time.Millisecond):
+		restoreErr := store.RenameExclusive(quarantine, socketPath)
+		if restoreErr != nil {
+			return errors.Join(inspectErr, fmt.Errorf("preserved quarantined socket entry at %s: %w", quarantine, restoreErr))
 		}
+		if inspectErr != nil {
+			return fmt.Errorf("inspect quarantined socket %s: %w", quarantine, inspectErr)
+		}
+		return fmt.Errorf("preserved unexpected socket entry at %s", socketPath)
 	}
+	return fmt.Errorf("allocate socket quarantine path for %s", socketPath)
+}
+
+func socketQuarantinePath(socketPath string) (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", fmt.Errorf("generate socket quarantine name: %w", err)
+	}
+	return filepath.Join(filepath.Dir(socketPath), fmt.Sprintf(".%s.quarantine-%x", filepath.Base(socketPath), nonce)), nil
 }
 
 func loadConfig(args []string) (config.Config, error) {

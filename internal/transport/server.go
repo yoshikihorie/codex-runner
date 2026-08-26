@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"net"
 	"os"
@@ -118,21 +119,52 @@ func (r *tailConnRegistry) closeAll() {
 }
 
 // Serve starts a Unix-domain socket listener and stops accepting connections when ctx is cancelled.
-func Serve(ctx context.Context, socketPath string, dispatch func(Request) Response, tailHandler TailHandler, wg *sync.WaitGroup, tailConns *tailConnRegistry, acceptLoopDone chan<- struct{}) error {
+func Serve(ctx context.Context, socketPath string, dispatch func(Request) Response, tailHandler TailHandler, wg *sync.WaitGroup, tailConns *tailConnRegistry, acceptLoopDone chan<- struct{}, ready chan<- error) (fs.FileInfo, error) {
 	defer close(acceptLoopDone)
-	if err := os.Remove(socketPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("remove existing socket: %w", err)
+	if _, err := os.Lstat(socketPath); err == nil {
+		err = fmt.Errorf("socket path already exists; refusing to remove unverified entry: %s; stop its owner, verify the path, remove it manually, and restart codexd", socketPath)
+		ready <- err
+		return nil, err
+	} else if !errors.Is(err, fs.ErrNotExist) {
+		err = fmt.Errorf("lstat unix socket path: %w", err)
+		ready <- err
+		return nil, err
 	}
 	listener, err := listenUnix("unix", socketPath)
 	if err != nil {
-		return fmt.Errorf("listen on unix socket: %w", err)
+		err = fmt.Errorf("listen on unix socket: %w", err)
+		ready <- err
+		return nil, err
+	}
+	unixListener, ok := listener.(*net.UnixListener)
+	if !ok {
+		_ = listener.Close()
+		err = fmt.Errorf("unix listener does not support unlink control")
+		ready <- err
+		return nil, err
+	}
+	unixListener.SetUnlinkOnClose(false)
+	expected, err := os.Lstat(socketPath)
+	if err != nil {
+		_ = listener.Close()
+		err = fmt.Errorf("lstat unix socket: %w", err)
+		ready <- err
+		return nil, err
 	}
 	if err := os.Chmod(socketPath, 0o600); err != nil {
 		_ = listener.Close()
-		return fmt.Errorf("chmod unix socket: %w", err)
+		err = fmt.Errorf("chmod unix socket: %w", err)
+		ready <- err
+		return expected, err
 	}
+	ready <- nil
 	stop := context.AfterFunc(ctx, func() { _ = listener.Close() })
 	defer stop()
+	defer listener.Close()
+	return expected, serveAcceptLoop(ctx, listener, dispatch, tailHandler, wg, tailConns)
+}
+
+func serveAcceptLoop(ctx context.Context, listener net.Listener, dispatch func(Request) Response, tailHandler TailHandler, wg *sync.WaitGroup, tailConns *tailConnRegistry) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {

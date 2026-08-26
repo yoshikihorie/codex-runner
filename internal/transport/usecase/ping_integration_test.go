@@ -3,14 +3,12 @@ package usecase
 import (
 	"context"
 	"encoding/json"
-	"fmt"
 	"io"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/transport"
 )
@@ -53,9 +51,14 @@ func TestServePingConcurrentConnections(t *testing.T) {
 	var wg sync.WaitGroup
 	acceptLoopDone := make(chan struct{})
 	serveDone := make(chan error, 1)
+	ready := make(chan error, 1)
 	go func() {
-		serveDone <- transport.Serve(ctx, socketPath, dispatcher.Dispatch, func(context.Context, transport.Request, io.Writer) error { return nil }, &wg, transport.NewTailConnRegistry(), acceptLoopDone)
+		_, err := transport.Serve(ctx, socketPath, dispatcher.Dispatch, func(context.Context, transport.Request, io.Writer) error { return nil }, &wg, transport.NewTailConnRegistry(), acceptLoopDone, ready)
+		serveDone <- err
 	}()
+	if err := <-ready; err != nil {
+		t.Fatal(err)
+	}
 	t.Cleanup(func() {
 		cancel()
 		if err := <-serveDone; err != nil {
@@ -110,13 +113,5 @@ func TestServePingConcurrentConnections(t *testing.T) {
 }
 
 func dialUnix(socketPath string) (net.Conn, error) {
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		conn, err := net.Dial("unix", socketPath)
-		if err == nil {
-			return conn, nil
-		}
-		time.Sleep(time.Millisecond)
-	}
-	return nil, fmt.Errorf("dial Unix socket %q: timed out", socketPath)
+	return net.Dial("unix", socketPath)
 }

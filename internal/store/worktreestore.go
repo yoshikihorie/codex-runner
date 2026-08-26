@@ -68,7 +68,7 @@ func (s *WorktreeFileStore) Create(ctx context.Context, sourceDir string, destin
 	if err = ctx.Err(); err != nil {
 		return err
 	}
-	if err = renamexNPExclusive(temporary, destinationDir); err != nil {
+	if err = RenameExclusive(temporary, destinationDir); err != nil {
 		return fmt.Errorf("publish worktree: %w", err)
 	}
 	return nil
@@ -176,7 +176,9 @@ func copyWorktreeTree(ctx context.Context, source, destination string) ([]worktr
 	return directories, err
 }
 
-func renamexNPExclusive(source, destination string) error {
+// RenameExclusive atomically moves source to destination only when destination
+// does not already exist.
+func RenameExclusive(source, destination string) error {
 	from, err := syscall.BytePtrFromString(source)
 	if err != nil {
 		return err
@@ -193,6 +195,12 @@ func renamexNPExclusive(source, destination string) error {
 		return fs.ErrExist
 	}
 	return errno
+}
+
+// renamexNPExclusive preserves existing internal callers while the exported
+// helper is adopted by components outside this package.
+func renamexNPExclusive(source, destination string) error {
+	return RenameExclusive(source, destination)
 }
 
 // ListTopLevel returns normalized absolute paths for root's direct children only.
