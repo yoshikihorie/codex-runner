@@ -51,6 +51,7 @@ type LockedFinalizeResult struct {
 	RecordExited      bool
 	TerminalPersisted bool
 	MetricsInput      metrics.RecordTaskMetricsInput
+	Subcommand        domain.Subcommand
 }
 
 type finalizeStalledTimeTracker interface {
@@ -60,20 +61,21 @@ type finalizeStalledTimeTracker interface {
 
 // FinalizeTaskUseCase validates terminal artifacts and records a task's final state.
 type FinalizeTaskUseCase struct {
-	tasks           store.TaskStore
-	contractW       contract.ContractWriter
-	reader          store.ContractReader
-	clock           domain.Clock
-	taskMu          *store.TaskMutex
-	slotReleaser    recovery.SlotReleaser
-	timeoutDisarmer TimeoutDisarmer
-	metricsRecorder recovery.MetricsRecorder
-	stalledTracker  finalizeStalledTimeTracker
-	logger          *slog.Logger
+	tasks            store.TaskStore
+	contractW        contract.ContractWriter
+	reader           store.ContractReader
+	clock            domain.Clock
+	taskMu           *store.TaskMutex
+	slotReleaser     recovery.SlotReleaser
+	timeoutDisarmer  TimeoutDisarmer
+	pathLockReleaser *ReleasePathLockUseCase
+	metricsRecorder  recovery.MetricsRecorder
+	stalledTracker   finalizeStalledTimeTracker
+	logger           *slog.Logger
 }
 
-func NewFinalizeTaskUseCase(tasks store.TaskStore, contractWriter contract.ContractWriter, reader store.ContractReader, clock domain.Clock, taskMu *store.TaskMutex, slotReleaser recovery.SlotReleaser, timeoutDisarmer TimeoutDisarmer, metricsRecorder recovery.MetricsRecorder, stalledTracker finalizeStalledTimeTracker, loggers ...*slog.Logger) *FinalizeTaskUseCase {
-	if isNilStatusDependency(tasks) || isNilStatusDependency(contractWriter) || isNilStatusDependency(reader) || isNilStatusDependency(clock) || isNilStatusDependency(taskMu) || isNilStatusDependency(slotReleaser) || isNilStatusDependency(timeoutDisarmer) || isNilStatusDependency(metricsRecorder) || isNilStatusDependency(stalledTracker) {
+func NewFinalizeTaskUseCase(tasks store.TaskStore, contractWriter contract.ContractWriter, reader store.ContractReader, clock domain.Clock, taskMu *store.TaskMutex, slotReleaser recovery.SlotReleaser, timeoutDisarmer TimeoutDisarmer, pathLockReleaser *ReleasePathLockUseCase, metricsRecorder recovery.MetricsRecorder, stalledTracker finalizeStalledTimeTracker, loggers ...*slog.Logger) *FinalizeTaskUseCase {
+	if isNilStatusDependency(tasks) || isNilStatusDependency(contractWriter) || isNilStatusDependency(reader) || isNilStatusDependency(clock) || isNilStatusDependency(taskMu) || isNilStatusDependency(slotReleaser) || isNilStatusDependency(timeoutDisarmer) || isNilStatusDependency(pathLockReleaser) || isNilStatusDependency(metricsRecorder) || isNilStatusDependency(stalledTracker) {
 		panic("finalize task use case requires non-nil dependencies")
 	}
 	if len(loggers) > 1 {
@@ -83,7 +85,7 @@ func NewFinalizeTaskUseCase(tasks store.TaskStore, contractWriter contract.Contr
 	if len(loggers) == 1 && loggers[0] != nil {
 		logger = loggers[0]
 	}
-	return &FinalizeTaskUseCase{tasks: tasks, contractW: contractWriter, reader: reader, clock: clock, taskMu: taskMu, slotReleaser: slotReleaser, timeoutDisarmer: timeoutDisarmer, metricsRecorder: metricsRecorder, stalledTracker: stalledTracker, logger: logger}
+	return &FinalizeTaskUseCase{tasks: tasks, contractW: contractWriter, reader: reader, clock: clock, taskMu: taskMu, slotReleaser: slotReleaser, timeoutDisarmer: timeoutDisarmer, pathLockReleaser: pathLockReleaser, metricsRecorder: metricsRecorder, stalledTracker: stalledTracker, logger: logger}
 }
 
 type contractWriteFailure struct {
@@ -146,6 +148,7 @@ func (uc *FinalizeTaskUseCase) executeLocked(in FinalizeTaskInput, present bool)
 	if err != nil {
 		return LockedFinalizeResult{}, err
 	}
+	subcommand := task.Subcommand()
 
 	if in.RawExitCode < exitCodeMin || in.RawExitCode > exitCodeMax {
 		uc.logger.Warn("output contract violation: exit code out of range", "task_id", in.TaskID.String(), "raw_exit_code", in.RawExitCode, "error", domain.ErrOutputContractViolation)
@@ -162,39 +165,39 @@ func (uc *FinalizeTaskUseCase) executeLocked(in FinalizeTaskInput, present bool)
 
 	writeFail, nonRetryable, persisted := uc.writeTerminalState(in.TaskID, exitCode, task, snapshot, events, in.OccurredAt, "initial")
 	if nonRetryable != nil {
-		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: task.State(), Events: events}, RecordExited: true}, nonRetryable
+		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: task.State(), Events: events}, RecordExited: true, Subcommand: subcommand}, nonRetryable
 	}
 	if persisted {
-		return uc.persistedFinalizeResult(in.TaskID, previousState, task.State(), events, in.OccurredAt, FinalizeTaskOutput{ResultState: task.State(), Events: events}), nil
+		return uc.persistedFinalizeResult(in.TaskID, previousState, task.State(), events, in.OccurredAt, subcommand, FinalizeTaskOutput{ResultState: task.State(), Events: events}), nil
 	}
 
 	uc.logStructuredContractFailure(in.TaskID, writeFail)
 	retrySnapshot, loadErr := uc.tasks.Load(in.TaskID)
 	if loadErr != nil {
-		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: task.State(), Events: events, ContractWriteError: writeFail}, RecordExited: true}, fmt.Errorf("reload for failsafe: %w", errors.Join(writeFail, loadErr))
+		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: task.State(), Events: events, ContractWriteError: writeFail}, RecordExited: true, Subcommand: subcommand}, fmt.Errorf("reload for failsafe: %w", errors.Join(writeFail, loadErr))
 	}
 	retryTask, restoreErr := retrySnapshot.Restore()
 	if restoreErr != nil {
-		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: task.State(), Events: events, ContractWriteError: writeFail}, RecordExited: true}, fmt.Errorf("restore for failsafe: %w", errors.Join(writeFail, restoreErr))
+		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: task.State(), Events: events, ContractWriteError: writeFail}, RecordExited: true, Subcommand: subcommand}, fmt.Errorf("restore for failsafe: %w", errors.Join(writeFail, restoreErr))
 	}
 	retryPreviousState := retryTask.State()
 	retryEvents, recordErr := retryTask.RecordExit(exitCode, false, in.Estimated, in.AdoptedAfterRestart, in.OccurredAt)
 	if recordErr != nil {
-		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: task.State(), Events: events, ContractWriteError: writeFail}, RecordExited: true}, fmt.Errorf("record exit for failsafe: %w", errors.Join(writeFail, recordErr))
+		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: task.State(), Events: events, ContractWriteError: writeFail}, RecordExited: true, Subcommand: subcommand}, fmt.Errorf("record exit for failsafe: %w", errors.Join(writeFail, recordErr))
 	}
 
 	retryWriteFail, retryNonRetryable, retryPersisted := uc.writeTerminalState(in.TaskID, exitCode, retryTask, retrySnapshot, retryEvents, in.OccurredAt, "retry")
 	if retryNonRetryable != nil {
-		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}, RecordExited: true}, errors.Join(writeFail, retryNonRetryable)
+		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}, RecordExited: true, Subcommand: retryTask.Subcommand()}, errors.Join(writeFail, retryNonRetryable)
 	}
 	if retryPersisted {
-		return uc.persistedFinalizeResult(in.TaskID, retryPreviousState, retryTask.State(), retryEvents, in.OccurredAt, FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}), nil
+		return uc.persistedFinalizeResult(in.TaskID, retryPreviousState, retryTask.State(), retryEvents, in.OccurredAt, retryTask.Subcommand(), FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}), nil
 	}
 	if retryWriteFail != nil {
 		uc.logStructuredContractFailure(in.TaskID, retryWriteFail)
-		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}, RecordExited: true}, errors.Join(writeFail, retryWriteFail)
+		return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}, RecordExited: true, Subcommand: retryTask.Subcommand()}, errors.Join(writeFail, retryWriteFail)
 	}
-	return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}, RecordExited: true}, nil
+	return LockedFinalizeResult{Output: FinalizeTaskOutput{ResultState: retryTask.State(), Events: retryEvents, ContractWriteError: writeFail}, RecordExited: true, Subcommand: retryTask.Subcommand()}, nil
 }
 
 // ReleaseAfterFinalization releases resources after taskMu has been unlocked.
@@ -206,6 +209,11 @@ func (uc *FinalizeTaskUseCase) ReleaseAfterFinalization(ctx context.Context, res
 		uc.metricsRecorder.Execute(ctx, result.MetricsInput)
 	}
 	uc.timeoutDisarmer.Disarm(taskID)
+	if result.Subcommand == domain.SubcommandImpl {
+		if err := uc.pathLockReleaser.Execute(ctx, ReleasePathLockInput{TaskID: taskID}); err != nil {
+			uc.logger.Warn("release path lock after finalization", "task_id", taskID.String(), "error", err)
+		}
+	}
 	uc.slotReleaser.ReleaseAndAdvance(ctx, taskID, uc.clock.Now())
 }
 
@@ -238,12 +246,12 @@ func (uc *FinalizeTaskUseCase) writeTerminalState(taskID domain.TaskID, exitCode
 	return nil, nil, true
 }
 
-func (uc *FinalizeTaskUseCase) persistedFinalizeResult(taskID domain.TaskID, previousState, finalState domain.TaskState, events []domain.Event, occurredAt time.Time, output FinalizeTaskOutput) LockedFinalizeResult {
+func (uc *FinalizeTaskUseCase) persistedFinalizeResult(taskID domain.TaskID, previousState, finalState domain.TaskState, events []domain.Event, occurredAt time.Time, subcommand domain.Subcommand, output FinalizeTaskOutput) LockedFinalizeResult {
 	if previousState == domain.StateStalled {
 		uc.stalledTracker.LeaveStalled(taskID, occurredAt)
 	}
 	stalledTotal := uc.stalledTracker.TakeTotal(taskID)
-	return LockedFinalizeResult{Output: output, RecordExited: true, TerminalPersisted: true, MetricsInput: metrics.RecordTaskMetricsInput{TaskID: taskID, FinalState: finalState, Estimated: taskExitedEstimated(events), OccurredAt: occurredAt, StalledTotalMs: stalledTotal}}
+	return LockedFinalizeResult{Output: output, RecordExited: true, TerminalPersisted: true, MetricsInput: metrics.RecordTaskMetricsInput{TaskID: taskID, FinalState: finalState, Estimated: taskExitedEstimated(events), OccurredAt: occurredAt, StalledTotalMs: stalledTotal}, Subcommand: subcommand}
 }
 
 func taskExitedEstimated(events []domain.Event) bool {

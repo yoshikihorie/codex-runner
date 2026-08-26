@@ -752,7 +752,7 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	resume := recovery.NewRecoverViaResumeUseCase(tasks, writer, recovery.NewResumeRecoverer(execution.NewResumeLauncher(processRunner, logger), reader, cfg.CodexBinaryPath(), clock), partial, slots, metricRecorder, stalled, taskMu, clock, logger)
 	enforce := execution.NewEnforceTaskTimeoutUseCase(tasks, writer, processRunner, resume, termination, validator, pending, pathRelease, taskMu, clock, stalled)
 	watcher := execution.NewTimeoutWatcher(enforce, clock, afterFuncTimerFactory{}, baseCtx, logger)
-	finalize := execution.NewFinalizeTaskUseCase(tasks, writer, reader, clock, taskMu, slots, watcher, metricRecorder, stalled, logger)
+	finalize := execution.NewFinalizeTaskUseCase(tasks, writer, reader, clock, taskMu, slots, watcher, pathRelease, metricRecorder, stalled, logger)
 	killed := execution.NewConfirmTaskKilledUseCase(tasks, writer, reader, taskMu, watcher, pathRelease, slots, clock, metricRecorder, stalled, pending, logger)
 	failLaunch := usecase.NewFailTaskLaunchUseCase(tasks, taskMu, writer, reader, slots, usecase.NewPathLockReleaser(pathRelease), clock, logger)
 	worktreeRoot, err := execution.DefaultWorktreeRoot()

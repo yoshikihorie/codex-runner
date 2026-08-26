@@ -257,6 +257,28 @@ type finalizeMetricsFake struct {
 	output metrics.RecordTaskMetricsOutput
 }
 
+type finalizePathLockStore struct {
+	mu        sync.Mutex
+	trace     *finalizeTrace
+	deleted   []domain.TaskID
+	deleteErr error
+}
+
+func (s *finalizePathLockStore) List() ([]PathLockSnapshot, error)                 { return nil, nil }
+func (s *finalizePathLockStore) Save(domain.TaskID, []domain.NormalizedPath) error { return nil }
+func (s *finalizePathLockStore) Delete(taskID domain.TaskID) error {
+	s.trace.add("release-path-lock")
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.deleted = append(s.deleted, taskID)
+	return s.deleteErr
+}
+func (s *finalizePathLockStore) deletedSnapshot() []domain.TaskID {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]domain.TaskID(nil), s.deleted...)
+}
+
 func (f *finalizeMetricsFake) Execute(_ context.Context, in metrics.RecordTaskMetricsInput) metrics.RecordTaskMetricsOutput {
 	f.trace.add("metrics")
 	f.mu.Lock()
@@ -297,7 +319,8 @@ func finalizeFixtures(t *testing.T, state domain.TaskState, now time.Time) (*fin
 	timeout := &finalizeTimeoutFake{trace: trace, taskMu: taskMu}
 	tracker := &finalizeStalledTrackerFake{trace: trace}
 	recorder := &finalizeMetricsFake{trace: trace}
-	return s, r, w, slot, timeout, NewFinalizeTaskUseCase(s, w, r, domain.ClockFunc(func() time.Time { return now }), taskMu, slot, timeout, recorder, tracker)
+	pathLocks := &finalizePathLockStore{trace: trace}
+	return s, r, w, slot, timeout, NewFinalizeTaskUseCase(s, w, r, domain.ClockFunc(func() time.Time { return now }), taskMu, slot, timeout, NewReleasePathLockUseCase(pathLocks), recorder, tracker)
 }
 func finalizeInput(id domain.TaskID, at time.Time) FinalizeTaskInput {
 	return FinalizeTaskInput{TaskID: id, RawExitCode: 0, OccurredAt: at}
@@ -489,7 +512,7 @@ func TestFinalizeTaskUseCaseScenarios(t *testing.T) {
 				t.Fatalf("disarms=%d id=%v", disarms, disarmedID)
 			}
 			callsTrace := w.trace.snapshot()
-			if len(callsTrace) < 2 || callsTrace[len(callsTrace)-2] != "disarm" || callsTrace[len(callsTrace)-1] != "release-slot" {
+			if len(callsTrace) < 3 || callsTrace[len(callsTrace)-3] != "disarm" || callsTrace[len(callsTrace)-2] != "release-path-lock" || callsTrace[len(callsTrace)-1] != "release-slot" {
 				t.Fatalf("post-processing order=%v", callsTrace)
 			}
 			if tc.reason != "" {
@@ -831,7 +854,7 @@ func TestFinalizeTaskUseCaseUnlocksBeforeDisarm(t *testing.T) {
 		t.Fatalf("disarms=%d id=%v slots=%d", disarms, disarmedID, calls)
 	}
 	callsTrace := timeout.trace.snapshot()
-	if len(callsTrace) < 2 || callsTrace[len(callsTrace)-2] != "disarm" || callsTrace[len(callsTrace)-1] != "release-slot" {
+	if len(callsTrace) < 3 || callsTrace[len(callsTrace)-3] != "disarm" || callsTrace[len(callsTrace)-2] != "release-path-lock" || callsTrace[len(callsTrace)-1] != "release-slot" {
 		t.Fatalf("post-processing order=%v", callsTrace)
 	}
 }
@@ -843,6 +866,7 @@ func TestNewFinalizeTaskUseCaseContract(t *testing.T) {
 	mu := store.NewTaskMutex()
 	tracker := &finalizeStalledTrackerFake{trace: &finalizeTrace{}}
 	recorder := &finalizeMetricsFake{trace: &finalizeTrace{}}
+	pathLocks := NewReleasePathLockUseCase(&finalizePathLockStore{trace: &finalizeTrace{}})
 	mustPanic := func(t *testing.T, f func()) {
 		t.Helper()
 		defer func() {
@@ -856,24 +880,26 @@ func TestNewFinalizeTaskUseCaseContract(t *testing.T) {
 		name string
 		f    func()
 	}{
-		{"tasks", func() { NewFinalizeTaskUseCase(nil, w, r, clock, mu, slot, timeout, recorder, tracker) }}, {"writer", func() { NewFinalizeTaskUseCase(s, nil, r, clock, mu, slot, timeout, recorder, tracker) }}, {"reader", func() { NewFinalizeTaskUseCase(s, w, nil, clock, mu, slot, timeout, recorder, tracker) }}, {"clock", func() { NewFinalizeTaskUseCase(s, w, r, nil, mu, slot, timeout, recorder, tracker) }}, {"mutex", func() { NewFinalizeTaskUseCase(s, w, r, clock, nil, slot, timeout, recorder, tracker) }}, {"slot", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, nil, timeout, recorder, tracker) }}, {"timeout", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, nil, recorder, tracker) }}, {"metrics nil", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, nil, tracker) }}, {"metrics typed nil", func() {
-			NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, (*finalizeMetricsFake)(nil), tracker)
-		}}, {"tracker nil", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, recorder, nil) }}, {"tracker typed nil", func() {
-			NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, recorder, (*finalizeStalledTrackerFake)(nil))
+		{"tasks", func() { NewFinalizeTaskUseCase(nil, w, r, clock, mu, slot, timeout, pathLocks, recorder, tracker) }}, {"writer", func() { NewFinalizeTaskUseCase(s, nil, r, clock, mu, slot, timeout, pathLocks, recorder, tracker) }}, {"reader", func() { NewFinalizeTaskUseCase(s, w, nil, clock, mu, slot, timeout, pathLocks, recorder, tracker) }}, {"clock", func() { NewFinalizeTaskUseCase(s, w, r, nil, mu, slot, timeout, pathLocks, recorder, tracker) }}, {"mutex", func() { NewFinalizeTaskUseCase(s, w, r, clock, nil, slot, timeout, pathLocks, recorder, tracker) }}, {"slot", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, nil, timeout, pathLocks, recorder, tracker) }}, {"timeout", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, nil, pathLocks, recorder, tracker) }}, {"path lock nil", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, nil, recorder, tracker) }}, {"path lock typed nil", func() {
+			NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, (*ReleasePathLockUseCase)(nil), recorder, tracker)
+		}}, {"metrics nil", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, pathLocks, nil, tracker) }}, {"metrics typed nil", func() {
+			NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, pathLocks, (*finalizeMetricsFake)(nil), tracker)
+		}}, {"tracker nil", func() { NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, pathLocks, recorder, nil) }}, {"tracker typed nil", func() {
+			NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, pathLocks, recorder, (*finalizeStalledTrackerFake)(nil))
 		}}, {"many loggers", func() {
-			NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, recorder, tracker, slog.Default(), slog.Default())
+			NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, pathLocks, recorder, tracker, slog.Default(), slog.Default())
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) { mustPanic(t, tc.f) })
 	}
-	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, recorder, tracker); got.logger != slog.Default() || got.timeoutDisarmer != timeout || got.metricsRecorder != recorder || got.stalledTracker != tracker {
+	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, pathLocks, recorder, tracker); got.logger != slog.Default() || got.timeoutDisarmer != timeout || got.pathLockReleaser != pathLocks || got.metricsRecorder != recorder || got.stalledTracker != tracker {
 		t.Fatal("default logger not used")
 	}
-	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, recorder, tracker, nil); got.logger != slog.Default() {
+	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, pathLocks, recorder, tracker, nil); got.logger != slog.Default() {
 		t.Fatal("nil logger not default")
 	}
 	logger := slog.New(slog.NewTextHandler(testingWriter{t}, nil))
-	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, recorder, tracker, logger); got.logger != logger {
+	if got := NewFinalizeTaskUseCase(s, w, r, clock, mu, slot, timeout, pathLocks, recorder, tracker, logger); got.logger != logger {
 		t.Fatal("provided logger not retained")
 	}
 }
@@ -1030,7 +1056,7 @@ func TestFinalizeTaskUseCaseTerminalPersistenceFinalizesStalledMetrics(t *testin
 			}
 			if tc.wantMetrics == 1 {
 				calls := uc.contractW.(*finalizeWriterFake).trace.snapshot()
-				wantSuffix := []string{"leave-stalled", "take-total", "metrics", "disarm", "release-slot"}
+				wantSuffix := []string{"leave-stalled", "take-total", "metrics", "disarm", "release-path-lock", "release-slot"}
 				if tc.wantLeave == 0 {
 					wantSuffix = wantSuffix[1:]
 				}
@@ -1042,6 +1068,168 @@ func TestFinalizeTaskUseCaseTerminalPersistenceFinalizesStalledMetrics(t *testin
 						t.Fatalf("trace=%v want suffix=%v", calls, wantSuffix)
 					}
 				}
+			}
+		})
+	}
+}
+
+func TestFinalizeTaskUseCaseReleasesPathLockForImplAfterFinalization_SCNLock0104(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name string
+		raw  int
+		want domain.TaskState
+	}{
+		{"completed", 0, domain.StateCompleted},
+		{"failed", 1, domain.StateFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, _, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
+			locks := &finalizePathLockStore{trace: uc.contractW.(*finalizeWriterFake).trace}
+			uc.pathLockReleaser = NewReleasePathLockUseCase(locks)
+			out, err := uc.Execute(context.Background(), FinalizeTaskInput{TaskID: s.latest.TaskID, RawExitCode: tc.raw, OccurredAt: now})
+			if err != nil || out.ResultState != tc.want {
+				t.Fatalf("out=%+v err=%v", out, err)
+			}
+			if got := locks.deletedSnapshot(); !reflect.DeepEqual(got, []domain.TaskID{s.latest.TaskID}) {
+				t.Fatalf("deleted=%v", got)
+			}
+			if calls, _ := timeout.snapshot(); calls != 1 {
+				t.Fatalf("disarms=%d", calls)
+			}
+			if calls, _, _ := slot.snapshot(); calls != 1 {
+				t.Fatalf("slots=%d", calls)
+			}
+		})
+	}
+}
+
+func TestFinalizeTaskUseCaseDoesNotReleasePathLockForNonImpl(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
+	s, _, _, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
+	s.latest.Subcommand = domain.SubcommandReview
+	locks := &finalizePathLockStore{trace: uc.contractW.(*finalizeWriterFake).trace}
+	uc.pathLockReleaser = NewReleasePathLockUseCase(locks)
+	if _, err := uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, now)); err != nil {
+		t.Fatal(err)
+	}
+	if got := locks.deletedSnapshot(); len(got) != 0 {
+		t.Fatalf("deleted=%v", got)
+	}
+	if calls, _ := timeout.snapshot(); calls != 1 {
+		t.Fatalf("disarms=%d", calls)
+	}
+	if calls, _, _ := slot.snapshot(); calls != 1 {
+		t.Fatalf("slots=%d", calls)
+	}
+}
+
+func TestFinalizeTaskUseCaseDoesNotReleasePathLockWhenRecordExitDidNotOccur(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
+	s, _, _, slot, timeout, uc := finalizeFixtures(t, domain.StateRunning, now)
+	locks := &finalizePathLockStore{trace: uc.contractW.(*finalizeWriterFake).trace}
+	uc.pathLockReleaser = NewReleasePathLockUseCase(locks)
+	uc.ReleaseAfterFinalization(context.Background(), LockedFinalizeResult{RecordExited: false, Subcommand: domain.SubcommandImpl}, s.latest.TaskID)
+	if got := locks.deletedSnapshot(); len(got) != 0 {
+		t.Fatalf("deleted=%v", got)
+	}
+	if calls, _ := timeout.snapshot(); calls != 0 {
+		t.Fatalf("disarms=%d", calls)
+	}
+	if calls, _, _ := slot.snapshot(); calls != 0 {
+		t.Fatalf("slots=%d", calls)
+	}
+	if got := uc.metricsRecorder.(*finalizeMetricsFake).snapshot(); len(got) != 0 {
+		t.Fatalf("metrics=%v", got)
+	}
+}
+
+func TestFinalizeTaskUseCasePathLockReleaseFailureIsFailSoft(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
+	s, _, _, slot, _, uc := finalizeFixtures(t, domain.StateRunning, now)
+	failure := errors.New("delete path lock")
+	locks := &finalizePathLockStore{trace: uc.contractW.(*finalizeWriterFake).trace, deleteErr: failure}
+	uc.pathLockReleaser = NewReleasePathLockUseCase(locks)
+	capture := &logCapture{}
+	uc.logger = slog.New(capture)
+	out, err := uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, now))
+	if err != nil || out.ResultState != domain.StateCompleted {
+		t.Fatalf("out=%+v err=%v", out, err)
+	}
+	if calls, _, _ := slot.snapshot(); calls != 1 {
+		t.Fatalf("slots=%d", calls)
+	}
+	logs := capture.snapshot()
+	if len(logs) != 1 || logs[0].level != slog.LevelWarn || logs[0].msg != "release path lock after finalization" || logs[0].attrs["task_id"] != s.latest.TaskID.String() || !errors.Is(logs[0].attrs["error"].(error), failure) {
+		t.Fatalf("logs=%#v", logs)
+	}
+}
+
+func TestFinalizeTaskUseCaseExecuteLockedPropagatesImplSubcommandOnRecordedExitPaths(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name      string
+		configure func(*finalizeStoreFake, *finalizeReaderFake, *finalizeWriterFake)
+	}{
+		{"initial non-retryable", func(_ *finalizeStoreFake, r *finalizeReaderFake, _ *finalizeWriterFake) {
+			r.exits = []struct {
+				code   int
+				exists bool
+				err    error
+			}{{err: errors.New("initial")}}
+		}},
+		{"reload fails", func(s *finalizeStoreFake, _ *finalizeReaderFake, w *finalizeWriterFake) {
+			w.writeErrs = []error{errors.New("initial")}
+			s.loads = []loadResult{{snapshot: s.latest}, {err: errors.New("reload")}}
+		}},
+		{"restore fails", func(s *finalizeStoreFake, _ *finalizeReaderFake, w *finalizeWriterFake) {
+			bad := s.latest
+			bad.State = "invalid"
+			w.writeErrs = []error{errors.New("initial")}
+			s.loads = []loadResult{{snapshot: s.latest}, {snapshot: bad}}
+		}},
+		{"record exit fails", func(s *finalizeStoreFake, _ *finalizeReaderFake, w *finalizeWriterFake) {
+			terminal := s.latest
+			terminal.State = domain.StateCompleted
+			code := domain.NewExitCode(0)
+			terminal.ExitCode = &code
+			w.writeErrs = []error{errors.New("initial")}
+			s.loads = []loadResult{{snapshot: s.latest}, {snapshot: terminal}}
+		}},
+		{"retry non-retryable", func(_ *finalizeStoreFake, r *finalizeReaderFake, w *finalizeWriterFake) {
+			w.writeErrs = []error{errors.New("initial")}
+			r.exits = []struct {
+				code   int
+				exists bool
+				err    error
+			}{{}, {err: errors.New("retry")}}
+		}},
+		{"retry persisted", func(s *finalizeStoreFake, _ *finalizeReaderFake, w *finalizeWriterFake) {
+			w.writeErrs = []error{errors.New("initial")}
+			s.saveErrs = []error{errors.New("initial save")}
+		}},
+		{"retry write fails", func(_ *finalizeStoreFake, _ *finalizeReaderFake, w *finalizeWriterFake) {
+			w.writeErrs = []error{errors.New("initial"), errors.New("retry")}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, r, w, _, _, uc := finalizeFixtures(t, domain.StateRunning, now)
+			locks := &finalizePathLockStore{trace: w.trace}
+			uc.pathLockReleaser = NewReleasePathLockUseCase(locks)
+			tc.configure(s, r, w)
+			prepared, err := uc.Prepare(context.Background(), finalizeInput(s.latest.TaskID, now))
+			if err != nil {
+				t.Fatal(err)
+			}
+			uc.taskMu.Lock(s.latest.TaskID)
+			result, _ := uc.ExecuteLocked(context.Background(), prepared)
+			uc.taskMu.Unlock(s.latest.TaskID)
+			if !result.RecordExited || result.Subcommand != domain.SubcommandImpl {
+				t.Fatalf("result=%+v", result)
+			}
+			uc.ReleaseAfterFinalization(context.Background(), result, s.latest.TaskID)
+			if got := locks.deletedSnapshot(); !reflect.DeepEqual(got, []domain.TaskID{s.latest.TaskID}) {
+				t.Fatalf("deleted=%v", got)
 			}
 		})
 	}

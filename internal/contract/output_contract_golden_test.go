@@ -215,7 +215,8 @@ func runGoldenScenario(t *testing.T, scenario string, family domain.Subcommand, 
 		t.Fatalf("recovery branch=%v does not match manifest recovery=%v", needsRecovery, manifestRecovery)
 	}
 	if !needsRecovery {
-		out, err := execution.NewFinalizeTaskUseCase(tasks, writer, reader, clock, mu, goldenSlot{}, goldenDisarmer{}, goldenMetrics{}, goldenTracker{}).Execute(context.Background(), execution.FinalizeTaskInput{TaskID: id, RawExitCode: observed, OccurredAt: now})
+		pathLocks := store.NewPathLockFileStore(t.TempDir())
+		out, err := execution.NewFinalizeTaskUseCase(tasks, writer, reader, clock, mu, goldenSlot{}, goldenDisarmer{}, execution.NewReleasePathLockUseCase(pathLocks), goldenMetrics{}, goldenTracker{}).Execute(context.Background(), execution.FinalizeTaskInput{TaskID: id, RawExitCode: observed, OccurredAt: now})
 		if err != nil || out.ResultState != domain.StateCompleted {
 			t.Fatalf("finalize=%+v err=%v", out, err)
 		}

@@ -330,7 +330,7 @@ func (f metricsAcceptanceFixture) finishE(ctx context.Context, id domain.TaskID,
 		if expected == domain.StateFailed {
 			raw = metricsAcceptanceFailureExitCode
 		}
-		uc := NewFinalizeTaskUseCase(f.tasks, f.writer, f.reader, domain.ClockFunc(func() time.Time { return f.now }), f.mutex, f.slots, f.disarmer, capture, f.tracker)
+		uc := NewFinalizeTaskUseCase(f.tasks, f.writer, f.reader, domain.ClockFunc(func() time.Time { return f.now }), f.mutex, f.slots, f.disarmer, NewReleasePathLockUseCase(f.pathLocks), capture, f.tracker)
 		result.Finalize, result.Err = uc.Execute(ctx, FinalizeTaskInput{TaskID: id, RawExitCode: raw, OccurredAt: occurredAt})
 	case metricsRouteConfirmKilled:
 		uc := NewConfirmTaskKilledUseCase(f.tasks, f.writer, f.reader, f.mutex, f.disarmer, NewReleasePathLockUseCase(f.pathLocks), f.slots, domain.ClockFunc(func() time.Time { return f.now }), capture, f.tracker, &recovery.PendingReconciliationSet{})
