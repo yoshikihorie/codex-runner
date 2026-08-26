@@ -20,8 +20,7 @@ import (
 const (
 	taskIDGenerationMaxAttempts = 10
 
-	// Confirmed implementation identifiers pending registration in the canonical
-	// error-code and message catalogs.
+	// Canonical identifiers registered in the published error-code and message catalogs.
 	admissionUnavailableCode       = "ADMISSION_UNAVAILABLE"
 	admissionUnavailableMessageKey = "error.admission.unavailable"
 )
@@ -215,7 +214,12 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 				}
 			}
 			uc.releaseReservation(id)
-			return SubmitTaskOutput{}, &submitError{code: admissionUnavailableCode, message: admissionUnavailableMessageKey, cause: context.Canceled}
+			return SubmitTaskOutput{}, &submitError{
+				code:    admissionUnavailableCode,
+				message: admissionUnavailableMessageKey,
+				detail:  map[string]any{"task_id": id.String()},
+				cause:   context.Canceled,
+			}
 		}
 	}
 	return SubmitTaskOutput{TaskID: id, State: domain.StateQueued, QueuePosition: result.QueuePosition, Events: result.Events}, nil

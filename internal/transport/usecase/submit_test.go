@@ -25,6 +25,7 @@ type submitStoreFake struct {
 	reserved      []domain.TaskID
 	released      []domain.TaskID
 	releaseErr    error
+	events        *[]string
 }
 
 func (f *submitStoreFake) Reserve(id domain.TaskID) error {
@@ -38,6 +39,9 @@ func (f *submitStoreFake) Reserve(id domain.TaskID) error {
 }
 func (f *submitStoreFake) Release(id domain.TaskID) error {
 	f.released = append(f.released, id)
+	if f.events != nil {
+		*f.events = append(*f.events, "reservation")
+	}
 	return f.releaseErr
 }
 
@@ -61,12 +65,16 @@ type submitPathLockReleaserFake struct {
 	ids       []domain.TaskID
 	cancelled []bool
 	err       error
+	events    *[]string
 }
 
 func (f *submitPathLockReleaserFake) Release(ctx context.Context, id domain.TaskID) error {
 	f.calls++
 	f.ids = append(f.ids, id)
 	f.cancelled = append(f.cancelled, ctx.Err() != nil)
+	if f.events != nil {
+		*f.events = append(*f.events, "path-lock")
+	}
 	return f.err
 }
 
@@ -77,6 +85,7 @@ type submitAdmitterFake struct {
 	err           error
 	compensated   []domain.TaskID
 	compensateErr error
+	events        *[]string
 }
 
 func (f *submitAdmitterFake) Admit(in execution.TaskAdmissionInput) (execution.TaskAdmissionResult, error) {
@@ -87,6 +96,9 @@ func (f *submitAdmitterFake) Admit(in execution.TaskAdmissionInput) (execution.T
 
 func (f *submitAdmitterFake) CompensateRejectedStart(id domain.TaskID) error {
 	f.compensated = append(f.compensated, id)
+	if f.events != nil {
+		*f.events = append(*f.events, "admission")
+	}
 	return f.compensateErr
 }
 
@@ -331,6 +343,10 @@ func TestSubmitExecuteAdmissionResultsStartOnlyImmediatePayload(t *testing.T) {
 
 func TestSubmitTaskUseCaseCompensatesRejectedLifecycleStart(t *testing.T) {
 	fixture := newSubmitFixture()
+	var compensationOrder []string
+	fixture.admitter.events = &compensationOrder
+	fixture.releaser.events = &compensationOrder
+	fixture.store.events = &compensationOrder
 	fixture.starter.rejected = true
 	fixture.admitter.result.LaunchPayload = &execution.TaskLaunchPayload{Model: "payload"}
 	in := validSubmitInput(t)
@@ -341,9 +357,23 @@ func TestSubmitTaskUseCaseCompensatesRejectedLifecycleStart(t *testing.T) {
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("err=%v", err)
 	}
-	assertSubmitError(t, err, "ADMISSION_UNAVAILABLE", "error.admission.unavailable", nil)
+	var submitErr *submitError
+	if !errors.As(err, &submitErr) {
+		t.Fatalf("err=%T, want *submitError", err)
+	}
+	taskID, ok := submitErr.detail["task_id"].(string)
+	if !ok || taskID == "" {
+		t.Fatalf("detail=%#v, want non-empty task_id", submitErr.detail)
+	}
+	if len(fixture.admitter.compensated) != 1 || taskID != fixture.admitter.compensated[0].String() {
+		t.Fatalf("detail task_id=%q compensated=%v", taskID, fixture.admitter.compensated)
+	}
+	assertSubmitError(t, err, "ADMISSION_UNAVAILABLE", "error.admission.unavailable", map[string]any{"task_id": taskID})
 	if len(fixture.starter.payloads) != 1 || len(fixture.admitter.compensated) != 1 || len(fixture.store.released) != 1 || fixture.releaser.calls != 1 {
 		t.Fatalf("starts=%d compensations=%d reservations=%d path_locks=%d", len(fixture.starter.payloads), len(fixture.admitter.compensated), len(fixture.store.released), fixture.releaser.calls)
+	}
+	if !reflect.DeepEqual(compensationOrder, []string{"admission", "path-lock", "reservation"}) {
+		t.Fatalf("compensation order=%v", compensationOrder)
 	}
 
 	handleFixture := newSubmitFixture()
@@ -355,6 +385,10 @@ func TestSubmitTaskUseCaseCompensatesRejectedLifecycleStart(t *testing.T) {
 	})
 	if response.OK || response.Error == nil || response.Error.Code != "ADMISSION_UNAVAILABLE" || response.Error.MessageKey != "error.admission.unavailable" {
 		t.Fatalf("response=%#v", response)
+	}
+	responseTaskID, ok := response.Error.Detail["task_id"].(string)
+	if !ok || len(handleFixture.admitter.compensated) != 1 || responseTaskID != handleFixture.admitter.compensated[0].String() {
+		t.Fatalf("detail=%#v compensated=%v", response.Error.Detail, handleFixture.admitter.compensated)
 	}
 }
 
