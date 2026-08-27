@@ -36,7 +36,7 @@ func ObserveEvents(ctx context.Context, stdout io.Reader, onKnown func(string, j
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		line, size, err := readEventLine(reader)
+		line, size, err := readEventLineWithContext(ctx, reader)
 		if err := ctx.Err(); err != nil {
 			return err
 		}
@@ -72,6 +72,27 @@ func ObserveEvents(ctx context.Context, stdout io.Reader, onKnown func(string, j
 			return nil
 		}
 		return err
+	}
+}
+
+type eventLineResult struct {
+	line []byte
+	size int
+	err  error
+}
+
+func readEventLineWithContext(ctx context.Context, reader *bufio.Reader) ([]byte, int, error) {
+	result := make(chan eventLineResult, 1)
+	go func() {
+		line, size, err := readEventLine(reader)
+		result <- eventLineResult{line: line, size: size, err: err}
+	}()
+
+	select {
+	case result := <-result:
+		return result.line, result.size, result.err
+	case <-ctx.Done():
+		return nil, 0, ctx.Err()
 	}
 }
 

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestEventMonitorKnownAndUnknownEvents(t *testing.T) {
@@ -155,4 +156,56 @@ func TestObserveEventsStopsAfterCallbackCancelsContext(t *testing.T) {
 	if err != context.Canceled || len(known) != 1 {
 		t.Fatalf("known=%v err=%v", known, err)
 	}
+}
+
+func TestObserveEventsReturnsWhenContextCanceledDuringBlockingRead(t *testing.T) {
+	reader := &blockingReader{
+		readStarted:  make(chan struct{}),
+		release:      make(chan struct{}),
+		readReturned: make(chan struct{}),
+	}
+	t.Cleanup(func() {
+		close(reader.release)
+		select {
+		case <-reader.readReturned:
+		case <-time.After(time.Second):
+			t.Error("blocking reader did not return after release")
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- ObserveEvents(ctx, reader, nil, nil)
+	}()
+
+	select {
+	case <-reader.readStarted:
+	case <-time.After(time.Second):
+		t.Fatal("blocking reader did not start")
+	}
+	cancel()
+
+	select {
+	case err := <-result:
+		if err != context.Canceled {
+			t.Fatalf("error=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("ObserveEvents did not return after context cancellation")
+	}
+}
+
+type blockingReader struct {
+	readStarted  chan struct{}
+	release      chan struct{}
+	readReturned chan struct{}
+}
+
+func (r *blockingReader) Read([]byte) (int, error) {
+	close(r.readStarted)
+	<-r.release
+	close(r.readReturned)
+	return 0, io.EOF
 }
