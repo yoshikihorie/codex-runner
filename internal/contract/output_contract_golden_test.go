@@ -170,6 +170,12 @@ func runGoldenScenario(t *testing.T, scenario string, family domain.Subcommand, 
 	if err != nil {
 		t.Fatal(err)
 	}
+	if m.Scenario != scenario {
+		t.Fatalf("manifest scenario=%q does not match test scenario=%q", m.Scenario, scenario)
+	}
+	if m.SubcommandFamily != string(family) {
+		t.Fatalf("manifest subcommand_family=%q does not match test family=%q", m.SubcommandFamily, family)
+	}
 	baseline := map[string][]byte{}
 	for _, f := range m.Files {
 		if f.Immutable {
@@ -205,14 +211,8 @@ func runGoldenScenario(t *testing.T, scenario string, family domain.Subcommand, 
 		t.Fatalf("wait calls=%d code=%d", runner.waiter.calls, observed)
 	}
 	needsRecovery := recoveryRequired(observed)
-	manifestRecovery := false
-	for _, f := range m.Files {
-		if (f.Name == "recovered-after-timeout" || f.Name == "partial-output.md") && f.Presence == "required" {
-			manifestRecovery = true
-		}
-	}
-	if needsRecovery != manifestRecovery {
-		t.Fatalf("recovery branch=%v does not match manifest recovery=%v", needsRecovery, manifestRecovery)
+	if needsRecovery != m.RecoveryExpected {
+		t.Fatalf("recovery branch=%v does not match manifest recovery_expected=%v", needsRecovery, m.RecoveryExpected)
 	}
 	if !needsRecovery {
 		pathLocks := store.NewPathLockFileStore(t.TempDir())

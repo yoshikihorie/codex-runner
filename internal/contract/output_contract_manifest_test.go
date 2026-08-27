@@ -27,6 +27,7 @@ type outputManifest struct {
 	Canon            []string       `json:"canon"`
 	Files            []manifestFile `json:"files"`
 	AllowedExtra     []string       `json:"allowed_extra"`
+	RecoveryExpected bool           `json:"recovery_expected"`
 }
 type manifestFile struct {
 	Name      string        `json:"name"`
