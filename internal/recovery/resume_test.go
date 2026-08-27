@@ -417,7 +417,6 @@ func TestRecoverViaResumeUseCaseTakesStalledTotalForEveryTerminal(t *testing.T) 
 		{"recovered", domain.StateTimeout, true, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)}, domain.StateRecovered, nil, true},
 		{"timeout lost", domain.StateTimeout, false, RecoveryResult{}, domain.StateTimeoutLost, nil, true},
 		{"lost", domain.StateOrphaned, true, RecoveryResult{ExitCode: domain.NewExitCode(1)}, domain.StateLost, nil, true},
-		{"terminal save failure", domain.StateTimeout, true, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)}, domain.StateRecovered, errors.New("save"), true},
 		{"metrics fail soft", domain.StateOrphaned, true, RecoveryResult{ExitCode: domain.NewExitCode(1)}, domain.StateLost, nil, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -433,6 +432,46 @@ func TestRecoverViaResumeUseCaseTakesStalledTotalForEveryTerminal(t *testing.T) 
 				t.Fatalf("out=(%+v,%v) metrics=%+v slots=%d", out, err, recorder.inputs, slots.calls)
 			}
 		})
+	}
+}
+
+func TestRecoverViaResumeUseCaseSaveFailureIsNotTerminal(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, store, writer, recoverer, recorded, slots, mutex := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	store.saveErr, store.saveErrOn = errors.New("save failed"), 2
+
+	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
+	if err == nil || err.Error() != "recovery: terminal transition was not persisted" {
+		t.Fatalf("err = %v, want terminal transition not persisted error", err)
+	}
+	if out != (RecoverViaResumeOutput{}) {
+		t.Fatalf("out = %+v, want zero value", out)
+	}
+	if len(recorded.inputs) != 0 {
+		t.Fatalf("metrics recorded despite unpersisted terminal state: %+v", recorded.inputs)
+	}
+	if slots.calls != 0 {
+		t.Fatalf("slot released despite unpersisted terminal state: calls=%d", slots.calls)
+	}
+	if writer.exitCodeCalls != 0 {
+		t.Fatalf("exit code written despite unpersisted terminal state: calls=%d", writer.exitCodeCalls)
+	}
+	// begin() saves the recovering-transition snapshot (call 1); finish()
+	// attempts to persist the terminal snapshot and fails (call 2).
+	if store.saves != 2 {
+		t.Fatalf("save calls = %d, want 2 (begin + failed finish attempt)", store.saves)
+	}
+	if recoverer.calls != 1 || mutex.locks != 2 || mutex.unlocks != 2 {
+		t.Fatalf("recoverer calls=%d locks=%d unlocks=%d", recoverer.calls, mutex.locks, mutex.unlocks)
+	}
+	// The recovered marker must only be written after the terminal snapshot
+	// save succeeds; otherwise a marker file could exist while the
+	// persisted task state is still stuck in "recovering".
+	if writer.markerCalls != 0 {
+		t.Fatalf("recovered marker written despite unpersisted terminal state: calls=%d", writer.markerCalls)
+	}
+	if len(writer.events) != 1 || writer.events[0].Type() != "RecoveryAttempted" {
+		t.Fatalf("events = %#v, want only RecoveryAttempted from begin()", writer.events)
 	}
 }
 

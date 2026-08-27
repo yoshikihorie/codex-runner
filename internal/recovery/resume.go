@@ -224,9 +224,6 @@ func (uc *RecoverViaResumeUseCase) finish(ctx context.Context, in RecoverViaResu
 		if err != nil {
 			return RecoverViaResumeOutput{}, false
 		}
-		if err := writer.WriteRecoveredMarker(in.TaskID, at); err != nil {
-			uc.logger.Warn("write recovered marker failed", "task_id", in.TaskID.String(), "error", err)
-		}
 	} else {
 		if origin == domain.RecoveryOriginTimeout {
 			partialResult, partialErr := uc.partial.Execute(ctx, SavePartialOutputInput{TaskID: in.TaskID, OccurredAt: at})
@@ -246,11 +243,17 @@ func (uc *RecoverViaResumeUseCase) finish(ctx context.Context, in RecoverViaResu
 		return RecoverViaResumeOutput{}, false
 	}
 	output := RecoverViaResumeOutput{Succeeded: result.Succeeded, ExitCode: result.ExitCode, PartialOutputSaved: partialSaved, FinalState: task.State()}
+	if err := uc.tasks.Save(in.TaskID, updated); err != nil {
+		uc.logger.Error("save recovery terminal state failed", "task_id", in.TaskID.String(), "error", err)
+		return RecoverViaResumeOutput{}, false
+	}
+	if result.Succeeded {
+		if err := writer.WriteRecoveredMarker(in.TaskID, at); err != nil {
+			uc.logger.Warn("write recovered marker failed", "task_id", in.TaskID.String(), "error", err)
+		}
+	}
 	if err := writer.WriteExitCode(in.TaskID, result.ExitCode); err != nil {
 		uc.logger.Warn("write recovery exit code failed", "task_id", in.TaskID.String(), "error", err)
-	}
-	if err := uc.tasks.Save(in.TaskID, updated); err != nil {
-		uc.logger.Warn("save recovery terminal state failed", "task_id", in.TaskID.String(), "error", err)
 	}
 	for _, event := range events {
 		if err := writer.AppendEvent(in.TaskID, event); err != nil {
