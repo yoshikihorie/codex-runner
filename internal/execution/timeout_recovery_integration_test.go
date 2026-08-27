@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -34,6 +35,7 @@ const (
 	metricsAcceptanceSuccessExitCode = 0
 	metricsAcceptanceFailureExitCode = 1
 	metricsAcceptanceKilledExitCode  = 130
+	metricsAcceptanceBarrierTimeout  = 2 * time.Second
 )
 
 type metricsTerminalRoute int
@@ -119,14 +121,15 @@ type metricsAcceptanceFailingWriter struct {
 type metricsAcceptanceConcurrentWriter struct {
 	mu       sync.Mutex
 	delegate metrics.MetricsWriter
+	ctx      context.Context
 	want     int
 	current  int
 	max      int
 	gate     chan struct{}
 }
 
-func newMetricsAcceptanceConcurrentWriter(delegate metrics.MetricsWriter, want int) *metricsAcceptanceConcurrentWriter {
-	return &metricsAcceptanceConcurrentWriter{delegate: delegate, want: want, gate: make(chan struct{})}
+func newMetricsAcceptanceConcurrentWriter(ctx context.Context, delegate metrics.MetricsWriter, want int) *metricsAcceptanceConcurrentWriter {
+	return &metricsAcceptanceConcurrentWriter{ctx: ctx, delegate: delegate, want: want, gate: make(chan struct{})}
 }
 func (w *metricsAcceptanceConcurrentWriter) Append(id domain.TaskID, month string, line []byte) error {
 	w.mu.Lock()
@@ -139,7 +142,14 @@ func (w *metricsAcceptanceConcurrentWriter) Append(id domain.TaskID, month strin
 	}
 	gate := w.gate
 	w.mu.Unlock()
-	<-gate
+	select {
+	case <-gate:
+	case <-w.ctx.Done():
+		w.mu.Lock()
+		w.current--
+		w.mu.Unlock()
+		return w.ctx.Err()
+	}
 	err := w.delegate.Append(id, month, line)
 	w.mu.Lock()
 	w.current--
@@ -533,13 +543,15 @@ func TestMetricsAcceptance_SCNMetrics0109_FourConcurrentTerminalTasksWriteIndepe
 		id, session := f.prepare(t, suffix, domain.StateRunning, f.now, []byte("acceptance answer"))
 		prepared = append(prepared, preparedTask{id: id, session: session})
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), metricsAcceptanceBarrierTimeout)
+	defer cancel()
 	start := make(chan struct{})
 	results := make(chan metricsAcceptanceResult, len(prepared))
-	concurrentWriter := newMetricsAcceptanceConcurrentWriter(metrics.NewFileMetricsWriter(f.logs, 1<<20), len(prepared))
+	concurrentWriter := newMetricsAcceptanceConcurrentWriter(ctx, metrics.NewFileMetricsWriter(f.logs, 1<<20), len(prepared))
 	for _, task := range prepared {
 		go func(task preparedTask) {
 			<-start
-			results <- f.finishE(context.Background(), task.id, task.session, metricsRouteFinalize, domain.StateCompleted, f.now, true, concurrentWriter)
+			results <- f.finishE(ctx, task.id, task.session, metricsRouteFinalize, domain.StateCompleted, f.now, true, concurrentWriter)
 		}(task)
 	}
 	close(start)
@@ -550,6 +562,9 @@ func TestMetricsAcceptance_SCNMetrics0109_FourConcurrentTerminalTasksWriteIndepe
 			t.Fatalf("result=%#v", result)
 		}
 		seen[result.TaskID.String()] = struct{}{}
+	}
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("metrics barrier timed out: %v", err)
 	}
 	if len(seen) != len(prepared) || concurrentWriter.maximum() < 2 || f.slots.count() != len(prepared) || f.disarmer.count() != len(prepared) {
 		t.Fatalf("unique=%d concurrent=%d slots=%d disarms=%d", len(seen), concurrentWriter.maximum(), f.slots.count(), f.disarmer.count())
@@ -576,6 +591,27 @@ func TestMetricsAcceptance_SCNMetrics0109_FourConcurrentTerminalTasksWriteIndepe
 		if len(lineIDs) != len(prepared) {
 			t.Fatalf("line task IDs=%d", len(lineIDs))
 		}
+	}
+}
+
+func TestMetricsAcceptanceConcurrentWriterCancelsWhenBarrierIsNotReached(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), metricsAcceptanceBarrierTimeout)
+	defer cancel()
+	delegate := &metricsAcceptanceFailingWriter{err: errors.New("delegate must not be called")}
+	writer := newMetricsAcceptanceConcurrentWriter(ctx, delegate, 2)
+	id, _ := domain.NewTaskID("impl-20260814-120000-a1b2-scn0109-barrier")
+	result := make(chan error, 1)
+	go func() { result <- writer.Append(id, "2026-08", []byte("record")) }()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("barrier wait error=%v", err)
+		}
+	case <-time.After(2 * metricsAcceptanceBarrierTimeout):
+		t.Fatal("metrics barrier did not stop at the context deadline")
+	}
+	if delegate.count() != 0 {
+		t.Fatalf("delegate calls=%d", delegate.count())
 	}
 }
 
@@ -629,6 +665,27 @@ func (s *timeoutRecoveryIntegrationSlots) ReleaseAndAdvance(_ context.Context, t
 	s.calls++
 	s.taskID = taskID
 	s.at = at
+}
+
+type timeoutRecoveryIntegrationOwnership struct {
+	mu         sync.Mutex
+	calls      int
+	taskID     domain.TaskID
+	generation domain.LifecycleGeneration
+}
+
+func (o *timeoutRecoveryIntegrationOwnership) WithCurrent(taskID domain.TaskID, generation domain.LifecycleGeneration, action func() error) (bool, error) {
+	o.mu.Lock()
+	o.calls++
+	o.taskID, o.generation = taskID, generation
+	o.mu.Unlock()
+	return true, action()
+}
+
+func (o *timeoutRecoveryIntegrationOwnership) observed() (int, domain.TaskID, domain.LifecycleGeneration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.calls, o.taskID, o.generation
 }
 
 // SCN-exec-06-05: a timed-out task without a session transitions through
@@ -718,9 +775,38 @@ func TestTimeoutRecoveryIntegrationNilSessionTransitionsToTimeoutLost(t *testing
 }
 
 func TestTimeoutRecoveryIntegrationCarriesLifecycleGeneration(t *testing.T) {
-	var input EnforceTaskTimeoutInput
-	input.Generation = domain.LifecycleGeneration(1)
-	if input.Generation == 0 {
-		t.Fatal("timeout input must retain the lifecycle generation")
+	root := t.TempDir()
+	id := timeoutID(t, "lifecycle-generation")
+	now := time.Date(2026, time.August, 14, 12, 0, 0, 0, time.UTC)
+	pid := 123
+	tasks, err := store.NewFileTaskStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks.Reserve(id); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := domain.TaskSnapshot{TaskID: id, Subcommand: domain.SubcommandReview, PID: &pid, ProcessStartedAt: &now, ResolvedTimeoutSeconds: 1800, Model: "gpt-5", RequestedAt: now, Route: domain.ExecutionRouteDaemon, State: domain.StateRunning, StateUpdatedAt: now, SchemaVersion: 1}
+	if err := tasks.Save(id, snapshot); err != nil {
+		t.Fatal(err)
+	}
+	writer := contract.NewFileContractWriter(root, domain.ClockFunc(func() time.Time { return now }))
+	taskMu := store.NewTaskMutex()
+	ownership := &timeoutRecoveryIntegrationOwnership{}
+	validator := recovery.NewProcessSignalAuthorityValidator(tasks, taskMu, ownership)
+	proc := &timeoutProcessFake{}
+	liveness := NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }), func(domain.TaskID) string { return filepath.Join(root, "unused.lock") })
+	enforce := NewEnforceTaskTimeoutUseCase(tasks, writer, proc, &timeoutRecoveryFake{}, NewTerminationEnsurer(liveness, proc, domain.ClockFunc(func() time.Time { return now }), func(context.Context, time.Duration) {}, validator), validator, &recovery.PendingReconciliationSet{}, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), taskMu, domain.ClockFunc(func() time.Time { return now }), &metrics.StalledTimeTracker{})
+	factory := &timeoutTimerFake{}
+	watcher := NewTimeoutWatcher(enforce, domain.ClockFunc(func() time.Time { return now }), factory, context.Background(), slog.New(slog.NewTextHandler(io.Discard, nil)))
+	expectedGeneration := domain.LifecycleGeneration(17)
+	watcher.Arm(id, now, snapshot.ResolvedTimeoutSeconds, expectedGeneration)
+	factory.fire(0)
+	calls, observedTaskID, observedGeneration := ownership.observed()
+	if calls != 1 || observedTaskID != id || observedGeneration != expectedGeneration {
+		t.Fatalf("ownership calls=%d task_id=%s generation=%d want=%d", calls, observedTaskID.String(), observedGeneration, expectedGeneration)
+	}
+	if proc.calls != 1 || proc.pid != pid {
+		t.Fatalf("terminate calls=%d pid=%d", proc.calls, proc.pid)
 	}
 }
