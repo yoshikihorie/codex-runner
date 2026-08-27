@@ -47,11 +47,12 @@ type RecoveryResult struct {
 	PartialOutputSaved bool
 }
 type RecoveryAttempt struct {
-	TaskID          domain.TaskID
-	Origin          domain.RecoveryOrigin
-	SessionRef      domain.SessionRef
-	StartedAt       time.Time
-	CodexBinaryPath string
+	TaskID            domain.TaskID
+	Origin            domain.RecoveryOrigin
+	SessionRef        domain.SessionRef
+	StartedAt         time.Time
+	CodexBinaryPath   string
+	TaskPlacementRoot string
 }
 
 func failureExitCodeFor(origin domain.RecoveryOrigin) domain.ExitCode {
@@ -64,7 +65,13 @@ func failureExitCodeFor(origin domain.RecoveryOrigin) domain.ExitCode {
 func (r *RecoveryAttempt) Attempt(ctx context.Context, launcher ResumeLauncher, reader ContractReader) (RecoveryResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, resumeRecoveryTimeout)
 	defer cancel()
-	params := ResumeLaunchParams{TaskID: r.TaskID, CodexBinaryPath: r.CodexBinaryPath, SessionID: r.SessionRef.SessionID(), OutputLastMessagePath: filepath.Join(recoveryTaskPlacementRoot, r.TaskID.String(), "last-message.md")}
+	taskPlacementRoot := r.TaskPlacementRoot
+	if taskPlacementRoot == "" {
+		// Fallback for callers that construct RecoveryAttempt without wiring
+		// TaskPlacementRoot explicitly (e.g. existing unit tests).
+		taskPlacementRoot = recoveryTaskPlacementRoot
+	}
+	params := ResumeLaunchParams{TaskID: r.TaskID, CodexBinaryPath: r.CodexBinaryPath, SessionID: r.SessionRef.SessionID(), OutputLastMessagePath: filepath.Join(taskPlacementRoot, r.TaskID.String(), "last-message.md")}
 	if err := launcher.LaunchAndWait(ctx, params); err != nil {
 		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, err
 	}
@@ -79,23 +86,24 @@ func (r *RecoveryAttempt) Attempt(ctx context.Context, launcher ResumeLauncher, 
 }
 
 type resumeRecoverer struct {
-	launcher        ResumeLauncher
-	reader          ContractReader
-	codexBinaryPath string
-	clock           Clock
+	launcher          ResumeLauncher
+	reader            ContractReader
+	codexBinaryPath   string
+	taskPlacementRoot string
+	clock             Clock
 }
 
-func NewResumeRecoverer(launcher ResumeLauncher, reader ContractReader, codexBinaryPath string, clock Clock) Recoverer {
+func NewResumeRecoverer(launcher ResumeLauncher, reader ContractReader, codexBinaryPath string, taskPlacementRoot string, clock Clock) Recoverer {
 	if isNilAdoptionDependency(launcher) || isNilAdoptionDependency(reader) || isNilAdoptionDependency(clock) {
 		panic("resume recoverer requires non-nil dependencies")
 	}
-	return &resumeRecoverer{launcher: launcher, reader: reader, codexBinaryPath: codexBinaryPath, clock: clock}
+	return &resumeRecoverer{launcher: launcher, reader: reader, codexBinaryPath: codexBinaryPath, taskPlacementRoot: taskPlacementRoot, clock: clock}
 }
 func (r *resumeRecoverer) Resume(ctx context.Context, taskID domain.TaskID, sessionRef *domain.SessionRef, origin domain.RecoveryOrigin) (RecoveryResult, error) {
 	if sessionRef == nil {
 		return RecoveryResult{}, nil
 	}
-	return (&RecoveryAttempt{TaskID: taskID, Origin: origin, SessionRef: *sessionRef, StartedAt: r.clock.Now(), CodexBinaryPath: r.codexBinaryPath}).Attempt(ctx, r.launcher, r.reader)
+	return (&RecoveryAttempt{TaskID: taskID, Origin: origin, SessionRef: *sessionRef, StartedAt: r.clock.Now(), CodexBinaryPath: r.codexBinaryPath, TaskPlacementRoot: r.taskPlacementRoot}).Attempt(ctx, r.launcher, r.reader)
 }
 
 type recoveryContractWriter interface {

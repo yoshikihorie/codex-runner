@@ -78,13 +78,13 @@ type goldenResumeLauncher struct {
 func (l *goldenResumeLauncher) LaunchAndWait(_ context.Context, p recovery.ResumeLaunchParams) error {
 	l.calls++
 	l.params = append(l.params, p)
-	if p.TaskID != l.taskID || p.SessionID != l.sessionID || p.CodexBinaryPath != l.codexBinaryPath || p.OutputLastMessagePath != filepath.Join("/tmp/codex-tasks", l.taskID.String(), "last-message.md") {
+	if p.TaskID != l.taskID || p.SessionID != l.sessionID || p.CodexBinaryPath != l.codexBinaryPath || p.OutputLastMessagePath != filepath.Join(l.taskDir, "last-message.md") {
 		return errors.New("invalid golden resume launch parameters")
 	}
 	if !l.success {
 		return errors.New("deterministic resume failure")
 	}
-	return os.WriteFile(filepath.Join(l.taskDir, "last-message.md"), []byte("recovered answer\n"), 0o600)
+	return os.WriteFile(p.OutputLastMessagePath, []byte("recovered answer\n"), 0o600)
 }
 
 func recoveryRequired(rawExit int) bool {
@@ -250,7 +250,7 @@ func runGoldenScenario(t *testing.T, scenario string, family domain.Subcommand, 
 			}
 		}
 		launcher := &goldenResumeLauncher{taskDir: dir, success: resumeSuccess, taskID: id, sessionID: session.SessionID(), codexBinaryPath: "/usr/bin/false"}
-		recoverer := recovery.NewResumeRecoverer(launcher, reader, "/usr/bin/false", clock)
+		recoverer := recovery.NewResumeRecoverer(launcher, reader, "/usr/bin/false", root, clock)
 		partial := recovery.NewSavePartialOutputUseCase(reader, writer)
 		out, err := recovery.NewRecoverViaResumeUseCase(tasks, writer, recoverer, partial, goldenSlot{}, goldenMetrics{}, goldenTracker{}, mu, clock).Execute(context.Background(), recovery.RecoverViaResumeInput{TaskID: id, SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: now})
 		if err != nil {

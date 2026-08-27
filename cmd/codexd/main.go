@@ -758,7 +758,7 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	advance := usecase.NewAdvanceQueueUseCase(queue, registry, launching, promotions, queueMu, cfg.MaxConcurrentTasks(), cfg.MaxConcurrentImplTasks())
 	slots := usecase.NewSlotReleaser(advance, starter, logger)
 	partial := recovery.NewSavePartialOutputUseCase(reader, writer, logger)
-	resume := recovery.NewRecoverViaResumeUseCase(tasks, writer, recovery.NewResumeRecoverer(execution.NewResumeLauncher(processRunner, logger), reader, cfg.CodexBinaryPath(), clock), partial, slots, metricRecorder, stalled, taskMu, clock, logger)
+	resume := recovery.NewRecoverViaResumeUseCase(tasks, writer, recovery.NewResumeRecoverer(execution.NewResumeLauncher(processRunner, logger), reader, cfg.CodexBinaryPath(), taskPlacementRoot, clock), partial, slots, metricRecorder, stalled, taskMu, clock, logger)
 	enforce := execution.NewEnforceTaskTimeoutUseCase(tasks, writer, processRunner, resume, termination, validator, pending, pathRelease, taskMu, clock, stalled)
 	watcher := execution.NewTimeoutWatcher(enforce, clock, afterFuncTimerFactory{}, baseCtx, logger)
 	finalize := execution.NewFinalizeTaskUseCase(tasks, writer, reader, clock, taskMu, slots, watcher, pathRelease, metricRecorder, stalled, logger)

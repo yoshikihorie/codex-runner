@@ -119,7 +119,7 @@ func TestRecoveryAttemptAppliesResumeRecoveryTimeout(t *testing.T) {
 
 func TestResumeRecovererAllowsNilSessionRef(t *testing.T) {
 	launcher := &resumeLauncherFake{}
-	recoverer := NewResumeRecoverer(launcher, &resumeReaderFake{}, "/usr/local/bin/codex", domain.ClockFunc(time.Now))
+	recoverer := NewResumeRecoverer(launcher, &resumeReaderFake{}, "/usr/local/bin/codex", "", domain.ClockFunc(time.Now))
 	result, err := recoverer.Resume(context.Background(), recoveryTestTaskID(t), nil, domain.RecoveryOriginTimeout)
 	if err != nil || result != (RecoveryResult{}) || launcher.calls != 0 {
 		t.Fatalf("result=(%+v, %v), launches=%d", result, err, launcher.calls)
@@ -132,13 +132,13 @@ func TestNewResumeRecovererRejectsTypedNilDependencies(t *testing.T) {
 		build func()
 	}{
 		{"launcher", func() {
-			NewResumeRecoverer((*resumeLauncherFake)(nil), &resumeReaderFake{}, "/usr/local/bin/codex", domain.ClockFunc(time.Now))
+			NewResumeRecoverer((*resumeLauncherFake)(nil), &resumeReaderFake{}, "/usr/local/bin/codex", "", domain.ClockFunc(time.Now))
 		}},
 		{"reader", func() {
-			NewResumeRecoverer(&resumeLauncherFake{}, (*resumeReaderFake)(nil), "/usr/local/bin/codex", domain.ClockFunc(time.Now))
+			NewResumeRecoverer(&resumeLauncherFake{}, (*resumeReaderFake)(nil), "/usr/local/bin/codex", "", domain.ClockFunc(time.Now))
 		}},
 		{"clock", func() {
-			NewResumeRecoverer(&resumeLauncherFake{}, &resumeReaderFake{}, "/usr/local/bin/codex", (domain.ClockFunc)(nil))
+			NewResumeRecoverer(&resumeLauncherFake{}, &resumeReaderFake{}, "/usr/local/bin/codex", "", (domain.ClockFunc)(nil))
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
