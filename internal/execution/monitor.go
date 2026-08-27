@@ -9,8 +9,6 @@ import (
 	"log/slog"
 )
 
-const eventLineMaxBytes = 1 << 20
-
 var knownEventTypes = map[string]struct{}{
 	"thread.started": {}, "turn.started": {}, "item.started": {},
 	"item.completed": {}, "turn.completed": {}, "turn.failed": {},
@@ -46,7 +44,7 @@ func ObserveEvents(ctx context.Context, stdout io.Reader, onKnown func(string, j
 			var envelope struct {
 				Type any `json:"type"`
 			}
-			if size > eventLineMaxBytes || !json.Valid(line) {
+			if !json.Valid(line) {
 				slog.Default().Warn("malformed event stream line", "code", "EVENT_STREAM_MALFORMED", "line", lineNo, "bytes", size)
 			} else {
 				_ = json.Unmarshal(line, &envelope)
@@ -56,8 +54,10 @@ func ObserveEvents(ctx context.Context, stdout io.Reader, onKnown func(string, j
 				}
 				raw := json.RawMessage(append([]byte(nil), line...))
 				if _, ok := knownEventTypes[typ]; ok {
-					onKnown(typ, raw)
-				} else {
+					if onKnown != nil {
+						onKnown(typ, raw)
+					}
+				} else if onUnknown != nil {
 					onUnknown(typ, raw)
 				}
 			}
@@ -82,19 +82,12 @@ func readEventLine(reader *bufio.Reader) ([]byte, int, error) {
 	for {
 		part, err := reader.ReadSlice('\n')
 		size += len(part)
-		content := part
+		line = append(line, part...)
 		if err == nil {
-			content = content[:len(content)-1]
-			if len(content) > 0 && content[len(content)-1] == '\r' {
-				content = content[:len(content)-1]
+			line = line[:len(line)-1]
+			if len(line) > 0 && line[len(line)-1] == '\r' {
+				line = line[:len(line)-1]
 			}
-		}
-		if size <= eventLineMaxBytes {
-			line = append(line, content...)
-		} else {
-			line = nil
-		}
-		if err == nil {
 			return line, size, nil
 		}
 		if errors.Is(err, bufio.ErrBufferFull) {

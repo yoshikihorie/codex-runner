@@ -25,6 +25,32 @@ func TestEventMonitorKnownAndUnknownEvents(t *testing.T) {
 	}
 }
 
+func TestObserveEventsNilKnownCallback(t *testing.T) {
+	unknownCalls := 0
+	err := ObserveEvents(context.Background(), strings.NewReader("{\"type\":\"item.completed\"}\n"), nil, func(string, json.RawMessage) {
+		unknownCalls++
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unknownCalls != 0 {
+		t.Fatalf("unknown callback calls=%d", unknownCalls)
+	}
+}
+
+func TestObserveEventsNilUnknownCallback(t *testing.T) {
+	knownCalls := 0
+	err := ObserveEvents(context.Background(), strings.NewReader("{\"type\":\"future.event\"}\n"), func(string, json.RawMessage) {
+		knownCalls++
+	}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if knownCalls != 0 {
+		t.Fatalf("known callback calls=%d", knownCalls)
+	}
+}
+
 func TestNewEventMonitorProvidesEventMonitorAndHonorsCanceledContext(t *testing.T) {
 	var _ EventMonitor = NewEventMonitor()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -41,16 +67,20 @@ func TestObserveEventsMalformedLinesDoNotLogPayload(t *testing.T) {
 	old := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, nil)))
 	t.Cleanup(func() { slog.SetDefault(old) })
-	over := "{\"type\":\"" + strings.Repeat("x", eventLineMaxBytes) + "\"}\n"
-	err := ObserveEvents(context.Background(), strings.NewReader("{"+secret+"}\n\n"+over+"{\"type\":\"item.completed\"}"), func(string, json.RawMessage) {}, func(string, json.RawMessage) {})
+	invalid := "{\"type\":\"" + strings.Repeat("x", 1<<20+1) + secret + "\n"
+	var known []string
+	err := ObserveEvents(context.Background(), strings.NewReader(invalid+"{\"type\":\"item.completed\"}"), func(typ string, _ json.RawMessage) { known = append(known, typ) }, func(string, json.RawMessage) {})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !strings.Contains(logs.String(), "EVENT_STREAM_MALFORMED") {
-		t.Fatalf("logs=%s", logs.String())
+		t.Fatal("malformed event log missing")
 	}
 	if strings.Contains(logs.String(), secret) {
-		t.Fatalf("payload leaked: %s", logs.String())
+		t.Fatal("payload leaked into logs")
+	}
+	if strings.Join(known, ",") != "item.completed" {
+		t.Fatalf("known=%v", known)
 	}
 }
 
@@ -61,10 +91,11 @@ func TestReadEventLineHandlesUnterminatedFinalLine(t *testing.T) {
 	}
 }
 
-func TestReadEventLineDiscardsOversizedPayloadAndContinues(t *testing.T) {
-	reader := bufio.NewReader(strings.NewReader(strings.Repeat("x", eventLineMaxBytes+1) + "\nnext\n"))
+func TestReadEventLineHandlesOversizedLines(t *testing.T) {
+	body := strings.Repeat("x", 1<<20+1)
+	reader := bufio.NewReader(strings.NewReader(body + "\nnext\n"))
 	line, size, err := readEventLine(reader)
-	if err != nil || line != nil || size != eventLineMaxBytes+2 {
+	if err != nil || string(line) != body || size != len(body)+1 {
 		t.Fatalf("line=%q size=%d err=%v", line, size, err)
 	}
 	line, size, err = readEventLine(reader)
@@ -73,30 +104,33 @@ func TestReadEventLineDiscardsOversizedPayloadAndContinues(t *testing.T) {
 	}
 }
 
-func TestReadEventLineCountsLineEndingAtMaximumBoundary(t *testing.T) {
-	for _, tc := range []struct {
-		name     string
-		bodySize int
-		wantLine bool
-		wantSize int
-	}{
-		{name: "within-limit", bodySize: eventLineMaxBytes - 1, wantLine: true, wantSize: eventLineMaxBytes},
-		{name: "over-limit", bodySize: eventLineMaxBytes, wantLine: false, wantSize: eventLineMaxBytes + 1},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			body := strings.Repeat("x", tc.bodySize)
-			line, size, err := readEventLine(bufio.NewReader(strings.NewReader(body + "\n")))
-			if err != nil || size != tc.wantSize {
-				t.Fatalf("line=%q size=%d err=%v", line, size, err)
-			}
-			if tc.wantLine {
-				if string(line) != body {
-					t.Fatalf("line length=%d want length=%d", len(line), len(body))
-				}
-			} else if line != nil {
-				t.Fatalf("line=%q", line)
-			}
-		})
+func TestReadEventLineHandlesOversizedUnterminatedFinalLine(t *testing.T) {
+	body := strings.Repeat("x", 1<<20+1)
+	line, size, err := readEventLine(bufio.NewReader(strings.NewReader(body)))
+	if err != io.EOF || string(line) != body || size != len(body) {
+		t.Fatalf("line length=%d size=%d err=%v", len(line), size, err)
+	}
+}
+
+func TestObserveEventsDeliversOversizedKnownEvent(t *testing.T) {
+	raw := "{\"type\":\"item.completed\",\"text\":\"" + strings.Repeat("x", 1<<20+1) + "\"}"
+	var got []string
+	err := ObserveEvents(context.Background(), strings.NewReader(raw+"\n"), func(typ string, event json.RawMessage) {
+		got = append(got, typ+":"+string(event))
+	}, func(string, json.RawMessage) {})
+	if err != nil || len(got) != 1 || got[0] != "item.completed:"+raw {
+		t.Fatalf("got count=%d err=%v", len(got), err)
+	}
+}
+
+func TestObserveEventsDeliversOversizedUnknownEvent(t *testing.T) {
+	raw := "{\"type\":\"future.event\",\"text\":\"" + strings.Repeat("x", 1<<20+1) + "\"}"
+	var got []string
+	err := ObserveEvents(context.Background(), strings.NewReader(raw+"\n"), func(string, json.RawMessage) {}, func(typ string, event json.RawMessage) {
+		got = append(got, typ+":"+string(event))
+	})
+	if err != nil || len(got) != 1 || got[0] != "future.event:"+raw {
+		t.Fatalf("got count=%d err=%v", len(got), err)
 	}
 }
 
