@@ -123,6 +123,7 @@ type RecoverViaResumeUseCase struct {
 	stalledTracker  stalledTimeTracker
 	taskMu          TaskMutex
 	clock           Clock
+	ownership       RecoveryOwnershipRegistry
 	logger          *slog.Logger
 }
 
@@ -134,7 +135,18 @@ func NewRecoverViaResumeUseCase(tasks TaskStore, contract recoveryContractWriter
 	if len(loggers) > 0 && loggers[0] != nil {
 		logger = loggers[0]
 	}
-	return &RecoverViaResumeUseCase{tasks: tasks, contract: contract, recoverer: recoverer, partial: partial, slotReleaser: slotReleaser, metricsRecorder: metricsRecorder, stalledTracker: stalledTracker, taskMu: taskMu, clock: clock, logger: logger}
+	return &RecoverViaResumeUseCase{tasks: tasks, contract: contract, recoverer: recoverer, partial: partial, slotReleaser: slotReleaser, metricsRecorder: metricsRecorder, stalledTracker: stalledTracker, taskMu: taskMu, clock: clock, ownership: NewRecoveryOwnershipRegistry(), logger: logger}
+}
+
+// WithRecoveryOwnership wires the use case to the daemon-shared registry.
+// Omitting it leaves each use case with an independent registry and disables
+// cross-use-case recovery protection.
+func (uc *RecoverViaResumeUseCase) WithRecoveryOwnership(ownership RecoveryOwnershipRegistry) *RecoverViaResumeUseCase {
+	if isNilAdoptionDependency(ownership) {
+		panic("recover via resume use case requires a non-nil recovery ownership registry")
+	}
+	uc.ownership = ownership
+	return uc
 }
 
 func (uc *RecoverViaResumeUseCase) Execute(ctx context.Context, in RecoverViaResumeInput) (RecoverViaResumeOutput, error) {
@@ -150,6 +162,11 @@ func (uc *RecoverViaResumeUseCase) Execute(ctx context.Context, in RecoverViaRes
 	if in.SessionRef != nil && in.SessionRef.Ephemeral() {
 		return RecoverViaResumeOutput{}, domain.ErrSessionNotResumable
 	}
+	release, acquired := uc.ownership.Acquire(in.TaskID)
+	if !acquired {
+		return RecoverViaResumeOutput{}, ErrRecoveryAlreadyInFlight
+	}
+	defer release()
 	origin, err := uc.begin(in)
 	if err != nil {
 		return RecoverViaResumeOutput{}, err
@@ -166,6 +183,7 @@ func (uc *RecoverViaResumeUseCase) Execute(ctx context.Context, in RecoverViaRes
 	completedAt := uc.clock.Now()
 	cleanupCtx := context.WithoutCancel(ctx)
 	output, terminal := uc.finish(cleanupCtx, in, origin, result, completedAt)
+	release()
 	if !terminal {
 		return output, fmt.Errorf("recovery: terminal transition was not persisted")
 	}

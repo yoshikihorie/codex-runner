@@ -28,6 +28,57 @@ func (r *timeoutRecoveryIntegrationRecoverer) Resume(context.Context, domain.Tas
 	return recovery.RecoveryResult{}, nil
 }
 
+type timeoutRecoveryBlockingRecoverer struct {
+	started chan<- struct{}
+	release <-chan struct{}
+}
+
+func (r *timeoutRecoveryBlockingRecoverer) Resume(context.Context, domain.TaskID, *domain.SessionRef, domain.RecoveryOrigin) (recovery.RecoveryResult, error) {
+	r.started <- struct{}{}
+	<-r.release
+	return recovery.RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)}, nil
+}
+
+type timeoutRecoveryLiveness struct {
+	mu    sync.Mutex
+	calls int
+}
+
+func (l *timeoutRecoveryLiveness) Execute(context.Context, domain.TaskID) (bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.calls++
+	return true, nil
+}
+
+func (l *timeoutRecoveryLiveness) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.calls
+}
+
+type timeoutRecoveryObservedMutex struct {
+	delegate      recovery.TaskMutex
+	mu            sync.Mutex
+	locks         int
+	observedLocks chan<- struct{}
+}
+
+func (m *timeoutRecoveryObservedMutex) Lock(id domain.TaskID) {
+	m.delegate.Lock(id)
+	m.mu.Lock()
+	m.locks++
+	locks := m.locks
+	m.mu.Unlock()
+	if locks == 2 || locks == 3 {
+		m.observedLocks <- struct{}{}
+	}
+}
+
+func (m *timeoutRecoveryObservedMutex) Unlock(id domain.TaskID) {
+	m.delegate.Unlock(id)
+}
+
 // metricsAcceptanceFixture deliberately uses the file-backed metrics dependencies.
 // Terminal-route unit tests cover each route's state transition; these tests keep the
 // acceptance mapping focused on the persisted JSON Lines contract.
@@ -808,5 +859,76 @@ func TestTimeoutRecoveryIntegrationCarriesLifecycleGeneration(t *testing.T) {
 	}
 	if proc.calls != 1 || proc.pid != pid {
 		t.Fatalf("terminate calls=%d pid=%d", proc.calls, proc.pid)
+	}
+}
+
+func TestTimeoutRecoveryIntegrationReconcileSkipsOwnedRecoveringTask(t *testing.T) {
+	fixture := newMetricsAcceptanceFixture(t)
+	id, session := fixture.prepare(t, "owned-recovery", domain.StateTimeout, fixture.now, nil)
+	pending := &recovery.PendingReconciliationSet{}
+	if err := pending.Register(id, recovery.PendingSendConfirmOnly, nil); err != nil {
+		t.Fatal(err)
+	}
+	registry := recovery.NewRecoveryOwnershipRegistry()
+	observedLocks := make(chan struct{}, 2)
+	sharedMutex := &timeoutRecoveryObservedMutex{delegate: store.NewTaskMutex(), observedLocks: observedLocks}
+	started := make(chan struct{}, 1)
+	releaseRecovery := make(chan struct{})
+	recoverer := &timeoutRecoveryBlockingRecoverer{started: started, release: releaseRecovery}
+	metricsRecorder := &timeoutRecoveryIntegrationMetrics{}
+	slots := &timeoutRecoveryIntegrationSlots{}
+	resume := recovery.NewRecoverViaResumeUseCase(fixture.tasks, fixture.writer, recoverer, recovery.NewSavePartialOutputUseCase(fixture.reader, fixture.writer), slots, metricsRecorder, fixture.tracker, sharedMutex, domain.ClockFunc(func() time.Time { return fixture.now })).WithRecoveryOwnership(registry)
+	liveness := &timeoutRecoveryLiveness{}
+	reconcile := recovery.NewReconcilePendingUseCase(pending, fixture.tasks, liveness, fixture.reader, fixture.writer, metricsAcceptanceFinalizer{}, metricsAcceptanceTermination{}, metricsAcceptanceKilled{}, NewReleasePathLockUseCase(&timeoutPathStoreFake{}), resume, slots, sharedMutex, domain.ClockFunc(func() time.Time { return fixture.now }), fixture.tracker, metricsRecorder, time.Nanosecond, time.Second, slog.New(slog.NewTextHandler(io.Discard, nil))).WithRecoveryOwnership(registry)
+
+	resumeDone := make(chan error, 1)
+	go func() {
+		_, err := resume.Execute(context.Background(), recovery.RecoverViaResumeInput{TaskID: id, SessionRef: session, Origin: domain.RecoveryOriginTimeout, OccurredAt: fixture.now})
+		if err == nil {
+			pending.Remove(id)
+		}
+		resumeDone <- err
+	}()
+	<-started
+
+	ctx, cancel := context.WithCancel(context.Background())
+	reconcileDone := make(chan struct{})
+	go func() {
+		reconcile.Run(ctx)
+		close(reconcileDone)
+	}()
+	<-observedLocks
+	<-observedLocks
+	stored, err := fixture.tasks.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != domain.StateRecovering || len(pending.List()) != 1 || liveness.count() != 0 {
+		t.Fatalf("state=%s pending=%+v liveness=%d", stored.State, pending.List(), liveness.count())
+	}
+	cancel()
+	<-reconcileDone
+
+	close(releaseRecovery)
+	if err := <-resumeDone; err != nil {
+		t.Fatal(err)
+	}
+	stored, err = fixture.tasks.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != domain.StateRecovered || len(pending.List()) != 0 {
+		t.Fatalf("state=%s pending=%+v", stored.State, pending.List())
+	}
+	code, exists, err := fixture.reader.ReadExitCode(id)
+	if err != nil || !exists || code != 0 {
+		t.Fatalf("exit code=(%d, %t, %v)", code, exists, err)
+	}
+	events, err := os.ReadFile(filepath.Join(fixture.root, id.String(), "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(events, []byte("RecoverySucceeded")) {
+		t.Fatalf("RecoverySucceeded event is absent: %s", events)
 	}
 }

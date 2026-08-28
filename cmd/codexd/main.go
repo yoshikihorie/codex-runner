@@ -758,7 +758,8 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	advance := usecase.NewAdvanceQueueUseCase(queue, registry, launching, promotions, queueMu, cfg.MaxConcurrentTasks(), cfg.MaxConcurrentImplTasks())
 	slots := usecase.NewSlotReleaser(advance, starter, logger)
 	partial := recovery.NewSavePartialOutputUseCase(reader, writer, logger)
-	resume := recovery.NewRecoverViaResumeUseCase(tasks, writer, recovery.NewResumeRecoverer(execution.NewResumeLauncher(processRunner, logger), reader, cfg.CodexBinaryPath(), taskPlacementRoot, clock), partial, slots, metricRecorder, stalled, taskMu, clock, logger)
+	recoveryOwnership := recovery.NewRecoveryOwnershipRegistry()
+	resume := recovery.NewRecoverViaResumeUseCase(tasks, writer, recovery.NewResumeRecoverer(execution.NewResumeLauncher(processRunner, logger), reader, cfg.CodexBinaryPath(), taskPlacementRoot, clock), partial, slots, metricRecorder, stalled, taskMu, clock, logger).WithRecoveryOwnership(recoveryOwnership)
 	enforce := execution.NewEnforceTaskTimeoutUseCase(tasks, writer, processRunner, resume, termination, validator, pending, pathRelease, taskMu, clock, stalled)
 	watcher := execution.NewTimeoutWatcher(enforce, clock, afterFuncTimerFactory{}, baseCtx, logger)
 	finalize := execution.NewFinalizeTaskUseCase(tasks, writer, reader, clock, taskMu, slots, watcher, pathRelease, metricRecorder, stalled, logger)
@@ -794,7 +795,7 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 		return daemonDependencies{}, err
 	}
 	adoption := recovery.NewAdoptRunningTasksUseCase(tasks, liveness, reader, writer, finalize, resume, slots, registry, termination, killed, pathRelease, pending, taskMu, clock, stalled, metricRecorder, logger)
-	reconcile := recovery.NewReconcilePendingUseCase(pending, tasks, liveness, reader, writer, finalize, termination, killed, pathRelease, resume, slots, taskMu, clock, stalled, metricRecorder, reconcileInterval, execution.TimeoutKillGrace, logger)
+	reconcile := recovery.NewReconcilePendingUseCase(pending, tasks, liveness, reader, writer, finalize, termination, killed, pathRelease, resume, slots, taskMu, clock, stalled, metricRecorder, reconcileInterval, execution.TimeoutKillGrace, logger).WithRecoveryOwnership(recoveryOwnership)
 	stall := usecase.NewCheckStallUseCase(tasks, taskMu, liveness, writer, clock, stalled, ownership, logger)
 	connections := &sync.WaitGroup{}
 	tailConns := transport.NewTailConnRegistry()

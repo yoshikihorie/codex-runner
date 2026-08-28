@@ -33,6 +33,7 @@ type ReconcilePendingUseCase struct {
 	killed           KillConfirmer
 	pathLocks        PathLockReleaser
 	resume           *RecoverViaResumeUseCase
+	ownership        RecoveryOwnershipRegistry
 	slots            SlotReleaser
 	taskMu           TaskMutex
 	clock            domain.Clock
@@ -61,7 +62,18 @@ func NewReconcilePendingUseCase(pending *PendingReconciliationSet, tasks Adoptio
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &ReconcilePendingUseCase{pending: pending, tasks: tasks, liveness: liveness, reader: reader, writer: writer, finalizer: finalizer, termination: termination, killed: killed, pathLocks: pathLocks, resume: resume, slots: slots, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker, metricsRecorder: metricsRecorder, interval: interval, terminationGrace: terminationGrace, logger: logger}
+	return &ReconcilePendingUseCase{pending: pending, tasks: tasks, liveness: liveness, reader: reader, writer: writer, finalizer: finalizer, termination: termination, killed: killed, pathLocks: pathLocks, resume: resume, ownership: NewRecoveryOwnershipRegistry(), slots: slots, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker, metricsRecorder: metricsRecorder, interval: interval, terminationGrace: terminationGrace, logger: logger}
+}
+
+// WithRecoveryOwnership wires the use case to the daemon-shared registry.
+// Omitting it leaves each use case with an independent registry and disables
+// cross-use-case recovery protection.
+func (uc *ReconcilePendingUseCase) WithRecoveryOwnership(ownership RecoveryOwnershipRegistry) *ReconcilePendingUseCase {
+	if isNilAdoptionDependency(ownership) {
+		panic("reconcile pending use case requires a non-nil recovery ownership registry")
+	}
+	uc.ownership = ownership
+	return uc
 }
 
 // Run processes a snapshot of the pending set on every interval until ctx ends.
@@ -104,6 +116,12 @@ func (uc *ReconcilePendingUseCase) reconcileOne(ctx context.Context, entry Pendi
 	}
 	switch snapshot.State {
 	case domain.StateRecovering:
+		// Acquire, rather than IsOwned, decides exclusive recovery ownership.
+		release, acquired := uc.ownership.Acquire(taskID)
+		if !acquired {
+			return
+		}
+		defer release()
 		uc.reconcileRecovering(ctx, taskID)
 	case domain.StateOrphaned:
 		uc.reconcileOrphaned(ctx, taskID, snapshot)

@@ -76,6 +76,35 @@ type reconcileLivenessFake struct {
 	once    sync.Once
 }
 
+type reconcileOwnershipProbe struct {
+	registry     RecoveryOwnershipRegistry
+	mu           sync.Mutex
+	acquireCalls int
+	acquired     chan struct{}
+	once         sync.Once
+}
+
+func (p *reconcileOwnershipProbe) Acquire(taskID domain.TaskID) (func(), bool) {
+	p.mu.Lock()
+	p.acquireCalls++
+	p.mu.Unlock()
+	release, acquired := p.registry.Acquire(taskID)
+	if acquired {
+		p.once.Do(func() { close(p.acquired) })
+	}
+	return release, acquired
+}
+
+func (p *reconcileOwnershipProbe) IsOwned(taskID domain.TaskID) bool {
+	return p.registry.IsOwned(taskID)
+}
+
+func (p *reconcileOwnershipProbe) calls() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.acquireCalls
+}
+
 func (f *reconcileLivenessFake) Execute(ctx context.Context, _ domain.TaskID) (bool, error) {
 	f.once.Do(func() { close(f.called) })
 	select {
@@ -314,6 +343,142 @@ func newReconcileFixture(t *testing.T, state domain.TaskState, dead bool, presen
 	mutex := &reconcileMutexFake{order: &order}
 	uc := NewReconcilePendingUseCase(pending, tasks, liveness, &reconcileReaderFake{present: present}, writer, &adoptionFinalizerFake{}, termination, killed, pathLocks, newAdoptionResumeUseCase(t), slots, mutex, domain.ClockFunc(time.Now), &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, time.Nanosecond, 17*time.Second, slog.Default())
 	return uc, pending, tasks, liveness, writer, termination, killed, pathLocks, slots, mutex, &order
+}
+
+func TestReconcilePendingSkipsOwnedRecoveringTask(t *testing.T) {
+	uc, pending, tasks, liveness, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateRecovering, true, false)
+	id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
+	registry := NewRecoveryOwnershipRegistry()
+	release, acquired := registry.Acquire(id)
+	if !acquired {
+		t.Fatal("Acquire did not acquire")
+	}
+	t.Cleanup(release)
+	uc.WithRecoveryOwnership(registry)
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
+	liveness.release <- struct{}{}
+
+	uc.reconcileOne(context.Background(), pending.List()[0])
+
+	select {
+	case <-liveness.called:
+		t.Fatal("liveness was called for an owned recovery")
+	default:
+	}
+	if len(pending.List()) != 1 {
+		t.Fatalf("pending entries = %+v, want one retained entry", pending.List())
+	}
+	if tasks.entries[id].State != domain.StateRecovering {
+		t.Fatalf("state = %q, want recovering", tasks.entries[id].State)
+	}
+}
+
+func TestReconcilePendingRecoveringAcquiresOwnershipBeforeConcurrentRecovery(t *testing.T) {
+	uc, pending, tasks, liveness, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateRecovering, false, false)
+	id := adoptionID(t, "reconcile-ownership-race")
+	snapshot := adoptionSnapshot(t, id, domain.StateRecovering)
+	tasks.entries[id] = snapshot
+	registerReconcilePending(t, pending, snapshot, PendingSendConfirmOnly)
+	registry := NewRecoveryOwnershipRegistry()
+	ownership := &reconcileOwnershipProbe{registry: registry, acquired: make(chan struct{})}
+	uc.WithRecoveryOwnership(ownership)
+
+	done := make(chan struct{})
+	go func() {
+		uc.reconcileOne(context.Background(), pending.List()[0])
+		close(done)
+	}()
+	select {
+	case <-ownership.acquired:
+	case <-time.After(time.Second):
+		t.Fatal("reconciliation did not acquire recovery ownership")
+	}
+	otherRelease, otherAcquired := registry.Acquire(id)
+	if otherAcquired {
+		otherRelease()
+		t.Fatal("concurrent recovery acquired ownership while reconciliation was active")
+	}
+	select {
+	case <-liveness.called:
+	case <-time.After(time.Second):
+		t.Fatal("reconciliation did not enter liveness check")
+	}
+	liveness.release <- struct{}{}
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("reconciliation did not complete")
+	}
+}
+
+func TestReconcilePendingRecoveringSkipsProcessingWhenOwnershipAcquireFails(t *testing.T) {
+	uc, pending, tasks, liveness, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateRecovering, true, false)
+	id := adoptionID(t, "reconcile-ownership-denied")
+	snapshot := adoptionSnapshot(t, id, domain.StateRecovering)
+	tasks.entries[id] = snapshot
+	registerReconcilePending(t, pending, snapshot, PendingSendConfirmOnly)
+	registry := NewRecoveryOwnershipRegistry()
+	release, acquired := registry.Acquire(id)
+	if !acquired {
+		t.Fatal("competing recovery did not acquire ownership")
+	}
+	t.Cleanup(release)
+	ownership := &reconcileOwnershipProbe{registry: registry, acquired: make(chan struct{})}
+	uc.WithRecoveryOwnership(ownership)
+
+	uc.reconcileOne(context.Background(), pending.List()[0])
+
+	if ownership.calls() != 1 {
+		t.Fatalf("Acquire calls = %d, want 1", ownership.calls())
+	}
+	select {
+	case <-liveness.called:
+		t.Fatal("liveness was called after ownership acquisition failed")
+	default:
+	}
+}
+
+func TestReconcilePendingRecoveringReleasesOwnershipAfterCompletion(t *testing.T) {
+	uc, pending, tasks, liveness, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateRecovering, true, true)
+	id := adoptionID(t, "reconcile-ownership-release")
+	snapshot := adoptionSnapshot(t, id, domain.StateRecovering)
+	tasks.entries[id] = snapshot
+	registerReconcilePending(t, pending, snapshot, PendingSendConfirmOnly)
+	registry := NewRecoveryOwnershipRegistry()
+	uc.WithRecoveryOwnership(registry)
+	liveness.release <- struct{}{}
+
+	uc.reconcileOne(context.Background(), pending.List()[0])
+
+	if registry.IsOwned(id) {
+		t.Fatal("reconciliation retained recovery ownership after completion")
+	}
+}
+
+func TestRecoveryUseCasesRequireSharedOwnershipRegistry(t *testing.T) {
+	resume, _, _, _, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, nil, RecoveryResult{})
+	reconcile, _, _, _, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateRecovering, true, false)
+	id := adoptionID(t, "shared-ownership")
+	release, acquired := resume.ownership.Acquire(id)
+	if !acquired {
+		t.Fatal("resume registry did not acquire")
+	}
+	defer release()
+	if reconcile.ownership.IsOwned(id) {
+		t.Fatal("independent registries unexpectedly share recovery ownership")
+	}
+
+	shared := NewRecoveryOwnershipRegistry()
+	resume.WithRecoveryOwnership(shared)
+	reconcile.WithRecoveryOwnership(shared)
+	sharedRelease, sharedAcquired := shared.Acquire(id)
+	if !sharedAcquired {
+		t.Fatal("shared registry did not acquire")
+	}
+	defer sharedRelease()
+	if !reconcile.ownership.IsOwned(id) {
+		t.Fatal("injected shared registry did not protect reconcile")
+	}
 }
 
 type reconciliationRun struct {

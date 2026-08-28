@@ -171,12 +171,15 @@ func (f resumeLauncherFunc) LaunchAndWait(ctx context.Context, params ResumeLaun
 }
 
 type recovererFake struct {
-	result RecoveryResult
-	err    error
-	calls  int
-	origin domain.RecoveryOrigin
-	mutex  *recoveryMutexFake
-	cancel context.CancelFunc
+	result  RecoveryResult
+	err     error
+	calls   int
+	origin  domain.RecoveryOrigin
+	mutex   *recoveryMutexFake
+	cancel  context.CancelFunc
+	started chan<- struct{}
+	release <-chan struct{}
+	panic   any
 }
 
 func (f *recovererFake) Resume(_ context.Context, _ domain.TaskID, _ *domain.SessionRef, origin domain.RecoveryOrigin) (RecoveryResult, error) {
@@ -185,6 +188,15 @@ func (f *recovererFake) Resume(_ context.Context, _ domain.TaskID, _ *domain.Ses
 	}
 	f.calls++
 	f.origin = origin
+	if f.started != nil {
+		f.started <- struct{}{}
+	}
+	if f.release != nil {
+		<-f.release
+	}
+	if f.panic != nil {
+		panic(f.panic)
+	}
 	if f.cancel != nil {
 		f.cancel()
 	}
@@ -197,6 +209,7 @@ type recoveryStoreFake struct {
 	saves     int
 	saveErr   error
 	saveErrOn int
+	saveHook  func(int)
 }
 
 func (f *recoveryStoreFake) Load(domain.TaskID) (domain.TaskSnapshot, error) {
@@ -206,6 +219,9 @@ func (f *recoveryStoreFake) Load(domain.TaskID) (domain.TaskSnapshot, error) {
 
 func (f *recoveryStoreFake) Save(_ domain.TaskID, snapshot domain.TaskSnapshot) error {
 	f.saves++
+	if f.saveHook != nil {
+		f.saveHook(f.saves)
+	}
 	if f.saveErrOn == f.saves {
 		return f.saveErr
 	}
@@ -225,6 +241,7 @@ type recoveryWriterFake struct {
 	exitCodeErr   error
 	exitCodeCalls int
 	exitCode      domain.ExitCode
+	appendHook    func()
 }
 
 func (f *recoveryWriterFake) ReadLastMessage(domain.TaskID) (bool, error) { return f.lastPresent, nil }
@@ -244,18 +261,29 @@ func (f *recoveryWriterFake) WriteExitCode(_ domain.TaskID, exitCode domain.Exit
 }
 func (f *recoveryWriterFake) AppendEvent(_ domain.TaskID, event domain.Event) error {
 	f.events = append(f.events, event)
+	if f.appendHook != nil {
+		f.appendHook()
+	}
 	return f.appendErr
 }
 
 type recoveryMetricsFake struct {
-	inputs []metrics.RecordTaskMetricsInput
-	record metrics.RecordTaskMetricsOutput
-	ctxErr error
+	inputs  []metrics.RecordTaskMetricsInput
+	record  metrics.RecordTaskMetricsOutput
+	ctxErr  error
+	started chan<- struct{}
+	release <-chan struct{}
 }
 
 func (f *recoveryMetricsFake) Execute(ctx context.Context, in metrics.RecordTaskMetricsInput) metrics.RecordTaskMetricsOutput {
 	f.inputs = append(f.inputs, in)
 	f.ctxErr = ctx.Err()
+	if f.started != nil {
+		f.started <- struct{}{}
+	}
+	if f.release != nil {
+		<-f.release
+	}
 	return f.record
 }
 
@@ -277,15 +305,23 @@ func (f *recoveryStalledTrackerFake) TakeTotal(taskID domain.TaskID) int {
 }
 
 type recoverySlotFake struct {
-	calls  int
-	at     time.Time
-	ctxErr error
+	calls   int
+	at      time.Time
+	ctxErr  error
+	started chan<- struct{}
+	release <-chan struct{}
 }
 
 func (f *recoverySlotFake) ReleaseAndAdvance(ctx context.Context, _ domain.TaskID, at time.Time) {
 	f.calls++
 	f.at = at
 	f.ctxErr = ctx.Err()
+	if f.started != nil {
+		f.started <- struct{}{}
+	}
+	if f.release != nil {
+		<-f.release
+	}
 }
 
 type recoveryMutexFake struct {
@@ -402,6 +438,161 @@ func newRecoveryUseCaseFixture(t *testing.T, state domain.TaskState, session *do
 	partial := NewSavePartialOutputUseCase(writer, writer)
 	uc := NewRecoverViaResumeUseCase(store, writer, recoverer, partial, slots, metricsRecorder, tracker, mutex, clock)
 	return uc, store, writer, recoverer, metricsRecorder, slots, mutex
+}
+
+func TestRecoverViaResumeUseCaseOwnershipCoversBeginAndFinish(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, store, writer, _, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	registry := NewRecoveryOwnershipRegistry()
+	uc.WithRecoveryOwnership(registry)
+	id := recoveryTestTaskID(t)
+	store.saveHook = func(save int) {
+		if !registry.IsOwned(id) {
+			t.Fatalf("ownership was absent during save %d", save)
+		}
+	}
+	writer.appendHook = func() {
+		if store.saves == 2 && !registry.IsOwned(id) {
+			t.Fatal("ownership was released before finish returned")
+		}
+	}
+
+	if _, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: id, SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if registry.IsOwned(id) {
+		t.Fatal("ownership remains after Execute returns")
+	}
+}
+
+func TestRecoverViaResumeUseCaseReleasesOwnershipBeforeBlockingMetrics(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, _, _, _, recorded, _, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	registry := NewRecoveryOwnershipRegistry()
+	uc.WithRecoveryOwnership(registry)
+	id := recoveryTestTaskID(t)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	recorded.started, recorded.release = started, release
+	done := make(chan error, 1)
+	go func() {
+		_, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: id, SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
+		done <- err
+	}()
+	<-started
+	if registry.IsOwned(id) {
+		t.Fatal("ownership remains while metrics recording is blocked")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoverViaResumeUseCaseReleasesOwnershipBeforeBlockingSlotRelease(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, _, _, _, _, slots, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	registry := NewRecoveryOwnershipRegistry()
+	uc.WithRecoveryOwnership(registry)
+	id := recoveryTestTaskID(t)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	slots.started, slots.release = started, release
+	done := make(chan error, 1)
+	go func() {
+		_, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: id, SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
+		done <- err
+	}()
+	<-started
+	if registry.IsOwned(id) {
+		t.Fatal("ownership remains while slot release is blocked")
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestRecoverViaResumeUseCaseReleasesOwnershipAfterBeginFailure(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, store, _, _, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{})
+	registry := NewRecoveryOwnershipRegistry()
+	uc.WithRecoveryOwnership(registry)
+	id := recoveryTestTaskID(t)
+	store.saveErr, store.saveErrOn = errors.New("begin save failed"), 1
+	if _, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: id, SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()}); err == nil {
+		t.Fatal("Execute succeeded despite begin save failure")
+	}
+	if registry.IsOwned(id) {
+		t.Fatal("ownership remains after begin failure")
+	}
+}
+
+func TestRecoverViaResumeUseCaseReleasesOwnershipAfterNonTerminalFinish(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, store, _, _, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	registry := NewRecoveryOwnershipRegistry()
+	uc.WithRecoveryOwnership(registry)
+	id := recoveryTestTaskID(t)
+	store.saveErr, store.saveErrOn = errors.New("finish save failed"), 2
+	if _, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: id, SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()}); err == nil {
+		t.Fatal("Execute succeeded despite non-terminal finish")
+	}
+	if registry.IsOwned(id) {
+		t.Fatal("ownership remains after non-terminal finish")
+	}
+}
+
+func TestRecoverViaResumeUseCaseReleasesOwnershipAfterPanic(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, _, _, recoverer, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{})
+	registry := NewRecoveryOwnershipRegistry()
+	uc.WithRecoveryOwnership(registry)
+	id := recoveryTestTaskID(t)
+	recoverer.panic = "recoverer panic"
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("Execute did not panic")
+			}
+		}()
+		_, _ = uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: id, SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
+	}()
+	if registry.IsOwned(id) {
+		t.Fatal("ownership remains after panic")
+	}
+}
+
+func TestRecoverViaResumeUseCaseRejectsConcurrentExecutionBeforeSideEffects(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, store, writer, recoverer, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	registry := NewRecoveryOwnershipRegistry()
+	uc.WithRecoveryOwnership(registry)
+	id := recoveryTestTaskID(t)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	recoverer.started, recoverer.release = started, release
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: id, SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
+		firstDone <- err
+	}()
+	<-started
+	loads, saves, events, resumes := store.loads, store.saves, len(writer.events), recoverer.calls
+	_, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: id, SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
+	if !errors.Is(err, ErrRecoveryAlreadyInFlight) {
+		t.Fatalf("error = %v, want ErrRecoveryAlreadyInFlight", err)
+	}
+	if store.loads != loads || store.saves != saves || len(writer.events) != events || recoverer.calls != resumes {
+		t.Fatalf("second Execute had side effects: loads=%d/%d saves=%d/%d events=%d/%d resume=%d/%d", store.loads, loads, store.saves, saves, len(writer.events), events, recoverer.calls, resumes)
+	}
+	close(release)
+	if err := <-firstDone; err != nil {
+		t.Fatal(err)
+	}
+	if registry.IsOwned(id) {
+		t.Fatal("ownership remains after the first concurrent Execute completes")
+	}
 }
 
 func TestRecoverViaResumeUseCaseTakesStalledTotalForEveryTerminal(t *testing.T) {
