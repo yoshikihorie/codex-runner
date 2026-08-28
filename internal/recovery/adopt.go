@@ -389,7 +389,7 @@ func (uc *AdoptRunningTasksUseCase) adoptRecoveringLocked(ctx context.Context, t
 		if ctx.Err() != nil {
 			return "", false
 		}
-		uc.reconcilePendingAfterConfirmedDeath(taskID)
+		uc.reconcilePendingAfterConfirmedDeath(ctx, taskID)
 		if ctx.Err() != nil {
 			return "", false
 		}
@@ -602,7 +602,7 @@ func (uc *AdoptRunningTasksUseCase) adoptTimeoutLocked(ctx context.Context, task
 		if err, completed := uc.startTimeoutRecovery(ctx, taskID, snapshot); !completed {
 			return "", false
 		} else if err != nil {
-			uc.reconcilePendingAfterConfirmedDeath(taskID)
+			uc.reconcilePendingAfterConfirmedDeath(ctx, taskID)
 			return adoptionOutcomeError, true
 		}
 		return adoptionOutcomeOrphanRecoveryStarted, true
@@ -713,7 +713,7 @@ func (uc *AdoptRunningTasksUseCase) adoptCancellingLocked(ctx context.Context, t
 				return "", false
 			}
 			uc.logFailure("confirm cancelling task killed failed", taskID, err)
-			uc.reconcilePendingAfterConfirmedDeath(taskID)
+			uc.reconcilePendingAfterConfirmedDeath(ctx, taskID)
 			return adoptionOutcomeError, true
 		}
 		return adoptionOutcomeReconciled, true
@@ -812,7 +812,7 @@ func (uc *AdoptRunningTasksUseCase) recoverOrphan(ctx context.Context, taskID do
 				return "", false
 			}
 			uc.logFailure("finalize adopted orphan failed", taskID, err)
-			uc.reconcilePendingAfterConfirmedDeath(taskID)
+			uc.reconcilePendingAfterConfirmedDeath(ctx, taskID)
 			return adoptionOutcomeError, true
 		}
 		return adoptionOutcomeOrphanRecovered, true
@@ -837,7 +837,7 @@ func (uc *AdoptRunningTasksUseCase) resumeRecovery(ctx context.Context, in Recov
 		if claim.Token != 0 {
 			uc.pending.InvalidateSend(claim)
 		} else {
-			uc.reconcilePendingAfterConfirmedDeath(in.TaskID)
+			uc.reconcilePendingAfterConfirmedDeath(ctx, in.TaskID)
 		}
 		return
 	}
@@ -920,12 +920,12 @@ func (uc *AdoptRunningTasksUseCase) registerPendingConfirmOnly(taskID domain.Tas
 	}
 }
 
-func (uc *AdoptRunningTasksUseCase) reconcilePendingAfterSnapshotFailure(taskID domain.TaskID) {
-	reconcilePendingAfterFailure(uc.tasks, uc.pending, uc.taskMu, uc.logger, taskID, pendingFailureFromSnapshot)
+func (uc *AdoptRunningTasksUseCase) reconcilePendingAfterSnapshotFailure(ctx context.Context, taskID domain.TaskID) {
+	reconcilePendingAfterFailure(ctx, uc.tasks, uc.pending, uc.taskMu, uc.logger, taskID, pendingFailureFromSnapshot)
 }
 
-func (uc *AdoptRunningTasksUseCase) reconcilePendingAfterConfirmedDeath(taskID domain.TaskID) {
-	reconcilePendingAfterFailure(uc.tasks, uc.pending, uc.taskMu, uc.logger, taskID, pendingFailureAfterConfirmedDeath)
+func (uc *AdoptRunningTasksUseCase) reconcilePendingAfterConfirmedDeath(ctx context.Context, taskID domain.TaskID) {
+	reconcilePendingAfterFailure(ctx, uc.tasks, uc.pending, uc.taskMu, uc.logger, taskID, pendingFailureAfterConfirmedDeath)
 }
 
 func (uc *AdoptRunningTasksUseCase) appendAdoptionEvents(ctx context.Context, taskID domain.TaskID, events []domain.Event) bool {

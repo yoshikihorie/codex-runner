@@ -105,6 +105,10 @@ func (uc *ReconcilePendingUseCase) reconcileOne(ctx context.Context, entry Pendi
 		return
 	}
 	uc.taskMu.Lock(taskID)
+	if ctx.Err() != nil {
+		uc.taskMu.Unlock(taskID)
+		return
+	}
 	snapshot, err := uc.tasks.Load(taskID)
 	uc.taskMu.Unlock(taskID)
 	if err != nil {
@@ -153,6 +157,9 @@ func (uc *ReconcilePendingUseCase) reconcileRecovering(ctx context.Context, task
 	present, err := uc.reader.ReadLastMessage(taskID)
 	if err != nil {
 		uc.logFailure("read last message for pending recovering task failed", taskID, err)
+		if ctx.Err() != nil {
+			return
+		}
 		uc.registerConfirmOnly(taskID)
 		return
 	}
@@ -161,18 +168,33 @@ func (uc *ReconcilePendingUseCase) reconcileRecovering(ctx context.Context, task
 	}
 	occurredAt := uc.clock.Now()
 	uc.taskMu.Lock(taskID)
+	if ctx.Err() != nil {
+		uc.taskMu.Unlock(taskID)
+		return
+	}
 	snapshot, err := uc.tasks.Load(taskID)
+	if ctx.Err() != nil {
+		uc.taskMu.Unlock(taskID)
+		return
+	}
+	completed := true
 	if err == nil && snapshot.State == domain.StateRecovering {
-		err = resolveRecoveringLocked(uc.tasks, uc.reader, uc.writer, uc.logger, taskID, snapshot, present, occurredAt)
+		err, completed = resolveRecoveringLockedWithContext(ctx, uc.tasks, uc.reader, uc.writer, uc.logger, taskID, snapshot, present, occurredAt)
 	}
 	uc.taskMu.Unlock(taskID)
+	if !completed {
+		return
+	}
 	if err != nil {
 		uc.logFailure("resolve pending recovering task failed", taskID, err)
-		uc.reconcilePendingAfterConfirmedDeath(taskID)
+		if ctx.Err() != nil {
+			return
+		}
+		uc.reconcilePendingAfterConfirmedDeath(ctx, taskID)
 		return
 	}
 	if snapshot.State != domain.StateRecovering {
-		if isReconciliationTerminalState(snapshot.State) {
+		if ctx.Err() == nil && isReconciliationTerminalState(snapshot.State) {
 			uc.pending.Remove(taskID)
 		}
 		return
@@ -181,9 +203,21 @@ func (uc *ReconcilePendingUseCase) reconcileRecovering(ctx context.Context, task
 		return
 	}
 	finalState := recoveringFinalState(present, snapshot)
+	if ctx.Err() != nil {
+		return
+	}
 	stalledTotal := uc.stalledTracker.TakeTotal(taskID)
+	if ctx.Err() != nil {
+		return
+	}
 	uc.metricsRecorder.Execute(ctx, metrics.RecordTaskMetricsInput{TaskID: taskID, FinalState: finalState, Estimated: true, OccurredAt: occurredAt, StalledTotalMs: stalledTotal})
+	if ctx.Err() != nil {
+		return
+	}
 	uc.slots.ReleaseAndAdvance(ctx, taskID, uc.clock.Now())
+	if ctx.Err() != nil {
+		return
+	}
 	uc.pending.Remove(taskID)
 }
 
@@ -194,6 +228,9 @@ func (uc *ReconcilePendingUseCase) reconcileOrphaned(ctx context.Context, taskID
 	present, err := uc.reader.ReadLastMessage(taskID)
 	if err != nil {
 		uc.logFailure("read last message for pending orphaned task failed", taskID, err)
+		if ctx.Err() != nil {
+			return
+		}
 		uc.registerConfirmOnly(taskID)
 		return
 	}
@@ -203,7 +240,13 @@ func (uc *ReconcilePendingUseCase) reconcileOrphaned(ctx context.Context, taskID
 	if present {
 		if err := uc.finalizer.Finalize(taskID, 0, true, true, uc.clock.Now()); err != nil {
 			uc.logFailure("finalize pending orphaned task failed", taskID, err)
-			uc.reconcilePendingAfterConfirmedDeath(taskID)
+			if ctx.Err() != nil {
+				return
+			}
+			uc.reconcilePendingAfterConfirmedDeath(ctx, taskID)
+			return
+		}
+		if ctx.Err() != nil {
 			return
 		}
 		uc.pending.Remove(taskID)
@@ -238,7 +281,10 @@ func (uc *ReconcilePendingUseCase) reconcileTermination(ctx context.Context, tas
 	confirmedDead, err := uc.termination.Confirm(ctx, taskID)
 	if err != nil {
 		uc.logFailure("confirm pending task termination failed", taskID, err)
-		uc.reconcilePendingAfterSnapshotFailure(taskID)
+		if ctx.Err() != nil {
+			return
+		}
+		uc.reconcilePendingAfterSnapshotFailure(ctx, taskID)
 		return
 	}
 	if confirmedDead {
@@ -280,10 +326,13 @@ func (uc *ReconcilePendingUseCase) completeTerminated(ctx context.Context, taskI
 		if snapshot.Subcommand == domain.SubcommandImpl {
 			if err := uc.pathLocks.Release(ctx, taskID); err != nil {
 				uc.logFailure("release path lock before pending timeout recovery failed", taskID, err)
+				if ctx.Err() != nil {
+					return
+				}
 				if claim.Token != 0 {
 					uc.pending.InvalidateSend(claim)
 				} else {
-					uc.reconcilePendingAfterConfirmedDeath(taskID)
+					uc.reconcilePendingAfterConfirmedDeath(ctx, taskID)
 				}
 				return
 			}
@@ -296,16 +345,26 @@ func (uc *ReconcilePendingUseCase) completeTerminated(ctx context.Context, taskI
 		return
 	}
 	rawExitCode := cancelledExitCode
-	if existing, exists, err := uc.reader.ReadExitCode(taskID); err == nil && exists {
+	existing, exists, readErr := uc.reader.ReadExitCode(taskID)
+	if ctx.Err() != nil {
+		return
+	}
+	if readErr == nil && exists {
 		rawExitCode = existing
 	}
 	if err := uc.killed.ConfirmKilled(ctx, taskID, rawExitCode, true, terminationConfirmedAt); err != nil {
 		uc.logFailure("confirm pending cancelling task killed failed", taskID, err)
+		if ctx.Err() != nil {
+			return
+		}
 		if claim.Token != 0 {
 			uc.pending.InvalidateSend(claim)
 		} else {
-			uc.reconcilePendingAfterConfirmedDeath(taskID)
+			uc.reconcilePendingAfterConfirmedDeath(ctx, taskID)
 		}
+		return
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	if claim.Token != 0 {
@@ -321,7 +380,7 @@ func (uc *ReconcilePendingUseCase) resumeRecovery(ctx context.Context, in Recove
 		if claim.Token != 0 {
 			uc.pending.InvalidateSend(claim)
 		} else {
-			uc.reconcilePendingAfterConfirmedDeath(in.TaskID)
+			uc.reconcilePendingAfterConfirmedDeath(ctx, in.TaskID)
 		}
 		return
 	}
@@ -338,12 +397,12 @@ func (uc *ReconcilePendingUseCase) registerConfirmOnly(taskID domain.TaskID) {
 	}
 }
 
-func (uc *ReconcilePendingUseCase) reconcilePendingAfterSnapshotFailure(taskID domain.TaskID) {
-	reconcilePendingAfterFailure(uc.tasks, uc.pending, uc.taskMu, uc.logger, taskID, pendingFailureFromSnapshot)
+func (uc *ReconcilePendingUseCase) reconcilePendingAfterSnapshotFailure(ctx context.Context, taskID domain.TaskID) {
+	reconcilePendingAfterFailure(ctx, uc.tasks, uc.pending, uc.taskMu, uc.logger, taskID, pendingFailureFromSnapshot)
 }
 
-func (uc *ReconcilePendingUseCase) reconcilePendingAfterConfirmedDeath(taskID domain.TaskID) {
-	reconcilePendingAfterFailure(uc.tasks, uc.pending, uc.taskMu, uc.logger, taskID, pendingFailureAfterConfirmedDeath)
+func (uc *ReconcilePendingUseCase) reconcilePendingAfterConfirmedDeath(ctx context.Context, taskID domain.TaskID) {
+	reconcilePendingAfterFailure(ctx, uc.tasks, uc.pending, uc.taskMu, uc.logger, taskID, pendingFailureAfterConfirmedDeath)
 }
 
 type pendingFailureDisposition uint8
@@ -353,12 +412,22 @@ const (
 	pendingFailureAfterConfirmedDeath
 )
 
-func reconcilePendingAfterFailure(tasks AdoptionTaskStore, pending *PendingReconciliationSet, taskMu TaskMutex, logger *slog.Logger, taskID domain.TaskID, failureDisposition pendingFailureDisposition) {
+func reconcilePendingAfterFailure(ctx context.Context, tasks AdoptionTaskStore, pending *PendingReconciliationSet, taskMu TaskMutex, logger *slog.Logger, taskID domain.TaskID, failureDisposition pendingFailureDisposition) {
+	if ctx.Err() != nil {
+		return
+	}
 	taskMu.Lock(taskID)
+	if ctx.Err() != nil {
+		taskMu.Unlock(taskID)
+		return
+	}
 	snapshot, err := tasks.Load(taskID)
 	taskMu.Unlock(taskID)
 	if err != nil {
 		logger.Error("reload task after recovery failure failed", "task_id", taskID.String(), "error", err)
+		return
+	}
+	if ctx.Err() != nil {
 		return
 	}
 	if isReconciliationTerminalState(snapshot.State) {
@@ -372,6 +441,9 @@ func reconcilePendingAfterFailure(tasks AdoptionTaskStore, pending *PendingRecon
 			// Register deliberately preserves a completed send, so replace that entry
 			// before recording the stronger confirmed-death disposition.
 			pending.Remove(taskID)
+		}
+		if ctx.Err() != nil {
+			return
 		}
 		if err := pending.Register(taskID, disposition, authority); err != nil {
 			logger.Error("register task after recovery failure failed", "task_id", taskID.String(), "error", err)

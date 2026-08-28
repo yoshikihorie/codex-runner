@@ -78,6 +78,7 @@ type adoptionStoreFake struct {
 	listErr     error
 	loadErr     map[domain.TaskID]error
 	loadResults map[domain.TaskID][]adoptionLoadResult
+	loads       int
 	saves       int
 	saveErr     error
 	saveErrs    []error
@@ -97,6 +98,7 @@ func (f *adoptionStoreFake) ListByStates([]domain.TaskState) ([]domain.TaskSnaps
 	return f.listed, f.listErr
 }
 func (f *adoptionStoreFake) Load(id domain.TaskID) (domain.TaskSnapshot, error) {
+	f.loads++
 	if f.onLoad != nil {
 		f.onLoad(id)
 	}
@@ -475,6 +477,23 @@ func waitForPendingRemoval(t *testing.T, pending *PendingReconciliationSet) {
 
 func newAdoptionUseCase(tasks *adoptionStoreFake, liveness *adoptionLivenessFake, reader *adoptionReaderFake, writer *adoptionWriterFake, finalizer *adoptionFinalizerFake, resume *RecoverViaResumeUseCase, slots *adoptionSlotsFake, mutex *adoptionMutexFake) *AdoptRunningTasksUseCase {
 	return NewAdoptRunningTasksUseCase(tasks, liveness, reader, writer, finalizer, resume, slots, slots, &adoptionTerminationFake{}, &adoptionKilledFake{}, &adoptionPathLocksFake{}, &PendingReconciliationSet{}, mutex, domain.ClockFunc(time.Now), &adoptionStalledTrackerFake{}, &adoptionMetricsFake{}, slog.Default())
+}
+
+func TestAdoptionFailureReconciliationCancelledContextStopsBeforeLoad(t *testing.T) {
+	id := adoptionID(t, "failure-reconciliation-cancelled")
+	snapshot := adoptionSnapshot(t, id, domain.StateRecovering)
+	tasks := &adoptionStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}
+	mutex := &adoptionMutexFake{}
+	uc := newAdoptionUseCase(tasks, &adoptionLivenessFake{}, &adoptionReaderFake{}, &adoptionWriterFake{}, &adoptionFinalizerFake{}, newAdoptionResumeUseCase(t), &adoptionSlotsFake{}, mutex)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	uc.reconcilePendingAfterSnapshotFailure(ctx, id)
+	uc.reconcilePendingAfterConfirmedDeath(ctx, id)
+
+	if tasks.loads != 0 || mutex.held || len(uc.pending.List()) != 0 {
+		t.Fatalf("loads=%d task mutex held=%t pending=%+v", tasks.loads, mutex.held, uc.pending.List())
+	}
 }
 
 func newOrphanAdoptionUseCase(t *testing.T, tasks *adoptionStoreFake, liveness *adoptionLivenessFake, reader *adoptionReaderFake, finalizer *adoptionFinalizerFake, dispatcher orphanResumeDispatcher, tracker stalledTimeTracker, logger *slog.Logger) *AdoptRunningTasksUseCase {

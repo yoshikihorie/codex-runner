@@ -29,6 +29,8 @@ type reconcileStoreFake struct {
 	order       *[]string
 	saveErr     error
 	loadResults map[domain.TaskID][]reconcileLoadResult
+	afterLoad   func()
+	afterSave   func()
 }
 
 type reconcileLoadResult struct {
@@ -44,11 +46,17 @@ func (f *reconcileStoreFake) Load(id domain.TaskID) (domain.TaskSnapshot, error)
 	if results := f.loadResults[id]; len(results) > 0 {
 		result := results[0]
 		f.loadResults[id] = results[1:]
+		if f.afterLoad != nil {
+			f.afterLoad()
+		}
 		return result.snapshot, result.err
 	}
 	snapshot, found := f.entries[id]
 	if !found {
 		return domain.TaskSnapshot{}, domain.ErrTaskNotFound
+	}
+	if f.afterLoad != nil {
+		f.afterLoad()
 	}
 	return snapshot, nil
 }
@@ -60,6 +68,9 @@ func (f *reconcileStoreFake) Save(id domain.TaskID, snapshot domain.TaskSnapshot
 	*f.order = append(*f.order, "save")
 	if f.saveErr == nil {
 		f.entries[id] = snapshot
+	}
+	if f.afterSave != nil {
+		f.afterSave()
 	}
 	return f.saveErr
 }
@@ -139,6 +150,8 @@ type reconcileReaderFake struct {
 	results    []reconcileReaderResult
 	calls      int
 	afterRead  func()
+	afterError func()
+	afterExit  func()
 }
 
 func (f *reconcileReaderFake) ReadLastMessage(domain.TaskID) (bool, error) {
@@ -148,6 +161,9 @@ func (f *reconcileReaderFake) ReadLastMessage(domain.TaskID) (bool, error) {
 		if err == nil && f.afterRead != nil {
 			f.afterRead()
 		}
+		if err != nil && f.afterError != nil {
+			f.afterError()
+		}
 		return present, err
 	}
 	result := f.results[0]
@@ -155,10 +171,16 @@ func (f *reconcileReaderFake) ReadLastMessage(domain.TaskID) (bool, error) {
 	if result.err == nil && f.afterRead != nil {
 		f.afterRead()
 	}
+	if result.err != nil && f.afterError != nil {
+		f.afterError()
+	}
 	return result.present, result.err
 }
 func (*reconcileReaderFake) ReadStderrLog(domain.TaskID) ([]byte, error) { return nil, nil }
 func (f *reconcileReaderFake) ReadExitCode(domain.TaskID) (int, bool, error) {
+	if f.afterExit != nil {
+		f.afterExit()
+	}
 	return f.exitCode, f.exitExists, f.exitErr
 }
 
@@ -173,6 +195,10 @@ type reconcileWriterFake struct {
 	adoptedErr       error
 	recoveredErr     error
 	exitErr          error
+	afterAdopted     func()
+	afterRecovered   func()
+	afterExitCode    func()
+	afterEvent       func()
 }
 
 func (*reconcileWriterFake) WritePrompt(domain.TaskID, []byte) error         { return nil }
@@ -185,22 +211,34 @@ func (f *reconcileWriterFake) WriteExitCode(_ domain.TaskID, exitCode domain.Exi
 	f.exitCodes++
 	f.exitCode = &exitCode
 	*f.order = append(*f.order, "exit-code")
+	if f.afterExitCode != nil {
+		f.afterExitCode()
+	}
 	return f.exitErr
 }
 func (*reconcileWriterFake) WritePartialOutput(domain.TaskID, string) error { return nil }
 func (f *reconcileWriterFake) WriteRecoveredMarker(domain.TaskID, time.Time) error {
 	f.recoveredMarkers++
 	*f.order = append(*f.order, "recovered-marker")
+	if f.afterRecovered != nil {
+		f.afterRecovered()
+	}
 	return f.recoveredErr
 }
 func (f *reconcileWriterFake) WriteAdoptedMarker(domain.TaskID, time.Time) error {
 	f.adoptedMarkers++
 	*f.order = append(*f.order, "adopted-marker")
+	if f.afterAdopted != nil {
+		f.afterAdopted()
+	}
 	return f.adoptedErr
 }
 func (f *reconcileWriterFake) AppendEvent(domain.TaskID, domain.Event) error {
 	f.events++
 	*f.order = append(*f.order, "event")
+	if f.afterEvent != nil {
+		f.afterEvent()
+	}
 	return f.appendErr
 }
 func (*reconcileWriterFake) AppendRawEvent(domain.TaskID, string, json.RawMessage) error {
@@ -246,31 +284,41 @@ func (f *reconcileTerminationFake) SendAndConfirm(_ context.Context, _ domain.Ta
 }
 
 type reconcileKilledFake struct {
-	calls       int
-	rawExitCode int
-	err         error
+	calls        int
+	rawExitCode  int
+	err          error
+	afterConfirm func()
 }
 
 func (f *reconcileKilledFake) ConfirmKilled(_ context.Context, _ domain.TaskID, rawExitCode int, _ bool, _ time.Time) error {
 	f.calls++
 	f.rawExitCode = rawExitCode
+	if f.afterConfirm != nil {
+		f.afterConfirm()
+	}
 	return f.err
 }
 
 type reconcilePathLocksFake struct {
-	order *[]string
-	calls int
+	order        *[]string
+	calls        int
+	err          error
+	afterRelease func()
 }
 
 func (f *reconcilePathLocksFake) Release(context.Context, domain.TaskID) error {
 	f.calls++
 	*f.order = append(*f.order, "path-lock")
-	return nil
+	if f.afterRelease != nil {
+		f.afterRelease()
+	}
+	return f.err
 }
 
 type reconcileSlotsFake struct {
-	order *[]string
-	calls int
+	order        *[]string
+	calls        int
+	afterRelease func()
 }
 
 type reconcileTrackerProbe struct {
@@ -278,6 +326,7 @@ type reconcileTrackerProbe struct {
 	mutex             *reconcileMutexFake
 	calledWhileLocked bool
 	order             *[]string
+	afterTake         func()
 }
 
 func (f *reconcileTrackerProbe) TakeTotal(id domain.TaskID) int {
@@ -285,18 +334,40 @@ func (f *reconcileTrackerProbe) TakeTotal(id domain.TaskID) int {
 	if f.order != nil {
 		*f.order = append(*f.order, "tracker")
 	}
-	return f.adoptionStalledTrackerFake.TakeTotal(id)
+	total := f.adoptionStalledTrackerFake.TakeTotal(id)
+	if f.afterTake != nil {
+		f.afterTake()
+	}
+	return total
+}
+
+type reconcileFinalizerFake struct {
+	calls         int
+	err           error
+	afterFinalize func()
+}
+
+func (f *reconcileFinalizerFake) Finalize(domain.TaskID, int, bool, bool, time.Time) error {
+	f.calls++
+	if f.afterFinalize != nil {
+		f.afterFinalize()
+	}
+	return f.err
 }
 
 type reconcileMetricsProbe struct {
-	inputs []metrics.RecordTaskMetricsInput
-	record metrics.RecordTaskMetricsOutput
-	order  *[]string
+	inputs        []metrics.RecordTaskMetricsInput
+	record        metrics.RecordTaskMetricsOutput
+	order         *[]string
+	beforeExecute func()
 }
 
 func (f *reconcileMetricsProbe) Execute(_ context.Context, in metrics.RecordTaskMetricsInput) metrics.RecordTaskMetricsOutput {
 	if f.order != nil {
 		*f.order = append(*f.order, "metrics")
+	}
+	if f.beforeExecute != nil {
+		f.beforeExecute()
 	}
 	f.inputs = append(f.inputs, in)
 	return f.record
@@ -305,11 +376,15 @@ func (f *reconcileMetricsProbe) Execute(_ context.Context, in metrics.RecordTask
 func (f *reconcileSlotsFake) ReleaseAndAdvance(context.Context, domain.TaskID, time.Time) {
 	f.calls++
 	*f.order = append(*f.order, "slot")
+	if f.afterRelease != nil {
+		f.afterRelease()
+	}
 }
 
 type reconcileMutexFake struct {
-	order *[]string
-	held  bool
+	order     *[]string
+	held      bool
+	afterLock func()
 }
 
 func (f *reconcileMutexFake) Lock(domain.TaskID) {
@@ -318,6 +393,9 @@ func (f *reconcileMutexFake) Lock(domain.TaskID) {
 	}
 	f.held = true
 	*f.order = append(*f.order, "lock")
+	if f.afterLock != nil {
+		f.afterLock()
+	}
 }
 func (f *reconcileMutexFake) Unlock(domain.TaskID) {
 	if !f.held {
@@ -1136,7 +1214,7 @@ func TestReconcilePendingAfterConfirmedDeathDoesNotRestoreSendAuthority(t *testi
 	snapshot := tasks.entries[id]
 	registerReconcilePending(t, pending, snapshot, PendingSendUnsent)
 
-	uc.reconcilePendingAfterConfirmedDeath(id)
+	uc.reconcilePendingAfterConfirmedDeath(context.Background(), id)
 
 	entries := pending.List()
 	if len(entries) != 1 || pendingDisposition(entries[0]) != PendingSendConfirmOnly || entries[0].authority != (ProcessSignalAuthority{}) {
@@ -1172,6 +1250,115 @@ func TestReconcilePendingTimeoutDispatchRemovesPendingAfterResumeSucceeds(t *tes
 	if pathLocks.calls != 1 || len(pending.List()) != 0 {
 		t.Fatalf("pathLocks=%d pending=%+v", pathLocks.calls, pending.List())
 	}
+}
+
+func TestSCNDaemon0118RetriesPathLockReleaseBeforeDispatchingTimeoutRecovery(t *testing.T) {
+	uc, pending, tasks, _, _, termination, _, pathLocks, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
+	id := adoptionID(t, "reconcile-"+string(domain.StateTimeout))
+	_, testPath, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("caller path unavailable")
+	}
+	sourcePath, err := filepath.Abs(filepath.Join(filepath.Dir(testPath), "reconcile.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertPathLockReleaseFailureReturnsBeforeRecoveryDispatch(t, sourcePath)
+	session := recoveryTestSession(t)
+	snapshot := tasks.entries[id]
+	snapshot.Subcommand = domain.SubcommandImpl
+	snapshot.SessionRef = &session
+	tasks.entries[id] = snapshot
+
+	resume, store, _, recoverer, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	store.snapshot = snapshot
+	uc.resume = resume
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	recoverer.started = started
+	recoverer.release = release
+
+	pathLocks.err = errors.New("release path lock")
+	termination.confirmDead = true
+	close(termination.release)
+	registerReconcilePending(t, pending, snapshot, PendingSendConfirmOnly)
+
+	uc.reconcileOne(context.Background(), pending.List()[0])
+
+	entries := pending.List()
+	if pathLocks.calls != 1 || termination.confirm != 1 || recoverer.calls != 0 || len(entries) != 1 || pendingDisposition(entries[0]) != PendingSendConfirmOnly {
+		t.Fatalf("pathLocks=%d confirms=%d recoveries=%d pending=%+v", pathLocks.calls, termination.confirm, recoverer.calls, entries)
+	}
+
+	pathLocks.err = nil
+	uc.reconcileOne(context.Background(), pending.List()[0])
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("timeout recovery was not dispatched after path lock release succeeded")
+	}
+	close(release)
+	waitForPendingRemoval(t, pending)
+
+	if pathLocks.calls != 2 || termination.confirm != 2 || recoverer.calls != 1 {
+		t.Fatalf("pathLocks=%d confirms=%d recoveries=%d", pathLocks.calls, termination.confirm, recoverer.calls)
+	}
+}
+
+func assertPathLockReleaseFailureReturnsBeforeRecoveryDispatch(t *testing.T, sourcePath string) {
+	t.Helper()
+	fileSet := token.NewFileSet()
+	file, err := parser.ParseFile(fileSet, sourcePath, nil, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var dispatchPos, releaseFailureReturnPos token.Pos
+	for _, declaration := range file.Decls {
+		function, ok := declaration.(*ast.FuncDecl)
+		if !ok || function.Name.Name != "completeTerminated" {
+			continue
+		}
+		ast.Inspect(function.Body, func(node ast.Node) bool {
+			goStatement, ok := node.(*ast.GoStmt)
+			if ok && isResumeRecoveryCall(goStatement.Call) && (!dispatchPos.IsValid() || goStatement.Pos() < dispatchPos) {
+				dispatchPos = goStatement.Pos()
+			}
+			ifStatement, ok := node.(*ast.IfStmt)
+			if !ok || !isPathLockReleaseCall(ifStatement.Init) {
+				return true
+			}
+			for _, statement := range ifStatement.Body.List {
+				if returnStatement, ok := statement.(*ast.ReturnStmt); ok {
+					releaseFailureReturnPos = returnStatement.Pos()
+				}
+			}
+			return true
+		})
+	}
+	if !releaseFailureReturnPos.IsValid() || !dispatchPos.IsValid() {
+		t.Fatalf("path lock release failure return or recovery dispatch not found in %s", sourcePath)
+	}
+	if releaseFailureReturnPos > dispatchPos {
+		t.Fatalf("path lock release failure return must precede recovery dispatch in %s", sourcePath)
+	}
+}
+
+func isPathLockReleaseCall(statement ast.Stmt) bool {
+	assignment, ok := statement.(*ast.AssignStmt)
+	if !ok || len(assignment.Rhs) != 1 {
+		return false
+	}
+	call, ok := assignment.Rhs[0].(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || selector.Sel.Name != "Release" {
+		return false
+	}
+	pathLocks, ok := selector.X.(*ast.SelectorExpr)
+	return ok && pathLocks.Sel.Name == "pathLocks"
 }
 
 func TestReconcileResumeRecoveryResolvesClaimPerOutcome(t *testing.T) {
@@ -1430,6 +1617,294 @@ func TestReconcilePendingRecoveringCancellationAfterReadStopsBeforeLock(t *testi
 	}
 	if writer.adoptedMarkers != 0 || writer.recoveredMarkers != 0 || writer.exitCodes != 0 || writer.events != 0 {
 		t.Fatalf("writer=%+v", writer)
+	}
+}
+
+func TestReconcilePendingCancellationAfterLockStopsBeforeInitialLoad(t *testing.T) {
+	uc, pending, tasks, _, _, _, _, _, _, mutex, _ := newReconcileFixture(t, domain.StateRecovering, false, false)
+	id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
+	ctx, cancel := context.WithCancel(context.Background())
+	mutex.afterLock = cancel
+
+	uc.reconcileOne(ctx, pending.List()[0])
+
+	if tasks.loads != 0 || mutex.held || len(pending.List()) != 1 {
+		t.Fatalf("loads=%d held=%t pending=%+v", tasks.loads, mutex.held, pending.List())
+	}
+}
+
+func TestReconcilePendingRecoveringCancellationAfterLockStopsBeforeLoad(t *testing.T) {
+	uc, pending, tasks, liveness, _, _, _, _, _, mutex, _ := newReconcileFixture(t, domain.StateRecovering, true, true)
+	id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
+	ctx, cancel := context.WithCancel(context.Background())
+	mutex.afterLock = cancel
+	liveness.release <- struct{}{}
+
+	uc.reconcileRecovering(ctx, id)
+
+	if tasks.loads != 0 || mutex.held || len(pending.List()) != 1 {
+		t.Fatalf("loads=%d held=%t pending=%+v", tasks.loads, mutex.held, pending.List())
+	}
+}
+
+func TestReconcilePendingAfterConfirmedDeathCancellationAfterLockStopsBeforeLoad(t *testing.T) {
+	uc, pending, tasks, _, _, _, _, _, _, mutex, _ := newReconcileFixture(t, domain.StateRecovering, false, false)
+	id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
+	ctx, cancel := context.WithCancel(context.Background())
+	mutex.afterLock = cancel
+
+	uc.reconcilePendingAfterConfirmedDeath(ctx, id)
+
+	if tasks.loads != 0 || mutex.held || len(pending.List()) != 0 {
+		t.Fatalf("loads=%d held=%t pending=%+v", tasks.loads, mutex.held, pending.List())
+	}
+}
+
+func TestReconcilePendingRecoveringCancellationAfterReadErrorStopsBeforePendingRegistration(t *testing.T) {
+	uc, pending, tasks, liveness, _, _, _, _, slots, mutex, _ := newReconcileFixture(t, domain.StateRecovering, true, false)
+	id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
+	ctx, cancel := context.WithCancel(context.Background())
+	uc.reader = &reconcileReaderFake{err: errors.New("read"), afterError: cancel}
+	liveness.release <- struct{}{}
+
+	uc.reconcileRecovering(ctx, id)
+
+	if tasks.loads != 0 || mutex.held || slots.calls != 0 || len(pending.List()) != 0 {
+		t.Fatalf("loads=%d held=%t slots=%d pending=%+v", tasks.loads, mutex.held, slots.calls, pending.List())
+	}
+}
+
+func TestReconcilePendingRecoveringCancellationAfterLoadUnlocksBeforeResolution(t *testing.T) {
+	uc, pending, tasks, liveness, writer, _, _, _, slots, mutex, _ := newReconcileFixture(t, domain.StateRecovering, true, true)
+	id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
+	ctx, cancel := context.WithCancel(context.Background())
+	tasks.afterLoad = cancel
+	liveness.release <- struct{}{}
+
+	uc.reconcileRecovering(ctx, id)
+
+	if tasks.loads != 1 || tasks.saves != 0 || mutex.held || slots.calls != 0 || len(pending.List()) != 0 || writer.events != 0 {
+		t.Fatalf("loads=%d saves=%d held=%t slots=%d pending=%+v events=%d", tasks.loads, tasks.saves, mutex.held, slots.calls, pending.List(), writer.events)
+	}
+}
+
+func TestReconcilePendingRecoveringCancellationStopsEachPostResolutionEffect(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		prepare func(*reconcileStoreFake, *reconcileWriterFake, *reconcileTrackerProbe, *reconcileMetricsProbe, *reconcileSlotsFake, context.CancelFunc)
+		check   func(*testing.T, *PendingReconciliationSet, *reconcileTrackerProbe, *reconcileMetricsProbe, *reconcileSlotsFake)
+	}{
+		{
+			name: "before tracker",
+			prepare: func(_ *reconcileStoreFake, writer *reconcileWriterFake, _ *reconcileTrackerProbe, _ *reconcileMetricsProbe, _ *reconcileSlotsFake, cancel context.CancelFunc) {
+				writer.afterEvent = cancel
+			},
+			check: func(t *testing.T, pending *PendingReconciliationSet, tracker *reconcileTrackerProbe, recorder *reconcileMetricsProbe, slots *reconcileSlotsFake) {
+				if tracker.takes != 0 || len(recorder.inputs) != 0 || slots.calls != 0 || len(pending.List()) != 1 {
+					t.Fatalf("takes=%d metrics=%d slots=%d pending=%+v", tracker.takes, len(recorder.inputs), slots.calls, pending.List())
+				}
+			},
+		},
+		{
+			name: "before metrics",
+			prepare: func(_ *reconcileStoreFake, _ *reconcileWriterFake, tracker *reconcileTrackerProbe, _ *reconcileMetricsProbe, _ *reconcileSlotsFake, cancel context.CancelFunc) {
+				tracker.afterTake = cancel
+			},
+			check: func(t *testing.T, pending *PendingReconciliationSet, tracker *reconcileTrackerProbe, recorder *reconcileMetricsProbe, slots *reconcileSlotsFake) {
+				if tracker.takes != 1 || len(recorder.inputs) != 0 || slots.calls != 0 || len(pending.List()) != 1 {
+					t.Fatalf("takes=%d metrics=%d slots=%d pending=%+v", tracker.takes, len(recorder.inputs), slots.calls, pending.List())
+				}
+			},
+		},
+		{
+			name: "before slot release",
+			prepare: func(_ *reconcileStoreFake, _ *reconcileWriterFake, _ *reconcileTrackerProbe, recorder *reconcileMetricsProbe, _ *reconcileSlotsFake, cancel context.CancelFunc) {
+				recorder.beforeExecute = cancel
+			},
+			check: func(t *testing.T, pending *PendingReconciliationSet, tracker *reconcileTrackerProbe, recorder *reconcileMetricsProbe, slots *reconcileSlotsFake) {
+				if tracker.takes != 1 || len(recorder.inputs) != 1 || slots.calls != 0 || len(pending.List()) != 1 {
+					t.Fatalf("takes=%d metrics=%d slots=%d pending=%+v", tracker.takes, len(recorder.inputs), slots.calls, pending.List())
+				}
+			},
+		},
+		{
+			name: "before pending removal",
+			prepare: func(_ *reconcileStoreFake, _ *reconcileWriterFake, _ *reconcileTrackerProbe, _ *reconcileMetricsProbe, slots *reconcileSlotsFake, cancel context.CancelFunc) {
+				slots.afterRelease = cancel
+			},
+			check: func(t *testing.T, pending *PendingReconciliationSet, tracker *reconcileTrackerProbe, recorder *reconcileMetricsProbe, slots *reconcileSlotsFake) {
+				if tracker.takes != 1 || len(recorder.inputs) != 1 || slots.calls != 1 || len(pending.List()) != 1 {
+					t.Fatalf("takes=%d metrics=%d slots=%d pending=%+v", tracker.takes, len(recorder.inputs), slots.calls, pending.List())
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			uc, pending, tasks, liveness, writer, _, _, _, slots, mutex, order := newReconcileFixture(t, domain.StateRecovering, true, true)
+			id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
+			ctx, cancel := context.WithCancel(context.Background())
+			tracker := &reconcileTrackerProbe{adoptionStalledTrackerFake: &adoptionStalledTrackerFake{}, mutex: mutex, order: order}
+			recorder := &reconcileMetricsProbe{order: order}
+			uc.stalledTracker, uc.metricsRecorder = tracker, recorder
+			registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
+			tc.prepare(tasks, writer, tracker, recorder, slots, cancel)
+			liveness.release <- struct{}{}
+			uc.reconcileRecovering(ctx, id)
+			tc.check(t, pending, tracker, recorder, slots)
+		})
+	}
+}
+
+func TestReconcilePendingRecoveringCancellationAtResolutionBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		configure func(*reconcileStoreFake, *reconcileReaderFake, *reconcileWriterFake, context.CancelFunc)
+		check     func(*testing.T, *PendingReconciliationSet, *reconcileStoreFake, *reconcileWriterFake)
+	}{
+		{
+			name: "after save",
+			configure: func(store *reconcileStoreFake, _ *reconcileReaderFake, _ *reconcileWriterFake, cancel context.CancelFunc) {
+				store.afterSave = cancel
+			},
+			check: func(t *testing.T, pending *PendingReconciliationSet, _ *reconcileStoreFake, writer *reconcileWriterFake) {
+				if writer.events != 0 || len(pending.List()) != 1 {
+					t.Fatalf("events=%d pending=%+v", writer.events, pending.List())
+				}
+			},
+		},
+		{
+			name: "save error",
+			configure: func(store *reconcileStoreFake, _ *reconcileReaderFake, _ *reconcileWriterFake, cancel context.CancelFunc) {
+				store.saveErr, store.afterSave = errors.New("save"), cancel
+			},
+			check: func(t *testing.T, pending *PendingReconciliationSet, _ *reconcileStoreFake, writer *reconcileWriterFake) {
+				if writer.events != 0 || len(pending.List()) != 1 {
+					t.Fatalf("events=%d pending=%+v", writer.events, pending.List())
+				}
+			},
+		},
+		{
+			name: "after adopted marker",
+			configure: func(_ *reconcileStoreFake, _ *reconcileReaderFake, writer *reconcileWriterFake, cancel context.CancelFunc) {
+				writer.afterAdopted = cancel
+			},
+			check: func(t *testing.T, pending *PendingReconciliationSet, store *reconcileStoreFake, writer *reconcileWriterFake) {
+				if writer.recoveredMarkers != 0 || store.saves != 0 || len(pending.List()) != 1 {
+					t.Fatalf("recovered=%d saves=%d pending=%+v", writer.recoveredMarkers, store.saves, pending.List())
+				}
+			},
+		},
+		{
+			name: "adopted marker error",
+			configure: func(_ *reconcileStoreFake, _ *reconcileReaderFake, writer *reconcileWriterFake, cancel context.CancelFunc) {
+				writer.adoptedErr, writer.afterAdopted = errors.New("marker"), cancel
+			},
+			check: func(t *testing.T, pending *PendingReconciliationSet, store *reconcileStoreFake, writer *reconcileWriterFake) {
+				if writer.recoveredMarkers != 0 || store.saves != 0 || len(pending.List()) != 1 {
+					t.Fatalf("recovered=%d saves=%d pending=%+v", writer.recoveredMarkers, store.saves, pending.List())
+				}
+			},
+		},
+		{
+			name: "exit code read error",
+			configure: func(_ *reconcileStoreFake, reader *reconcileReaderFake, _ *reconcileWriterFake, cancel context.CancelFunc) {
+				reader.exitErr, reader.afterExit = errors.New("exit"), cancel
+			},
+			check: func(t *testing.T, pending *PendingReconciliationSet, store *reconcileStoreFake, writer *reconcileWriterFake) {
+				if store.saves != 0 || writer.adoptedMarkers != 0 || len(pending.List()) != 1 {
+					t.Fatalf("saves=%d adopted=%d pending=%+v", store.saves, writer.adoptedMarkers, pending.List())
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			uc, pending, store, liveness, writer, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateRecovering, true, true)
+			id := adoptionID(t, "reconcile-"+string(domain.StateRecovering))
+			ctx, cancel := context.WithCancel(context.Background())
+			reader := uc.reader.(*reconcileReaderFake)
+			registerReconcilePending(t, pending, store.entries[id], PendingSendConfirmOnly)
+			tc.configure(store, reader, writer, cancel)
+			liveness.release <- struct{}{}
+			uc.reconcileRecovering(ctx, id)
+			tc.check(t, pending, store, writer)
+		})
+	}
+}
+
+func TestReconcilePendingOrphanedCancellationAfterFinalizeStopsPendingUpdates(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+	}{{"success", nil}, {"error", errors.New("finalize")}} {
+		t.Run(tc.name, func(t *testing.T) {
+			uc, pending, tasks, _, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateOrphaned, false, true)
+			id := adoptionID(t, "reconcile-"+string(domain.StateOrphaned))
+			ctx, cancel := context.WithCancel(context.Background())
+			finalizer := &reconcileFinalizerFake{err: tc.err, afterFinalize: cancel}
+			uc.finalizer = finalizer
+			registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
+			uc.reconcileOrphaned(ctx, id, tasks.entries[id])
+			if finalizer.calls != 1 || len(pending.List()) != 1 {
+				t.Fatalf("finalizer=%d pending=%+v", finalizer.calls, pending.List())
+			}
+		})
+	}
+}
+
+func TestCompleteTerminatedCancellationStopsPostIOEffects(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		state     domain.TaskState
+		timeout   bool
+		configure func(*reconcileReaderFake, *reconcileKilledFake, *reconcilePathLocksFake, context.CancelFunc)
+		check     func(*testing.T, *PendingReconciliationSet, *reconcileKilledFake)
+	}{
+		{"after exit code read", domain.StateCancelling, false, func(reader *reconcileReaderFake, _ *reconcileKilledFake, _ *reconcilePathLocksFake, cancel context.CancelFunc) {
+			reader.afterExit = cancel
+		}, func(t *testing.T, pending *PendingReconciliationSet, killed *reconcileKilledFake) {
+			if killed.calls != 0 || len(pending.List()) != 1 {
+				t.Fatalf("killed=%d pending=%+v", killed.calls, pending.List())
+			}
+		}},
+		{"after killed success", domain.StateCancelling, false, func(_ *reconcileReaderFake, killed *reconcileKilledFake, _ *reconcilePathLocksFake, cancel context.CancelFunc) {
+			killed.afterConfirm = cancel
+		}, func(t *testing.T, pending *PendingReconciliationSet, killed *reconcileKilledFake) {
+			if killed.calls != 1 || len(pending.List()) != 1 {
+				t.Fatalf("killed=%d pending=%+v", killed.calls, pending.List())
+			}
+		}},
+		{"after killed error", domain.StateCancelling, false, func(_ *reconcileReaderFake, killed *reconcileKilledFake, _ *reconcilePathLocksFake, cancel context.CancelFunc) {
+			killed.err, killed.afterConfirm = errors.New("killed"), cancel
+		}, func(t *testing.T, pending *PendingReconciliationSet, killed *reconcileKilledFake) {
+			if killed.calls != 1 || len(pending.List()) != 1 {
+				t.Fatalf("killed=%d pending=%+v", killed.calls, pending.List())
+			}
+		}},
+		{"after path lock error", domain.StateTimeout, true, func(_ *reconcileReaderFake, _ *reconcileKilledFake, locks *reconcilePathLocksFake, cancel context.CancelFunc) {
+			locks.err, locks.afterRelease = errors.New("lock"), cancel
+		}, func(t *testing.T, pending *PendingReconciliationSet, killed *reconcileKilledFake) {
+			if killed.calls != 0 || len(pending.List()) != 1 {
+				t.Fatalf("killed=%d pending=%+v", killed.calls, pending.List())
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			uc, pending, tasks, _, _, _, killed, locks, _, _, _ := newReconcileFixture(t, tc.state, false, false)
+			id := adoptionID(t, "reconcile-"+string(tc.state))
+			if tc.timeout {
+				snapshot := tasks.entries[id]
+				snapshot.Subcommand = domain.SubcommandImpl
+				tasks.entries[id] = snapshot
+			}
+			ctx, cancel := context.WithCancel(context.Background())
+			reader := uc.reader.(*reconcileReaderFake)
+			registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
+			tc.configure(reader, killed, locks, cancel)
+			uc.completeTerminated(ctx, id, tasks.entries[id], tc.timeout, time.Now())
+			tc.check(t, pending, killed)
+		})
 	}
 }
 
