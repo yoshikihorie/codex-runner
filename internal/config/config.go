@@ -73,6 +73,12 @@ func (e *LoadError) Error() string {
 
 func (e *LoadError) Unwrap() error { return e.Err }
 
+type invalidValueError struct{ cause error }
+
+func (e *invalidValueError) Error() string        { return fmt.Sprintf("%v: %v", ErrInvalidConfig, e.cause) }
+func (e *invalidValueError) Is(target error) bool { return target == ErrInvalidConfig }
+func (e *invalidValueError) Unwrap() error        { return e.cause }
+
 // Config is an immutable, validated codexd configuration value.
 type Config struct {
 	maxConcurrentTasks             int
@@ -376,11 +382,9 @@ func isExecutableRegularFile(info fs.FileInfo) bool {
 
 func invalid(key, reason string, cause error) *LoadError {
 	if cause == nil {
-		cause = ErrInvalidConfig
-	} else {
-		cause = fmt.Errorf("%w: %v", ErrInvalidConfig, cause)
+		return &LoadError{Key: key, Reason: reason, Err: ErrInvalidConfig}
 	}
-	return &LoadError{Key: key, Reason: reason, Err: cause}
+	return &LoadError{Key: key, Reason: reason, Err: &invalidValueError{cause: cause}}
 }
 
 func IsModelAllowed(model string) bool {

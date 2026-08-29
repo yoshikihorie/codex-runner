@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/BurntSushi/toml"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 )
 
@@ -327,6 +328,28 @@ read = 1`},
 				t.Fatalf("wrong type was accepted: %v", err)
 			}
 		})
+	}
+}
+
+func TestLoadExplicitPreservesTOMLParseErrorCause(t *testing.T) {
+	_, err := LoadExplicit(writeConfig(t, "max_concurrent_tasks = ["))
+	if err == nil {
+		t.Fatal("LoadExplicit succeeded")
+	}
+
+	var loadError *LoadError
+	if !errors.As(err, &loadError) {
+		t.Fatalf("error is not a LoadError: %T", err)
+	}
+	// This must exercise LoadExplicit so a regression in invalid() cannot be
+	// hidden by a manually constructed wrapper.
+	cause := errors.Unwrap(loadError.Err)
+	if cause == nil {
+		t.Fatal("TOML parse error cause was not unwrapped")
+	}
+	var parseError toml.ParseError
+	if !errors.As(cause, &parseError) {
+		t.Fatalf("unwrapped error = %T; want toml.ParseError", cause)
 	}
 }
 

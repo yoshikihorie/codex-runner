@@ -1045,16 +1045,35 @@ func ensureSocketParent(parent, managedRunDir string) error {
 
 func safeConfigErrorAttributes(err error) []any {
 	var loadErr *config.LoadError
-	if errors.As(err, &loadErr) && loadErr.Key != "" {
-		return []any{"key", loadErr.Key}
+	if !errors.As(err, &loadErr) {
+		return nil
 	}
-	return nil
+
+	var attrs []any
+	if loadErr.Key != "" {
+		attrs = append(attrs, "key", loadErr.Key)
+	}
+	if loadErr.Reason != "" {
+		attrs = append(attrs, "reason", loadErr.Reason)
+	}
+	if cause := errors.Unwrap(loadErr.Err); cause != nil {
+		attrs = append(attrs, "cause_type", fmt.Sprintf("%T", cause))
+	}
+	return attrs
 }
 
 func safeConfigErrorMessage(err error) string {
 	var loadErr *config.LoadError
-	if errors.As(err, &loadErr) && loadErr.Key != "" {
-		return "configuration load failed for key " + loadErr.Key
+	if !errors.As(err, &loadErr) {
+		return "configuration load failed"
 	}
-	return "configuration load failed"
+
+	message := "configuration load failed"
+	if loadErr.Key != "" {
+		message += " for key " + loadErr.Key
+	}
+	if loadErr.Reason != "" {
+		message += ": " + loadErr.Reason
+	}
+	return message
 }
