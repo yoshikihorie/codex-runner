@@ -84,3 +84,16 @@ func TestEventReaderReadsLineOverBufferLimit(t *testing.T) {
 		t.Fatalf("got=%d err=%v", len(got), err)
 	}
 }
+
+func TestFileEventReaderReadsOneMiBPlusEventForTailReplay(t *testing.T) {
+	root, id := t.TempDir(), eventReaderID(t)
+	raw := string(make([]byte, 1024*1024+1))
+	writeEvents(t, root, id, eventLine(t, 1, raw))
+	got, err := NewFileEventReader(root).ReadFrom(id, 0)
+	if err != nil || len(got) != 1 {
+		t.Fatalf("got=%d err=%v", len(got), err)
+	}
+	if value, ok := got[0].Raw.(string); !ok || len(value) != len(raw) {
+		t.Fatalf("raw length = %d", len(value))
+	}
+}

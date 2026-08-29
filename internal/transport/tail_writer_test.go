@@ -152,7 +152,7 @@ func TestProgressWriterWritesSeparateJSONLinesWithSharedRequestID(t *testing.T) 
 func TestProgressWriterReturnsUnderlyingWriteError(t *testing.T) {
 	output := &failingTailWriter{err: errTailWrite, failAfter: 0}
 	writer := NewProgressWriter(output, "request-error")
-	if err := writer.WriteProgress(progressTailLine()); err != errTailWrite {
+	if err := writer.WriteProgress(progressTailLine()); !errors.Is(err, errTailWrite) {
 		t.Fatalf("WriteProgress error = %v, want %v", err, errTailWrite)
 	}
 }
@@ -178,5 +178,111 @@ func TestProgressWriterReturnsMarshalErrorWithoutWriting(t *testing.T) {
 	}
 	if output.writes != 0 || output.bytes != 0 {
 		t.Fatalf("writer was used: writes=%d bytes=%d", output.writes, output.bytes)
+	}
+}
+
+func TestProgressWriterTruncatesOversizeRawAndPreservesProgressEnvelope(t *testing.T) {
+	var output bytes.Buffer
+	writer := NewProgressWriter(&output, "request-oversize")
+	line := progressTailLine()
+	line.Raw = map[string]any{"message": strings.Repeat("x", protocolLineMaxBytes+1)}
+	raw, err := json.Marshal(line.Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteProgress(line); err != nil {
+		t.Fatal(err)
+	}
+	encoded := bytes.TrimSuffix(output.Bytes(), []byte{'\n'})
+	if len(encoded) > protocolLineMaxBytes {
+		t.Fatalf("encoded progress = %d bytes", len(encoded))
+	}
+	response := assertTailSuccessEnvelope(t, encoded, "request-oversize")
+	var decoded schema.ProgressLine
+	if err := json.Unmarshal(response.Result, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if !decoded.Truncated || decoded.RawBytes != len(raw) || decoded.Seq != line.Seq || decoded.EventType != line.EventType || decoded.TaskState != line.TaskState {
+		t.Fatalf("progress line = %#v", decoded)
+	}
+	if raw, ok := decoded.Raw.(map[string]any); !ok || len(raw) != 0 {
+		t.Fatalf("truncated raw = %#v", decoded.Raw)
+	}
+}
+
+func TestProgressWriterPreservesRawAndOmitsTruncationMetadataAtOrBelowLimit(t *testing.T) {
+	var output bytes.Buffer
+	writer := NewProgressWriter(&output, "request-normal").(*progressWriter)
+	line := progressTailLine()
+	line.Raw = strings.Repeat("x", protocolLineMaxBytes)
+	encoded, err := writer.marshalProgress(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	line.Raw = strings.Repeat("x", protocolLineMaxBytes-(len(encoded)-protocolLineMaxBytes))
+	encoded, err = writer.marshalProgress(line)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(encoded) != protocolLineMaxBytes {
+		t.Fatalf("encoded progress = %d bytes, want %d", len(encoded), protocolLineMaxBytes)
+	}
+	if err := writer.WriteProgress(line); err != nil {
+		t.Fatal(err)
+	}
+	if len(bytes.TrimSuffix(output.Bytes(), []byte{'\n'})) != protocolLineMaxBytes {
+		t.Fatalf("written progress = %d bytes, want %d", len(bytes.TrimSuffix(output.Bytes(), []byte{'\n'})), protocolLineMaxBytes)
+	}
+	var result map[string]json.RawMessage
+	response := assertTailSuccessEnvelope(t, bytes.TrimSuffix(output.Bytes(), []byte{'\n'}), "request-normal")
+	if err := json.Unmarshal(response.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := result["truncated"]; ok {
+		t.Fatalf("unexpected truncated field: %s", response.Result)
+	}
+	if _, ok := result["raw_bytes"]; ok {
+		t.Fatalf("unexpected raw_bytes field: %s", response.Result)
+	}
+	var raw string
+	if err := json.Unmarshal(result["raw"], &raw); err != nil || raw != line.Raw {
+		t.Fatalf("raw = %q, err = %v", raw, err)
+	}
+}
+
+func TestProgressWriterReturnsProtocolLineTooLongWhenEnvelopeExceedsLimitAfterTruncation(t *testing.T) {
+	var output bytes.Buffer
+	writer := NewProgressWriter(&output, "request-too-long")
+	line := progressTailLine()
+	line.EventType = strings.Repeat("x", protocolLineMaxBytes)
+	line.Raw = map[string]any{"message": strings.Repeat("x", protocolLineMaxBytes+1)}
+
+	if err := writer.WriteProgress(line); !errors.Is(err, errProtocolLineTooLong) {
+		t.Fatalf("WriteProgress error = %v, want %v", err, errProtocolLineTooLong)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("output length = %d, want 0", output.Len())
+	}
+}
+
+func TestProgressWriterTruncatedProgressAllowsFollowingCompleteLine(t *testing.T) {
+	var output bytes.Buffer
+	writer := NewProgressWriter(&output, "request-following")
+	line := progressTailLine()
+	line.Raw = map[string]any{"message": strings.Repeat("x", protocolLineMaxBytes+1)}
+	if err := writer.WriteProgress(line); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteComplete(completeTailLine()); err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(strings.TrimSuffix(output.String(), "\n"), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("lines = %d", len(lines))
+	}
+	var complete schema.CompleteLine
+	response := assertTailSuccessEnvelope(t, []byte(lines[1]), "request-following")
+	if err := json.Unmarshal(response.Result, &complete); err != nil || complete != completeTailLine() {
+		t.Fatalf("complete = %#v, err = %v", complete, err)
 	}
 }

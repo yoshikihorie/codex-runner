@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
+	"github.com/yoshikihorie/codex-runner/internal/transport/schema"
 )
 
 func noOpTailHandler(context.Context, Request, io.Writer) error { return nil }
@@ -780,6 +781,53 @@ func TestHandleConnTailHandlerWritesLinesAndConnectionRemainsReusable(t *testing
 	registry.mu.Unlock()
 	if remaining != 0 {
 		t.Fatalf("tail connection registry entries = %d", remaining)
+	}
+	_ = client.Close()
+	wg.Wait()
+}
+
+func TestHandleConnTailProgressWriterDoesNotCloseForOversizeRaw(t *testing.T) {
+	server, client := net.Pipe()
+	defer client.Close()
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go handleConn(context.Background(), server, func(Request) Response { return Response{} }, func(_ context.Context, req Request, out io.Writer) error {
+		writer := NewProgressWriter(out, req.RequestID)
+		line := progressTailLine()
+		line.Raw = map[string]any{"message": strings.Repeat("x", protocolLineMaxBytesForTest)}
+		if err := writer.WriteProgress(line); err != nil {
+			return err
+		}
+		return writer.WriteComplete(completeTailLine())
+	}, &wg, NewTailConnRegistry())
+
+	if _, err := client.Write([]byte(`{"verb":"tail","request_id":"tail-oversize"}` + "\n")); err != nil {
+		t.Fatal(err)
+	}
+	decoder := json.NewDecoder(client)
+	var progress Response
+	if err := decoder.Decode(&progress); err != nil {
+		t.Fatal(err)
+	}
+	var result struct {
+		Truncated bool `json:"truncated"`
+	}
+	if err := json.Unmarshal(progress.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !result.Truncated {
+		t.Fatalf("truncated = false, result = %#v", result)
+	}
+	var complete Response
+	if err := decoder.Decode(&complete); err != nil {
+		t.Fatal(err)
+	}
+	var completeResult schema.CompleteLine
+	if err := json.Unmarshal(complete.Result, &completeResult); err != nil {
+		t.Fatal(err)
+	}
+	if completeResult.LineType != schema.LineTypeComplete {
+		t.Fatalf("complete line = %#v", completeResult)
 	}
 	_ = client.Close()
 	wg.Wait()

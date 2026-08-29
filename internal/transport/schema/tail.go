@@ -25,6 +25,8 @@ type ProgressLine struct {
 	EventType  string           `json:"event_type"`
 	Raw        any              `json:"raw"`
 	TaskState  domain.TaskState `json:"task_state"`
+	Truncated  bool             `json:"truncated,omitempty"`
+	RawBytes   int              `json:"raw_bytes,omitempty"`
 }
 
 type CompleteLine struct {
