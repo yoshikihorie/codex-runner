@@ -12,6 +12,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -26,6 +27,38 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/transport"
 	"github.com/yoshikihorie/codex-runner/internal/transport/client"
 )
+
+func TestBuildDependenciesWiresEvictWorkDirAtDefaultWorktreeRoot(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	configPath := writeTestConfig(t, home)
+	cfg, err := config.LoadExplicit(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logsDir := filepath.Join(home, "logs")
+	if err := os.Mkdir(logsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	deps, err := buildDependencies(context.Background(), cfg, home, logsDir, func(string) error { return nil }, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if deps.evictWorkDir == nil {
+		t.Fatal("evict worktree dependency is nil")
+	}
+	root, err := execution.DefaultWorktreeRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := reflect.ValueOf(deps.evictWorkDir).Elem().FieldByName("root").String()
+	if got != root {
+		t.Fatalf("evict worktree root=%q, want %q", got, root)
+	}
+}
 
 type statsReaderFake struct {
 	list func(string, *string, *string) ([]string, error)

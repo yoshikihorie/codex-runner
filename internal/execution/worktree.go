@@ -164,8 +164,8 @@ func NewEvictWorkDirUseCase(store WorktreeStore, locks *CheckLivenessUseCase, ro
 	if store == nil || locks == nil {
 		return nil, fmt.Errorf("store and locks must not be nil")
 	}
-	if root == "" {
-		return nil, fmt.Errorf("root must not be empty")
+	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root {
+		return nil, fmt.Errorf("root must be a normalized absolute path")
 	}
 	logger := slog.Default()
 	if len(loggers) > 0 && loggers[0] != nil {

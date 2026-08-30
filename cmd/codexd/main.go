@@ -72,10 +72,12 @@ const (
 const socketRecoveryConnectTimeout = time.Duration(clientDefaultConnectTimeoutSeconds) * time.Second
 
 const (
-	taskPlacementRoot  = "/tmp/codex-tasks"
-	reconcileInterval  = time.Minute
-	shutdownGrace      = 5 * time.Second
-	serverCleanupGrace = shutdownGrace
+	taskPlacementRoot = "/tmp/codex-tasks"
+	reconcileInterval = time.Minute
+	// Canonical source: WORKTREE_CLEANUP_INTERVAL_SECONDS in validation-rules.yaml.
+	evictWorkDirInterval = time.Duration(3600) * time.Second
+	shutdownGrace        = 5 * time.Second
+	serverCleanupGrace   = shutdownGrace
 )
 
 type versionResolver func(context.Context, string) (*string, error)
@@ -729,6 +731,7 @@ func runMain(ctx context.Context, args []string, stderr io.Writer) error {
 	startBackground(deps.reconcile.Run)
 	evictLogsInterval := time.Duration(cfg.LogEvictionScanIntervalSeconds()) * time.Second
 	startBackground(func(ctx context.Context) { deps.evictLogs.Run(ctx, evictLogsInterval) })
+	startBackground(func(ctx context.Context) { deps.evictWorkDir.Run(ctx, evictWorkDirInterval) })
 
 	var result serveResult
 	serveReturned := false
@@ -757,6 +760,7 @@ type daemonDependencies struct {
 	stall           interface{ Run(context.Context) }
 	reconcile       *recovery.ReconcilePendingUseCase
 	evictLogs       *execution.EvictLogsUseCase
+	evictWorkDir    *execution.EvictWorkDirUseCase
 	watcher         *execution.TimeoutWatcher
 	starter         execution.TaskLifecycleStarter
 	shutdownStarter func(context.Context)
@@ -827,6 +831,10 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	if err != nil {
 		return daemonDependencies{}, err
 	}
+	evictWorkDir, err := execution.NewEvictWorkDirUseCase(store.NewWorktreeFileStore(), liveness, worktreeRoot, logger)
+	if err != nil {
+		return daemonDependencies{}, err
+	}
 	orchestrator, err := usecase.NewTaskLifecycleOrchestrator(usecase.TaskLifecycleDependencies{
 		AcquireForChild: execution.AcquireForChild, RecordStarting: usecase.NewRecordTaskStartingUseCase(tasks, writer, logger), CreateWorktree: worktree,
 		Launch: usecase.NewLaunchWithPTYUseCase(processRunner), RecordProcess: usecase.NewRecordTaskProcessUseCase(tasks, writer, logger), FailLaunch: failLaunch,
@@ -861,7 +869,7 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 		result.socketRemoveErr = removeOwnedSocket(cfg.SocketPath(), expected)
 		return result
 	}
-	return daemonDependencies{adoption: adoption, stall: stall, reconcile: reconcile, evictLogs: evictLogs, watcher: watcher, starter: starter, shutdownStarter: starterConcrete.Shutdown, finalizer: transport.NewShutdownFinalizer(connections, tailConns, acceptDone), serve: serve}, nil
+	return daemonDependencies{adoption: adoption, stall: stall, reconcile: reconcile, evictLogs: evictLogs, evictWorkDir: evictWorkDir, watcher: watcher, starter: starter, shutdownStarter: starterConcrete.Shutdown, finalizer: transport.NewShutdownFinalizer(connections, tailConns, acceptDone), serve: serve}, nil
 }
 
 func newEvictLogsUseCase(cfg config.Config, home, logsDir string, reopenLog func(string) error, liveness *execution.CheckLivenessUseCase, logger *slog.Logger) (*execution.EvictLogsUseCase, error) {

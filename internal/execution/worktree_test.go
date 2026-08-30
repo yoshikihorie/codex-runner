@@ -268,6 +268,18 @@ func TestEvictWorkDirValidation(t *testing.T) {
 	}
 }
 
+func TestEvictWorkDirUseCaseRejectsLegacyNamedDirectory(t *testing.T) {
+	store := &fakeWorktreeStore{changes: map[string]bool{}, mtime: map[string]time.Time{}, links: map[string]bool{}, errs: map[string]error{}}
+	uc, root := newTestUseCase(t, store, func(string) (bool, error) { return true, nil })
+	legacyNamed := filepath.Join(root, "codex-runner-"+testWorktreeTaskID)
+	store.paths = []string{legacyNamed}
+
+	_, skipped, err := uc.Plan(context.Background(), validInput(TriggerAutomatic))
+	if err != nil || len(skipped) != 1 || skipped[0] != (WorktreeSkipped{Path: legacyNamed, Reason: WorktreeSkipInvalidTaskID}) {
+		t.Fatalf("Plan() = %#v, %v", skipped, err)
+	}
+}
+
 func TestEvictWorkDirPlanAndExecute(t *testing.T) {
 	store := &fakeWorktreeStore{changes: map[string]bool{}, mtime: map[string]time.Time{}, links: map[string]bool{}, errs: map[string]error{}}
 	uc, root := newTestUseCase(t, store, func(string) (bool, error) { return true, nil })
