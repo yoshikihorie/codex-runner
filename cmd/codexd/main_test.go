@@ -9,6 +9,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -1003,6 +1004,110 @@ func TestAcquireDaemonInstanceLeaseRejectsHeldLock(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("lock mode=%#o", info.Mode().Perm())
+	}
+}
+
+func TestStaleSocketRecoveryRemovesUnreachableSocket(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "codexd-stale-socket-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+
+	lease, err := acquireDaemonInstanceLease(filepath.Join(root, "codexd.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lease.Unlock() })
+
+	socketPath := filepath.Join(root, "codexd.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	unixListener := listener.(*net.UnixListener)
+	unixListener.SetUnlinkOnClose(false)
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	var logs bytes.Buffer
+	if err := newStaleSocketRecovery(slog.New(slog.NewJSONHandler(&logs, nil))).recover(context.Background(), socketPath); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(socketPath); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("socket remains after recovery: %v", err)
+	}
+	listener, err = net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatalf("listen after recovery: %v", err)
+	}
+	defer listener.Close()
+	if !strings.Contains(logs.String(), "recovered stale Unix socket") {
+		t.Fatalf("recovery log missing: %s", logs.String())
+	}
+}
+
+func TestStaleSocketRecoveryRejectsReachableSocketWithoutRemovingIt(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "codexd-stale-socket-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+
+	lease, err := acquireDaemonInstanceLease(filepath.Join(root, "codexd.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = lease.Unlock() })
+
+	socketPath := filepath.Join(root, "codexd.sock")
+	listener, err := net.Listen("unix", socketPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer listener.Close()
+
+	var logs bytes.Buffer
+	err = newStaleSocketRecovery(slog.New(slog.NewJSONHandler(&logs, nil))).recover(context.Background(), socketPath)
+	if err == nil {
+		t.Fatal("reachable socket was accepted")
+	}
+	if _, err := os.Lstat(socketPath); err != nil {
+		t.Fatalf("reachable socket was removed: %v", err)
+	}
+	if !strings.Contains(logs.String(), "stale socket recovery skipped") {
+		t.Fatalf("skip log missing: %s", logs.String())
+	}
+}
+
+func TestStaleSocketRecoveryPreservesNonSocketEntries(t *testing.T) {
+	root, err := os.MkdirTemp("/tmp", "codexd-stale-socket-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+
+	for _, tc := range []struct {
+		name   string
+		create func(string) error
+	}{
+		{name: "file", create: func(path string) error { return os.WriteFile(path, []byte("file"), 0o600) }},
+		{name: "directory", create: func(path string) error { return os.Mkdir(path, 0o700) }},
+		{name: "symlink", create: func(path string) error { return os.Symlink(filepath.Join(root, "target"), path) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(root, tc.name)
+			if err := tc.create(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := newStaleSocketRecovery(slog.New(slog.NewJSONHandler(io.Discard, nil))).recover(context.Background(), path); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := os.Lstat(path); err != nil {
+				t.Fatalf("non-socket entry was removed: %v", err)
+			}
+		})
 	}
 }
 

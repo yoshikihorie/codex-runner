@@ -11,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -67,6 +68,8 @@ const (
 	// Canonical source: validation-rules.md PROTOCOL_LINE_MAX_BYTES.
 	clientProtocolLineMaxBytes int64 = 1_048_576
 )
+
+const socketRecoveryConnectTimeout = time.Duration(clientDefaultConnectTimeoutSeconds) * time.Second
 
 const (
 	taskPlacementRoot  = "/tmp/codex-tasks"
@@ -599,6 +602,54 @@ func reportMainError(stderr io.Writer, err error) {
 	}
 }
 
+type staleSocketRecovery struct {
+	dial        func(context.Context, string, string) (net.Conn, error)
+	pingTimeout time.Duration
+	logger      *slog.Logger
+}
+
+func newStaleSocketRecovery(logger *slog.Logger) staleSocketRecovery {
+	dialer := &net.Dialer{}
+	return staleSocketRecovery{
+		dial:        dialer.DialContext,
+		pingTimeout: socketRecoveryConnectTimeout,
+		logger:      logger,
+	}
+}
+
+func (r staleSocketRecovery) recover(ctx context.Context, socketPath string) error {
+	expected, err := os.Lstat(socketPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspect socket before recovery %s: %w", socketPath, err)
+	}
+	if expected.Mode()&os.ModeSocket == 0 {
+		return nil
+	}
+
+	timed, cancel := context.WithTimeout(ctx, r.pingTimeout)
+	conn, err := r.dial(timed, "unix", socketPath)
+	cancel()
+	if err == nil {
+		closeErr := conn.Close()
+		r.logger.Warn("stale socket recovery skipped: socket accepts connections", "socket_path", socketPath)
+		if closeErr != nil {
+			return fmt.Errorf("close connection to existing socket %s: %w", socketPath, closeErr)
+		}
+		return fmt.Errorf("existing socket accepts connections: %s", socketPath)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if err := removeOwnedSocket(socketPath, expected); err != nil {
+		return fmt.Errorf("recover stale socket %s: %w", socketPath, err)
+	}
+	r.logger.Info("recovered stale Unix socket", "socket_path", socketPath)
+	return nil
+}
+
 // runMain owns the startup boundary.  Dependency construction is deliberately
 // below configuration and filesystem validation so an invalid environment can
 // never create task state or open a listener.
@@ -641,6 +692,9 @@ func runMain(ctx context.Context, args []string, stderr io.Writer) error {
 		return err
 	}
 	if err := ensureSocketParent(filepath.Dir(cfg.SocketPath()), managedRunDir); err != nil {
+		return err
+	}
+	if err := newStaleSocketRecovery(logger).recover(ctx, cfg.SocketPath()); err != nil {
 		return err
 	}
 
@@ -877,6 +931,9 @@ func removeOwnedSocket(socketPath string, expected os.FileInfo) error {
 		info, inspectErr := os.Lstat(quarantine)
 		if inspectErr == nil && info.Mode()&os.ModeSocket != 0 && os.SameFile(expected, info) {
 			if err := os.Remove(quarantine); err != nil {
+				if os.IsNotExist(err) {
+					return nil
+				}
 				return fmt.Errorf("remove quarantined socket %s: %w", quarantine, err)
 			}
 			return nil
