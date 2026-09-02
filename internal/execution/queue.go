@@ -20,6 +20,7 @@ type TaskAdmissionInput struct {
 	ReasoningEffort  *string
 	SandboxMode      string
 	SourceWorkingDir string
+	WorktreeMode     domain.WorktreeMode
 }
 
 // TaskLaunchPayload carries all task data required by lifecycle orchestration.
@@ -33,6 +34,7 @@ type TaskLaunchPayload struct {
 	SandboxMode      string
 	SourceWorkingDir string
 	WorkingDir       *string
+	WorktreeMode     domain.WorktreeMode
 }
 
 // TaskAdmissionResult distinguishes immediate admission from queued admission.

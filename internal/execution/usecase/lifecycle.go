@@ -141,7 +141,8 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 	launchPrompt := input.PromptText
 	workingDir := input.WorkingDir
 	plannedWorkingDir := ""
-	if input.Task.Subcommand() == domain.SubcommandImpl {
+	useWorktree := input.Task.Subcommand() == domain.SubcommandImpl && input.WorktreeMode == domain.WorktreeModeAuto
+	if useWorktree {
 		if isNilValue(o.deps.CreateWorktree) {
 			_ = lock.Close()
 			o.fail(ctx, input, 130, true)
@@ -165,7 +166,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		o.fail(ctx, input, 130, true)
 		return
 	}
-	if input.Task.Subcommand() == domain.SubcommandImpl {
+	if useWorktree {
 		if o.stopForCancellation(ctx) {
 			_ = lock.Close()
 			return

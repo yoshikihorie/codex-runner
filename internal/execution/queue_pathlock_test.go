@@ -243,3 +243,49 @@ func TestSubmitPathLockIntegrationKeepsQueuedOwnerWithoutTaskLock(t *testing.T) 
 	requirePublicError(t, response, "PATH_LOCK_CONFLICT", "error.pathLock.conflict", map[string]any{"path": normalized.String(), "owner_task_id": owner.String()})
 	requireLockOwner(t, fixture.pathStore, owner, normalized)
 }
+
+// T2-08: worktree_mode does not change path-lock acquisition or release behavior.
+
+func TestPathLockAcquiredAndReleasedInCurrentMode(t *testing.T) {
+	fixture := newPathLockIntegrationFixture(t, 2, 2, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }))
+	path := t.TempDir()
+	normalized, err := store.NormalizePath(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	in := implInput(t, "current-mode-lock", path)
+	in.RawWorktreeMode = worktreeModePtr("current")
+	first, err := fixture.submit.Execute(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireLockOwner(t, fixture.pathStore, first.TaskID, normalized)
+	if err := fixture.releaser.Release(context.Background(), first.TaskID); err != nil {
+		t.Fatal(err)
+	}
+	locks, err := fixture.pathStore.List()
+	if err != nil || len(locks) != 0 {
+		t.Fatalf("locks after release=%#v err=%v", locks, err)
+	}
+}
+
+func TestPathLockNotAffectedByWorktreeMode(t *testing.T) {
+	fixture := newPathLockIntegrationFixture(t, 2, 2, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }))
+	path := t.TempDir()
+	normalized, err := store.NormalizePath(path, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	currentIn := implInput(t, "current-mode-conflict", path)
+	currentIn.RawWorktreeMode = worktreeModePtr("current")
+	first, err := fixture.submit.Execute(context.Background(), currentIn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requireLockOwner(t, fixture.pathStore, first.TaskID, normalized)
+	response := submitHandle(t, fixture.submit, implInput(t, "auto-mode-conflict", path))
+	requirePublicError(t, response, "PATH_LOCK_CONFLICT", "error.pathLock.conflict", map[string]any{"path": normalized.String(), "owner_task_id": first.TaskID.String()})
+	requireLockOwner(t, fixture.pathStore, first.TaskID, normalized)
+}
+
+func worktreeModePtr(value string) *string { return &value }

@@ -143,7 +143,7 @@ func promotionAdmissionInput(t *testing.T, suffix string) execution.TaskAdmissio
 	}
 	return execution.TaskAdmissionInput{
 		TaskID: taskID, Subcommand: domain.SubcommandReview, Slug: slug, RequestedAt: time.Now(),
-		PromptText: "prompt", ResolvedTimeout: timeout, Model: "model", SandboxMode: "read-only", SourceWorkingDir: "/private/tmp/source",
+		PromptText: "prompt", ResolvedTimeout: timeout, Model: "model", SandboxMode: "read-only", SourceWorkingDir: "/private/tmp/source", WorktreeMode: domain.WorktreeModeAuto,
 	}
 }
 

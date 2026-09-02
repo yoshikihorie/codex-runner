@@ -49,9 +49,9 @@ func (u *AdmitTaskUseCase) Execute(_ context.Context, input execution.TaskAdmiss
 	payload := execution.TaskLaunchPayload{
 		Task: task, Model: input.Model, ReasoningEffort: copyReasoningEffort(input.ReasoningEffort), PromptText: input.PromptText,
 		NormalizedPaths: copyNormalizedPaths(input.NormalizedPaths), ResolvedTimeout: input.ResolvedTimeout,
-		SandboxMode: input.SandboxMode, SourceWorkingDir: input.SourceWorkingDir,
+		SandboxMode: input.SandboxMode, SourceWorkingDir: input.SourceWorkingDir, WorktreeMode: input.WorktreeMode,
 	}
-	if input.Subcommand != domain.SubcommandImpl {
+	if input.Subcommand != domain.SubcommandImpl || input.WorktreeMode == domain.WorktreeModeCurrent {
 		workingDir := input.SourceWorkingDir
 		payload.WorkingDir = &workingDir
 	}
@@ -120,6 +120,8 @@ func validateAdmissionInput(input execution.TaskAdmissionInput) error {
 		return fmt.Errorf("task admission input sandbox mode is required")
 	case input.SourceWorkingDir == "":
 		return fmt.Errorf("task admission input source working directory is required")
+	case input.WorktreeMode == "":
+		return fmt.Errorf("task admission input worktree mode is required")
 	default:
 		return nil
 	}

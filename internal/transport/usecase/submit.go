@@ -53,6 +53,7 @@ type SubmitTaskInput struct {
 	Model                   *string
 	ReasoningEffort         *string
 	RawWorkingDir           string
+	RawWorktreeMode         *string
 	RequestedAt             time.Time
 }
 type SubmitTaskOutput struct {
@@ -97,6 +98,7 @@ type submitWireInput struct {
 	Model                   *string  `json:"model"`
 	ReasoningEffort         *string  `json:"reasoning_effort"`
 	WorkingDir              string   `json:"working_dir"`
+	WorktreeMode            *string  `json:"worktree_mode"`
 }
 
 type submitError struct {
@@ -121,7 +123,7 @@ func (uc *SubmitTaskUseCase) Handle(req transport.Request) transport.Response {
 	if err := json.Unmarshal(req.Params, &wire); err != nil {
 		return submitErrorResponse(req.RequestID, submitFailure("SUBMIT_PARAMS_MALFORMED", "error.submit.paramsMalformed", nil))
 	}
-	out, err := uc.Execute(context.Background(), SubmitTaskInput{Subcommand: wire.Subcommand, RawSlug: wire.Slug, Prompt: wire.Prompt, RequestedTimeoutSeconds: wire.RequestedTimeoutSeconds, RawPaths: wire.Paths, Model: wire.Model, ReasoningEffort: wire.ReasoningEffort, RawWorkingDir: wire.WorkingDir, RequestedAt: uc.clock.Now()})
+	out, err := uc.Execute(context.Background(), SubmitTaskInput{Subcommand: wire.Subcommand, RawSlug: wire.Slug, Prompt: wire.Prompt, RequestedTimeoutSeconds: wire.RequestedTimeoutSeconds, RawPaths: wire.Paths, Model: wire.Model, ReasoningEffort: wire.ReasoningEffort, RawWorkingDir: wire.WorkingDir, RawWorktreeMode: wire.WorktreeMode, RequestedAt: uc.clock.Now()})
 	if err != nil {
 		return submitErrorResponse(req.RequestID, uc.mapError(err))
 	}
@@ -171,6 +173,14 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 			}
 		}
 	}
+	worktreeMode := domain.WorktreeModeAuto
+	if subcommand == domain.SubcommandImpl {
+		resolved, resolveErr := resolveWorktreeMode(in.RawWorktreeMode)
+		if resolveErr != nil {
+			return SubmitTaskOutput{}, submitFailure("WORKTREE_MODE_NOT_ALLOWED", "error.worktreeMode.notAllowed", map[string]any{"worktree_mode": dereferenceString(in.RawWorktreeMode)})
+		}
+		worktreeMode = resolved
+	}
 	id, err := uc.reserveTaskID(subcommand, slug, in.RequestedAt)
 	if err != nil {
 		return SubmitTaskOutput{}, uc.mapError(err)
@@ -193,7 +203,7 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 	if subcommand == domain.SubcommandImpl {
 		sandbox = "workspace-write"
 	}
-	result, err := uc.admitter.Admit(execution.TaskAdmissionInput{TaskID: id, Subcommand: subcommand, Slug: slug, RequestedTimeout: in.RequestedTimeoutSeconds, RequestedAt: in.RequestedAt, PromptText: in.Prompt, NormalizedPaths: normalizedPaths, ResolvedTimeout: timeout, Model: model, ReasoningEffort: effort, SandboxMode: sandbox, SourceWorkingDir: workingDir})
+	result, err := uc.admitter.Admit(execution.TaskAdmissionInput{TaskID: id, Subcommand: subcommand, Slug: slug, RequestedTimeout: in.RequestedTimeoutSeconds, RequestedAt: in.RequestedAt, PromptText: in.Prompt, NormalizedPaths: normalizedPaths, ResolvedTimeout: timeout, Model: model, ReasoningEffort: effort, SandboxMode: sandbox, SourceWorkingDir: workingDir, WorktreeMode: worktreeMode})
 	if err != nil {
 		if acquired {
 			if cleanupErr := uc.pathLockReleaser.Release(context.WithoutCancel(ctx), id); cleanupErr != nil {
@@ -294,6 +304,12 @@ func submitErrorResponse(requestID string, err error) transport.Response {
 		value = &submitError{code: "TASK_DIR_CREATE_FAILED", message: "error.taskDir.createFailed"}
 	}
 	return transport.Response{ProtocolVersion: transport.ProtocolVersion, RequestID: requestID, OK: false, Error: &transport.ErrorBody{Code: value.code, MessageKey: value.message, Detail: value.detail}}
+}
+func resolveWorktreeMode(raw *string) (domain.WorktreeMode, error) {
+	if raw == nil {
+		return domain.WorktreeModeAuto, nil
+	}
+	return domain.ParseWorktreeMode(*raw)
 }
 func dereferenceInt(value *int) int {
 	if value == nil {

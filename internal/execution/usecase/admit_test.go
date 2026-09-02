@@ -28,7 +28,7 @@ func testAdmissionInput(t *testing.T, subcommand domain.Subcommand, suffix strin
 	}
 	return execution.TaskAdmissionInput{
 		TaskID: id, Subcommand: subcommand, Slug: slug, RequestedAt: time.Now(), PromptText: "prompt", ResolvedTimeout: timeout,
-		Model: "model", SandboxMode: "workspace-write", SourceWorkingDir: "/private/tmp/source",
+		Model: "model", SandboxMode: "workspace-write", SourceWorkingDir: "/private/tmp/source", WorktreeMode: domain.WorktreeModeAuto,
 	}
 }
 
@@ -150,6 +150,7 @@ func TestAdmitTaskUseCaseValidatesEveryRequiredFieldWithoutMutation(t *testing.T
 		{"timeout", func(in *execution.TaskAdmissionInput) { in.ResolvedTimeout = domain.Timeout{} }},
 		{"sandbox", func(in *execution.TaskAdmissionInput) { in.SandboxMode = "" }},
 		{"working_dir", func(in *execution.TaskAdmissionInput) { in.SourceWorkingDir = "" }},
+		{"worktree_mode", func(in *execution.TaskAdmissionInput) { in.WorktreeMode = "" }},
 	} {
 		t.Run(field.name, func(t *testing.T) {
 			queue, registry := execution.NewTaskQueue(), execution.NewActiveTaskRegistry()
@@ -211,6 +212,56 @@ func TestAdmitTaskUseCaseEmitsOneQueuedEventAndHonorsCapacityBoundary(t *testing
 				t.Fatalf("result=%#v", result)
 			}
 		})
+	}
+}
+
+// T2-08: WorktreeMode decides whether admission pre-resolves WorkingDir for impl tasks.
+
+func TestAdmitSetsWorkingDirForImplCurrentMode(t *testing.T) {
+	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
+	input := testAdmissionInput(t, domain.SubcommandImpl, "current-mode")
+	input.WorktreeMode = domain.WorktreeModeCurrent
+	result, err := newAdmitTaskUseCaseForTest(queue, registry, execution.NewLaunchingTaskRegistry(), mutex, 1, 1, 1).Execute(context.Background(), input)
+	if err != nil || result.LaunchPayload == nil || result.LaunchPayload.WorkingDir == nil || *result.LaunchPayload.WorkingDir != input.SourceWorkingDir {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+}
+
+func TestAdmitLeavesWorkingDirNilForImplAutoMode(t *testing.T) {
+	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
+	input := testAdmissionInput(t, domain.SubcommandImpl, "auto-mode")
+	input.WorktreeMode = domain.WorktreeModeAuto
+	result, err := newAdmitTaskUseCaseForTest(queue, registry, execution.NewLaunchingTaskRegistry(), mutex, 1, 1, 1).Execute(context.Background(), input)
+	if err != nil || result.LaunchPayload == nil || result.LaunchPayload.WorkingDir != nil {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+}
+
+func TestAdmitRejectsEmptyWorktreeMode(t *testing.T) {
+	input := testAdmissionInput(t, domain.SubcommandImpl, "empty-worktree-mode")
+	input.WorktreeMode = ""
+	result, err := newAdmitTaskUseCaseForTest(execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), execution.NewLaunchingTaskRegistry(), &sync.Mutex{}, 1, 1, 1).Execute(context.Background(), input)
+	if err == nil || result.State != "" || result.QueuePosition != nil || len(result.Events) != 0 || result.LaunchPayload != nil {
+		t.Fatalf("result=%#v err=%v", result, err)
+	}
+}
+
+func TestAdmitCarriesWorktreeModeIntoQueuedPayload(t *testing.T) {
+	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
+	useCase := newAdmitTaskUseCaseForTest(queue, registry, execution.NewLaunchingTaskRegistry(), mutex, 1, 1, 2)
+	active := testAdmissionInput(t, domain.SubcommandImpl, "queued-carry-active")
+	if _, err := useCase.Execute(context.Background(), active); err != nil {
+		t.Fatal(err)
+	}
+	queuedInput := testAdmissionInput(t, domain.SubcommandImpl, "queued-carry-waiting")
+	queuedInput.WorktreeMode = domain.WorktreeModeCurrent
+	queued, err := useCase.Execute(context.Background(), queuedInput)
+	if err != nil || queued.QueuePosition == nil || queued.LaunchPayload != nil {
+		t.Fatalf("queued=%#v err=%v", queued, err)
+	}
+	payload, found := queue.Dequeue()
+	if !found || payload.WorktreeMode != domain.WorktreeModeCurrent {
+		t.Fatalf("payload=%#v found=%t", payload, found)
 	}
 }
 

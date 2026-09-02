@@ -866,7 +866,7 @@ func newLifecycleFixture(t *testing.T) *lifecycleFixture {
 	t.Cleanup(func() { _ = file.Close() })
 	task := lifecycleTask(t, domain.SubcommandImpl)
 	timeout := lifecycleTimeout(t)
-	f.input = TaskLifecycleInput{TaskLaunchPayload: execution.TaskLaunchPayload{Task: task, Model: "gpt-5", PromptText: "prompt", ResolvedTimeout: timeout, SandboxMode: "workspace-write", SourceWorkingDir: "/private/tmp/source"}, TaskDirPath: "/private/tmp/task", Now: testLifecycleTime}
+	f.input = TaskLifecycleInput{TaskLaunchPayload: execution.TaskLaunchPayload{Task: task, Model: "gpt-5", PromptText: "prompt", ResolvedTimeout: timeout, SandboxMode: "workspace-write", SourceWorkingDir: "/private/tmp/source", WorktreeMode: domain.WorktreeModeAuto}, TaskDirPath: "/private/tmp/task", Now: testLifecycleTime}
 	f.acquire = &lifecycleRecordingAcquireForChild{file: file, trace: &f.trace}
 	f.starting = &lifecycleRecordingRecordStarting{trace: &f.trace}
 	f.worktree = &lifecycleRecordingCreateWorktree{resolved: "/private/tmp/worktree", output: execution.CreateWorktreeOutput{WorkingDir: "/private/tmp/worktree"}, trace: &f.trace}
@@ -998,6 +998,117 @@ func TestTaskLifecycleRunImplRewritesOnlySourceWorkingDirPathBoundaries(t *testi
 	}
 	if len(f.launch.params) != 1 || f.launch.params[0].PromptText != want {
 		t.Fatalf("Launch prompt=%q, want %q", f.launch.params[0].PromptText, want)
+	}
+}
+
+// T2-08: worktree_mode = current skips worktree creation and runs in the source working directory.
+
+func TestLifecycleCurrentModeDoesNotCreateWorktree(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.input.WorktreeMode = domain.WorktreeModeCurrent
+	sourceWorkingDir := f.input.SourceWorkingDir
+	f.input.WorkingDir = &sourceWorkingDir
+
+	f.run()
+
+	if f.worktree.resolveCalls != 0 || f.worktree.calls != 0 {
+		t.Fatalf("worktree resolveCalls=%d calls=%d, want 0/0", f.worktree.resolveCalls, f.worktree.calls)
+	}
+	if f.launch.calls != 1 || len(f.finalizer.calls) != 1 {
+		t.Fatalf("lifecycle did not complete: launch=%d finalize=%d trace=%v", f.launch.calls, len(f.finalizer.calls), f.trace)
+	}
+}
+
+func TestLifecycleCurrentModeKeepsPromptUnchanged(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.input.WorktreeMode = domain.WorktreeModeCurrent
+	sourceWorkingDir := f.input.SourceWorkingDir
+	f.input.WorkingDir = &sourceWorkingDir
+	f.input.PromptText = "edit /private/tmp/source/a.go and verify /private/tmp/source/b.go"
+
+	f.run()
+
+	if len(f.starting.prompts) != 1 || f.starting.prompts[0] != f.input.PromptText {
+		t.Fatalf("RecordStarting prompts=%q, want %q", f.starting.prompts, f.input.PromptText)
+	}
+	if len(f.launch.params) != 1 || f.launch.params[0].PromptText != f.input.PromptText {
+		t.Fatalf("Launch prompt=%q, want %q", f.launch.params[0].PromptText, f.input.PromptText)
+	}
+}
+
+func TestLifecycleCurrentModeLaunchesInSourceWorkingDir(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.input.WorktreeMode = domain.WorktreeModeCurrent
+	sourceWorkingDir := f.input.SourceWorkingDir
+	f.input.WorkingDir = &sourceWorkingDir
+
+	f.run()
+
+	if len(f.launch.params) != 1 || f.launch.params[0].WorkingDir != f.input.SourceWorkingDir {
+		t.Fatalf("launch working dir=%q, want %q", f.launch.params[0].WorkingDir, f.input.SourceWorkingDir)
+	}
+}
+
+func TestLifecycleCurrentModeKeepsWorkspaceWriteSandbox(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.input.WorktreeMode = domain.WorktreeModeCurrent
+	sourceWorkingDir := f.input.SourceWorkingDir
+	f.input.WorkingDir = &sourceWorkingDir
+
+	f.run()
+
+	if len(f.launch.params) != 1 || f.launch.params[0].SandboxMode != "workspace-write" {
+		t.Fatalf("sandbox mode=%q, want workspace-write", f.launch.params[0].SandboxMode)
+	}
+}
+
+func TestLifecycleAutoModeStillCreatesWorktree(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.input.WorktreeMode = domain.WorktreeModeAuto
+
+	f.run()
+
+	if f.worktree.resolveCalls != 1 || f.worktree.calls != 1 {
+		t.Fatalf("worktree resolveCalls=%d calls=%d, want 1/1", f.worktree.resolveCalls, f.worktree.calls)
+	}
+	if len(f.launch.params) != 1 || f.launch.params[0].WorkingDir != "/private/tmp/worktree" {
+		t.Fatalf("launch working dir=%q, want /private/tmp/worktree", f.launch.params[0].WorkingDir)
+	}
+}
+
+func TestLifecycleAutoModePromptReplacementUnchanged(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.input.WorktreeMode = domain.WorktreeModeAuto
+	f.input.PromptText = "edit /private/tmp/source/a.go and verify /private/tmp/source/b.go"
+
+	f.run()
+
+	want := "edit /private/tmp/worktree/a.go and verify /private/tmp/worktree/b.go"
+	if len(f.starting.prompts) != 1 || f.starting.prompts[0] != want {
+		t.Fatalf("RecordStarting prompts=%q, want %q", f.starting.prompts, want)
+	}
+	if len(f.launch.params) != 1 || f.launch.params[0].PromptText != want {
+		t.Fatalf("Launch prompt=%q, want %q", f.launch.params[0].PromptText, want)
+	}
+}
+
+func TestLifecycleCurrentModeDoesNotRequireWorktreeDependency(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.input.WorktreeMode = domain.WorktreeModeCurrent
+	sourceWorkingDir := f.input.SourceWorkingDir
+	f.input.WorkingDir = &sourceWorkingDir
+	deps := f.orchestrator.deps
+	deps.CreateWorktree = nil
+	orchestrator, err := NewTaskLifecycleOrchestrator(deps, f.orchestrator.launchConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.orchestrator = orchestrator
+
+	f.run()
+
+	if f.launch.calls != 1 || len(f.finalizer.calls) != 1 {
+		t.Fatalf("lifecycle did not complete without worktree dependency: launch=%d finalize=%d trace=%v", f.launch.calls, len(f.finalizer.calls), f.trace)
 	}
 }
 

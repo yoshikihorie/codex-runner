@@ -342,6 +342,7 @@ func TestSubmitExecuteValidationOrderAndNoSideEffects(t *testing.T) {
 		{"subcommand before model", "SUBCOMMAND_NOT_SUBMITTABLE", SubmitTaskInput{RawSlug: "valid-slug", Prompt: "safe", Subcommand: "bad", RequestedTimeoutSeconds: intPtr(1800)}},
 		{"working dir before paths", "WORKING_DIR_NOT_ABSOLUTE", SubmitTaskInput{RawSlug: "valid-slug", Prompt: "safe", Subcommand: "impl", RequestedTimeoutSeconds: intPtr(1800), RawWorkingDir: "relative", RawPaths: []string{"relative"}}},
 		{"paths last", "PATHS_NOT_ABSOLUTE", SubmitTaskInput{RawSlug: "valid-slug", Prompt: "safe", Subcommand: "impl", RequestedTimeoutSeconds: intPtr(1800), RawWorkingDir: t.TempDir(), RawPaths: []string{"relative"}}},
+		{"worktree mode after paths", "WORKTREE_MODE_NOT_ALLOWED", SubmitTaskInput{RawSlug: "valid-slug", Prompt: "safe", Subcommand: "impl", RequestedTimeoutSeconds: intPtr(1800), RawWorkingDir: t.TempDir(), RawPaths: []string{t.TempDir()}, RawWorktreeMode: ptrString("worktree")}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -597,8 +598,94 @@ func TestSubmitExecuteAdmissionFailureCompensatesWithoutCancelledContext(t *test
 	}
 }
 
+// T2-08: worktree_mode is resolved and validated only for impl, and defaults to auto.
+
+func TestSubmitExecute_WorktreeModeDefaultsToAutoWhenOmitted(t *testing.T) {
+	fixture := newSubmitFixture()
+	in := validSubmitInput(t)
+	in.Subcommand = "impl"
+	in.RawPaths = []string{t.TempDir()}
+	if _, err := fixture.uc.Execute(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.admitter.input.WorktreeMode != domain.WorktreeModeAuto {
+		t.Fatalf("worktree mode=%q, want %q", fixture.admitter.input.WorktreeMode, domain.WorktreeModeAuto)
+	}
+}
+
+func TestSubmitExecute_WorktreeModeCurrentIsPassedThrough(t *testing.T) {
+	fixture := newSubmitFixture()
+	in := validSubmitInput(t)
+	in.Subcommand = "impl"
+	in.RawPaths = []string{t.TempDir()}
+	in.RawWorktreeMode = ptrString("current")
+	if _, err := fixture.uc.Execute(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.admitter.input.WorktreeMode != domain.WorktreeModeCurrent {
+		t.Fatalf("worktree mode=%q, want %q", fixture.admitter.input.WorktreeMode, domain.WorktreeModeCurrent)
+	}
+}
+
+func TestSubmitExecute_UnknownWorktreeModeRejected(t *testing.T) {
+	fixture := newSubmitFixture()
+	in := validSubmitInput(t)
+	in.Subcommand = "impl"
+	in.RawPaths = []string{t.TempDir()}
+	in.RawWorktreeMode = ptrString("worktree")
+	_, err := fixture.uc.Execute(context.Background(), in)
+	assertSubmitError(t, err, "WORKTREE_MODE_NOT_ALLOWED", "error.worktreeMode.notAllowed", map[string]any{"worktree_mode": "worktree"})
+	if len(fixture.store.reserved) != 0 || fixture.locks.calls != 0 || fixture.admitter.calls != 0 || len(fixture.starter.payloads) != 0 {
+		t.Fatal("side effects occurred")
+	}
+}
+
+func TestSubmitExecute_EmptyWorktreeModeRejected(t *testing.T) {
+	fixture := newSubmitFixture()
+	in := validSubmitInput(t)
+	in.Subcommand = "impl"
+	in.RawPaths = []string{t.TempDir()}
+	in.RawWorktreeMode = ptrString("")
+	_, err := fixture.uc.Execute(context.Background(), in)
+	assertSubmitError(t, err, "WORKTREE_MODE_NOT_ALLOWED", "error.worktreeMode.notAllowed", map[string]any{"worktree_mode": ""})
+	if len(fixture.store.reserved) != 0 || fixture.locks.calls != 0 || fixture.admitter.calls != 0 || len(fixture.starter.payloads) != 0 {
+		t.Fatal("side effects occurred")
+	}
+}
+
+func TestSubmitExecute_WorktreeModeIgnoredForNonImpl(t *testing.T) {
+	fixture := newSubmitFixture()
+	in := validSubmitInput(t)
+	in.RawWorktreeMode = ptrString("current")
+	if _, err := fixture.uc.Execute(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.admitter.input.WorktreeMode != domain.WorktreeModeAuto {
+		t.Fatalf("worktree mode=%q, want %q (ignored for non-impl)", fixture.admitter.input.WorktreeMode, domain.WorktreeModeAuto)
+	}
+}
+
+func TestSubmitHandle_WorktreeModeFieldAbsentIsAccepted(t *testing.T) {
+	fixture := newSubmitFixture()
+	resp := fixture.uc.Handle(transport.Request{RequestID: "request", Params: json.RawMessage(fmt.Sprintf(`{"subcommand":"review","slug":"valid-slug","prompt":"safe","working_dir":%q}`, t.TempDir()))})
+	if !resp.OK {
+		t.Fatalf("response=%#v", resp)
+	}
+}
+
+func TestSubmitHandle_WorktreeModeWrongTypeIsMalformed(t *testing.T) {
+	fixture := newSubmitFixture()
+	resp := fixture.uc.Handle(transport.Request{RequestID: "request", Params: json.RawMessage(fmt.Sprintf(`{"subcommand":"review","slug":"valid-slug","prompt":"safe","working_dir":%q,"worktree_mode":1}`, t.TempDir()))})
+	if resp.OK || resp.Error == nil || resp.Error.Code != "SUBMIT_PARAMS_MALFORMED" || resp.Error.MessageKey != "error.submit.paramsMalformed" {
+		t.Fatalf("response=%#v", resp)
+	}
+	if len(fixture.store.reserved) != 0 || fixture.locks.calls != 0 || fixture.admitter.calls != 0 || len(fixture.starter.payloads) != 0 {
+		t.Fatalf("side effects occurred")
+	}
+}
+
 func mapSubmitMessage(code string) string {
-	return map[string]string{"SLUG_INVALID_FORMAT": "error.slug.invalidFormat", "TIMEOUT_BELOW_MINIMUM": "error.timeout.belowMinimum", "PROMPT_EMPTY": "error.prompt.empty", "SUBCOMMAND_NOT_SUBMITTABLE": "error.subcommand.notSubmittable", "MODEL_NOT_ALLOWED": "error.model.notAllowed", "REASONING_EFFORT_NOT_ALLOWED": "error.reasoningEffort.notAllowed", "WORKING_DIR_NOT_ABSOLUTE": "error.workingDir.notAbsolute", "PATHS_NOT_ABSOLUTE": "error.paths.notAbsolute"}[code]
+	return map[string]string{"SLUG_INVALID_FORMAT": "error.slug.invalidFormat", "TIMEOUT_BELOW_MINIMUM": "error.timeout.belowMinimum", "PROMPT_EMPTY": "error.prompt.empty", "SUBCOMMAND_NOT_SUBMITTABLE": "error.subcommand.notSubmittable", "MODEL_NOT_ALLOWED": "error.model.notAllowed", "REASONING_EFFORT_NOT_ALLOWED": "error.reasoningEffort.notAllowed", "WORKING_DIR_NOT_ABSOLUTE": "error.workingDir.notAbsolute", "PATHS_NOT_ABSOLUTE": "error.paths.notAbsolute", "WORKTREE_MODE_NOT_ALLOWED": "error.worktreeMode.notAllowed"}[code]
 }
 func intPtr(value int) *int          { return &value }
 func ptrString(value string) *string { return &value }
