@@ -806,7 +806,7 @@ func (uc *AdoptRunningTasksUseCase) recoverOrphan(ctx context.Context, taskID do
 		uc.logFailure("resume recovery for adopted orphan is unavailable", taskID, nil)
 		return adoptionOutcomeError, true
 	}
-	result := uc.orphanCoordinator.Handle(ctx, taskID, sessionRef, occurredAt)
+	result := uc.orphanCoordinator.Handle(ctx, OrphanTransitionInput{TaskID: taskID, SessionRef: sessionRef, AdoptedAfterRestart: true, OccurredAt: occurredAt})
 	if ctx.Err() != nil {
 		return "", false
 	}

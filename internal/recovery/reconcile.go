@@ -28,7 +28,7 @@ type ReconcilePendingUseCase struct {
 	liveness           LivenessChecker
 	reader             reconcileContractReader
 	writer             contract.ContractWriter
-	finalizer          OrphanFinalizer
+	orphanCoordinator  OrphanTransitionHandler
 	termination        TerminationEnsurer
 	killed             KillConfirmer
 	pathLocks          PathLockReleaser
@@ -63,7 +63,16 @@ func NewReconcilePendingUseCase(pending *PendingReconciliationSet, tasks Adoptio
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &ReconcilePendingUseCase{pending: pending, tasks: tasks, liveness: liveness, reader: reader, writer: writer, finalizer: finalizer, termination: termination, killed: killed, pathLocks: pathLocks, resume: resume, ownership: NewRecoveryOwnershipRegistry(), lifecycleOwnership: unownedLifecycleTasks{}, slots: slots, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker, metricsRecorder: metricsRecorder, interval: interval, terminationGrace: terminationGrace, logger: logger}
+	return &ReconcilePendingUseCase{pending: pending, tasks: tasks, liveness: liveness, reader: reader, writer: writer, orphanCoordinator: NewOrphanRecoveryCoordinator(tasks, reader, finalizer, resume, pending, taskMu, clock, logger), termination: termination, killed: killed, pathLocks: pathLocks, resume: resume, ownership: NewRecoveryOwnershipRegistry(), lifecycleOwnership: unownedLifecycleTasks{}, slots: slots, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker, metricsRecorder: metricsRecorder, interval: interval, terminationGrace: terminationGrace, logger: logger}
+}
+
+// WithOrphanRecoveryCoordinator shares the daemon-wide orphan handler.
+func (uc *ReconcilePendingUseCase) WithOrphanRecoveryCoordinator(coordinator OrphanTransitionHandler) *ReconcilePendingUseCase {
+	if isNilAdoptionDependency(coordinator) {
+		panic("reconcile pending use case requires a non-nil orphan recovery coordinator")
+	}
+	uc.orphanCoordinator = coordinator
+	return uc
 }
 
 // WithRecoveryOwnership wires the use case to the daemon-shared registry.
@@ -168,7 +177,7 @@ func (uc *ReconcilePendingUseCase) reconcileOne(ctx context.Context, entry Pendi
 		defer release()
 		uc.reconcileRecovering(ctx, taskID)
 	case domain.StateOrphaned:
-		uc.reconcileOrphaned(ctx, taskID, snapshot)
+		uc.orphanCoordinator.Handle(ctx, OrphanTransitionInput{TaskID: taskID, SessionRef: snapshot.SessionRef, AdoptedAfterRestart: snapshot.AdoptedAfterRestart, OccurredAt: uc.clock.Now()})
 	case domain.StateTimeout:
 		uc.reconcileTermination(ctx, taskID, snapshot, true, entry.authority)
 	case domain.StateCancelling:
@@ -259,40 +268,6 @@ func (uc *ReconcilePendingUseCase) reconcileRecovering(ctx context.Context, task
 		return
 	}
 	uc.pending.Remove(taskID)
-}
-
-func (uc *ReconcilePendingUseCase) reconcileOrphaned(ctx context.Context, taskID domain.TaskID, snapshot domain.TaskSnapshot) {
-	if ctx.Err() != nil {
-		return
-	}
-	present, err := uc.reader.ReadLastMessage(taskID)
-	if err != nil {
-		uc.logFailure("read last message for pending orphaned task failed", taskID, err)
-		if ctx.Err() != nil {
-			return
-		}
-		uc.registerConfirmOnly(taskID)
-		return
-	}
-	if ctx.Err() != nil {
-		return
-	}
-	if present {
-		if err := uc.finalizer.Finalize(taskID, 0, true, true, uc.clock.Now()); err != nil {
-			uc.logFailure("finalize pending orphaned task failed", taskID, err)
-			if ctx.Err() != nil {
-				return
-			}
-			uc.reconcilePendingAfterConfirmedDeath(ctx, taskID)
-			return
-		}
-		if ctx.Err() != nil {
-			return
-		}
-		uc.pending.Remove(taskID)
-		return
-	}
-	go uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: snapshot.SessionRef, Origin: domain.RecoveryOriginOrphan, OccurredAt: uc.clock.Now()}, SendClaim{})
 }
 
 func (uc *ReconcilePendingUseCase) reconcileTermination(ctx context.Context, taskID domain.TaskID, snapshot domain.TaskSnapshot, timeout bool, authority ProcessSignalAuthority) {

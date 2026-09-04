@@ -160,6 +160,55 @@ func TestAdoptAndStartProcessContracts(t *testing.T) {
 	}
 }
 
+func TestRecordExitOrphanProvenance(t *testing.T) {
+	t.Run("input provenance does not adopt an unadopted orphan", func(t *testing.T) {
+		task := testTask(t)
+		task.state = StateOrphaned
+
+		if _, err := task.RecordExit(NewExitCode(0), true, true, true, time.Now()); err != nil {
+			t.Fatal(err)
+		}
+		if task.adoptedAfterRestart {
+			t.Fatal("record exit input incorrectly adopted the task")
+		}
+	})
+
+	t.Run("unadopted orphan preserves false", func(t *testing.T) {
+		task := testTask(t)
+		task.state = StateOrphaned
+		events, err := task.RecordExit(NewExitCode(0), true, true, false, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		exited := events[0].(TaskExited)
+		if !exited.Estimated || exited.AdoptedAfterRestart || task.adoptedAfterRestart {
+			t.Fatalf("exit=%+v task adopted=%t", exited, task.adoptedAfterRestart)
+		}
+	})
+
+	t.Run("adopted orphan upgrades event flags", func(t *testing.T) {
+		task := testTask(t)
+		task.state = StateOrphaned
+		task.adoptedAfterRestart = true
+		events, err := task.RecordExit(NewExitCode(0), true, true, false, time.Now())
+		if err != nil {
+			t.Fatal(err)
+		}
+		exited := events[0].(TaskExited)
+		if !exited.Estimated || !exited.AdoptedAfterRestart {
+			t.Fatalf("exit=%+v", exited)
+		}
+	})
+
+	for _, adoptedAfterRestart := range []bool{false, true} {
+		task := testTask(t)
+		task.state = StateOrphaned
+		if _, err := task.RecordExit(NewExitCode(0), true, false, adoptedAfterRestart, time.Now()); err == nil {
+			t.Fatalf("estimated=false accepted with adoptedAfterRestart=%t", adoptedAfterRestart)
+		}
+	}
+}
+
 func TestCancelKeepsRaw137InKilledContext(t *testing.T) {
 	task := testTask(t)
 	if _, err := task.RequestCancel(false, time.Now()); err != nil {

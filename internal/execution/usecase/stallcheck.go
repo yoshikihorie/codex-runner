@@ -143,7 +143,7 @@ func (uc *checkStallUseCase) checkOne(ctx context.Context, taskID domain.TaskID)
 		persisted := uc.orphan(taskID, snapshot, task, now)
 		uc.taskMu.Unlock(taskID)
 		if persisted && uc.orphanCoordinator != nil {
-			uc.orphanCoordinator.Handle(ctx, taskID, snapshot.SessionRef, now)
+			uc.orphanCoordinator.Handle(ctx, recovery.OrphanTransitionInput{TaskID: taskID, SessionRef: snapshot.SessionRef, AdoptedAfterRestart: snapshot.AdoptedAfterRestart, OccurredAt: now})
 		}
 		return
 	}

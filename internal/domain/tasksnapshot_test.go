@@ -146,6 +146,29 @@ func TestTaskSnapshotValidateAllowsFailedWithoutPID(t *testing.T) {
 	}
 }
 
+func TestTaskSnapshotAllowsUnadoptedOrphanFinalizationWithoutProcessInfo(t *testing.T) {
+	snapshot := validRunningSnapshot(t)
+	snapshot.State = StateOrphaned
+	snapshot.PID, snapshot.ProcessStartedAt = nil, nil
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("orphan snapshot rejected: %v", err)
+	}
+	task, err := snapshot.Restore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := task.RecordExit(NewExitCode(0), true, true, false, snapshotTime(3)); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := snapshot.WithTask(task, snapshotTime(4))
+	if err != nil {
+		t.Fatalf("terminal snapshot rejected: %v", err)
+	}
+	if completed.State != StateCompleted || completed.PID != nil || completed.ProcessStartedAt != nil || completed.AdoptedAfterRestart {
+		t.Fatalf("completed snapshot=%+v", completed)
+	}
+}
+
 func TestTaskSnapshotValidateRunningWithoutPIDAfterAdoption(t *testing.T) {
 	for _, tc := range []struct {
 		name                string

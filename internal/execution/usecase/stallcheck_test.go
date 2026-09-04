@@ -81,12 +81,14 @@ func TestCheckStallReleasesTaskLockWhenNoStallStartTime(t *testing.T) {
 }
 
 type stallCoordinatorProbe struct {
-	lock  *stallLockProbe
-	calls int
-	id    domain.TaskID
+	lock                *stallLockProbe
+	calls               int
+	id                  domain.TaskID
+	adoptedAfterRestart bool
 }
 
-func (p *stallCoordinatorProbe) Handle(_ context.Context, id domain.TaskID, _ *domain.SessionRef, _ time.Time) recovery.OrphanTransitionResult {
+func (p *stallCoordinatorProbe) Handle(_ context.Context, input recovery.OrphanTransitionInput) recovery.OrphanTransitionResult {
+	id := input.TaskID
 	if p.lock.held {
 		panic("orphan coordinator called with task lock held")
 	}
@@ -96,6 +98,7 @@ func (p *stallCoordinatorProbe) Handle(_ context.Context, id domain.TaskID, _ *d
 	p.lock.Unlock(id)
 	p.calls++
 	p.id = id
+	p.adoptedAfterRestart = input.AdoptedAfterRestart
 	return recovery.OrphanTransitionResult{Finalized: true}
 }
 
@@ -208,6 +211,29 @@ func TestCheckStallReleasesTaskLockBeforeOrphanCoordinator(t *testing.T) {
 	}
 	if len(store.saved) != 1 || store.saved[0].State != domain.StateOrphaned {
 		t.Fatalf("saved=%+v", store.saved)
+	}
+}
+
+func TestCheckStallPassesSnapshotProvenanceToOrphanCoordinator(t *testing.T) {
+	start := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	for _, adoptedAfterRestart := range []bool{false, true} {
+		t.Run(fmt.Sprintf("adopted=%t", adoptedAfterRestart), func(t *testing.T) {
+			id := testID(t, fmt.Sprintf("orphan-provenance-%t", adoptedAfterRestart))
+			snapshot := testSnapshot(t, id, domain.StateRunning, start, &start)
+			snapshot.AdoptedAfterRestart = adoptedAfterRestart
+			recorder := &testRecorder{}
+			store := &testStore{r: recorder, loads: map[string]domain.TaskSnapshot{id.String(): snapshot}}
+			lock := &stallLockProbe{}
+			coordinator := &stallCoordinatorProbe{lock: lock}
+			uc := newCheckStallUseCase(store, lock, testLive(recorder, id, true, nil), &testWriter{r: recorder}, &testClock{at: start, r: recorder, id: id}, testTracker(recorder), time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: recorder}}, execution.NewLifecycleOwnershipRegistry())
+			uc.orphanCoordinator = coordinator
+
+			uc.checkOne(context.Background(), id)
+
+			if coordinator.calls != 1 || coordinator.adoptedAfterRestart != adoptedAfterRestart {
+				t.Fatalf("calls=%d adopted=%t, want adopted=%t", coordinator.calls, coordinator.adoptedAfterRestart, adoptedAfterRestart)
+			}
+		})
 	}
 }
 

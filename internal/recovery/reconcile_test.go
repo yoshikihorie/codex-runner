@@ -368,17 +368,40 @@ func (f *reconcileTrackerProbe) TakeTotal(id domain.TaskID) int {
 }
 
 type reconcileFinalizerFake struct {
-	calls         int
-	err           error
-	afterFinalize func()
+	calls               int
+	err                 error
+	afterFinalize       func()
+	adoptedAfterRestart bool
 }
 
-func (f *reconcileFinalizerFake) Finalize(domain.TaskID, int, bool, bool, time.Time) error {
+func (f *reconcileFinalizerFake) Finalize(_ domain.TaskID, _ int, _ bool, adoptedAfterRestart bool, _ time.Time) error {
 	f.calls++
+	f.adoptedAfterRestart = adoptedAfterRestart
 	if f.afterFinalize != nil {
 		f.afterFinalize()
 	}
 	return f.err
+}
+
+func TestReconcilePendingPassesSnapshotProvenanceToOrphanCoordinator(t *testing.T) {
+	for _, adoptedAfterRestart := range []bool{false, true} {
+		t.Run("adopted="+map[bool]string{false: "false", true: "true"}[adoptedAfterRestart], func(t *testing.T) {
+			uc, pending, tasks, _, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateOrphaned, false, true)
+			id := adoptionID(t, "reconcile-"+string(domain.StateOrphaned))
+			snapshot := tasks.entries[id]
+			snapshot.AdoptedAfterRestart = adoptedAfterRestart
+			tasks.entries[id] = snapshot
+			finalizer := &reconcileFinalizerFake{}
+			uc.WithOrphanRecoveryCoordinator(newOrphanRecoveryCoordinator(tasks, uc.reader, finalizer, uc.resume, pending, uc.taskMu, uc.clock, uc.logger, &adoptionOrphanResumeDispatcherFake{execute: true}))
+			registerReconcilePending(t, pending, snapshot, PendingSendConfirmOnly)
+
+			uc.reconcileOne(context.Background(), pending.List()[0])
+
+			if finalizer.calls != 1 || finalizer.adoptedAfterRestart != adoptedAfterRestart {
+				t.Fatalf("calls=%d adopted=%t, want adopted=%t", finalizer.calls, finalizer.adoptedAfterRestart, adoptedAfterRestart)
+			}
+		})
+	}
 }
 
 type reconcileMetricsProbe struct {
@@ -1908,9 +1931,9 @@ func TestReconcilePendingOrphanedCancellationAfterFinalizeStopsPendingUpdates(t 
 			id := adoptionID(t, "reconcile-"+string(domain.StateOrphaned))
 			ctx, cancel := context.WithCancel(context.Background())
 			finalizer := &reconcileFinalizerFake{err: tc.err, afterFinalize: cancel}
-			uc.finalizer = finalizer
+			uc.WithOrphanRecoveryCoordinator(newOrphanRecoveryCoordinator(tasks, uc.reader, finalizer, uc.resume, pending, uc.taskMu, uc.clock, uc.logger, &adoptionOrphanResumeDispatcherFake{execute: true}))
 			registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
-			uc.reconcileOrphaned(ctx, id, tasks.entries[id])
+			uc.orphanCoordinator.Handle(ctx, OrphanTransitionInput{TaskID: id, SessionRef: tasks.entries[id].SessionRef, AdoptedAfterRestart: tasks.entries[id].AdoptedAfterRestart, OccurredAt: uc.clock.Now()})
 			if finalizer.calls != 1 || len(pending.List()) != 1 {
 				t.Fatalf("finalizer=%d pending=%+v", finalizer.calls, pending.List())
 			}
@@ -1980,7 +2003,7 @@ func TestReconcileTickDiscoversPersistentOrphanAndConverges(t *testing.T) {
 	id := adoptionID(t, "reconcile-"+string(domain.StateOrphaned))
 	tasks.listed = []domain.TaskSnapshot{tasks.entries[id]}
 	finalizer := &reconcileFinalizerFake{}
-	uc.finalizer = finalizer
+	uc.WithOrphanRecoveryCoordinator(newOrphanRecoveryCoordinator(tasks, uc.reader, finalizer, uc.resume, pending, uc.taskMu, uc.clock, uc.logger, &adoptionOrphanResumeDispatcherFake{execute: true}))
 
 	uc.reconcileTick(context.Background())
 
@@ -1999,7 +2022,7 @@ func TestReconcileTickSkipsLifecycleOwnedDiscoveryUntilReleased(t *testing.T) {
 	owned := &reconcileLifecycleOwnershipFake{owned: map[domain.TaskID]bool{id: true}}
 	uc.WithLifecycleOwnership(owned)
 	finalizer := &reconcileFinalizerFake{}
-	uc.finalizer = finalizer
+	uc.WithOrphanRecoveryCoordinator(newOrphanRecoveryCoordinator(tasks, uc.reader, finalizer, uc.resume, pending, uc.taskMu, uc.clock, uc.logger, &adoptionOrphanResumeDispatcherFake{execute: true}))
 
 	uc.reconcileTick(context.Background())
 	if finalizer.calls != 0 || len(pending.List()) != 0 {

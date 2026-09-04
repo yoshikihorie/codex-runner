@@ -156,8 +156,8 @@ func (t *Task) MarkStalled(gapSeconds int, occurredAt time.Time) ([]Event, error
 }
 
 func (t *Task) RecordExit(exitCode ExitCode, lastMessagePresent, estimated, adoptedAfterRestart bool, occurredAt time.Time) ([]Event, error) {
-	if t.state == StateOrphaned && (!estimated || !adoptedAfterRestart) {
-		return nil, fmt.Errorf("orphan exit must be estimated and adopted")
+	if t.state == StateOrphaned && !estimated {
+		return nil, fmt.Errorf("orphan exit must be estimated")
 	}
 	if t.adoptedAfterRestart {
 		estimated, adoptedAfterRestart = true, true

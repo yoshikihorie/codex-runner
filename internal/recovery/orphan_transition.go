@@ -26,9 +26,17 @@ type OrphanTransitionResult struct {
 	Deferred        bool
 }
 
+// OrphanTransitionInput identifies a persisted orphan and its provenance.
+type OrphanTransitionInput struct {
+	TaskID              domain.TaskID
+	SessionRef          *domain.SessionRef
+	AdoptedAfterRestart bool
+	OccurredAt          time.Time
+}
+
 // OrphanTransitionHandler is the execution-facing boundary for orphan recovery.
 type OrphanTransitionHandler interface {
-	Handle(context.Context, domain.TaskID, *domain.SessionRef, time.Time) OrphanTransitionResult
+	Handle(context.Context, OrphanTransitionInput) OrphanTransitionResult
 }
 
 // OrphanRecoveryCoordinator owns the common post-orphan transition. It does
@@ -60,41 +68,61 @@ func newOrphanRecoveryCoordinator(tasks AdoptionTaskStore, reader ContractReader
 }
 
 // Handle runs after orphan persistence and after the caller has released taskMu.
-func (c *OrphanRecoveryCoordinator) Handle(ctx context.Context, taskID domain.TaskID, sessionRef *domain.SessionRef, occurredAt time.Time) OrphanTransitionResult {
+func (c *OrphanRecoveryCoordinator) Handle(ctx context.Context, input OrphanTransitionInput) OrphanTransitionResult {
 	if ctx.Err() != nil {
 		return OrphanTransitionResult{Deferred: true}
 	}
-	present, err := c.reader.ReadLastMessage(taskID)
+	present, err := c.reader.ReadLastMessage(input.TaskID)
 	if err != nil {
-		c.logger.Error("read last message for adopted orphan failed", "task_id", taskID.String(), "error", err)
-		c.reconcileAfterFailure(taskID)
+		c.logger.Error("read last message for adopted orphan failed", "task_id", input.TaskID.String(), "error", err)
+		if ctx.Err() == nil {
+			c.reconcileAfterFailure(ctx, input.TaskID)
+		}
+		return OrphanTransitionResult{Deferred: true}
+	}
+	if ctx.Err() != nil {
 		return OrphanTransitionResult{Deferred: true}
 	}
 	if present {
-		if err := c.finalizer.Finalize(taskID, 0, true, true, occurredAt); err != nil {
-			c.logger.Error("finalize adopted orphan failed", "task_id", taskID.String(), "error", err)
-			c.reconcileAfterFailure(taskID)
+		if ctx.Err() != nil {
 			return OrphanTransitionResult{Deferred: true}
 		}
-		c.pending.Remove(taskID)
+		if err := c.finalizer.Finalize(input.TaskID, 0, true, input.AdoptedAfterRestart, input.OccurredAt); err != nil {
+			c.logger.Error("finalize adopted orphan failed", "task_id", input.TaskID.String(), "error", err)
+			if ctx.Err() == nil {
+				c.reconcileAfterFailure(ctx, input.TaskID)
+			}
+			return OrphanTransitionResult{Deferred: true}
+		}
+		if ctx.Err() != nil {
+			return OrphanTransitionResult{Deferred: true}
+		}
+		c.pending.Remove(input.TaskID)
 		return OrphanTransitionResult{Finalized: true}
 	}
 
 	dispatchAt := c.clock.Now()
+	if ctx.Err() != nil {
+		return OrphanTransitionResult{Deferred: true}
+	}
 	c.dispatcher.dispatch(func() {
-		if _, err := c.resume.Execute(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: sessionRef, Origin: domain.RecoveryOriginOrphan, OccurredAt: dispatchAt}); err != nil {
+		if _, err := c.resume.Execute(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: input.TaskID, SessionRef: input.SessionRef, Origin: domain.RecoveryOriginOrphan, OccurredAt: dispatchAt}); err != nil {
 			if errors.Is(err, ErrRecoveryAlreadyInFlight) {
 				return
 			}
-			c.logger.Error("resume recovery for orphaned task failed", "task_id", taskID.String(), "error", err)
-			c.reconcileAfterFailure(taskID)
+			c.logger.Error("resume recovery for orphaned task failed", "task_id", input.TaskID.String(), "error", err)
+			if ctx.Err() == nil {
+				c.reconcileAfterFailure(ctx, input.TaskID)
+			}
 			return
 		}
-		c.pending.Remove(taskID)
+		if ctx.Err() == nil {
+			c.pending.Remove(input.TaskID)
+		}
 	})
 	return OrphanTransitionResult{RecoveryStarted: true}
 }
 
-func (c *OrphanRecoveryCoordinator) reconcileAfterFailure(taskID domain.TaskID) {
-	reconcilePendingAfterFailure(context.Background(), c.tasks, c.pending, c.taskMu, c.logger, taskID, pendingFailureAfterConfirmedDeath)
+func (c *OrphanRecoveryCoordinator) reconcileAfterFailure(ctx context.Context, taskID domain.TaskID) {
+	reconcilePendingAfterFailure(ctx, c.tasks, c.pending, c.taskMu, c.logger, taskID, pendingFailureAfterConfirmedDeath)
 }

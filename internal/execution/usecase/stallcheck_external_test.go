@@ -19,7 +19,7 @@ type externalStore struct{ store.TaskStore }
 type externalWriter struct{ contract.ContractWriter }
 type externalOrphanCoordinator struct{}
 
-func (externalOrphanCoordinator) Handle(context.Context, domain.TaskID, *domain.SessionRef, time.Time) recovery.OrphanTransitionResult {
+func (externalOrphanCoordinator) Handle(context.Context, recovery.OrphanTransitionInput) recovery.OrphanTransitionResult {
 	return recovery.OrphanTransitionResult{}
 }
 
