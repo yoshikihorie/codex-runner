@@ -227,16 +227,52 @@ func TestRecordTaskMetricsExecute_SCNMetrics0102_FailedWithoutLastMessageRecords
 	}
 }
 
-func TestRecordTaskMetricsExecute_SCNMetrics0105_AdoptedTaskUsesSnapshotAdoptedAfterRestartAndRecoveryOrigin(t *testing.T) {
+func TestRecordTaskMetricsExecute_SCNMetrics0105_AdoptedTaskUsesInputEstimatedAndRecoveryOrigin(t *testing.T) {
 	uc, tasks, _, _, writer := newRecordUseCase(t, domain.StateRecovered, false)
 	origin := domain.RecoveryOriginOrphan
 	tasks.snapshot.AdoptedAfterRestart, tasks.snapshot.Recovered, tasks.snapshot.RecoveryOrigin = true, true, &origin
-	if out := executeRecord(t, uc, domain.StateRecovered); !out.Recorded {
+	if out := uc.Execute(context.Background(), RecordTaskMetricsInput{
+		TaskID: recordID(t), FinalState: domain.StateRecovered, Estimated: true,
+		OccurredAt: time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC), StalledTotalMs: 7,
+	}); !out.Recorded {
 		t.Fatalf("output=%+v", out)
 	}
 	fields := recordFields(t, writer)
 	if fieldString(t, fields, "estimated") != "true" || fieldString(t, fields, "recovered") != "true" || fieldString(t, fields, "recovery_origin") != `"orphan"` || fieldString(t, fields, "stalled_total_ms") != "7" {
 		t.Fatalf("adoption fields: estimated=%s recovered=%s origin=%s stalled=%s", fields["estimated"], fields["recovered"], fields["recovery_origin"], fields["stalled_total_ms"])
+	}
+}
+
+func TestRecordTaskMetricsExecute_EstimatedIsIndependentOfSnapshotAdoptedAfterRestart(t *testing.T) {
+	cases := []struct {
+		name                string
+		estimated           bool
+		adoptedAfterRestart bool
+		wantEstimatedJSON   string
+	}{
+		{name: "live orphan finalize", estimated: true, adoptedAfterRestart: false, wantEstimatedJSON: "true"},
+		{name: "estimated kill", estimated: true, adoptedAfterRestart: false, wantEstimatedJSON: "true"},
+		{name: "startup adoption recovery", estimated: true, adoptedAfterRestart: true, wantEstimatedJSON: "true"},
+		{name: "pending recovery reconciliation", estimated: true, adoptedAfterRestart: true, wantEstimatedJSON: "true"},
+		{name: "timeout or live-orphan resume", estimated: true, adoptedAfterRestart: false, wantEstimatedJSON: "true"},
+		{name: "inverse independence", estimated: false, adoptedAfterRestart: true, wantEstimatedJSON: "false"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			uc, tasks, _, _, writer := newRecordUseCase(t, domain.StateRecovered, false)
+			tasks.snapshot.AdoptedAfterRestart = tc.adoptedAfterRestart
+			out := uc.Execute(context.Background(), RecordTaskMetricsInput{
+				TaskID: recordID(t), FinalState: domain.StateRecovered, Estimated: tc.estimated,
+				OccurredAt: time.Date(2026, 8, 1, 0, 0, 0, 0, time.UTC),
+			})
+			if !out.Recorded {
+				t.Fatalf("output=%+v", out)
+			}
+			if got := fieldString(t, recordFields(t, writer), "estimated"); got != tc.wantEstimatedJSON {
+				t.Fatalf("estimated=%s, want %s", got, tc.wantEstimatedJSON)
+			}
+		})
 	}
 }
 

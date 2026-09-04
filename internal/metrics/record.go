@@ -203,7 +203,7 @@ func (u *RecordTaskMetricsUseCase) derive(snapshot domain.TaskSnapshot, inputEve
 		Route: snapshot.Route, RequestedAt: snapshot.RequestedAt, StartedAt: snapshot.ProcessStartedAt,
 		FinishedAt: snapshot.StateUpdatedAt, QueuedMs: int(queued), StartupMs: startup, RunMs: run,
 		TotalMs: int(total), FinalState: snapshot.State, ExitCode: exitCode, ExitCodeClass: exitCodeClass,
-		Estimated: snapshot.AdoptedAfterRestart, PromptBytes: len(prompt), PromptLines: logicalLines(prompt),
+		Estimated: in.Estimated, PromptBytes: len(prompt), PromptLines: logicalLines(prompt),
 		PromptSHA256: promptHash, PromptBody: promptBody, LastMessageBytes: len(lastMessage),
 		LastMessageLines: logicalLines(lastMessage), LastMessageSHA256: lastHash, LastMessageBody: lastMessageBody,
 		EventCount: len(inputEvents), MaxEventGapMs: gap, StalledTotalMs: in.StalledTotalMs,
