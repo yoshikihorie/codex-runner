@@ -856,9 +856,10 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	if err != nil {
 		return daemonDependencies{}, err
 	}
-	adoption := recovery.NewAdoptRunningTasksUseCase(tasks, liveness, reader, writer, finalize, resume, slots, registry, termination, killed, pathRelease, pending, taskMu, clock, stalled, metricRecorder, logger)
-	reconcile := recovery.NewReconcilePendingUseCase(pending, tasks, liveness, reader, writer, finalize, termination, killed, pathRelease, resume, slots, taskMu, clock, stalled, metricRecorder, reconcileInterval, execution.TimeoutKillGrace, logger).WithRecoveryOwnership(recoveryOwnership)
-	stall := usecase.NewCheckStallUseCase(tasks, taskMu, liveness, writer, clock, stalled, ownership, logger)
+	orphanCoordinator := recovery.NewOrphanRecoveryCoordinator(tasks, reader, finalize, resume, pending, taskMu, clock, logger)
+	adoption := recovery.NewAdoptRunningTasksUseCase(tasks, liveness, reader, writer, finalize, resume, slots, registry, termination, killed, pathRelease, pending, taskMu, clock, stalled, metricRecorder, logger).WithOrphanRecoveryCoordinator(orphanCoordinator)
+	reconcile := recovery.NewReconcilePendingUseCase(pending, tasks, liveness, reader, writer, finalize, termination, killed, pathRelease, resume, slots, taskMu, clock, stalled, metricRecorder, reconcileInterval, execution.TimeoutKillGrace, logger).WithRecoveryOwnership(recoveryOwnership).WithLifecycleOwnership(ownership)
+	stall := usecase.NewCheckStallUseCase(tasks, taskMu, liveness, writer, clock, stalled, ownership, orphanCoordinator, logger)
 	connections := &sync.WaitGroup{}
 	tailConns := transport.NewTailConnRegistry()
 	acceptDone := make(chan struct{})

@@ -36,3 +36,29 @@ func TestAdoptionThenStallTickerMarksTaskStalled(t *testing.T) {
 		t.Fatal("status view input lost adopted_after_restart")
 	}
 }
+
+// SCN-exec-03-12/13: an adopted running task remains on the normal stall
+// path. The coordinator probe is shared with the lock test and confirms that
+// the recovered task is handed off only after orphan persistence.
+func TestAdoptedRunningTaskDeathIsHandedToSharedOrphanCoordinator(t *testing.T) {
+	start := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	for _, tc := range []struct{ name string }{{name: "artifact"}, {name: "no-session"}} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := testID(t, "adopted-death-"+tc.name)
+			snapshot := testSnapshot(t, id, domain.StateRunning, start, &start)
+			snapshot.AdoptedAfterRestart = true
+			recorder := &testRecorder{}
+			store := &testStore{r: recorder, loads: map[string]domain.TaskSnapshot{id.String(): snapshot}, lists: [][]domain.TaskSnapshot{{snapshot}}}
+			lock := &stallLockProbe{}
+			coordinator := &stallCoordinatorProbe{lock: lock}
+			uc := newCheckStallUseCase(store, lock, testLive(recorder, id, true, nil), &testWriter{r: recorder}, &testClock{at: start, r: recorder, id: id}, testTracker(recorder), time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: recorder}}, execution.NewLifecycleOwnershipRegistry())
+			uc.orphanCoordinator = coordinator
+
+			uc.scan(context.Background())
+
+			if coordinator.calls != 1 || coordinator.id != id || len(store.saved) != 1 || store.saved[0].State != domain.StateOrphaned || !store.saved[0].AdoptedAfterRestart {
+				t.Fatalf("coordinator=%d id=%s saved=%+v", coordinator.calls, coordinator.id, store.saved)
+			}
+		})
+	}
+}

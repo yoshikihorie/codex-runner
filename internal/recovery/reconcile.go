@@ -23,25 +23,26 @@ const (
 // ReconcilePendingUseCase periodically re-evaluates tasks whose adoption could
 // not synchronously establish a terminal state.
 type ReconcilePendingUseCase struct {
-	pending          *PendingReconciliationSet
-	tasks            AdoptionTaskStore
-	liveness         LivenessChecker
-	reader           reconcileContractReader
-	writer           contract.ContractWriter
-	finalizer        OrphanFinalizer
-	termination      TerminationEnsurer
-	killed           KillConfirmer
-	pathLocks        PathLockReleaser
-	resume           *RecoverViaResumeUseCase
-	ownership        RecoveryOwnershipRegistry
-	slots            SlotReleaser
-	taskMu           TaskMutex
-	clock            domain.Clock
-	stalledTracker   stalledTimeTracker
-	metricsRecorder  MetricsRecorder
-	interval         time.Duration
-	terminationGrace time.Duration
-	logger           *slog.Logger
+	pending            *PendingReconciliationSet
+	tasks              AdoptionTaskStore
+	liveness           LivenessChecker
+	reader             reconcileContractReader
+	writer             contract.ContractWriter
+	finalizer          OrphanFinalizer
+	termination        TerminationEnsurer
+	killed             KillConfirmer
+	pathLocks          PathLockReleaser
+	resume             *RecoverViaResumeUseCase
+	ownership          RecoveryOwnershipRegistry
+	lifecycleOwnership LifecycleOwnershipChecker
+	slots              SlotReleaser
+	taskMu             TaskMutex
+	clock              domain.Clock
+	stalledTracker     stalledTimeTracker
+	metricsRecorder    MetricsRecorder
+	interval           time.Duration
+	terminationGrace   time.Duration
+	logger             *slog.Logger
 }
 
 type reconcileContractReader interface {
@@ -62,7 +63,7 @@ func NewReconcilePendingUseCase(pending *PendingReconciliationSet, tasks Adoptio
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &ReconcilePendingUseCase{pending: pending, tasks: tasks, liveness: liveness, reader: reader, writer: writer, finalizer: finalizer, termination: termination, killed: killed, pathLocks: pathLocks, resume: resume, ownership: NewRecoveryOwnershipRegistry(), slots: slots, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker, metricsRecorder: metricsRecorder, interval: interval, terminationGrace: terminationGrace, logger: logger}
+	return &ReconcilePendingUseCase{pending: pending, tasks: tasks, liveness: liveness, reader: reader, writer: writer, finalizer: finalizer, termination: termination, killed: killed, pathLocks: pathLocks, resume: resume, ownership: NewRecoveryOwnershipRegistry(), lifecycleOwnership: unownedLifecycleTasks{}, slots: slots, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker, metricsRecorder: metricsRecorder, interval: interval, terminationGrace: terminationGrace, logger: logger}
 }
 
 // WithRecoveryOwnership wires the use case to the daemon-shared registry.
@@ -73,6 +74,16 @@ func (uc *ReconcilePendingUseCase) WithRecoveryOwnership(ownership RecoveryOwner
 		panic("reconcile pending use case requires a non-nil recovery ownership registry")
 	}
 	uc.ownership = ownership
+	return uc
+}
+
+// WithLifecycleOwnership excludes tasks still owned by the lifecycle
+// orchestrator from persistent-state discovery.
+func (uc *ReconcilePendingUseCase) WithLifecycleOwnership(ownership LifecycleOwnershipChecker) *ReconcilePendingUseCase {
+	if isNilAdoptionDependency(ownership) {
+		panic("reconcile pending use case requires a non-nil lifecycle ownership checker")
+	}
+	uc.lifecycleOwnership = ownership
 	return uc
 }
 
@@ -91,9 +102,35 @@ func (uc *ReconcilePendingUseCase) Run(ctx context.Context) {
 }
 
 func (uc *ReconcilePendingUseCase) reconcileTick(ctx context.Context) {
+	entries := uc.pending.List()
+	seen := make(map[domain.TaskID]struct{}, len(entries))
+	for _, entry := range entries {
+		seen[entry.taskID] = struct{}{}
+	}
+	// A failed scan aborts this tick so the next tick can retry from a stable
+	// persistent view rather than mixing a partial discovery with pending work.
+	discovered, err := uc.tasks.ListByStates([]domain.TaskState{domain.StateOrphaned, domain.StateRecovering, domain.StateTimeout, domain.StateCancelling})
+	if err != nil {
+		uc.logger.Error("list persistent reconciliation tasks failed", "error", err)
+		return
+	}
+	for _, snapshot := range discovered {
+		if _, exists := seen[snapshot.TaskID]; exists || uc.lifecycleOwnership.IsOwned(snapshot.TaskID) {
+			continue
+		}
+		disposition, authority := pendingRegistration(snapshot)
+		if err := uc.pending.Register(snapshot.TaskID, disposition, authority); err != nil && !errors.Is(err, ErrPendingClaimed) {
+			uc.logFailure("register discovered reconciliation task failed", snapshot.TaskID, err)
+			continue
+		}
+		seen[snapshot.TaskID] = struct{}{}
+	}
 	for _, entry := range uc.pending.List() {
 		if ctx.Err() != nil {
 			return
+		}
+		if uc.lifecycleOwnership.IsOwned(entry.taskID) {
+			continue
 		}
 		uc.reconcileOne(ctx, entry)
 	}
@@ -102,6 +139,9 @@ func (uc *ReconcilePendingUseCase) reconcileTick(ctx context.Context) {
 func (uc *ReconcilePendingUseCase) reconcileOne(ctx context.Context, entry PendingEntry) {
 	taskID := entry.taskID
 	if ctx.Err() != nil {
+		return
+	}
+	if uc.lifecycleOwnership.IsOwned(taskID) {
 		return
 	}
 	uc.taskMu.Lock(taskID)
@@ -376,6 +416,12 @@ func (uc *ReconcilePendingUseCase) completeTerminated(ctx context.Context, taskI
 
 func (uc *ReconcilePendingUseCase) resumeRecovery(ctx context.Context, in RecoverViaResumeInput, claim SendClaim) {
 	if _, err := uc.resume.Execute(ctx, in); err != nil {
+		if errors.Is(err, ErrRecoveryAlreadyInFlight) {
+			if claim.Token != 0 {
+				uc.pending.ReleaseSend(claim)
+			}
+			return
+		}
 		uc.logFailure("resume recovery for pending task failed", in.TaskID, err)
 		if claim.Token != 0 {
 			uc.pending.InvalidateSend(claim)

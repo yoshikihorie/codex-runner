@@ -31,6 +31,10 @@ type reconcileStoreFake struct {
 	loadResults map[domain.TaskID][]reconcileLoadResult
 	afterLoad   func()
 	afterSave   func()
+	listed      []domain.TaskSnapshot
+	listErr     error
+	listCalls   int
+	listStates  [][]domain.TaskState
 }
 
 type reconcileLoadResult struct {
@@ -75,8 +79,30 @@ func (f *reconcileStoreFake) Save(id domain.TaskID, snapshot domain.TaskSnapshot
 	return f.saveErr
 }
 
-func (*reconcileStoreFake) ListByStates([]domain.TaskState) ([]domain.TaskSnapshot, error) {
-	return nil, nil
+func (f *reconcileStoreFake) ListByStates(states []domain.TaskState) ([]domain.TaskSnapshot, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.listCalls++
+	f.listStates = append(f.listStates, append([]domain.TaskState(nil), states...))
+	return f.listed, f.listErr
+}
+
+type reconcileLifecycleOwnershipFake struct{ owned map[domain.TaskID]bool }
+
+func (f *reconcileLifecycleOwnershipFake) IsOwned(id domain.TaskID) bool { return f.owned[id] }
+
+type reconcileLifecycleOwnershipSequence struct {
+	values []bool
+	calls  int
+}
+
+func (f *reconcileLifecycleOwnershipSequence) IsOwned(domain.TaskID) bool {
+	value := f.values[len(f.values)-1]
+	if f.calls < len(f.values) {
+		value = f.values[f.calls]
+	}
+	f.calls++
+	return value
 }
 
 type reconcileLivenessFake struct {
@@ -1410,6 +1436,45 @@ func TestReconcileResumeRecoveryResolvesClaimPerOutcome(t *testing.T) {
 	}
 }
 
+func TestReconcileResumeRecoveryReleasesClaimWhenRecoveryAlreadyInFlight(t *testing.T) {
+	uc, pending, tasks, _, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
+	id := adoptionID(t, "reconcile-"+string(domain.StateTimeout))
+	snapshot := tasks.entries[id]
+	registerReconcilePending(t, pending, snapshot, PendingSendUnsent)
+	authority, ok := processSignalAuthority(snapshot)
+	if !ok {
+		t.Fatal("fixture requires process signal authority")
+	}
+	claim, outcome := pending.ClaimForSend(id, authority)
+	if outcome != ClaimAcquired || claim.Token == 0 {
+		t.Fatalf("initial claim=(%+v, %v), want acquired non-zero claim", claim, outcome)
+	}
+
+	registry := NewRecoveryOwnershipRegistry()
+	uc.resume.WithRecoveryOwnership(registry)
+	release, acquired := registry.Acquire(id)
+	if !acquired {
+		t.Fatal("competing recovery did not acquire ownership")
+	}
+	defer release()
+
+	uc.resumeRecovery(context.Background(), RecoverViaResumeInput{
+		TaskID:     id,
+		SessionRef: snapshot.SessionRef,
+		Origin:     domain.RecoveryOriginTimeout,
+		OccurredAt: time.Now(),
+	}, claim)
+
+	entries := pending.List()
+	if len(entries) != 1 || entries[0].state != pendingUnsent || entries[0].authority != authority {
+		t.Fatalf("pending=%+v, want original unsent authority", entries)
+	}
+	next, outcome := pending.ClaimForSend(id, authority)
+	if outcome != ClaimAcquired || next.Token == 0 {
+		t.Fatalf("retry claim=(%+v, %v), want acquired non-zero claim", next, outcome)
+	}
+}
+
 func TestReconcilePendingSendConfirmErrorRetainsSentEntry(t *testing.T) {
 	uc, pending, tasks, _, _, termination, _, _, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
 	id := adoptionID(t, "reconcile-"+string(domain.StateTimeout))
@@ -1905,6 +1970,90 @@ func TestCompleteTerminatedCancellationStopsPostIOEffects(t *testing.T) {
 			uc.completeTerminated(ctx, id, tasks.entries[id], tc.timeout, time.Now())
 			tc.check(t, pending, killed)
 		})
+	}
+}
+
+// SCN-daemon-01-32/34: persistent discovery makes orphan recovery survive a
+// lost in-memory pending set (the same condition after a daemon restart).
+func TestReconcileTickDiscoversPersistentOrphanAndConverges(t *testing.T) {
+	uc, pending, tasks, _, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateOrphaned, false, true)
+	id := adoptionID(t, "reconcile-"+string(domain.StateOrphaned))
+	tasks.listed = []domain.TaskSnapshot{tasks.entries[id]}
+	finalizer := &reconcileFinalizerFake{}
+	uc.finalizer = finalizer
+
+	uc.reconcileTick(context.Background())
+
+	if tasks.listCalls != 1 || finalizer.calls != 1 || len(pending.List()) != 0 {
+		t.Fatalf("list=%d finalize=%d pending=%+v", tasks.listCalls, finalizer.calls, pending.List())
+	}
+	if got := tasks.listStates[0]; !reflect.DeepEqual(got, []domain.TaskState{domain.StateOrphaned, domain.StateRecovering, domain.StateTimeout, domain.StateCancelling}) {
+		t.Fatalf("states=%v", got)
+	}
+}
+
+func TestReconcileTickSkipsLifecycleOwnedDiscoveryUntilReleased(t *testing.T) {
+	uc, pending, tasks, _, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateOrphaned, false, true)
+	id := adoptionID(t, "reconcile-"+string(domain.StateOrphaned))
+	tasks.listed = []domain.TaskSnapshot{tasks.entries[id]}
+	owned := &reconcileLifecycleOwnershipFake{owned: map[domain.TaskID]bool{id: true}}
+	uc.WithLifecycleOwnership(owned)
+	finalizer := &reconcileFinalizerFake{}
+	uc.finalizer = finalizer
+
+	uc.reconcileTick(context.Background())
+	if finalizer.calls != 0 || len(pending.List()) != 0 {
+		t.Fatalf("owned task was processed: finalize=%d pending=%+v", finalizer.calls, pending.List())
+	}
+	owned.owned[id] = false
+	uc.reconcileTick(context.Background())
+	if finalizer.calls != 1 || len(pending.List()) != 0 {
+		t.Fatalf("released task did not converge: finalize=%d pending=%+v", finalizer.calls, pending.List())
+	}
+}
+
+func TestReconcileTickListFailureLeavesPendingForRetry(t *testing.T) {
+	uc, pending, tasks, _, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateOrphaned, false, true)
+	id := adoptionID(t, "reconcile-"+string(domain.StateOrphaned))
+	registerReconcilePending(t, pending, tasks.entries[id], PendingSendConfirmOnly)
+	tasks.listErr = errors.New("temporary list failure")
+
+	uc.reconcileTick(context.Background())
+	if len(pending.List()) != 1 {
+		t.Fatalf("pending=%+v, want retained after failed scan", pending.List())
+	}
+	tasks.listErr = nil
+	uc.reconcileTick(context.Background())
+	if len(pending.List()) != 0 {
+		t.Fatalf("pending=%+v, want removed after retry", pending.List())
+	}
+}
+
+func TestReconcileTickDeduplicatesPendingAndPersistentTask(t *testing.T) {
+	uc, pending, tasks, _, _, _, _, _, _, _, _ := newReconcileFixture(t, domain.StateTimeout, false, false)
+	id := adoptionID(t, "reconcile-"+string(domain.StateTimeout))
+	snapshot := tasks.entries[id]
+	tasks.listed = []domain.TaskSnapshot{snapshot}
+	snapshotAuthority, ok := processSignalAuthority(snapshot)
+	if !ok {
+		t.Fatal("fixture requires process signal authority")
+	}
+	existingAuthority := snapshotAuthority
+	existingAuthority.PID++
+	if err := pending.Register(id, PendingSendUnsent, &existingAuthority); err != nil {
+		t.Fatal(err)
+	}
+	uc.WithLifecycleOwnership(&reconcileLifecycleOwnershipSequence{values: []bool{false, true}})
+
+	uc.reconcileTick(context.Background())
+
+	entries := pending.List()
+	if len(entries) != 1 || entries[0].state != pendingUnsent || entries[0].authority != existingAuthority {
+		t.Fatalf("pending=%+v, want existing unsent authority", entries)
+	}
+	claim, outcome := pending.ClaimForSend(id, existingAuthority)
+	if outcome != ClaimAcquired || claim.Token == 0 {
+		t.Fatalf("claim=(%+v, %v), want acquired non-zero claim", claim, outcome)
 	}
 }
 

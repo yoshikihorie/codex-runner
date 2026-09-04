@@ -13,6 +13,7 @@ import (
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/execution"
+	"github.com/yoshikihorie/codex-runner/internal/recovery"
 )
 
 type testTicker struct {
@@ -37,6 +38,65 @@ func stallUC(t *testing.T, id domain.TaskID, s *testStore, dead bool, liveErr er
 type stallOwnershipSequence struct {
 	values []bool
 	calls  int
+}
+
+type stallLockProbe struct{ held bool }
+
+func (p *stallLockProbe) Lock(domain.TaskID) {
+	if p.held {
+		panic("task lock re-acquired while held")
+	}
+	p.held = true
+}
+func (p *stallLockProbe) Unlock(domain.TaskID) {
+	if !p.held {
+		panic("task lock unlocked while not held")
+	}
+	p.held = false
+}
+
+func TestCheckStallReleasesTaskLockWhenNoStallStartTime(t *testing.T) {
+	r := &testRecorder{}
+	id := testID(t, "no-stall-start-time")
+	start := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	snapshot := testSnapshot(t, id, domain.StateRunning, start, nil)
+	snapshot.LastEventAt = nil
+	snapshot.PID, snapshot.ProcessStartedAt = nil, nil
+	snapshot.AdoptedAfterRestart = true
+	store := &testStore{r: r, loads: map[string]domain.TaskSnapshot{id.String(): snapshot}}
+	writer := &testWriter{r: r}
+	tracker := testTracker(r)
+	lock := &stallLockProbe{}
+	uc := newCheckStallUseCase(store, lock, testLive(r, id, false, nil), writer, &testClock{at: start, r: r, id: id}, tracker, time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: r}}, execution.NewLifecycleOwnershipRegistry())
+
+	uc.checkOne(context.Background(), id)
+	if lock.held {
+		t.Fatal("task lock remains held")
+	}
+	if len(store.saved) != 0 || len(writer.events) != 0 || len(tracker.calls) != 0 || tracker.takeCalls != 0 {
+		t.Fatalf("nil start changed task: saved=%v events=%v tracker=%v take=%d", store.saved, writer.events, tracker.calls, tracker.takeCalls)
+	}
+	lock.Lock(id)
+	lock.Unlock(id)
+}
+
+type stallCoordinatorProbe struct {
+	lock  *stallLockProbe
+	calls int
+	id    domain.TaskID
+}
+
+func (p *stallCoordinatorProbe) Handle(_ context.Context, id domain.TaskID, _ *domain.SessionRef, _ time.Time) recovery.OrphanTransitionResult {
+	if p.lock.held {
+		panic("orphan coordinator called with task lock held")
+	}
+	// Re-acquiring the same lock proves finalization/resume can safely enter
+	// their own task-serialized path after the stall transition.
+	p.lock.Lock(id)
+	p.lock.Unlock(id)
+	p.calls++
+	p.id = id
+	return recovery.OrphanTransitionResult{Finalized: true}
 }
 
 func (s *stallOwnershipSequence) Acquire(domain.TaskID) (domain.LifecycleGeneration, func(), bool) {
@@ -119,6 +179,35 @@ func TestCheckStallChecksRunningAndStalledAndOrphans(t *testing.T) {
 	uc.scan(context.Background())
 	if fmt.Sprint(s.listStates[0]) != fmt.Sprint([]domain.TaskState{domain.StateRunning, domain.StateStalled}) || len(w.events) != 1 || w.events[0] != "TaskOrphanDetected" || s.saved[0].State != domain.StateOrphaned {
 		t.Fatalf("states=%v events=%v saved=%#v", s.listStates, w.events, s.saved)
+	}
+}
+
+func TestCheckStallReleasesTaskLockBeforeOrphanCoordinator(t *testing.T) {
+	start := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	id := testID(t, "orphan-coordinator-unlocked")
+	snapshot := testSnapshot(t, id, domain.StateRunning, start, &start)
+	recorder := &testRecorder{}
+	store := &testStore{r: recorder, loads: map[string]domain.TaskSnapshot{id.String(): snapshot}}
+	lock := &stallLockProbe{}
+	coordinator := &stallCoordinatorProbe{lock: lock}
+	uc := newCheckStallUseCase(store, lock, testLive(recorder, id, true, nil), &testWriter{r: recorder}, &testClock{at: start, r: recorder, id: id}, testTracker(recorder), time.Second, testTickerFactory{&testTicker{ch: make(chan time.Time, 1), r: recorder}}, execution.NewLifecycleOwnershipRegistry())
+	uc.orphanCoordinator = coordinator
+
+	done := make(chan struct{})
+	go func() {
+		uc.checkOne(context.Background(), id)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("stall check deadlocked while handing off orphan recovery")
+	}
+	if coordinator.calls != 1 || coordinator.id != id || lock.held {
+		t.Fatalf("calls=%d id=%s held=%t", coordinator.calls, coordinator.id, lock.held)
+	}
+	if len(store.saved) != 1 || store.saved[0].State != domain.StateOrphaned {
+		t.Fatalf("saved=%+v", store.saved)
 	}
 }
 

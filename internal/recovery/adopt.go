@@ -97,25 +97,26 @@ type AdoptionOutcome struct {
 // AdoptRunningTasksUseCase re-establishes monitoring for tasks found in
 // non-terminal states after a daemon restart.
 type AdoptRunningTasksUseCase struct {
-	tasks           AdoptionTaskStore
-	liveness        LivenessChecker
-	reader          adoptionContractReader
-	contract        contract.ContractWriter
-	finalizer       OrphanFinalizer
-	resume          *RecoverViaResumeUseCase
-	slots           SlotReleaser
-	resetter        SlotResetter
-	termination     TerminationEnsurer
-	killed          KillConfirmer
-	pathLocks       PathLockReleaser
-	pending         *PendingReconciliationSet
-	taskMu          TaskMutex
-	clock           domain.Clock
-	stalledTracker  stalledTimeTracker
-	metricsRecorder MetricsRecorder
-	resumeDispatch  orphanResumeDispatcher
-	grace           time.Duration
-	logger          *slog.Logger
+	tasks             AdoptionTaskStore
+	liveness          LivenessChecker
+	reader            adoptionContractReader
+	contract          contract.ContractWriter
+	finalizer         OrphanFinalizer
+	resume            *RecoverViaResumeUseCase
+	slots             SlotReleaser
+	resetter          SlotResetter
+	termination       TerminationEnsurer
+	killed            KillConfirmer
+	pathLocks         PathLockReleaser
+	pending           *PendingReconciliationSet
+	taskMu            TaskMutex
+	clock             domain.Clock
+	stalledTracker    stalledTimeTracker
+	metricsRecorder   MetricsRecorder
+	resumeDispatch    orphanResumeDispatcher
+	orphanCoordinator *OrphanRecoveryCoordinator
+	grace             time.Duration
+	logger            *slog.Logger
 }
 
 func NewAdoptRunningTasksUseCase(tasks AdoptionTaskStore, liveness LivenessChecker, reader adoptionContractReader, writer contract.ContractWriter, finalizer OrphanFinalizer, resume *RecoverViaResumeUseCase, slots SlotReleaser, resetter SlotResetter, termination TerminationEnsurer, killed KillConfirmer, pathLocks PathLockReleaser, pending *PendingReconciliationSet, taskMu TaskMutex, clock domain.Clock, stalledTracker stalledTimeTracker, metricsRecorder MetricsRecorder, options ...any) *AdoptRunningTasksUseCase {
@@ -145,7 +146,17 @@ func NewAdoptRunningTasksUseCase(tasks AdoptionTaskStore, liveness LivenessCheck
 			panic("adopt running tasks use case received unsupported option")
 		}
 	}
-	return &AdoptRunningTasksUseCase{tasks: tasks, liveness: liveness, reader: reader, contract: writer, finalizer: finalizer, resume: resume, slots: slots, resetter: resetter, termination: termination, killed: killed, pathLocks: pathLocks, pending: pending, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker, metricsRecorder: metricsRecorder, resumeDispatch: resumeDispatch, grace: grace, logger: logger}
+	coordinator := newOrphanRecoveryCoordinator(tasks, reader, finalizer, resume, pending, taskMu, clock, logger, resumeDispatch)
+	return &AdoptRunningTasksUseCase{tasks: tasks, liveness: liveness, reader: reader, contract: writer, finalizer: finalizer, resume: resume, slots: slots, resetter: resetter, termination: termination, killed: killed, pathLocks: pathLocks, pending: pending, taskMu: taskMu, clock: clock, stalledTracker: stalledTracker, metricsRecorder: metricsRecorder, resumeDispatch: resumeDispatch, orphanCoordinator: coordinator, grace: grace, logger: logger}
+}
+
+// WithOrphanRecoveryCoordinator shares daemon-wide orphan transition handling.
+func (uc *AdoptRunningTasksUseCase) WithOrphanRecoveryCoordinator(coordinator *OrphanRecoveryCoordinator) *AdoptRunningTasksUseCase {
+	if isNilAdoptionDependency(coordinator) {
+		panic("adopt running tasks use case requires a non-nil orphan recovery coordinator")
+	}
+	uc.orphanCoordinator = coordinator
+	return uc
 }
 
 func (uc *AdoptRunningTasksUseCase) Execute(ctx context.Context) (AdoptRunningTasksOutput, error) {
@@ -788,47 +799,24 @@ func (uc *AdoptRunningTasksUseCase) confirmCancellationTermination(ctx context.C
 }
 
 func (uc *AdoptRunningTasksUseCase) recoverOrphan(ctx context.Context, taskID domain.TaskID, sessionRef *domain.SessionRef, occurredAt time.Time) (string, bool) {
-	if ctx.Err() != nil {
-		return "", false
-	}
-	present, err := uc.reader.ReadLastMessage(taskID)
-	if ctx.Err() != nil {
-		return "", false
-	}
-	if err != nil {
-		uc.logFailure("read last message for adopted orphan failed", taskID, err)
-		if ctx.Err() != nil {
-			return "", false
-		}
-		uc.registerPendingConfirmOnly(taskID)
-		return adoptionOutcomeError, true
-	}
-	if present {
-		if ctx.Err() != nil {
-			return "", false
-		}
-		if err := uc.finalizer.Finalize(taskID, 0, true, true, occurredAt); err != nil {
-			if ctx.Err() != nil {
-				return "", false
-			}
-			uc.logFailure("finalize adopted orphan failed", taskID, err)
-			uc.reconcilePendingAfterConfirmedDeath(ctx, taskID)
-			return adoptionOutcomeError, true
-		}
-		return adoptionOutcomeOrphanRecovered, true
-	}
 	if uc.resume == nil {
+		// Preserve the established read-before-dispatch contract for the
+		// defensive unavailable-resume branch.
+		_, _ = uc.reader.ReadLastMessage(taskID)
 		uc.logFailure("resume recovery for adopted orphan is unavailable", taskID, nil)
 		return adoptionOutcomeError, true
 	}
-	recoveryDispatchAt := uc.clock.Now()
+	result := uc.orphanCoordinator.Handle(ctx, taskID, sessionRef, occurredAt)
 	if ctx.Err() != nil {
 		return "", false
 	}
-	uc.resumeDispatch.dispatch(func() {
-		uc.resumeRecovery(context.WithoutCancel(ctx), RecoverViaResumeInput{TaskID: taskID, SessionRef: sessionRef, Origin: domain.RecoveryOriginOrphan, OccurredAt: recoveryDispatchAt}, SendClaim{})
-	})
-	return adoptionOutcomeOrphanRecoveryStarted, true
+	if result.Finalized {
+		return adoptionOutcomeOrphanRecovered, true
+	}
+	if result.RecoveryStarted {
+		return adoptionOutcomeOrphanRecoveryStarted, true
+	}
+	return adoptionOutcomeError, true
 }
 
 func (uc *AdoptRunningTasksUseCase) resumeRecovery(ctx context.Context, in RecoverViaResumeInput, claim SendClaim) {
