@@ -802,7 +802,7 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	}
 	pathAcquire := execution.NewAcquirePathLockUseCase(store.NewFileMutex(pathLocksMutexPath), pathStore, livenessLock, store.NormalizePath, tasks, logger)
 	pathRelease := execution.NewReleasePathLockUseCase(pathStore, logger)
-	processRunner := execution.NewProcessRunner(writer)
+	processRunner := execution.NewProcessRunner(writer, logger)
 	validator := recovery.NewProcessSignalAuthorityValidator(tasks, taskMu, ownership)
 	termination := execution.NewTerminationEnsurer(liveness, processRunner, clock, waitForContext, validator)
 	metricRecorder := metrics.NewRecordTaskMetricsUseCase(tasks, events, reader, metrics.NewFileMetricsWriter(logsDir, cfg.MetricsMaxFileBytes()), cfg.MetricsRecordContentEnabled(), clock, daemonVersion, nil, logger)

@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"log/slog"
 	"os"
@@ -60,9 +61,24 @@ var launchNewSession = proc.LaunchNewSession
 var sendTerminate = proc.SendTerminate
 var sendKill = proc.SendKill
 var now = time.Now
+var findGitBinary = proc.FindGitBinary
+var runGitRepositoryCheck = runGitRepositoryCheckCommand
+var decideSkipGitRepoCheck = detectSkipGitRepoCheck
 var newResumeProcessWaiter = func(cmd *exec.Cmd) ProcessWaiter {
 	return &processWaiter{cmd: cmd}
 }
+
+// Canonical source: validation-rules.md GIT_REPOSITORY_CHECK_TIMEOUT_SECONDS.
+var gitRepositoryCheckTimeout = 30 * time.Second
+
+type gitRepoCheckReason string
+
+const (
+	gitRepoCheckReasonNotConfirmed      gitRepoCheckReason = "not-confirmed-as-git-repository"
+	gitRepoCheckReasonBinaryUnavailable gitRepoCheckReason = "git-binary-unavailable"
+	gitRepoCheckReasonFailed            gitRepoCheckReason = "git-check-failed"
+	gitRepoCheckReasonTimeout           gitRepoCheckReason = "git-check-timeout"
+)
 
 const (
 	scriptBinaryPath = "/usr/bin/script"
@@ -72,11 +88,15 @@ const (
 	shellSignalExitBase        = 128
 )
 
-func buildLaunchArgs(p LaunchParams) (headProcess string, args []string) {
+func buildLaunchArgs(p LaunchParams, skipGitRepoCheck bool) (headProcess string, args []string) {
 	args = []string{"-oL", p.CodexBinaryPath, "exec", "--json",
-		"--sandbox", p.SandboxMode,
+		"--sandbox", p.SandboxMode}
+	if skipGitRepoCheck {
+		args = append(args, "--skip-git-repo-check")
+	}
+	args = append(args,
 		"-C", p.WorkingDir,
-		"--model", p.Model}
+		"--model", p.Model)
 	if p.ReasoningEffort != nil {
 		args = append(args, "-c", "model_reasoning_effort="+*p.ReasoningEffort)
 	}
@@ -88,7 +108,8 @@ func buildLaunchArgs(p LaunchParams) (headProcess string, args []string) {
 }
 
 type processRunner struct {
-	logs executionLogOpener
+	logs   executionLogOpener
+	logger *slog.Logger
 }
 
 type resumeLauncher struct {
@@ -111,7 +132,36 @@ func NewResumeLauncher(runner ProcessRunner, loggers ...*slog.Logger) recovery.R
 }
 
 func buildResumeArgs(params recovery.ResumeLaunchParams) []string {
-	return []string{"exec", "resume", params.SessionID, "--output-last-message", params.OutputLastMessagePath}
+	return []string{"exec", "resume", params.SessionID, "--skip-git-repo-check", "--output-last-message", params.OutputLastMessagePath}
+}
+
+func runGitRepositoryCheckCommand(ctx context.Context, gitBinary string, env []string, stdout io.Writer, stderr io.Writer, args ...string) error {
+	cmd := exec.CommandContext(ctx, gitBinary, args...)
+	cmd.Env = env
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	return cmd.Run()
+}
+
+func detectSkipGitRepoCheck(workingDir string) (bool, gitRepoCheckReason) {
+	gitBinary, err := findGitBinary()
+	if err != nil {
+		return true, gitRepoCheckReasonBinaryUnavailable
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), gitRepositoryCheckTimeout)
+	defer cancel()
+	err = runGitRepositoryCheck(ctx, gitBinary, proc.SafeChildEnv(), nil, nil, "-C", workingDir, "rev-parse", "--show-toplevel")
+	if err == nil {
+		return false, ""
+	}
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return true, gitRepoCheckReasonTimeout
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return true, gitRepoCheckReasonNotConfirmed
+	}
+	return true, gitRepoCheckReasonFailed
 }
 
 func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.ResumeLaunchParams) (retErr error) {
@@ -272,8 +322,12 @@ func (w *limitedWriter) Write(p []byte) (int, error) {
 	return len(p), nil
 }
 
-func NewProcessRunner(logs executionLogOpener) ProcessRunner {
-	return &processRunner{logs: logs}
+func NewProcessRunner(logs executionLogOpener, loggers ...*slog.Logger) ProcessRunner {
+	logger := slog.Default()
+	if len(loggers) > 0 && loggers[0] != nil {
+		logger = loggers[0]
+	}
+	return &processRunner{logs: logs, logger: logger}
 }
 
 func (r *processRunner) Launch(ctx context.Context, p LaunchParams) (*LaunchedProcess, error) {
@@ -289,7 +343,11 @@ func (r *processRunner) Launch(ctx context.Context, p LaunchParams) (*LaunchedPr
 		return nil, fmt.Errorf("task dir does not exist: %w", err)
 	}
 
-	head, args := buildLaunchArgs(p)
+	skipGitRepoCheck, reason := decideSkipGitRepoCheck(p.WorkingDir)
+	if skipGitRepoCheck {
+		r.logger.Warn("git repository check did not confirm repository; continuing with skip flag", "task_id", p.TaskID.String(), "reason", string(reason))
+	}
+	head, args := buildLaunchArgs(p, skipGitRepoCheck)
 	logs, err := r.logs.OpenExecutionLogs(p.TaskID)
 	if err != nil {
 		_ = p.LivenessLockFile.Close()

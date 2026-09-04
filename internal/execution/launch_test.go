@@ -43,7 +43,17 @@ func launchTestID(t *testing.T) domain.TaskID {
 
 func launchTestParams(t *testing.T, lock *os.File) LaunchParams {
 	t.Helper()
+	launchTestSeams(t)
 	return LaunchParams{TaskID: launchTestID(t), SandboxMode: "workspace-write", WorkingDir: t.TempDir(), PromptText: "prompt", TaskDirPath: t.TempDir(), AllowResume: true, LivenessLockFile: lock, CodexBinaryPath: "/bin/echo", Model: "test-model"}
+}
+
+func launchTestSeams(t *testing.T) {
+	t.Helper()
+	original := decideSkipGitRepoCheck
+	decideSkipGitRepoCheck = func(string) (bool, gitRepoCheckReason) {
+		return false, ""
+	}
+	t.Cleanup(func() { decideSkipGitRepoCheck = original })
 }
 
 func launchTestLogsFor(t *testing.T) *contract.ExecutionLogs {
@@ -83,7 +93,7 @@ func TestBuildLaunchArgs(t *testing.T) {
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			p.PTYEnabled = tt.pty
-			head, args := buildLaunchArgs(p)
+			head, args := buildLaunchArgs(p, false)
 			if head != tt.head || !reflect.DeepEqual(args[:len(tt.prefix)], tt.prefix) {
 				t.Fatalf("head,args = %q,%q", head, args)
 			}
@@ -96,9 +106,34 @@ func TestBuildLaunchArgs(t *testing.T) {
 		})
 	}
 	p.ReasoningEffort = nil
-	_, args := buildLaunchArgs(p)
+	_, args := buildLaunchArgs(p, false)
 	if strings.Contains(strings.Join(args, " "), "model_reasoning_effort") {
 		t.Fatal("unexpected reasoning effort")
+	}
+}
+
+func TestBuildLaunchArgsAddsSkipGitRepoCheckAtStablePosition(t *testing.T) {
+	reasoning := "high"
+	for _, pty := range []bool{false, true} {
+		for _, effort := range []*string{nil, &reasoning} {
+			p := launchTestParams(t, nil)
+			p.PTYEnabled = pty
+			p.ReasoningEffort = effort
+			_, args := buildLaunchArgs(p, true)
+			index := slices.Index(args, "--skip-git-repo-check")
+			count := 0
+			for _, arg := range args {
+				if arg == "--skip-git-repo-check" {
+					count++
+				}
+			}
+			if index < 0 || index != slices.Index(args, "-C")-1 || count != 1 {
+				t.Fatalf("skip flag position/count in %q", args)
+			}
+			if got := args[len(args)-4:]; !slices.Equal(got, []string{"--output-last-message", filepath.Join(p.TaskDirPath, "last-message.md"), "--", p.PromptText}) {
+				t.Fatalf("suffix = %q", got)
+			}
+		}
 	}
 }
 
@@ -119,13 +154,143 @@ func TestBuildLaunchArgsTerminatesOptionsBeforePrompt(t *testing.T) {
 				p.PromptText = prompt
 				p.PTYEnabled = pty
 
-				_, args := buildLaunchArgs(p)
+				_, args := buildLaunchArgs(p, false)
 				want := []string{"--", prompt}
 				if got := args[len(args)-len(want):]; !slices.Equal(got, want) {
 					t.Fatalf("argument suffix = %q, want %q", got, want)
 				}
 			})
 		}
+	}
+}
+
+func TestDetectSkipGitRepoCheck(t *testing.T) {
+	originalFind, originalRun, originalTimeout := findGitBinary, runGitRepositoryCheck, gitRepositoryCheckTimeout
+	t.Cleanup(func() {
+		findGitBinary, runGitRepositoryCheck, gitRepositoryCheckTimeout = originalFind, originalRun, originalTimeout
+	})
+	findGitBinary = func() (string, error) { return "/usr/bin/git", nil }
+
+	for _, tt := range []struct {
+		name       string
+		findErr    error
+		run        func(context.Context, string, []string, io.Writer, io.Writer, ...string) error
+		wantReason gitRepoCheckReason
+		wantSkip   bool
+	}{
+		{name: "success", run: func(context.Context, string, []string, io.Writer, io.Writer, ...string) error { return nil }},
+		{name: "non-zero", run: func(context.Context, string, []string, io.Writer, io.Writer, ...string) error {
+			return &exec.ExitError{}
+		}, wantSkip: true, wantReason: gitRepoCheckReasonNotConfirmed},
+		{name: "runner failure", run: func(context.Context, string, []string, io.Writer, io.Writer, ...string) error {
+			return errors.New("runner failure")
+		}, wantSkip: true, wantReason: gitRepoCheckReasonFailed},
+		{name: "timeout", run: func(ctx context.Context, _ string, _ []string, _ io.Writer, _ io.Writer, _ ...string) error {
+			<-ctx.Done()
+			return ctx.Err()
+		}, wantSkip: true, wantReason: gitRepoCheckReasonTimeout},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			gitRepositoryCheckTimeout = time.Millisecond
+			findGitBinary = func() (string, error) { return "/usr/bin/git", tt.findErr }
+			runGitRepositoryCheck = tt.run
+			if skip, reason := detectSkipGitRepoCheck("/safe/workdir"); skip != tt.wantSkip || reason != tt.wantReason {
+				t.Fatalf("skip, reason = %t, %q; want %t, %q", skip, reason, tt.wantSkip, tt.wantReason)
+			}
+		})
+	}
+	findGitBinary = func() (string, error) { return "", errors.New("not found") }
+	if skip, reason := detectSkipGitRepoCheck("/safe/workdir"); !skip || reason != gitRepoCheckReasonBinaryUnavailable {
+		t.Fatalf("binary failure = %t, %q", skip, reason)
+	}
+}
+
+func TestDetectSkipGitRepoCheckUsesSafeCommandContract(t *testing.T) {
+	originalFind, originalRun := findGitBinary, runGitRepositoryCheck
+	t.Cleanup(func() { findGitBinary, runGitRepositoryCheck = originalFind, originalRun })
+	findCalls, runCalls := 0, 0
+	findGitBinary = func() (string, error) {
+		findCalls++
+		return "/absolute/git", nil
+	}
+	workingDir := "/safe/workdir"
+	runGitRepositoryCheck = func(ctx context.Context, binary string, env []string, stdout, stderr io.Writer, args ...string) error {
+		runCalls++
+		if binary != "/absolute/git" || !slices.Equal(args, []string{"-C", workingDir, "rev-parse", "--show-toplevel"}) {
+			t.Fatalf("binary,args = %q,%q", binary, args)
+		}
+		if stdout != nil || stderr != nil || !slices.Equal(env, proc.SafeChildEnv()) {
+			t.Fatalf("env, stdout, stderr = %q, %v, %v", env, stdout, stderr)
+		}
+		if _, ok := ctx.Deadline(); !ok {
+			t.Fatal("git check context has no deadline")
+		}
+		return nil
+	}
+	if skip, reason := detectSkipGitRepoCheck(workingDir); skip || reason != "" {
+		t.Fatalf("skip, reason = %t, %q", skip, reason)
+	}
+	if findCalls != 1 || runCalls != 1 {
+		t.Fatalf("find calls=%d, run calls=%d; want 1 each", findCalls, runCalls)
+	}
+}
+
+func TestProcessRunnerLogsOnlySafeGitCheckAttributes(t *testing.T) {
+	p := launchTestParams(t, launchTestLock(t))
+	var output bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&output, nil))
+	originalDecision, originalLaunch := decideSkipGitRepoCheck, launchNewSession
+	t.Cleanup(func() { decideSkipGitRepoCheck, launchNewSession = originalDecision, originalLaunch })
+	decideSkipGitRepoCheck = func(string) (bool, gitRepoCheckReason) { return true, gitRepoCheckReasonNotConfirmed }
+	var launchArgs []string
+	launchNewSession = func(_ context.Context, _ string, _ []string, lock *os.File, _ io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
+		launchArgs = args
+		cmd := exec.Command("/bin/echo")
+		if err := cmd.Start(); err != nil {
+			return nil, err
+		}
+		_ = lock.Close()
+		return cmd, nil
+	}
+	launched, err := NewProcessRunner(launchTestLogs{logs: launchTestLogsFor(t)}, logger).Launch(context.Background(), p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := launched.Waiter.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	got := output.String()
+	if !strings.Contains(got, "task_id="+p.TaskID.String()) || !strings.Contains(got, "reason="+string(gitRepoCheckReasonNotConfirmed)) || strings.Contains(got, p.WorkingDir) {
+		t.Fatalf("unsafe or missing log attributes: %q", got)
+	}
+	if slices.Index(launchArgs, "--skip-git-repo-check") < 0 {
+		t.Fatalf("launch args do not contain skip flag: %q", launchArgs)
+	}
+}
+
+func TestNewProcessRunnerLoggerSelection(t *testing.T) {
+	logs := launchTestLogs{}
+	custom := slog.New(slog.NewTextHandler(io.Discard, nil))
+	for _, tt := range []struct {
+		name   string
+		logger *slog.Logger
+		want   *slog.Logger
+	}{
+		{name: "omitted", want: slog.Default()},
+		{name: "nil", logger: nil, want: slog.Default()},
+		{name: "custom", logger: custom, want: custom},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			var runner ProcessRunner
+			if tt.name == "omitted" {
+				runner = NewProcessRunner(logs)
+			} else {
+				runner = NewProcessRunner(logs, tt.logger)
+			}
+			if got := runner.(*processRunner).logger; got != tt.want {
+				t.Fatalf("logger = %p, want %p", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -374,7 +539,7 @@ func TestProcessRunnerCapturesTimestampAndDomainHandle(t *testing.T) {
 	if err != nil || string(output) != "\n" {
 		t.Fatalf("stdout = %q, err = %v", output, err)
 	}
-	wantName, wantArgs := buildLaunchArgs(p)
+	wantName, wantArgs := buildLaunchArgs(p, false)
 	if gotName != wantName {
 		t.Fatalf("name = %q, want %q", gotName, wantName)
 	}
@@ -410,7 +575,7 @@ func TestProcessRunnerLaunchPassesPTYArguments(t *testing.T) {
 	if _, err := launched.Waiter.Wait(); err != nil {
 		t.Fatal(err)
 	}
-	wantName, wantArgs := buildLaunchArgs(p)
+	wantName, wantArgs := buildLaunchArgs(p, false)
 	if gotName != wantName {
 		t.Fatalf("name = %q, want %q", gotName, wantName)
 	}
@@ -473,7 +638,7 @@ func TestProcessRunnerSignalDelegatesArgumentsAndError(t *testing.T) {
 func TestResumeLaunchArgs(t *testing.T) {
 	id := launchTestID(t)
 	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", OutputLastMessagePath: "/tmp/codex-tasks/last-message.md"}
-	if got, want := buildResumeArgs(params), []string{"exec", "resume", "session-id", "--output-last-message", "/tmp/codex-tasks/last-message.md"}; !slices.Equal(got, want) {
+	if got, want := buildResumeArgs(params), []string{"exec", "resume", "session-id", "--skip-git-repo-check", "--output-last-message", "/tmp/codex-tasks/last-message.md"}; !slices.Equal(got, want) {
 		t.Fatalf("args = %q, want %q", got, want)
 	}
 }
