@@ -73,6 +73,13 @@ func (f pathLockTaskStateReaderFake) Load(domain.TaskID) (domain.TaskSnapshot, e
 	return f.snapshot, f.err
 }
 
+type pathLockTaskStateReaderMustNotLoad struct{ t *testing.T }
+
+func (f pathLockTaskStateReaderMustNotLoad) Load(domain.TaskID) (domain.TaskSnapshot, error) {
+	f.t.Fatal("task state reader was called after successful liveness check")
+	return domain.TaskSnapshot{}, nil
+}
+
 func (s *pathLockTestStore) List() ([]PathLockSnapshot, error) { return s.snapshots, s.listErr }
 func (s *pathLockTestStore) Save(_ domain.TaskID, paths []domain.NormalizedPath) error {
 	s.saved = true
@@ -83,6 +90,17 @@ func (s *pathLockTestStore) Delete(taskID domain.TaskID) error {
 	s.deleted = append(s.deleted, taskID)
 	return s.deleteErr
 }
+
+type pathLockSaveFailingStore struct {
+	store   *store.PathLockFileStore
+	saveErr error
+}
+
+func (s pathLockSaveFailingStore) List() ([]PathLockSnapshot, error) { return s.store.List() }
+func (s pathLockSaveFailingStore) Save(domain.TaskID, []domain.NormalizedPath) error {
+	return s.saveErr
+}
+func (s pathLockSaveFailingStore) Delete(taskID domain.TaskID) error { return s.store.Delete(taskID) }
 
 func TestAcquirePathLockUseCaseDisambiguatesMissingTaskLockWithTaskState(t *testing.T) {
 	owner, err := domain.NewTaskID("impl-20260809-120000-a1b2-owner")
@@ -301,6 +319,153 @@ func TestAcquirePathLockConcurrentDisjointRequestsSerializeAndBothSucceed_SCNLoc
 	locks.mu.Unlock()
 	if saved != 2 {
 		t.Fatalf("saved=%d", saved)
+	}
+}
+
+func TestAcquirePathLockUseCaseRepairsDeadOwnerWithRealStores_SCNLock0103(t *testing.T) {
+	owner, requester := pathLockIDs(t)
+	root := t.TempDir()
+	targetPath := filepath.Join(root, "target.go")
+	if err := os.WriteFile(targetPath, []byte("package target\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pathStore := store.NewPathLockFileStore(filepath.Join(root, "ownership"))
+	normalizedTarget, err := store.NormalizePath(targetPath, runtime.GOOS == "darwin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pathStore.Save(owner, []domain.NormalizedPath{normalizedTarget}); err != nil {
+		t.Fatal(err)
+	}
+	tasksRoot := filepath.Join(root, "tasks")
+	resolver, err := NewLockPathResolver(tasksRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Dir(resolver(owner)), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lockFile, err := os.OpenFile(resolver(owner), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := lockFile.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	uc, err := NewAcquirePathLockUseCase(
+		store.NewFileMutex(filepath.Join(root, "path-locks.lock")),
+		pathStore,
+		domain.LivenessLockFunc(store.TryAcquireLiveness),
+		store.NormalizePath,
+		pathLockTaskStateReaderMustNotLoad{t: t},
+		resolver,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{targetPath}})
+	if err != nil || !out.Acquired || !reflect.DeepEqual(out.NormalizedPaths, []domain.NormalizedPath{normalizedTarget}) {
+		t.Fatalf("Execute=(%+v,%v)", out, err)
+	}
+	locks, err := pathStore.List()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(locks) != 1 || locks[0].TaskID != requester || !reflect.DeepEqual(locks[0].OwnedPaths, []string{normalizedTarget.String()}) {
+		t.Fatalf("locks after dead-owner repair=%+v", locks)
+	}
+}
+
+func TestAcquirePathLockUseCaseSaveFailureFailsClosedAndUnlocks_SCNLock0110(t *testing.T) {
+	_, requester := pathLockIDs(t)
+	root := t.TempDir()
+	targetPath := filepath.Join(root, "target.go")
+	if err := os.WriteFile(targetPath, []byte("package target\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pathStore := store.NewPathLockFileStore(filepath.Join(root, "ownership"))
+	mutexPath := filepath.Join(root, "path-locks.lock")
+	capture := &logCapture{}
+	uc, err := NewAcquirePathLockUseCase(
+		store.NewFileMutex(mutexPath),
+		pathLockSaveFailingStore{store: pathStore, saveErr: errors.New("injected save failure " + pathLockLogCanary)},
+		domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }),
+		store.NormalizePath,
+		pathLockTaskStateReaderFake{},
+		func(domain.TaskID) string { return filepath.Join(root, "unused-task.lock") },
+		slog.New(capture),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{targetPath}})
+	if !errors.Is(err, domain.ErrPathLockInfraFailure) || out.Acquired || out.NormalizedPaths != nil {
+		t.Fatalf("Execute=(%+v,%v)", out, err)
+	}
+	locks, listErr := pathStore.List()
+	if listErr != nil || len(locks) != 0 {
+		t.Fatalf("List=(%+v,%v)", locks, listErr)
+	}
+	reacquire := store.NewFileMutex(mutexPath)
+	done := make(chan error, 1)
+	go func() {
+		if lockErr := reacquire.Lock(); lockErr != nil {
+			done <- lockErr
+			return
+		}
+		done <- reacquire.Unlock()
+	}()
+	select {
+	case lockErr := <-done:
+		if lockErr != nil {
+			t.Fatal(lockErr)
+		}
+	case <-time.After(timeoutTestWait):
+		t.Fatal("path lock mutex was not released after Save failure")
+	}
+	logs := capture.snapshot()
+	if len(logs) != 1 || logs[0].level != slog.LevelError || logs[0].msg != "save path lock" || logs[0].attrs["task_id"] != requester.String() || logs[0].attrs["stage"] != "Save" {
+		t.Fatalf("logs=%#v", logs)
+	}
+	requireNoCanaryInLogs(t, logs)
+}
+
+func TestReleasePathLockUseCaseSecondReleaseSucceedsAndLogsInfo_SCNLock0111(t *testing.T) {
+	owner, _ := pathLockIDs(t)
+	root := t.TempDir()
+	pathStore := store.NewPathLockFileStore(filepath.Join(root, "ownership"))
+	targetPath := filepath.Join(root, "target.go")
+	if err := os.WriteFile(targetPath, []byte("package target\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	normalizedTarget, err := store.NormalizePath(targetPath, runtime.GOOS == "darwin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pathStore.Save(owner, []domain.NormalizedPath{normalizedTarget}); err != nil {
+		t.Fatal(err)
+	}
+	capture := &logCapture{}
+	uc := NewReleasePathLockUseCase(pathStore, slog.New(capture))
+	if err := uc.Execute(context.Background(), ReleasePathLockInput{TaskID: owner}); err != nil {
+		t.Fatal(err)
+	}
+	if err := uc.Execute(context.Background(), ReleasePathLockInput{TaskID: owner}); err != nil {
+		t.Fatal(err)
+	}
+	locks, err := pathStore.List()
+	if err != nil || len(locks) != 0 {
+		t.Fatalf("List=(%+v,%v)", locks, err)
+	}
+	logs := capture.snapshot()
+	if len(logs) != 2 {
+		t.Fatalf("logs=%#v", logs)
+	}
+	for index, record := range logs {
+		if record.level != slog.LevelInfo || record.msg != "released path lock" || record.attrs["task_id"] != owner.String() {
+			t.Fatalf("log[%d]=%#v", index, record)
+		}
 	}
 }
 
