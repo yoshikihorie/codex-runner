@@ -2,15 +2,74 @@ package config
 
 import (
 	"errors"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/BurntSushi/toml"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 )
+
+func TestTaskPlacementRootLiteralHasSingleNonTestDefinition(t *testing.T) {
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller failed")
+	}
+	repoRoot := filepath.Dir(filepath.Dir(filepath.Dir(thisFile)))
+	if _, err := os.Stat(filepath.Join(repoRoot, "go.mod")); err != nil {
+		t.Fatalf("repository root is not anchored by go.mod: %v", err)
+	}
+	var matches []string
+	err := filepath.WalkDir(repoRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() || filepath.Ext(path) != ".go" || strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		contents, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		if strings.Contains(string(contents), `"/tmp/codex-tasks"`) {
+			matches = append(matches, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := filepath.Join(repoRoot, "internal", "config", "config.go")
+	if len(matches) != 1 || matches[0] != want {
+		t.Fatalf("task placement literal matches=%q, want [%q]", matches, want)
+	}
+}
+
+func TestDefaultTaskPlacementRootValue(t *testing.T) {
+	if defaultTaskPlacementRoot != "/tmp/codex-tasks" {
+		t.Fatalf("default task placement root = %q", defaultTaskPlacementRoot)
+	}
+}
+
+func TestResolveTaskPlacementRootValidation(t *testing.T) {
+	parent := t.TempDir()
+	file := filepath.Join(parent, "not-a-directory")
+	if err := os.WriteFile(file, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, root := range []string{"", "relative", parent + "/../" + filepath.Base(parent) + "/tasks", parent + string(os.PathSeparator), filepath.Join(file, "tasks")} {
+		root := root
+		t.Run(root, func(t *testing.T) {
+			if _, err := resolve(rawConfig{TaskPlacementRoot: &root}); err == nil {
+				t.Fatal("resolve accepted invalid task placement root")
+			}
+		})
+	}
+}
 
 func TestResolveSubmitOptions(t *testing.T) {
 	requestedModel := "gpt-5.6-sol"

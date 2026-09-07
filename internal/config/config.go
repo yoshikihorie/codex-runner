@@ -32,8 +32,10 @@ const (
 	defaultModel                                = "gpt-5.6-terra"
 	readOnlyModel                               = "gpt-5.6-luna"
 	defaultPtyEnabled                           = false
-	maxConcurrentTasksMin                       = 1
-	maxConcurrentTasksMax                       = 16
+	// Canonical source: 10-shared/validation-rules.yaml constants.TASK_PLACEMENT_ROOT
+	defaultTaskPlacementRoot = "/tmp/codex-tasks"
+	maxConcurrentTasksMin    = 1
+	maxConcurrentTasksMax    = 16
 )
 
 var (
@@ -102,6 +104,7 @@ type Config struct {
 	reasoningEffort                *string
 	reasoningEffortOverrides       map[domain.Subcommand]string
 	ptyEnabled                     bool
+	taskPlacementRoot              string
 }
 
 type rawConfig struct {
@@ -126,6 +129,7 @@ type rawConfig struct {
 	ReasoningEffort                *string           `toml:"reasoning_effort"`
 	ReasoningEffortOverrides       map[string]string `toml:"reasoning_effort_overrides"`
 	PtyEnabled                     *bool             `toml:"pty_enabled"`
+	TaskPlacementRoot              *string           `toml:"task_placement_root"`
 }
 
 type missingFilePolicy bool
@@ -195,7 +199,8 @@ func resolve(raw rawConfig) (Config, error) {
 		taskPlacementRetentionDays: defaultTaskPlacementRetentionDays, totalTaskDiskBudgetMB: defaultTotalTaskDiskBudgetMB,
 		socketPath: socketPath, model: defaultModel,
 		modelOverrides: make(map[domain.Subcommand]string), reasoningEffortOverrides: make(map[domain.Subcommand]string),
-		ptyEnabled: defaultPtyEnabled,
+		ptyEnabled:        defaultPtyEnabled,
+		taskPlacementRoot: defaultTaskPlacementRoot,
 	}
 	if raw.MaxConcurrentTasks != nil {
 		c.maxConcurrentTasks = *raw.MaxConcurrentTasks
@@ -248,6 +253,21 @@ func resolve(raw rawConfig) (Config, error) {
 	}
 	if raw.PtyEnabled != nil {
 		c.ptyEnabled = *raw.PtyEnabled
+	}
+	if raw.TaskPlacementRoot != nil {
+		path, err := domain.NewNormalizedPath(*raw.TaskPlacementRoot)
+		if err != nil {
+			return Config{}, invalid("task_placement_root", "must be a normalized absolute path", err)
+		}
+		parent := filepath.Dir(path.String())
+		info, err := os.Stat(parent)
+		if err != nil {
+			return Config{}, invalid("task_placement_root", "parent must be an existing directory", err)
+		}
+		if !info.IsDir() {
+			return Config{}, invalid("task_placement_root", "parent must be an existing directory", fmt.Errorf("parent is not a directory: %s", parent))
+		}
+		c.taskPlacementRoot = path.String()
 	}
 
 	if err := validateRanges(c); err != nil {
@@ -470,6 +490,7 @@ func (c Config) SocketPath() string                  { return c.socketPath }
 func (c Config) CodexBinaryPath() string             { return c.codexBinaryPath }
 func (c Config) Model() string                       { return c.model }
 func (c Config) PtyEnabled() bool                    { return c.ptyEnabled }
+func (c Config) TaskPlacementRoot() string           { return c.taskPlacementRoot }
 func (c Config) ReasoningEffort() (string, bool) {
 	if c.reasoningEffort == nil {
 		return "", false

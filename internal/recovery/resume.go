@@ -14,8 +14,6 @@ import (
 const (
 	// Canonical source: validation-rules.md RESUME_RECOVERY_TIMEOUT_SECONDS.
 	resumeRecoveryTimeout = 300 * time.Second
-	// Canonical source: output-contract.md task placement root.
-	recoveryTaskPlacementRoot = "/tmp/codex-tasks"
 )
 
 type TaskStore interface {
@@ -36,6 +34,7 @@ type ResumeLaunchParams struct {
 	TaskID                domain.TaskID
 	CodexBinaryPath       string
 	SessionID             string
+	TaskPlacementRoot     string
 	OutputLastMessagePath string
 }
 type ResumeLauncher interface {
@@ -65,13 +64,12 @@ func failureExitCodeFor(origin domain.RecoveryOrigin) domain.ExitCode {
 func (r *RecoveryAttempt) Attempt(ctx context.Context, launcher ResumeLauncher, reader ContractReader) (RecoveryResult, error) {
 	ctx, cancel := context.WithTimeout(ctx, resumeRecoveryTimeout)
 	defer cancel()
-	taskPlacementRoot := r.TaskPlacementRoot
-	if taskPlacementRoot == "" {
-		// Fallback for callers that construct RecoveryAttempt without wiring
-		// TaskPlacementRoot explicitly (e.g. existing unit tests).
-		taskPlacementRoot = recoveryTaskPlacementRoot
+	path, err := domain.NewNormalizedPath(r.TaskPlacementRoot)
+	if err != nil {
+		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, fmt.Errorf("resume task placement root: %w", err)
 	}
-	params := ResumeLaunchParams{TaskID: r.TaskID, CodexBinaryPath: r.CodexBinaryPath, SessionID: r.SessionRef.SessionID(), OutputLastMessagePath: filepath.Join(taskPlacementRoot, r.TaskID.String(), "last-message.md")}
+	taskPlacementRoot := path.String()
+	params := ResumeLaunchParams{TaskID: r.TaskID, CodexBinaryPath: r.CodexBinaryPath, SessionID: r.SessionRef.SessionID(), TaskPlacementRoot: taskPlacementRoot, OutputLastMessagePath: filepath.Join(taskPlacementRoot, r.TaskID.String(), "last-message.md")}
 	if err := launcher.LaunchAndWait(ctx, params); err != nil {
 		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, err
 	}
@@ -93,11 +91,15 @@ type resumeRecoverer struct {
 	clock             Clock
 }
 
-func NewResumeRecoverer(launcher ResumeLauncher, reader ContractReader, codexBinaryPath string, taskPlacementRoot string, clock Clock) Recoverer {
+func NewResumeRecoverer(launcher ResumeLauncher, reader ContractReader, codexBinaryPath string, taskPlacementRoot string, clock Clock) (Recoverer, error) {
 	if isNilAdoptionDependency(launcher) || isNilAdoptionDependency(reader) || isNilAdoptionDependency(clock) {
 		panic("resume recoverer requires non-nil dependencies")
 	}
-	return &resumeRecoverer{launcher: launcher, reader: reader, codexBinaryPath: codexBinaryPath, taskPlacementRoot: taskPlacementRoot, clock: clock}
+	path, err := domain.NewNormalizedPath(taskPlacementRoot)
+	if err != nil {
+		return nil, err
+	}
+	return &resumeRecoverer{launcher: launcher, reader: reader, codexBinaryPath: codexBinaryPath, taskPlacementRoot: path.String(), clock: clock}, nil
 }
 func (r *resumeRecoverer) Resume(ctx context.Context, taskID domain.TaskID, sessionRef *domain.SessionRef, origin domain.RecoveryOrigin) (RecoveryResult, error) {
 	if sessionRef == nil {

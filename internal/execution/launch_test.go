@@ -645,18 +645,19 @@ func TestResumeLaunchArgs(t *testing.T) {
 
 func TestResumeLauncherRejectsInvalidOutputLastMessagePathBeforeLaunch(t *testing.T) {
 	id := launchTestID(t)
+	root := t.TempDir()
 	otherID, err := domain.NewTaskID("impl-20260820-120001-a1b2-other")
 	if err != nil {
 		t.Fatal(err)
 	}
-	taskDirPath := filepath.Join(taskPlacementRoot, id.String())
+	taskDirPath := filepath.Join(root, id.String())
 	for _, tt := range []struct {
 		name                  string
 		outputLastMessagePath string
 	}{
 		{
 			name:                  "another task",
-			outputLastMessagePath: filepath.Join(taskPlacementRoot, otherID.String(), "last-message.md"),
+			outputLastMessagePath: filepath.Join(root, otherID.String(), "last-message.md"),
 		},
 		{
 			name:                  "outside task placement",
@@ -692,6 +693,7 @@ func TestResumeLauncherRejectsInvalidOutputLastMessagePathBeforeLaunch(t *testin
 				TaskID:                id,
 				CodexBinaryPath:       "/usr/local/bin/codex",
 				SessionID:             "session-id",
+				TaskPlacementRoot:     root,
 				OutputLastMessagePath: tt.outputLastMessagePath,
 			}
 			err := NewResumeLauncher(&timeoutProcessFake{}).LaunchAndWait(context.Background(), params)
@@ -715,7 +717,8 @@ func TestResumeLauncherDoesNotLaunchWhenContextCanceledAfterLockAcquisition(t *t
 	if err != nil {
 		t.Fatal(err)
 	}
-	taskDir := filepath.Join(taskPlacementRoot, id.String())
+	root := t.TempDir()
+	taskDir := filepath.Join(root, id.String())
 	if err := os.MkdirAll(taskDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -742,7 +745,7 @@ func TestResumeLauncherDoesNotLaunchWhenContextCanceledAfterLockAcquisition(t *t
 		return nil, nil
 	}
 
-	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
 	err = NewResumeLauncher(&timeoutProcessFake{}).LaunchAndWait(ctx, params)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
@@ -765,7 +768,8 @@ func TestResumeLauncherRejectsEvictedWorktreeBeforeContextCancellation(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	taskDir := filepath.Join(taskPlacementRoot, id.String())
+	root := t.TempDir()
+	taskDir := filepath.Join(root, id.String())
 	if err := os.MkdirAll(taskDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -773,7 +777,8 @@ func TestResumeLauncherRejectsEvictedWorktreeBeforeContextCancellation(t *testin
 	if err := os.WriteFile(filepath.Join(taskDir, "task.lock"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(worktreeEvictionMarkerPath(id), nil, 0o600); err != nil {
+	markerPath := filepath.Join(taskDir, worktreeEvictionMarkerName)
+	if err := os.WriteFile(markerPath, nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	launchCalls := 0
@@ -784,7 +789,7 @@ func TestResumeLauncherRejectsEvictedWorktreeBeforeContextCancellation(t *testin
 	var logOutput bytes.Buffer
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
 	err = NewResumeLauncher(&timeoutProcessFake{}, slog.New(slog.NewTextHandler(&logOutput, nil))).LaunchAndWait(ctx, params)
 	if !errors.Is(err, ErrWorktreeEvicted) || errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want eviction error only", err)
@@ -800,7 +805,7 @@ func TestResumeLauncherRejectsEvictedWorktreeBeforeContextCancellation(t *testin
 	if lockErr := syscall.Flock(int(other.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); lockErr != nil {
 		t.Fatalf("resume lock remained held after eviction rejection: %v", lockErr)
 	}
-	if !strings.Contains(logOutput.String(), "task_id="+id.String()) || !strings.Contains(logOutput.String(), worktreeEvictionMarkerPath(id)) || !strings.Contains(logOutput.String(), ErrWorktreeEvicted.Error()) {
+	if !strings.Contains(logOutput.String(), "task_id="+id.String()) || !strings.Contains(logOutput.String(), markerPath) || !strings.Contains(logOutput.String(), ErrWorktreeEvicted.Error()) {
 		t.Fatalf("eviction rejection log = %q", logOutput.String())
 	}
 }
@@ -819,7 +824,8 @@ func TestResumeLauncherRejectsMarkerInspectionPermissionFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	taskDir := filepath.Join(taskPlacementRoot, id.String())
+	root := t.TempDir()
+	taskDir := filepath.Join(root, id.String())
 	if err := os.MkdirAll(taskDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -843,7 +849,7 @@ func TestResumeLauncherRejectsMarkerInspectionPermissionFailure(t *testing.T) {
 		return nil, nil
 	}
 	var logOutput bytes.Buffer
-	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
 	err = NewResumeLauncher(&timeoutProcessFake{}, slog.New(slog.NewTextHandler(&logOutput, nil))).LaunchAndWait(context.Background(), params)
 	if !errors.Is(err, syscall.EACCES) {
 		t.Fatalf("error = %v, want EACCES", err)
@@ -862,7 +868,7 @@ func TestResumeLauncherRejectsMarkerInspectionPermissionFailure(t *testing.T) {
 	if err := syscall.Flock(int(other.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		t.Fatalf("resume lock remained held after marker inspection failure: %v", err)
 	}
-	if !strings.Contains(logOutput.String(), "task_id="+id.String()) || !strings.Contains(logOutput.String(), worktreeEvictionMarkerPath(id)) || !strings.Contains(logOutput.String(), "permission denied") {
+	if !strings.Contains(logOutput.String(), "task_id="+id.String()) || !strings.Contains(logOutput.String(), filepath.Join(taskDir, worktreeEvictionMarkerName)) || !strings.Contains(logOutput.String(), "permission denied") {
 		t.Fatalf("marker inspection log = %q", logOutput.String())
 	}
 }
@@ -913,7 +919,8 @@ func TestResumeLauncherLogsCapturedStderrMetadataOnLaunchFailure(t *testing.T) {
 		return nil, errors.New("launch failed")
 	}
 	id := launchTestID(t)
-	taskDir := filepath.Join(taskPlacementRoot, id.String())
+	root := t.TempDir()
+	taskDir := filepath.Join(root, id.String())
 	if err := os.MkdirAll(taskDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -924,7 +931,7 @@ func TestResumeLauncherLogsCapturedStderrMetadataOnLaunchFailure(t *testing.T) {
 	if err := lock.Close(); err != nil {
 		t.Fatal(err)
 	}
-	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
 	if err := NewResumeLauncher(&timeoutProcessFake{}, logger).LaunchAndWait(context.Background(), params); err == nil {
 		t.Fatal("launch failure was accepted")
 	}

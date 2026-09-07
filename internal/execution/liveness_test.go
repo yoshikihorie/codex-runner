@@ -28,7 +28,7 @@ func testTaskID(t *testing.T) domain.TaskID {
 	return id
 }
 
-func testResolver(root string) lockPathResolver {
+func testResolver(root string) LockPathResolver {
 	return func(id domain.TaskID) string {
 		return filepath.Join(root, id.String(), "task.lock")
 	}
@@ -466,8 +466,12 @@ func TestLockPathResolvers(t *testing.T) {
 	if want := filepath.Join(root, id.String(), "task.lock"); received != want {
 		t.Fatalf("path = %q, want %q", received, want)
 	}
-	if want := filepath.Join(taskPlacementRoot, id.String(), "task.lock"); DefaultLockPathResolver(id) != want {
-		t.Fatalf("default path = %q, want %q", DefaultLockPathResolver(id), want)
+	resolver, err := NewLockPathResolver(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := filepath.Join(root, id.String(), "task.lock"); resolver(id) != want {
+		t.Fatalf("resolved path = %q, want %q", resolver(id), want)
 	}
 }
 

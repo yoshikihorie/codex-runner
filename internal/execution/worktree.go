@@ -34,10 +34,6 @@ var ErrWorktreeEvicted = errors.New("worktree was evicted")
 
 var writeAtomic = storepkg.WriteAtomic
 
-func worktreeEvictionMarkerPath(taskID domain.TaskID) string {
-	return filepath.Join(taskPlacementRoot, taskID.String(), worktreeEvictionMarkerName)
-}
-
 // WorktreeCreator creates one atomic worktree copy.
 type WorktreeCreator interface {
 	Create(ctx context.Context, sourceDir string, destinationDir string) error
@@ -154,24 +150,29 @@ type WorktreeStore interface {
 }
 
 type EvictWorkDirUseCase struct {
-	store  WorktreeStore
-	locks  *CheckLivenessUseCase
-	root   string
-	logger *slog.Logger
+	store             WorktreeStore
+	locks             *CheckLivenessUseCase
+	root              string
+	taskPlacementRoot string
+	logger            *slog.Logger
 }
 
-func NewEvictWorkDirUseCase(store WorktreeStore, locks *CheckLivenessUseCase, root string, loggers ...*slog.Logger) (*EvictWorkDirUseCase, error) {
+func NewEvictWorkDirUseCase(store WorktreeStore, locks *CheckLivenessUseCase, root, taskPlacementRoot string, loggers ...*slog.Logger) (*EvictWorkDirUseCase, error) {
 	if store == nil || locks == nil {
 		return nil, fmt.Errorf("store and locks must not be nil")
 	}
 	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root {
 		return nil, fmt.Errorf("root must be a normalized absolute path")
 	}
+	taskRoot, err := domain.NewNormalizedPath(taskPlacementRoot)
+	if err != nil {
+		return nil, fmt.Errorf("task placement root must be a normalized absolute path: %w", err)
+	}
 	logger := slog.Default()
 	if len(loggers) > 0 && loggers[0] != nil {
 		logger = loggers[0]
 	}
-	return &EvictWorkDirUseCase{store: store, locks: locks, root: root, logger: logger}, nil
+	return &EvictWorkDirUseCase{store: store, locks: locks, root: root, taskPlacementRoot: taskRoot.String(), logger: logger}, nil
 }
 
 // DefaultWorktreeRoot resolves the daemon-owned worktree placement root.
@@ -398,7 +399,7 @@ func (uc *EvictWorkDirUseCase) deleteWithDeathLease(candidate WorktreeCandidate)
 
 	writeMarker := false
 	if errors.Is(err, domain.ErrTaskNotFound) {
-		taskDirPath := filepath.Join(taskPlacementRoot, candidate.TaskID.String())
+		taskDirPath := filepath.Join(uc.taskPlacementRoot, candidate.TaskID.String())
 		info, lstatErr := os.Lstat(taskDirPath)
 		switch {
 		case errors.Is(lstatErr, fs.ErrNotExist):
@@ -428,7 +429,7 @@ func (uc *EvictWorkDirUseCase) deleteWithDeathLease(candidate WorktreeCandidate)
 	}
 
 	if writeMarker {
-		markerPath := worktreeEvictionMarkerPath(candidate.TaskID)
+		markerPath := filepath.Join(uc.taskPlacementRoot, candidate.TaskID.String(), worktreeEvictionMarkerName)
 		if writeErr := writeAtomic(markerPath, nil, 0o600); writeErr != nil {
 			uc.logger.Error("write worktree eviction marker", "task_id", candidate.TaskID.String(), "marker_path", markerPath, "error", writeErr)
 			return false, nil

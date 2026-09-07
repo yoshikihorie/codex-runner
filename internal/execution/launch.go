@@ -165,7 +165,11 @@ func detectSkipGitRepoCheck(workingDir string) (bool, gitRepoCheckReason) {
 }
 
 func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.ResumeLaunchParams) (retErr error) {
-	taskDirPath := filepath.Join(taskPlacementRoot, params.TaskID.String())
+	root, rootErr := domain.NewNormalizedPath(params.TaskPlacementRoot)
+	if rootErr != nil {
+		return fmt.Errorf("resume launch task placement root: %w", rootErr)
+	}
+	taskDirPath := filepath.Join(root.String(), params.TaskID.String())
 	expectedOutputPath := filepath.Join(taskDirPath, "last-message.md")
 	if !filepath.IsAbs(params.CodexBinaryPath) || params.OutputLastMessagePath != expectedOutputPath {
 		return fmt.Errorf("resume launch paths are invalid")
@@ -174,7 +178,7 @@ func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.Resu
 	if err != nil {
 		return fmt.Errorf("acquire resume liveness lock: %w", err)
 	}
-	markerPath := worktreeEvictionMarkerPath(params.TaskID)
+	markerPath := filepath.Join(root.String(), params.TaskID.String(), worktreeEvictionMarkerName)
 	if _, markerErr := os.Lstat(markerPath); markerErr == nil {
 		evictionErr := fmt.Errorf("%w: %s", ErrWorktreeEvicted, markerPath)
 		_ = lock.Close()

@@ -25,7 +25,13 @@ type EventReader interface {
 
 var _ EventReader = (*FileEventReader)(nil)
 
-func NewFileEventReader(root string) *FileEventReader { return &FileEventReader{root} }
+func NewFileEventReader(root string) (*FileEventReader, error) {
+	path, err := domain.NewNormalizedPath(root)
+	if err != nil {
+		return nil, err
+	}
+	return &FileEventReader{root: path.String()}, nil
+}
 func (r *FileEventReader) ReadFrom(id domain.TaskID, from int) ([]EventRecord, error) {
 	p, e := newTaskPaths(r.root, id)
 	if e != nil {

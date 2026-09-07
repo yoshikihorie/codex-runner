@@ -163,13 +163,17 @@ func NewEvictLogsUseCase(logs LogStore, locks *CheckLivenessUseCase, policy LogE
 	return &EvictLogsUseCase{store: logs, locks: locks, policy: policy, paths: paths, logger: logger, dial: dialer.DialContext, pingTimeout: time.Second, tickers: realLogTickerFactory{}, lockFactory: storepkg.NewFileMutex}, nil
 }
 
-func DefaultLogPaths() (LogPaths, error) {
+func DefaultLogPaths(taskPlacementRoot string) (LogPaths, error) {
+	taskRoot, err := domain.NewNormalizedPath(taskPlacementRoot)
+	if err != nil {
+		return LogPaths{}, err
+	}
 	home, err := os.UserHomeDir()
 	if err != nil {
 		return LogPaths{}, fmt.Errorf("resolve user home directory: %w", err)
 	}
 	logs := filepath.Join(home, ".claude", "logs")
-	return LogPaths{LogsRoot: logs, CodexdLog: filepath.Join(logs, "codexd.log"), RouteFallback: filepath.Join(logs, "route-fallback.jsonl"), TaskLogsRoot: taskPlacementRoot, SocketPath: filepath.Join(home, ".claude", "run", "codexd.sock"), LockPath: filepath.Join(home, ".claude", "run", "log-eviction.lock")}, nil
+	return LogPaths{LogsRoot: logs, CodexdLog: filepath.Join(logs, "codexd.log"), RouteFallback: filepath.Join(logs, "route-fallback.jsonl"), TaskLogsRoot: taskRoot.String(), SocketPath: filepath.Join(home, ".claude", "run", "codexd.sock"), LockPath: filepath.Join(home, ".claude", "run", "log-eviction.lock")}, nil
 }
 
 func validateEvictLogsInput(in EvictLogsInput) error {

@@ -60,6 +60,89 @@ func TestBuildDependenciesWiresEvictWorkDirAtDefaultWorktreeRoot(t *testing.T) {
 	}
 }
 
+func TestBuildDependenciesWiresTaskPlacementRootToStoreAndResumeRecoverer(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatal(err)
+	}
+	customRoot := filepath.Join(home, "custom-tasks")
+	if err := os.Mkdir(customRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configPath := writeTestConfig(t, home)
+	contents, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(configPath, append(contents, []byte(fmt.Sprintf("task_placement_root = %q\n", customRoot))...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadExplicit(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	logsDir := filepath.Join(home, "logs")
+	if err := os.Mkdir(logsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	deps, err := buildDependencies(context.Background(), cfg, home, logsDir, func(string) error { return nil }, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	storeRoot := reflect.ValueOf(deps.taskStore).Elem().FieldByName("root").String()
+	recovererRoot := reflect.ValueOf(deps.resumeRecoverer).Elem().FieldByName("taskPlacementRoot").String()
+	if storeRoot != cfg.TaskPlacementRoot() {
+		t.Fatalf("task store root=%q, want %q", storeRoot, cfg.TaskPlacementRoot())
+	}
+	if recovererRoot != cfg.TaskPlacementRoot() {
+		t.Fatalf("resume recoverer root=%q, want %q", recovererRoot, cfg.TaskPlacementRoot())
+	}
+}
+
+func TestPrepareTaskPlacementRoot(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "tasks")
+	if err := prepareTaskPlacementRoot(root); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(root)
+	if err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("created root mode=%v err=%v", info.Mode(), err)
+	}
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := prepareTaskPlacementRoot(root); err != nil {
+		t.Fatal(err)
+	}
+	info, err = os.Stat(root)
+	if err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("repaired root mode=%v err=%v", info.Mode(), err)
+	}
+	for _, invalid := range []string{"", "relative", root + string(os.PathSeparator), root + "/../" + filepath.Base(root)} {
+		if err := prepareTaskPlacementRoot(invalid); err == nil {
+			t.Fatalf("accepted invalid root %q", invalid)
+		}
+	}
+}
+
+func TestPrepareTaskPlacementRootRejectsForeignOwnerWithoutChmod(t *testing.T) {
+	root := t.TempDir()
+	if err := os.Chmod(root, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	original := taskPlacementRootOwnerUID
+	taskPlacementRootOwnerUID = func(fs.FileInfo) (uint32, bool) { return uint32(os.Geteuid()) + 1, true }
+	t.Cleanup(func() { taskPlacementRootOwnerUID = original })
+	if err := prepareTaskPlacementRoot(root); err == nil {
+		t.Fatal("foreign-owned root was accepted")
+	}
+	info, err := os.Stat(root)
+	if err != nil || info.Mode().Perm() != 0o755 {
+		t.Fatalf("foreign root mode=%v err=%v", info.Mode(), err)
+	}
+}
+
 type statsReaderFake struct {
 	list func(string, *string, *string) ([]string, error)
 	open func(string) (io.ReadCloser, error)
@@ -665,9 +748,13 @@ func TestNewEvictLogsUseCaseBuildsConfiguredDaemonPaths(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	resolver, err := execution.NewLockPathResolver(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	liveness := execution.NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) {
 		return false, nil
-	}), execution.DefaultLockPathResolver)
+	}), resolver)
 	evictLogs, err := newEvictLogsUseCase(cfg, root, filepath.Join(root, "logs"), func(string) error { return nil }, liveness, slog.Default())
 	if err != nil {
 		t.Fatal(err)
@@ -707,9 +794,13 @@ func TestNewEvictLogsUseCaseReopensDaemonLogAfterAutomaticRotation(t *testing.T)
 	if _, err := writer.Write([]byte("seed\n")); err != nil {
 		t.Fatal(err)
 	}
+	resolver, err := execution.NewLockPathResolver(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	liveness := execution.NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) {
 		return false, nil
-	}), execution.DefaultLockPathResolver)
+	}), resolver)
 	evictLogs, err := newEvictLogsUseCase(cfg, root, logsDir, writer.Reopen, liveness, slog.Default())
 	if err != nil {
 		t.Fatal(err)

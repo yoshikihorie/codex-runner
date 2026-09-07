@@ -54,7 +54,14 @@ func newPathLockIntegrationFixture(t *testing.T, maxConcurrent int, maxConcurren
 		t.Fatal(err)
 	}
 	pathStore := store.NewPathLockFileStore(lockRoot)
-	acquire := execution.NewAcquirePathLockUseCase(store.NewFileMutex(filepath.Join(mutexRoot, "path-locks.lock")), pathStore, liveness, store.NormalizePath, tasks, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	resolveLockPath, err := execution.NewLockPathResolver(tasksRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquire, err := execution.NewAcquirePathLockUseCase(store.NewFileMutex(filepath.Join(mutexRoot, "path-locks.lock")), pathStore, liveness, store.NormalizePath, tasks, resolveLockPath, slog.New(slog.NewTextHandler(os.Stderr, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
 	releaser := execution.NewReleasePathLockUseCase(pathStore, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	queue, registry := execution.NewTaskQueue(), execution.NewActiveTaskRegistry()
 	const queueMaxDepth = 10
@@ -236,7 +243,7 @@ func TestSubmitPathLockIntegrationKeepsQueuedOwnerWithoutTaskLock(t *testing.T) 
 	if err := fixture.pathStore.Save(owner, []domain.NormalizedPath{normalized}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := os.Stat(filepath.Join("/tmp/codex-tasks", owner.String(), "task.lock")); !errors.Is(err, os.ErrNotExist) {
+	if _, err := os.Stat(filepath.Join(fixture.tasksRoot, owner.String(), "task.lock")); !errors.Is(err, os.ErrNotExist) {
 		t.Fatal("queued test owner unexpectedly has task.lock")
 	}
 	response := submitHandle(t, fixture.submit, implInput(t, "queued-conflict", path))

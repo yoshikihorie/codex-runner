@@ -279,7 +279,10 @@ func newSubmitLifecycleFixture(t *testing.T, model string, effort *string) (*Sub
 	}
 	admitter := &submitLifecycleAdmitter{}
 	clock := domain.ClockFunc(func() time.Time { return time.Date(2026, 8, 20, 12, 0, 0, 0, time.UTC) })
-	writer := contract.NewFileContractWriter(root, clock)
+	writer, err := contract.NewFileContractWriter(root, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
 	recordStarting := executionusecase.NewRecordTaskStartingUseCase(tasks, writer)
 	starter := &submitSynchronousStarter{start: func(payload execution.TaskLaunchPayload) {
 		taskJSON := filepath.Join(root, payload.Task.ID().String(), "task.json")

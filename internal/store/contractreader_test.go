@@ -25,9 +25,17 @@ func readerDir(t *testing.T) (string, domain.TaskID) {
 	}
 	return root, id
 }
+func newContractReader(t *testing.T, root string) *FileContractReader {
+	t.Helper()
+	r, err := NewFileContractReader(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
 func TestReadStderrLogExistsAndMissing(t *testing.T) {
 	root, id := readerDir(t)
-	r := NewFileContractReader(root)
+	r := newContractReader(t, root)
 	p, _ := StderrLogPath(root, id)
 	if err := os.WriteFile(p, []byte("stderr"), taskFilePerm); err != nil {
 		t.Fatal(err)
@@ -47,7 +55,7 @@ func TestReadStderrLogExistsAndMissing(t *testing.T) {
 }
 func TestContractReaderRejectsSymlinkedFile(t *testing.T) {
 	root, id := readerDir(t)
-	r := NewFileContractReader(root)
+	r := newContractReader(t, root)
 	target := filepath.Join(root, "target")
 	if err := os.WriteFile(target, []byte("secret"), taskFilePerm); err != nil {
 		t.Fatal(err)
@@ -62,7 +70,7 @@ func TestContractReaderRejectsSymlinkedFile(t *testing.T) {
 }
 func TestReadLastMessagePresenceAndContent(t *testing.T) {
 	root, id := readerDir(t)
-	r := NewFileContractReader(root)
+	r := newContractReader(t, root)
 	p := filepath.Join(root, id.String(), "last-message.md")
 	present, err := r.ReadLastMessage(id)
 	if err != nil || present {
@@ -97,7 +105,7 @@ func TestReadLastMessagePresenceAndContent(t *testing.T) {
 }
 func TestReadPromptContentAndExitCode(t *testing.T) {
 	root, id := readerDir(t)
-	r := NewFileContractReader(root)
+	r := newContractReader(t, root)
 	prompt, _ := PromptMDPath(root, id)
 	if err := os.WriteFile(prompt, []byte{0, 1, 2}, taskFilePerm); err != nil {
 		t.Fatal(err)
@@ -130,7 +138,7 @@ func TestReadPromptContentAndExitCode(t *testing.T) {
 }
 func TestReadPartialOutputContent(t *testing.T) {
 	root, id := readerDir(t)
-	r := NewFileContractReader(root)
+	r := newContractReader(t, root)
 	p, err := PartialOutputMDPath(root, id)
 	if err != nil {
 		t.Fatal(err)
@@ -163,7 +171,7 @@ func TestReadPartialOutputContent(t *testing.T) {
 }
 func TestContractReaderRejectsSymlinkedContractPaths(t *testing.T) {
 	root, id := readerDir(t)
-	r := NewFileContractReader(root)
+	r := newContractReader(t, root)
 	target := filepath.Join(root, "target")
 	if err := os.WriteFile(target, []byte("x"), taskFilePerm); err != nil {
 		t.Fatal(err)

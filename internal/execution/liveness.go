@@ -13,8 +13,6 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 )
 
-const taskPlacementRoot = "/tmp/codex-tasks"
-
 const (
 	existingLivenessLockRetryFirstWait  = 10 * time.Millisecond
 	existingLivenessLockRetrySecondWait = 30 * time.Millisecond
@@ -25,11 +23,16 @@ var flockFunc = func(f *os.File, how int) error {
 	return syscall.Flock(int(f.Fd()), how)
 }
 
-type lockPathResolver func(taskID domain.TaskID) string
+// LockPathResolver resolves a task's liveness-lock path.
+type LockPathResolver func(taskID domain.TaskID) string
 
-// DefaultLockPathResolver returns the standard liveness lock location for taskID.
-func DefaultLockPathResolver(taskID domain.TaskID) string {
-	return filepath.Join(taskPlacementRoot, taskID.String(), "task.lock")
+// NewLockPathResolver returns a liveness resolver rooted at a validated task placement path.
+func NewLockPathResolver(root string) (LockPathResolver, error) {
+	path, err := domain.NewNormalizedPath(root)
+	if err != nil {
+		return nil, err
+	}
+	return func(taskID domain.TaskID) string { return filepath.Join(path.String(), taskID.String(), "task.lock") }, nil
 }
 
 // AcquireForChild creates and exclusively locks a liveness lock for child inheritance.
@@ -82,11 +85,11 @@ func acquireExistingForChild(taskDirPath string, wait func(time.Duration)) (*os.
 // CheckLivenessUseCase checks whether a task liveness lock is currently unheld.
 type CheckLivenessUseCase struct {
 	lock            domain.LivenessLock
-	resolveLockPath lockPathResolver
+	resolveLockPath LockPathResolver
 }
 
 // NewCheckLivenessUseCase constructs a liveness query with injected dependencies.
-func NewCheckLivenessUseCase(lock domain.LivenessLock, resolveLockPath lockPathResolver) *CheckLivenessUseCase {
+func NewCheckLivenessUseCase(lock domain.LivenessLock, resolveLockPath LockPathResolver) *CheckLivenessUseCase {
 	return &CheckLivenessUseCase{lock: lock, resolveLockPath: resolveLockPath}
 }
 

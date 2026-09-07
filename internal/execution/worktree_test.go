@@ -236,7 +236,7 @@ func newTestUseCase(t *testing.T, store *fakeWorktreeStore, liveness func(string
 	t.Helper()
 	root := t.TempDir()
 	locks := NewCheckLivenessUseCase(domain.LivenessLockFunc(liveness), func(id domain.TaskID) string { return id.String() })
-	uc, err := NewEvictWorkDirUseCase(store, locks, root)
+	uc, err := NewEvictWorkDirUseCase(store, locks, root, root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -323,7 +323,7 @@ func TestEvictWorkDirExplicitRecheckSkipsRevivedCandidateAndDeletesOtherCandidat
 		calls[id]++
 		return id != testWorktreeTaskID || calls[id] == 1, nil
 	}), func(id domain.TaskID) string { return id.String() })
-	uc, err := NewEvictWorkDirUseCase(store, locks, root)
+	uc, err := NewEvictWorkDirUseCase(store, locks, root, root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -349,7 +349,7 @@ func TestEvictWorkDirLivenessErrors(t *testing.T) {
 		t.Fatalf("not found = %#v, %v", candidates, err)
 	}
 	locks := NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return false, errors.New("io") }), func(id domain.TaskID) string { return id.String() })
-	uc, err = NewEvictWorkDirUseCase(store, locks, root)
+	uc, err = NewEvictWorkDirUseCase(store, locks, root, root)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -488,7 +488,7 @@ func TestEvictWorkDirLogsLivenessAndSymlinkErrors(t *testing.T) {
 	brokenSymlinkCheck := filepath.Join(root, testWorktreeTaskID)
 	livenessFailed := filepath.Join(root, "impl-20260808-120001-abcd-cleanup")
 	locks := NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return false, errors.New("lock read failed") }), func(id domain.TaskID) string { return id.String() })
-	uc, err := NewEvictWorkDirUseCase(store, locks, root, slog.New(slog.NewTextHandler(&logs, nil)))
+	uc, err := NewEvictWorkDirUseCase(store, locks, root, root, slog.New(slog.NewTextHandler(&logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -511,7 +511,7 @@ func TestEvictWorkDirRemoveFailureContinuesAndLogs(t *testing.T) {
 	store := &fakeWorktreeStore{changes: map[string]bool{}, mtime: map[string]time.Time{}, links: map[string]bool{}, errs: map[string]error{}}
 	root := t.TempDir()
 	locks := NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }), func(id domain.TaskID) string { return id.String() })
-	uc, err := NewEvictWorkDirUseCase(store, locks, root, slog.New(slog.NewTextHandler(&logs, nil)))
+	uc, err := NewEvictWorkDirUseCase(store, locks, root, root, slog.New(slog.NewTextHandler(&logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -534,7 +534,7 @@ func TestEvictWorkDirLogsAgeErrorAndRejectedPath(t *testing.T) {
 	store := &fakeWorktreeStore{changes: map[string]bool{}, mtime: map[string]time.Time{}, links: map[string]bool{}, errs: map[string]error{}}
 	root := t.TempDir()
 	locks := NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }), func(id domain.TaskID) string { return id.String() })
-	uc, err := NewEvictWorkDirUseCase(store, locks, root, slog.New(slog.NewTextHandler(&logs, nil)))
+	uc, err := NewEvictWorkDirUseCase(store, locks, root, root, slog.New(slog.NewTextHandler(&logs, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -613,7 +613,8 @@ func TestEvictWorkDirHoldsDeathLeaseAndWritesMarkerBeforeRemove(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	taskDir := filepath.Join(taskPlacementRoot, id.String())
+	taskRoot := t.TempDir()
+	taskDir := filepath.Join(taskRoot, id.String())
 	if err := os.MkdirAll(taskDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -627,7 +628,7 @@ func TestEvictWorkDirHoldsDeathLeaseAndWritesMarkerBeforeRemove(t *testing.T) {
 	path := filepath.Join(root, id.String())
 	store.mtime[path] = validInput(TriggerExplicit).OccurredAt
 	store.onRemove = func(string) {
-		if _, err := os.Lstat(worktreeEvictionMarkerPath(id)); err != nil {
+		if _, err := os.Lstat(filepath.Join(taskDir, worktreeEvictionMarkerName)); err != nil {
 			t.Errorf("marker unavailable during Remove: %v", err)
 		}
 		other, err := os.OpenFile(lockPath, os.O_RDWR, 0)
@@ -641,7 +642,7 @@ func TestEvictWorkDirHoldsDeathLeaseAndWritesMarkerBeforeRemove(t *testing.T) {
 		}
 	}
 	locks := NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }), func(domain.TaskID) string { return lockPath })
-	uc, err := NewEvictWorkDirUseCase(store, locks, root)
+	uc, err := NewEvictWorkDirUseCase(store, locks, root, taskRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -664,7 +665,8 @@ func TestEvictWorkDirSkipsCandidateWhenDeathLeaseIsHeld(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	taskDir := filepath.Join(taskPlacementRoot, id.String())
+	taskRoot := t.TempDir()
+	taskDir := filepath.Join(taskRoot, id.String())
 	if err := os.MkdirAll(taskDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -684,7 +686,7 @@ func TestEvictWorkDirSkipsCandidateWhenDeathLeaseIsHeld(t *testing.T) {
 	path := filepath.Join(root, id.String())
 	store.mtime[path] = validInput(TriggerExplicit).OccurredAt
 	locks := NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }), func(domain.TaskID) string { return lockPath })
-	uc, err := NewEvictWorkDirUseCase(store, locks, root)
+	uc, err := NewEvictWorkDirUseCase(store, locks, root, taskRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -700,7 +702,8 @@ func TestEvictWorkDirRetainsMarkerAndReleasesDeathLeaseAfterRemoveFailure(t *tes
 	if err != nil {
 		t.Fatal(err)
 	}
-	taskDir := filepath.Join(taskPlacementRoot, id.String())
+	taskRoot := t.TempDir()
+	taskDir := filepath.Join(taskRoot, id.String())
 	if err := os.MkdirAll(taskDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -716,7 +719,7 @@ func TestEvictWorkDirRetainsMarkerAndReleasesDeathLeaseAfterRemoveFailure(t *tes
 	store.mtime[path] = validInput(TriggerExplicit).OccurredAt
 	store.errs["remove:"+path] = errors.New("remove failed")
 	locks := NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }), func(domain.TaskID) string { return lockPath })
-	uc, err := NewEvictWorkDirUseCase(store, locks, root)
+	uc, err := NewEvictWorkDirUseCase(store, locks, root, taskRoot)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -725,7 +728,7 @@ func TestEvictWorkDirRetainsMarkerAndReleasesDeathLeaseAfterRemoveFailure(t *tes
 	if err != nil || len(out.Deleted) != 0 || len(out.Skipped) != 1 || out.Skipped[0].Reason != WorktreeSkipRemoveFailed {
 		t.Fatalf("Execute() = %#v, %v", out, err)
 	}
-	if _, err := os.Lstat(worktreeEvictionMarkerPath(id)); err != nil {
+	if _, err := os.Lstat(filepath.Join(taskDir, worktreeEvictionMarkerName)); err != nil {
 		t.Fatalf("marker was not retained after remove failure: %v", err)
 	}
 	other, err := os.OpenFile(lockPath, os.O_RDWR, 0)
@@ -790,7 +793,8 @@ func TestEvictWorkDirHandlesMissingDeathLockTaskDirectoryStates(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			taskDir := filepath.Join(taskPlacementRoot, id.String())
+			taskRoot := t.TempDir()
+			taskDir := filepath.Join(taskRoot, id.String())
 			if err := os.RemoveAll(taskDir); err != nil {
 				t.Fatal(err)
 			}
@@ -804,7 +808,7 @@ func TestEvictWorkDirHandlesMissingDeathLockTaskDirectoryStates(t *testing.T) {
 			path := filepath.Join(root, id.String())
 			store.mtime[path] = validInput(TriggerExplicit).OccurredAt
 			locks := NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }), func(domain.TaskID) string { return filepath.Join(taskDir, "task.lock") })
-			uc, err := NewEvictWorkDirUseCase(store, locks, root)
+			uc, err := NewEvictWorkDirUseCase(store, locks, root, taskRoot)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -813,16 +817,17 @@ func TestEvictWorkDirHandlesMissingDeathLockTaskDirectoryStates(t *testing.T) {
 			if err != nil || (len(out.Deleted) == 1) != tt.wantDelete || len(out.Skipped) != 0 {
 				t.Fatalf("Execute() = %#v, err=%v", out, err)
 			}
-			_, markerErr := os.Lstat(worktreeEvictionMarkerPath(id))
+			markerPath := filepath.Join(taskDir, worktreeEvictionMarkerName)
+			_, markerErr := os.Lstat(markerPath)
 			if (markerErr == nil) != tt.wantMarker {
 				t.Fatalf("marker error = %v, want marker=%t", markerErr, tt.wantMarker)
 			}
 			if tt.wantMarker {
-				info, err := os.Stat(worktreeEvictionMarkerPath(id))
+				info, err := os.Stat(markerPath)
 				if err != nil || info.Mode().Perm() != 0o600 {
 					t.Fatalf("marker info = (%v, %v), want mode 600", info, err)
 				}
-				if data, err := os.ReadFile(worktreeEvictionMarkerPath(id)); err != nil || len(data) != 0 {
+				if data, err := os.ReadFile(markerPath); err != nil || len(data) != 0 {
 					t.Fatalf("marker data = %q, err=%v", data, err)
 				}
 			}
@@ -835,7 +840,8 @@ func TestEvictWorkDirDoesNotRemoveWhenMarkerWriteFails(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	taskDir := filepath.Join(taskPlacementRoot, id.String())
+	taskRoot := t.TempDir()
+	taskDir := filepath.Join(taskRoot, id.String())
 	if err := os.MkdirAll(taskDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
@@ -854,7 +860,7 @@ func TestEvictWorkDirDoesNotRemoveWhenMarkerWriteFails(t *testing.T) {
 	path := filepath.Join(root, id.String())
 	store.mtime[path] = validInput(TriggerExplicit).OccurredAt
 	locks := NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }), func(domain.TaskID) string { return lockPath })
-	uc, err := NewEvictWorkDirUseCase(store, locks, root, slog.New(slog.NewTextHandler(&logOutput, nil)))
+	uc, err := NewEvictWorkDirUseCase(store, locks, root, taskRoot, slog.New(slog.NewTextHandler(&logOutput, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -863,7 +869,7 @@ func TestEvictWorkDirDoesNotRemoveWhenMarkerWriteFails(t *testing.T) {
 	if err != nil || len(store.removed) != 0 || len(out.Deleted) != 0 || len(out.Skipped) != 0 {
 		t.Fatalf("Execute() = %#v, removed=%v, err=%v", out, store.removed, err)
 	}
-	if !bytes.Contains(logOutput.Bytes(), []byte(id.String())) || !bytes.Contains(logOutput.Bytes(), []byte(worktreeEvictionMarkerPath(id))) || !bytes.Contains(logOutput.Bytes(), []byte("marker write failed")) {
+	if !bytes.Contains(logOutput.Bytes(), []byte(id.String())) || !bytes.Contains(logOutput.Bytes(), []byte(filepath.Join(taskDir, worktreeEvictionMarkerName))) || !bytes.Contains(logOutput.Bytes(), []byte("marker write failed")) {
 		t.Fatalf("marker write failure log = %q", logOutput.String())
 	}
 }

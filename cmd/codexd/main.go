@@ -72,7 +72,6 @@ const (
 const socketRecoveryConnectTimeout = time.Duration(clientDefaultConnectTimeoutSeconds) * time.Second
 
 const (
-	taskPlacementRoot = "/tmp/codex-tasks"
 	reconcileInterval = time.Minute
 	// Canonical source: WORKTREE_CLEANUP_INTERVAL_SECONDS in validation-rules.yaml.
 	evictWorkDirInterval = time.Duration(3600) * time.Second
@@ -679,6 +678,7 @@ func runMain(ctx context.Context, args []string, stderr io.Writer) error {
 		fmt.Fprintln(stderr, safeConfigErrorMessage(err))
 		return &reportedError{cause: err}
 	}
+	taskPlacementRoot := cfg.TaskPlacementRoot()
 	managedRunDir := filepath.Join(home, ".claude", "run")
 	if err := ensureManagedPrivateDir(managedRunDir); err != nil {
 		return err
@@ -690,7 +690,7 @@ func runMain(ctx context.Context, args []string, stderr io.Writer) error {
 		return &reportedError{cause: fmt.Errorf("acquire daemon instance lock (another codexd may be running): %w", err)}
 	}
 	defer func() { _ = daemonLease.Unlock() }()
-	if err := ensureManagedPrivateDir(taskPlacementRoot); err != nil {
+	if err := prepareTaskPlacementRoot(taskPlacementRoot); err != nil {
 		return err
 	}
 	if err := ensureSocketParent(filepath.Dir(cfg.SocketPath()), managedRunDir); err != nil {
@@ -756,6 +756,8 @@ func runMain(ctx context.Context, args []string, stderr io.Writer) error {
 }
 
 type daemonDependencies struct {
+	taskStore       *store.FileTaskStore
+	resumeRecoverer recovery.Recoverer
 	adoption        *recovery.AdoptRunningTasksUseCase
 	stall           interface{ Run(context.Context) }
 	reconcile       *recovery.ReconcilePendingUseCase
@@ -773,14 +775,25 @@ type daemonDependencies struct {
 func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir string, reopenLog func(string) error, logger *slog.Logger) (daemonDependencies, error) {
 	clock := domain.ClockFunc(time.Now)
 	notifier := execution.NewTaskChangeNotifier()
+	taskPlacementRoot := cfg.TaskPlacementRoot()
 	rawTasks, err := store.NewFileTaskStore(taskPlacementRoot)
 	if err != nil {
 		return daemonDependencies{}, err
 	}
 	tasks := execution.NewNotifyingTaskStore(rawTasks, notifier)
-	writer := execution.NewNotifyingContractWriter(contract.NewFileContractWriter(taskPlacementRoot, clock), notifier)
-	reader := store.NewFileContractReader(taskPlacementRoot)
-	events := store.NewFileEventReader(taskPlacementRoot)
+	rawWriter, err := contract.NewFileContractWriter(taskPlacementRoot, clock)
+	if err != nil {
+		return daemonDependencies{}, err
+	}
+	writer := execution.NewNotifyingContractWriter(rawWriter, notifier)
+	reader, err := store.NewFileContractReader(taskPlacementRoot)
+	if err != nil {
+		return daemonDependencies{}, err
+	}
+	events, err := store.NewFileEventReader(taskPlacementRoot)
+	if err != nil {
+		return daemonDependencies{}, err
+	}
 	taskMu := store.NewTaskMutex()
 	queueMu := &sync.Mutex{}
 	queue := execution.NewTaskQueue()
@@ -795,12 +808,19 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	}
 	pathStore := store.NewPathLockFileStore(pathLocksDir)
 	livenessLock := domain.LivenessLockFunc(store.TryAcquireLiveness)
-	liveness := execution.NewCheckLivenessUseCase(livenessLock, execution.DefaultLockPathResolver)
+	resolveLockPath, err := execution.NewLockPathResolver(taskPlacementRoot)
+	if err != nil {
+		return daemonDependencies{}, err
+	}
+	liveness := execution.NewCheckLivenessUseCase(livenessLock, resolveLockPath)
 	evictLogs, err := newEvictLogsUseCase(cfg, home, logsDir, reopenLog, liveness, logger)
 	if err != nil {
 		return daemonDependencies{}, err
 	}
-	pathAcquire := execution.NewAcquirePathLockUseCase(store.NewFileMutex(pathLocksMutexPath), pathStore, livenessLock, store.NormalizePath, tasks, logger)
+	pathAcquire, err := execution.NewAcquirePathLockUseCase(store.NewFileMutex(pathLocksMutexPath), pathStore, livenessLock, store.NormalizePath, tasks, resolveLockPath, logger)
+	if err != nil {
+		return daemonDependencies{}, err
+	}
 	pathRelease := execution.NewReleasePathLockUseCase(pathStore, logger)
 	processRunner := execution.NewProcessRunner(writer, logger)
 	validator := recovery.NewProcessSignalAuthorityValidator(tasks, taskMu, ownership)
@@ -817,7 +837,11 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	slots := usecase.NewSlotReleaser(advance, starter, logger)
 	partial := recovery.NewSavePartialOutputUseCase(reader, writer, logger)
 	recoveryOwnership := recovery.NewRecoveryOwnershipRegistry()
-	resume := recovery.NewRecoverViaResumeUseCase(tasks, writer, recovery.NewResumeRecoverer(execution.NewResumeLauncher(processRunner, logger), reader, cfg.CodexBinaryPath(), taskPlacementRoot, clock), partial, slots, metricRecorder, stalled, taskMu, clock, logger).WithRecoveryOwnership(recoveryOwnership)
+	resumeRecoverer, err := recovery.NewResumeRecoverer(execution.NewResumeLauncher(processRunner, logger), reader, cfg.CodexBinaryPath(), taskPlacementRoot, clock)
+	if err != nil {
+		return daemonDependencies{}, err
+	}
+	resume := recovery.NewRecoverViaResumeUseCase(tasks, writer, resumeRecoverer, partial, slots, metricRecorder, stalled, taskMu, clock, logger).WithRecoveryOwnership(recoveryOwnership)
 	enforce := execution.NewEnforceTaskTimeoutUseCase(tasks, writer, processRunner, resume, termination, validator, pending, pathRelease, taskMu, clock, stalled)
 	watcher := execution.NewTimeoutWatcher(enforce, clock, afterFuncTimerFactory{}, baseCtx, logger)
 	finalize := execution.NewFinalizeTaskUseCase(tasks, writer, reader, clock, taskMu, slots, watcher, pathRelease, metricRecorder, stalled, logger)
@@ -831,7 +855,7 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	if err != nil {
 		return daemonDependencies{}, err
 	}
-	evictWorkDir, err := execution.NewEvictWorkDirUseCase(store.NewWorktreeFileStore(), liveness, worktreeRoot, logger)
+	evictWorkDir, err := execution.NewEvictWorkDirUseCase(store.NewWorktreeFileStore(), liveness, worktreeRoot, taskPlacementRoot, logger)
 	if err != nil {
 		return daemonDependencies{}, err
 	}
@@ -870,7 +894,7 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 		result.socketRemoveErr = removeOwnedSocket(cfg.SocketPath(), expected)
 		return result
 	}
-	return daemonDependencies{adoption: adoption, stall: stall, reconcile: reconcile, evictLogs: evictLogs, evictWorkDir: evictWorkDir, watcher: watcher, starter: starter, shutdownStarter: starterConcrete.Shutdown, finalizer: transport.NewShutdownFinalizer(connections, tailConns, acceptDone), serve: serve}, nil
+	return daemonDependencies{taskStore: rawTasks, resumeRecoverer: resumeRecoverer, adoption: adoption, stall: stall, reconcile: reconcile, evictLogs: evictLogs, evictWorkDir: evictWorkDir, watcher: watcher, starter: starter, shutdownStarter: starterConcrete.Shutdown, finalizer: transport.NewShutdownFinalizer(connections, tailConns, acceptDone), serve: serve}, nil
 }
 
 func newEvictLogsUseCase(cfg config.Config, home, logsDir string, reopenLog func(string) error, liveness *execution.CheckLivenessUseCase, logger *slog.Logger) (*execution.EvictLogsUseCase, error) {
@@ -886,7 +910,7 @@ func newEvictLogsUseCase(cfg config.Config, home, logsDir string, reopenLog func
 		LogsRoot:      logsDir,
 		CodexdLog:     filepath.Join(logsDir, daemonLogFileName),
 		RouteFallback: filepath.Join(logsDir, routeFallbackLogFileName),
-		TaskLogsRoot:  taskPlacementRoot,
+		TaskLogsRoot:  cfg.TaskPlacementRoot(),
 		SocketPath:    cfg.SocketPath(),
 		LockPath:      filepath.Join(home, ".claude", "run", logEvictionLockFileName),
 	}
@@ -1090,6 +1114,36 @@ func ensureManagedPrivateDir(path string) error {
 		return fmt.Errorf("secure runtime directory: %w", err)
 	}
 	return nil
+}
+
+var taskPlacementRootOwnerUID = func(info fs.FileInfo) (uint32, bool) {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return stat.Uid, true
+}
+
+func prepareTaskPlacementRoot(root string) error {
+	path, err := domain.NewNormalizedPath(root)
+	if err != nil {
+		return fmt.Errorf("validate task placement root: %w", err)
+	}
+	info, err := os.Lstat(path.String())
+	if errors.Is(err, fs.ErrNotExist) {
+		return ensureManagedPrivateDir(path.String())
+	}
+	if err != nil {
+		return fmt.Errorf("inspect task placement root: %w", err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return fmt.Errorf("task placement root is not a real directory")
+	}
+	ownerUID, ok := taskPlacementRootOwnerUID(info)
+	if !ok || ownerUID != uint32(os.Geteuid()) {
+		return fmt.Errorf("task placement root is not owned by the effective user")
+	}
+	return ensureManagedPrivateDir(path.String())
 }
 
 func ensureSocketParent(parent, managedRunDir string) error {

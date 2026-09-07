@@ -32,8 +32,20 @@ func pathLockIDs(t *testing.T) (domain.TaskID, domain.TaskID) {
 	return owner, requester
 }
 
-func livePathLockAcquirer(locks PathLockStore) *AcquirePathLockUseCase {
-	return NewAcquirePathLockUseCase(&pathLockTestMutex{}, locks, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), store.NormalizePath, pathLockTaskStateReaderFake{})
+func pathLockTestResolver(domain.TaskID) string { return "/private/tmp/pathlock-test/task.lock" }
+
+func mustNewAcquirePathLockUseCase(t *testing.T, mutex PathLockMutex, locks PathLockStore, liveness domain.LivenessLock, normalize normalizePathFunc, tasks PathLockTaskStateReader, loggers ...*slog.Logger) *AcquirePathLockUseCase {
+	t.Helper()
+	uc, err := NewAcquirePathLockUseCase(mutex, locks, liveness, normalize, tasks, pathLockTestResolver, loggers...)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return uc
+}
+
+func livePathLockAcquirer(t *testing.T, locks PathLockStore) *AcquirePathLockUseCase {
+	t.Helper()
+	return mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, locks, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), store.NormalizePath, pathLockTaskStateReaderFake{})
 }
 
 type pathLockTestMutex struct {
@@ -98,7 +110,7 @@ func TestAcquirePathLockUseCaseDisambiguatesMissingTaskLockWithTaskState(t *test
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{path.String()}}}}
-			uc := NewAcquirePathLockUseCase(&pathLockTestMutex{}, store, domain.LivenessLockFunc(func(string) (bool, error) { return false, fs.ErrNotExist }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{snapshot: domain.TaskSnapshot{State: tc.state}, err: tc.loadErr})
+			uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, store, domain.LivenessLockFunc(func(string) (bool, error) { return false, fs.ErrNotExist }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{snapshot: domain.TaskSnapshot{State: tc.state}, err: tc.loadErr})
 			out, acquireErr := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{path.String()}})
 			if acquireErr != nil || out.Acquired == tc.conflicted {
 				t.Fatalf("Execute=(%+v,%v)", out, acquireErr)
@@ -129,7 +141,7 @@ func TestAcquirePathLockSymlinkConflictWithLiveOwner_SCNLock0105(t *testing.T) {
 		t.Fatal(err)
 	}
 	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{realFile}}}}
-	out, err := livePathLockAcquirer(locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{filepath.Join(alias, "file.go")}})
+	out, err := livePathLockAcquirer(t, locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{filepath.Join(alias, "file.go")}})
 	if err != nil || out.Acquired || out.ConflictingTaskID == nil || *out.ConflictingTaskID != owner || locks.saved || len(locks.deleted) != 0 {
 		t.Fatalf("out=%+v err=%v store=%+v", out, err, locks)
 	}
@@ -142,7 +154,7 @@ func TestAcquirePathLockTrailingSeparatorConflictWithLiveOwner_SCNLock0106(t *te
 		t.Fatal(err)
 	}
 	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{dir + string(filepath.Separator)}}}}
-	out, err := livePathLockAcquirer(locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{dir}})
+	out, err := livePathLockAcquirer(t, locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{dir}})
 	if err != nil || out.Acquired || locks.saved || len(locks.deleted) != 0 {
 		t.Fatalf("out=%+v err=%v store=%+v", out, err, locks)
 	}
@@ -172,7 +184,7 @@ func TestAcquirePathLockMacOSCaseFoldConflictWithLiveOwner_SCNLock0107(t *testin
 		}
 	}
 	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{upperFile}}}}
-	out, err := livePathLockAcquirer(locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{lowerFile}})
+	out, err := livePathLockAcquirer(t, locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{lowerFile}})
 	if err != nil || out.Acquired || locks.saved || len(locks.deleted) != 0 {
 		t.Fatalf("out=%+v err=%v store=%+v", out, err, locks)
 	}
@@ -224,9 +236,9 @@ func TestAcquirePathLockConcurrentDisjointRequestsSerializeAndBothSucceed_SCNLoc
 	owner, requester := pathLockIDs(t)
 	locks := &pathLockConcurrentStore{firstSave: make(chan struct{}), allowFirstSave: make(chan struct{})}
 	mutexPath := filepath.Join(root, "path-locks.lock")
-	first := NewAcquirePathLockUseCase(store.NewFileMutex(mutexPath), locks, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), store.NormalizePath, pathLockTaskStateReaderFake{})
+	first := mustNewAcquirePathLockUseCase(t, store.NewFileMutex(mutexPath), locks, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), store.NormalizePath, pathLockTaskStateReaderFake{})
 	secondMutex := &pathLockNotifyingMutex{mutex: store.NewFileMutex(mutexPath), attempted: make(chan struct{})}
-	second := NewAcquirePathLockUseCase(secondMutex, locks, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), store.NormalizePath, pathLockTaskStateReaderFake{})
+	second := mustNewAcquirePathLockUseCase(t, secondMutex, locks, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), store.NormalizePath, pathLockTaskStateReaderFake{})
 	results := make(chan AcquirePathLockOutput, 2)
 	errs := make(chan error, 2)
 	go func() {
@@ -297,7 +309,7 @@ func TestAcquirePathLockUseCaseFailsClosedWhenTaskStateReadFails(t *testing.T) {
 	requester, _ := domain.NewTaskID("impl-20260809-120001-a1b2-requester")
 	path, _ := domain.NewNormalizedPath(t.TempDir())
 	store := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{path.String()}}}}
-	uc := NewAcquirePathLockUseCase(&pathLockTestMutex{}, store, domain.LivenessLockFunc(func(string) (bool, error) { return false, fs.ErrNotExist }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{err: errors.New("task store unavailable")})
+	uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, store, domain.LivenessLockFunc(func(string) (bool, error) { return false, fs.ErrNotExist }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{err: errors.New("task store unavailable")})
 	_, err := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{path.String()}})
 	var liveness *LivenessCheckError
 	if !errors.Is(err, domain.ErrPathLockInfraFailure) || errors.As(err, &liveness) || len(store.deleted) != 0 || store.saved {
@@ -310,7 +322,7 @@ func TestAcquirePathLockUseCaseConflictLogOmitsPath(t *testing.T) {
 	requester, _ := domain.NewTaskID("impl-20260809-120001-a1b2-requester")
 	path, _ := domain.NewNormalizedPath("/tmp/" + pathLockLogCanary + "/conflict")
 	capture := &logCapture{}
-	uc := NewAcquirePathLockUseCase(&pathLockTestMutex{}, &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{path.String()}}}}, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{}, slog.New(capture))
+	uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{path.String()}}}}, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{}, slog.New(capture))
 	out, err := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{path.String()}})
 	if err != nil || out.Acquired || out.ConflictingPath == nil || out.ConflictingPath.String() != path.String() {
 		t.Fatalf("Execute=(%+v,%v)", out, err)
@@ -341,7 +353,7 @@ func TestAcquirePathLockUseCaseConflictAndEmptyRequest(t *testing.T) {
 	mutex := &pathLockTestMutex{}
 	store := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: first, OwnedPaths: []string{path.String()}}}}
 	normalize := func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }
-	uc := NewAcquirePathLockUseCase(mutex, store, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), normalize, pathLockTaskStateReaderFake{})
+	uc := mustNewAcquirePathLockUseCase(t, mutex, store, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), normalize, pathLockTaskStateReaderFake{})
 	out, err := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: second, RequestedPaths: []string{path.String()}})
 	if err != nil || out.Acquired || out.ConflictingTaskID == nil {
 		t.Fatalf("conflict result = (%+v, %v)", out, err)
@@ -381,8 +393,13 @@ func TestAcquirePathLockUseCaseRepairsOwnerWhenTaskLockIsMissing(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	lockPath := taskLockPath(staleTaskID)
-	if err := os.MkdirAll("/tmp/codex-tasks/"+staleTaskID.String(), 0o700); err != nil {
+	tasksRoot := t.TempDir()
+	resolver, err := NewLockPathResolver(tasksRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lockPath := resolver(staleTaskID)
+	if err := os.MkdirAll(filepath.Join(tasksRoot, staleTaskID.String()), 0o700); err != nil {
 		t.Fatal(err)
 	}
 	lockFile, err := os.Create(lockPath)
@@ -395,10 +412,9 @@ func TestAcquirePathLockUseCaseRepairsOwnerWhenTaskLockIsMissing(t *testing.T) {
 	if err := os.Remove(lockPath); err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.RemoveAll("/tmp/codex-tasks/" + staleTaskID.String()) })
 
 	normalize := func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }
-	uc := NewAcquirePathLockUseCase(
+	uc := mustNewAcquirePathLockUseCase(t,
 		&pathLockTestMutex{},
 		pathStore,
 		domain.LivenessLockFunc(func(string) (bool, error) { return false, fs.ErrNotExist }),
@@ -415,6 +431,20 @@ func TestAcquirePathLockUseCaseRepairsOwnerWhenTaskLockIsMissing(t *testing.T) {
 	}
 	if len(locks) != 1 || locks[0].TaskID != newTaskID {
 		t.Fatalf("locks after repair = %+v", locks)
+	}
+}
+
+func TestNewAcquirePathLockUseCaseRejectsNilResolver(t *testing.T) {
+	_, err := NewAcquirePathLockUseCase(
+		&pathLockTestMutex{},
+		&pathLockTestStore{},
+		domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }),
+		store.NormalizePath,
+		pathLockTaskStateReaderFake{},
+		nil,
+	)
+	if err == nil {
+		t.Fatal("nil resolver was accepted")
 	}
 }
 
@@ -436,7 +466,7 @@ func TestAcquirePathLockUseCaseDoesNotRepairBeforeAllLivenessChecksSucceed(t *te
 		{TaskID: unknownTaskID, OwnedPaths: []string{path.String()}},
 	}}
 	checks := 0
-	uc := NewAcquirePathLockUseCase(
+	uc := mustNewAcquirePathLockUseCase(t,
 		&pathLockTestMutex{},
 		store,
 		domain.LivenessLockFunc(func(string) (bool, error) {
@@ -470,7 +500,7 @@ func TestAcquirePathLockUseCaseAcquireReturnsTypedConflict(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	uc := NewAcquirePathLockUseCase(&pathLockTestMutex{}, &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{path.String()}}}}, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{})
+	uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{path.String()}}}}, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{})
 	_, err = uc.Acquire(requester, []string{path.String()})
 	if !errors.Is(err, domain.ErrPathLockConflict) {
 		t.Fatalf("errors.Is conflict = false: %v", err)
@@ -496,7 +526,7 @@ func TestAcquirePathLockUseCaseAcquireReturnsTypedLivenessError(t *testing.T) {
 	}
 	original := errors.New("liveness failure")
 	store := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{path.String()}}}}
-	uc := NewAcquirePathLockUseCase(&pathLockTestMutex{}, store, domain.LivenessLockFunc(func(string) (bool, error) { return false, original }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{})
+	uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, store, domain.LivenessLockFunc(func(string) (bool, error) { return false, original }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{})
 	_, err = uc.Acquire(requester, []string{path.String()})
 	var liveness *LivenessCheckError
 	if !errors.As(err, &liveness) || liveness.TaskID != owner || !errors.Is(err, original) || errors.Is(err, domain.ErrPathLockInfraFailure) {
@@ -539,7 +569,7 @@ func TestAcquirePathLockUseCaseInfrastructureFailuresAreSentinelErrors(t *testin
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			uc := NewAcquirePathLockUseCase(tc.mutex, tc.store, domain.LivenessLockFunc(func(string) (bool, error) { return tc.dead, nil }), tc.normalize, pathLockTaskStateReaderFake{})
+			uc := mustNewAcquirePathLockUseCase(t, tc.mutex, tc.store, domain.LivenessLockFunc(func(string) (bool, error) { return tc.dead, nil }), tc.normalize, pathLockTaskStateReaderFake{})
 			paths, acquireErr := uc.Acquire(taskID, []string{path.String()})
 			if !errors.Is(acquireErr, domain.ErrPathLockInfraFailure) || paths != nil {
 				t.Fatalf("Acquire=(%v,%v)", paths, acquireErr)
@@ -559,7 +589,7 @@ func TestAcquirePathLockUseCaseKeepsSuccessAfterUnlockFailure(t *testing.T) {
 	}
 	mutex := &pathLockTestMutex{unlockErr: errors.New("unlock failure")}
 	store := &pathLockTestStore{}
-	uc := NewAcquirePathLockUseCase(mutex, store, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{})
+	uc := mustNewAcquirePathLockUseCase(t, mutex, store, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{})
 	paths, err := uc.Acquire(taskID, []string{path.String()})
 	if err != nil || !mutex.unlocked || !store.saved || !reflect.DeepEqual(paths, store.savedPaths) {
 		t.Fatalf("Acquire=(%v,%v), saved=%v", paths, err, store.savedPaths)
@@ -575,7 +605,7 @@ func TestAcquirePathLockUseCaseKeepsEmptySuccessAfterUnlockFailure(t *testing.T)
 	mutex := &pathLockTestMutex{unlockErr: errors.New("unlock failure")}
 	pathStore := &pathLockTestStore{}
 	capture := &logCapture{}
-	uc := NewAcquirePathLockUseCase(mutex, pathStore, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{}, slog.New(capture))
+	uc := mustNewAcquirePathLockUseCase(t, mutex, pathStore, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{}, slog.New(capture))
 	paths, err := uc.Acquire(taskID, nil)
 	if err != nil || len(paths) != 0 || pathStore.saved || len(pathStore.deleted) != 0 || !mutex.unlocked {
 		t.Fatal("empty acquisition did not retain success after unlock failure")
@@ -632,7 +662,7 @@ func TestAcquirePathLockUseCaseLogsFailureStages(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			mutex, pathStore, liveness, normalize := tc.build()
 			capture := &logCapture{}
-			uc := NewAcquirePathLockUseCase(mutex, pathStore, liveness, normalize, pathLockTaskStateReaderFake{}, slog.New(capture))
+			uc := mustNewAcquirePathLockUseCase(t, mutex, pathStore, liveness, normalize, pathLockTaskStateReaderFake{}, slog.New(capture))
 			_, acquireErr := uc.Acquire(requester, []string{requestedPath})
 			if !errors.Is(acquireErr, domain.ErrPathLockInfraFailure) {
 				t.Fatal("expected path-lock infrastructure failure")
@@ -644,7 +674,7 @@ func TestAcquirePathLockUseCaseLogsFailureStages(t *testing.T) {
 	t.Run("liveness", func(t *testing.T) {
 		capture := &logCapture{}
 		pathStore := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{storedPath}}}}
-		uc := NewAcquirePathLockUseCase(&pathLockTestMutex{}, pathStore, domain.LivenessLockFunc(func(string) (bool, error) { return false, rawFailure }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{}, slog.New(capture))
+		uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, pathStore, domain.LivenessLockFunc(func(string) (bool, error) { return false, rawFailure }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{}, slog.New(capture))
 		_, acquireErr := uc.Acquire(requester, []string{requestedPath})
 		var liveness *LivenessCheckError
 		if !errors.As(acquireErr, &liveness) || liveness.TaskID != owner || len(pathStore.deleted) != 0 {

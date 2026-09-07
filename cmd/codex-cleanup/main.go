@@ -52,17 +52,17 @@ var cleanupMessages = map[string]map[string]string{
 	},
 }
 
-func newCleanupLogsUseCase() (*execution.EvictLogsUseCase, error) {
-	cfg, err := config.LoadDefault()
-	if err != nil {
-		return nil, err
-	}
-	paths, err := execution.DefaultLogPaths()
+func newCleanupLogsUseCase(cfg config.Config) (*execution.EvictLogsUseCase, error) {
+	paths, err := execution.DefaultLogPaths(cfg.TaskPlacementRoot())
 	if err != nil {
 		return nil, err
 	}
 	paths.SocketPath = cfg.SocketPath()
-	locks := execution.NewCheckLivenessUseCase(domain.LivenessLockFunc(store.TryAcquireLiveness), execution.DefaultLockPathResolver)
+	resolver, err := execution.NewLockPathResolver(cfg.TaskPlacementRoot())
+	if err != nil {
+		return nil, err
+	}
+	locks := execution.NewCheckLivenessUseCase(domain.LivenessLockFunc(store.TryAcquireLiveness), resolver)
 	policy := execution.LogEvictionPolicy{
 		RotationMaxSize:  cfg.LogRotationMaxSizeBytes(),
 		RotationInterval: time.Duration(cfg.LogRotationIntervalSeconds()) * time.Second,
@@ -74,16 +74,20 @@ func newCleanupLogsUseCase() (*execution.EvictLogsUseCase, error) {
 	return execution.NewEvictLogsUseCase(store.NewFileLogStore(nil), locks, policy, paths)
 }
 
-func newCleanupUseCase() (*execution.EvictWorkDirUseCase, error) {
+func newCleanupUseCase(cfg config.Config) (*execution.EvictWorkDirUseCase, error) {
 	root, err := execution.DefaultWorktreeRoot()
+	if err != nil {
+		return nil, err
+	}
+	resolver, err := execution.NewLockPathResolver(cfg.TaskPlacementRoot())
 	if err != nil {
 		return nil, err
 	}
 	locks := execution.NewCheckLivenessUseCase(
 		domain.LivenessLockFunc(store.TryAcquireLiveness),
-		execution.DefaultLockPathResolver,
+		resolver,
 	)
-	return execution.NewEvictWorkDirUseCase(store.NewWorktreeFileStore(), locks, root)
+	return execution.NewEvictWorkDirUseCase(store.NewWorktreeFileStore(), locks, root, cfg.TaskPlacementRoot())
 }
 
 func runCleanup(ctx context.Context, uc cleanupUseCase, args []string, stdin io.Reader, stdout io.Writer, now func() time.Time) (execution.EvictWorkDirOutput, error) {
@@ -239,12 +243,17 @@ func runMain(ctx context.Context, uc cleanupUseCase, args []string, stdin io.Rea
 }
 
 func main() {
-	uc, err := newCleanupUseCase()
+	cfg, err := config.LoadDefault()
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-	logs, err := newCleanupLogsUseCase()
+	uc, err := newCleanupUseCase(cfg)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	logs, err := newCleanupLogsUseCase(cfg)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)

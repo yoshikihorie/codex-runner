@@ -284,8 +284,19 @@ func newMetricsAcceptanceFixture(t *testing.T) metricsAcceptanceFixture {
 		t.Fatal(err)
 	}
 	now := time.Date(2026, time.August, 14, 12, 0, 0, 0, time.UTC)
-	writer := contract.NewFileContractWriter(root, domain.ClockFunc(func() time.Time { return now }))
-	return metricsAcceptanceFixture{root: root, logs: logs, tasks: tasks, writer: writer, reader: store.NewFileContractReader(root), events: store.NewFileEventReader(root), mutex: store.NewTaskMutex(), slots: &metricsAcceptanceSlots{}, disarmer: &metricsAcceptanceDisarmer{}, pathLocks: &metricsAcceptancePathLocks{}, tracker: &metrics.StalledTimeTracker{}, now: now}
+	writer, err := contract.NewFileContractWriter(root, domain.ClockFunc(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := store.NewFileContractReader(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := store.NewFileEventReader(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return metricsAcceptanceFixture{root: root, logs: logs, tasks: tasks, writer: writer, reader: reader, events: events, mutex: store.NewTaskMutex(), slots: &metricsAcceptanceSlots{}, disarmer: &metricsAcceptanceDisarmer{}, pathLocks: &metricsAcceptancePathLocks{}, tracker: &metrics.StalledTimeTracker{}, now: now}
 }
 
 func (f metricsAcceptanceFixture) newRecorder(content bool, writer metrics.MetricsWriter) *metricsAcceptanceRecorder {
@@ -757,8 +768,14 @@ func TestTimeoutRecoveryIntegrationNilSessionTransitionsToTimeoutLost(t *testing
 	if err := tasks.Save(id, snapshot); err != nil {
 		t.Fatal(err)
 	}
-	writer := contract.NewFileContractWriter(root, domain.ClockFunc(func() time.Time { return now }))
-	reader := store.NewFileContractReader(root)
+	writer, err := contract.NewFileContractWriter(root, domain.ClockFunc(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := store.NewFileContractReader(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	sharedMutex := store.NewTaskMutex()
 	recoverer := &timeoutRecoveryIntegrationRecoverer{}
 	metricsRecorder := &timeoutRecoveryIntegrationMetrics{}
@@ -841,7 +858,10 @@ func TestTimeoutRecoveryIntegrationCarriesLifecycleGeneration(t *testing.T) {
 	if err := tasks.Save(id, snapshot); err != nil {
 		t.Fatal(err)
 	}
-	writer := contract.NewFileContractWriter(root, domain.ClockFunc(func() time.Time { return now }))
+	writer, err := contract.NewFileContractWriter(root, domain.ClockFunc(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
 	taskMu := store.NewTaskMutex()
 	ownership := &timeoutRecoveryIntegrationOwnership{}
 	validator := recovery.NewProcessSignalAuthorityValidator(tasks, taskMu, ownership)

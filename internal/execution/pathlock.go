@@ -74,21 +74,25 @@ type normalizePathFunc func(raw string, isMacOS bool) (domain.NormalizedPath, er
 
 // AcquirePathLockUseCase acquires ownership of requested paths for a task.
 type AcquirePathLockUseCase struct {
-	mutex       PathLockMutex
-	store       PathLockStore
-	liveness    domain.LivenessLock
-	normalizeFn normalizePathFunc
-	tasks       PathLockTaskStateReader
-	logger      *slog.Logger
+	mutex           PathLockMutex
+	store           PathLockStore
+	liveness        domain.LivenessLock
+	resolveLockPath LockPathResolver
+	normalizeFn     normalizePathFunc
+	tasks           PathLockTaskStateReader
+	logger          *slog.Logger
 }
 
-// NewAcquirePathLockUseCase constructs an acquirer. logger is optional and defaults to slog.Default.
-func NewAcquirePathLockUseCase(mutex PathLockMutex, store PathLockStore, liveness domain.LivenessLock, normalizeFn normalizePathFunc, tasks PathLockTaskStateReader, loggers ...*slog.Logger) *AcquirePathLockUseCase {
+// NewAcquirePathLockUseCase constructs an acquirer with an explicit task-lock resolver.
+func NewAcquirePathLockUseCase(mutex PathLockMutex, store PathLockStore, liveness domain.LivenessLock, normalizeFn normalizePathFunc, tasks PathLockTaskStateReader, resolveLockPath LockPathResolver, loggers ...*slog.Logger) (*AcquirePathLockUseCase, error) {
+	if mutex == nil || store == nil || liveness == nil || normalizeFn == nil || tasks == nil || resolveLockPath == nil {
+		return nil, fmt.Errorf("path lock acquirer requires non-nil dependencies")
+	}
 	logger := slog.Default()
 	if len(loggers) > 0 && loggers[0] != nil {
 		logger = loggers[0]
 	}
-	return &AcquirePathLockUseCase{mutex: mutex, store: store, liveness: liveness, normalizeFn: normalizeFn, tasks: tasks, logger: logger}
+	return &AcquirePathLockUseCase{mutex: mutex, store: store, liveness: liveness, normalizeFn: normalizeFn, tasks: tasks, resolveLockPath: resolveLockPath, logger: logger}, nil
 }
 
 // Execute atomically checks, repairs, and creates a path-lock snapshot.
@@ -118,7 +122,7 @@ func (uc *AcquirePathLockUseCase) Execute(_ context.Context, in AcquirePathLockI
 	survivors := make([]PathLockSnapshot, 0, len(snapshots))
 	staleTaskIDs := make([]domain.TaskID, 0, len(snapshots))
 	for _, snapshot := range snapshots {
-		dead, livenessErr := uc.liveness.TryAcquire(taskLockPath(snapshot.TaskID))
+		dead, livenessErr := uc.liveness.TryAcquire(uc.resolveLockPath(snapshot.TaskID))
 		if errors.Is(livenessErr, fs.ErrNotExist) {
 			task, loadErr := uc.tasks.Load(snapshot.TaskID)
 			switch {
@@ -256,8 +260,4 @@ func (uc *ReleasePathLockUseCase) Execute(_ context.Context, in ReleasePathLockI
 // Release adapts Execute to the PathLockReleaser boundary.
 func (uc *ReleasePathLockUseCase) Release(ctx context.Context, taskID domain.TaskID) error {
 	return uc.Execute(ctx, ReleasePathLockInput{TaskID: taskID})
-}
-
-func taskLockPath(taskID domain.TaskID) string {
-	return DefaultLockPathResolver(taskID)
 }

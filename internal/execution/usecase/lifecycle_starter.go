@@ -22,8 +22,9 @@ func NewTaskLifecycleStarter(runner taskLifecycleRunner, tasksRoot string, baseC
 	if runner == nil || baseCtx == nil || clock == nil {
 		return nil, fmt.Errorf("task lifecycle starter requires non-nil dependencies")
 	}
-	if tasksRoot == "" || !filepath.IsAbs(tasksRoot) {
-		return nil, fmt.Errorf("task lifecycle starter tasks root must be an absolute path")
+	path, err := domain.NewNormalizedPath(tasksRoot)
+	if err != nil {
+		return nil, fmt.Errorf("task lifecycle starter tasks root must be a normalized absolute path: %w", err)
 	}
 	if len(loggers) > 1 {
 		return nil, fmt.Errorf("task lifecycle starter accepts at most one logger")
@@ -32,7 +33,7 @@ func NewTaskLifecycleStarter(runner taskLifecycleRunner, tasksRoot string, baseC
 	if len(loggers) == 1 && loggers[0] != nil {
 		logger = loggers[0]
 	}
-	starter := &taskLifecycleStarter{runner: runner, tasksRoot: tasksRoot, clock: clock, logger: logger}
+	starter := &taskLifecycleStarter{runner: runner, tasksRoot: path.String(), clock: clock, logger: logger}
 	starter.starter = execution.NewDefaultTaskLifecycleStarter(baseCtx, starter.run)
 	return starter, nil
 }

@@ -46,8 +46,12 @@ type fileContractWriter struct {
 	events eventState
 }
 
-func NewFileContractWriter(root string, clock domain.Clock) *fileContractWriter {
-	return &fileContractWriter{root: root, clock: clock}
+func NewFileContractWriter(root string, clock domain.Clock) (*fileContractWriter, error) {
+	path, err := domain.NewNormalizedPath(root)
+	if err != nil {
+		return nil, err
+	}
+	return &fileContractWriter{root: path.String(), clock: clock}, nil
 }
 func (w *fileContractWriter) dir(id domain.TaskID) (string, error) {
 	p, e := store.EventsJSONLPath(w.root, id)

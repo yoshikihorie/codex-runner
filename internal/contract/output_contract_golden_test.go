@@ -152,8 +152,14 @@ func runGoldenScenario(t *testing.T, scenario string, family domain.Subcommand, 
 	if err := tasks.Reserve(id); err != nil {
 		t.Fatal(err)
 	}
-	writer := contract.NewFileContractWriter(root, clock)
-	reader := store.NewFileContractReader(root)
+	writer, err := contract.NewFileContractWriter(root, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader, err := store.NewFileContractReader(root)
+	if err != nil {
+		t.Fatal(err)
+	}
 	dir := filepath.Join(root, id.String())
 	if err := usecase.NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), task, timeout, "test-model", nil, domain.ExecutionRouteDaemon, "golden prompt\n", now); err != nil {
 		t.Fatal(err)
@@ -250,7 +256,10 @@ func runGoldenScenario(t *testing.T, scenario string, family domain.Subcommand, 
 			}
 		}
 		launcher := &goldenResumeLauncher{taskDir: dir, success: resumeSuccess, taskID: id, sessionID: session.SessionID(), codexBinaryPath: "/usr/bin/false"}
-		recoverer := recovery.NewResumeRecoverer(launcher, reader, "/usr/bin/false", root, clock)
+		recoverer, err := recovery.NewResumeRecoverer(launcher, reader, "/usr/bin/false", root, clock)
+		if err != nil {
+			t.Fatal(err)
+		}
 		partial := recovery.NewSavePartialOutputUseCase(reader, writer)
 		out, err := recovery.NewRecoverViaResumeUseCase(tasks, writer, recoverer, partial, goldenSlot{}, goldenMetrics{}, goldenTracker{}, mu, clock).Execute(context.Background(), recovery.RecoverViaResumeInput{TaskID: id, SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: now})
 		if err != nil {

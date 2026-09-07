@@ -31,7 +31,11 @@ func stateWriter(t *testing.T) (*fileContractWriter, string, domain.TaskID, time
 		t.Fatal(err)
 	}
 	now := time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC)
-	return NewFileContractWriter(root, domain.ClockFunc(func() time.Time { return now })), root, id, now
+	w, err := NewFileContractWriter(root, domain.ClockFunc(func() time.Time { return now }))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w, root, id, now
 }
 func readEventRecords(t *testing.T, root string, id domain.TaskID) []store.EventRecord {
 	t.Helper()
@@ -118,7 +122,10 @@ func TestAppendEventResumesSeqAfterRestart(t *testing.T) {
 	if err := w.AppendRawEvent(id, "first", json.RawMessage(`{}`)); err != nil {
 		t.Fatal(err)
 	}
-	restarted := NewFileContractWriter(root, nil)
+	restarted, err := NewFileContractWriter(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := restarted.AppendRawEvent(id, "second", json.RawMessage(`{}`)); err != nil {
 		t.Fatal(err)
 	}
@@ -149,7 +156,10 @@ func TestAppendEventTruncatesIncompleteEventOnResume(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	restarted := NewFileContractWriter(root, nil)
+	restarted, err := NewFileContractWriter(root, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := restarted.AppendRawEvent(id, "second", json.RawMessage(`{}`)); err != nil {
 		t.Fatal(err)
 	}

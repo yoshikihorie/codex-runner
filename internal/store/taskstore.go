@@ -30,6 +30,11 @@ type TaskStore interface {
 var _ TaskStore = (*FileTaskStore)(nil)
 
 func NewFileTaskStore(root string) (*FileTaskStore, error) {
+	path, err := domain.NewNormalizedPath(root)
+	if err != nil {
+		return nil, err
+	}
+	root = path.String()
 	s := &FileTaskStore{root: root, index: map[string]domain.TaskSnapshot{}}
 	es, e := os.ReadDir(root)
 	if os.IsNotExist(e) {

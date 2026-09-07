@@ -29,6 +29,14 @@ func writerRoot(t *testing.T) (string, domain.TaskID) {
 	}
 	return root, id
 }
+func newWriter(t *testing.T, root string, clock domain.Clock) *fileContractWriter {
+	t.Helper()
+	w, err := NewFileContractWriter(root, clock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return w
+}
 func readWriterFile(t *testing.T, path string, want []byte) {
 	t.Helper()
 	got, err := os.ReadFile(path)
@@ -50,7 +58,7 @@ func readWriterFile(t *testing.T, path string, want []byte) {
 }
 func TestContractWriterWritesAllContractFiles(t *testing.T) {
 	root, id := writerRoot(t)
-	w := NewFileContractWriter(root, domain.ClockFunc(func() time.Time { return time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC) }))
+	w := newWriter(t, root, domain.ClockFunc(func() time.Time { return time.Date(2026, 8, 6, 12, 0, 0, 0, time.UTC) }))
 	for _, tc := range []struct {
 		name  string
 		write func() error
@@ -107,7 +115,7 @@ func TestContractWriterWritesAllContractFiles(t *testing.T) {
 }
 func TestOpenExecutionLogsOpensBothHandles(t *testing.T) {
 	root, id := writerRoot(t)
-	logs, err := NewFileContractWriter(root, nil).OpenExecutionLogs(id)
+	logs, err := newWriter(t, root, nil).OpenExecutionLogs(id)
 	if err != nil || logs == nil || logs.Stdout == nil || logs.Stderr == nil {
 		t.Fatalf("logs=%#v err=%v", logs, err)
 	}
@@ -125,7 +133,7 @@ func TestOpenExecutionLogsCleansUpOnPartialFailure(t *testing.T) {
 	if err := os.Symlink(target, stderr); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := NewFileContractWriter(root, nil).OpenExecutionLogs(id); err == nil {
+	if _, err := newWriter(t, root, nil).OpenExecutionLogs(id); err == nil {
 		t.Fatal("partial log opening succeeded")
 	}
 	// stdout.log is an O_APPEND stream-type file, so the all-or-nothing
@@ -138,7 +146,7 @@ func TestOpenExecutionLogsCleansUpOnPartialFailure(t *testing.T) {
 }
 func TestContractWriterOnceFilesRejectClobber(t *testing.T) {
 	root, id := writerRoot(t)
-	w := NewFileContractWriter(root, nil)
+	w := newWriter(t, root, nil)
 	for _, tc := range []struct {
 		name  string
 		write func() error
@@ -159,7 +167,7 @@ func TestContractWriterOnceFilesRejectClobber(t *testing.T) {
 }
 func TestContractWriterRejectsSymlinkedContractPath(t *testing.T) {
 	root, id := writerRoot(t)
-	w := NewFileContractWriter(root, nil)
+	w := newWriter(t, root, nil)
 	target := filepath.Join(root, "target")
 	if err := os.WriteFile(target, []byte("unchanged"), 0o600); err != nil {
 		t.Fatal(err)
@@ -187,7 +195,7 @@ func TestContractWriterRejectsSymlinkedTaskDir(t *testing.T) {
 	if err := os.Symlink(target, p); err != nil {
 		t.Fatal(err)
 	}
-	w := NewFileContractWriter(root, nil)
+	w := newWriter(t, root, nil)
 	for name, write := range map[string]func() error{
 		"once":   func() error { return w.WritePrompt(id, []byte("prompt")) },
 		"logs":   func() error { _, err := w.OpenExecutionLogs(id); return err },

@@ -22,7 +22,13 @@ type ContractReader interface {
 
 var _ ContractReader = (*FileContractReader)(nil)
 
-func NewFileContractReader(root string) *FileContractReader { return &FileContractReader{root} }
+func NewFileContractReader(root string) (*FileContractReader, error) {
+	path, err := domain.NewNormalizedPath(root)
+	if err != nil {
+		return nil, err
+	}
+	return &FileContractReader{root: path.String()}, nil
+}
 func (r *FileContractReader) read(id domain.TaskID, get func(taskPaths) string) ([]byte, error) {
 	p, e := newTaskPaths(r.root, id)
 	if e != nil {

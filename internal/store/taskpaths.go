@@ -18,7 +18,6 @@ var errZeroTaskID = errors.New("task id is zero value")
 
 type taskPaths struct{ root string }
 
-func defaultTasksRoot() string { return "/tmp/codex-tasks" }
 func newTaskPaths(root string, id domain.TaskID) (taskPaths, error) {
 	if id.String() == "" {
 		return taskPaths{}, errZeroTaskID

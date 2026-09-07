@@ -58,8 +58,12 @@ func (*worktreeEvictionStore) Remove(string) error                    { return n
 
 func newWorktreeEvictionRunUseCase(t *testing.T, store WorktreeStore, root string, logger *slog.Logger) *EvictWorkDirUseCase {
 	t.Helper()
-	locks := NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }), DefaultLockPathResolver)
-	uc, err := NewEvictWorkDirUseCase(store, locks, root, logger)
+	resolver, err := NewLockPathResolver(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	locks := NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }), resolver)
+	uc, err := NewEvictWorkDirUseCase(store, locks, root, root, logger)
 	if err != nil {
 		t.Fatal(err)
 	}

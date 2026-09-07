@@ -18,6 +18,14 @@ func eventReaderID(t *testing.T) domain.TaskID {
 	}
 	return id
 }
+func newEventReader(t *testing.T, root string) *FileEventReader {
+	t.Helper()
+	r, err := NewFileEventReader(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
 func writeEvents(t *testing.T, root string, id domain.TaskID, lines ...[]byte) {
 	t.Helper()
 	dir := filepath.Join(root, id.String())
@@ -44,7 +52,7 @@ func eventLine(t *testing.T, seq int, raw any) []byte {
 func TestEventReaderReadsAllAndFiltersBySequence(t *testing.T) {
 	root, id := t.TempDir(), eventReaderID(t)
 	writeEvents(t, root, id, eventLine(t, 1, "a"), eventLine(t, 2, "b"), eventLine(t, 3, "c"))
-	r := NewFileEventReader(root)
+	r := newEventReader(t, root)
 	all, err := r.ReadFrom(id, 0)
 	if err != nil || len(all) != 3 {
 		t.Fatalf("all=%#v err=%v", all, err)
@@ -57,7 +65,7 @@ func TestEventReaderReadsAllAndFiltersBySequence(t *testing.T) {
 func TestEventReaderIgnoresIncompleteFinalLine(t *testing.T) {
 	root, id := t.TempDir(), eventReaderID(t)
 	writeEvents(t, root, id, eventLine(t, 1, "ok"), []byte(`{"seq":2`))
-	got, err := NewFileEventReader(root).ReadFrom(id, 0)
+	got, err := newEventReader(t, root).ReadFrom(id, 0)
 	if err != nil || len(got) != 1 {
 		t.Fatalf("got=%#v err=%v", got, err)
 	}
@@ -65,12 +73,12 @@ func TestEventReaderIgnoresIncompleteFinalLine(t *testing.T) {
 func TestEventReaderFailsFastOnMalformedCompleteLine(t *testing.T) {
 	root, id := t.TempDir(), eventReaderID(t)
 	writeEvents(t, root, id, eventLine(t, 1, "ok"), []byte("{bad}\n"), eventLine(t, 3, "late"))
-	if _, err := NewFileEventReader(root).ReadFrom(id, 0); err == nil {
+	if _, err := newEventReader(t, root).ReadFrom(id, 0); err == nil {
 		t.Fatal("malformed line accepted")
 	}
 }
 func TestEventReaderMissingFileReturnsEmptySlice(t *testing.T) {
-	got, err := NewFileEventReader(t.TempDir()).ReadFrom(eventReaderID(t), 0)
+	got, err := newEventReader(t, t.TempDir()).ReadFrom(eventReaderID(t), 0)
 	if err != nil || got == nil || len(got) != 0 {
 		t.Fatalf("got=%#v err=%v", got, err)
 	}
@@ -79,7 +87,7 @@ func TestEventReaderReadsLineOverBufferLimit(t *testing.T) {
 	root, id := t.TempDir(), eventReaderID(t)
 	raw := string(make([]byte, 70*1024))
 	writeEvents(t, root, id, eventLine(t, 1, raw))
-	got, err := NewFileEventReader(root).ReadFrom(id, 0)
+	got, err := newEventReader(t, root).ReadFrom(id, 0)
 	if err != nil || len(got) != 1 {
 		t.Fatalf("got=%d err=%v", len(got), err)
 	}
@@ -89,7 +97,7 @@ func TestFileEventReaderReadsOneMiBPlusEventForTailReplay(t *testing.T) {
 	root, id := t.TempDir(), eventReaderID(t)
 	raw := string(make([]byte, 1024*1024+1))
 	writeEvents(t, root, id, eventLine(t, 1, raw))
-	got, err := NewFileEventReader(root).ReadFrom(id, 0)
+	got, err := newEventReader(t, root).ReadFrom(id, 0)
 	if err != nil || len(got) != 1 {
 		t.Fatalf("got=%d err=%v", len(got), err)
 	}
