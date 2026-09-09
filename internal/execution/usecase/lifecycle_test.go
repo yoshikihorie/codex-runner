@@ -968,6 +968,16 @@ func TestTaskLifecycleRunImplSuccessOrdersLaunchAndFinalization(t *testing.T) {
 	}
 }
 
+func TestTaskLifecycleRunForwardsOutputSchemaPathToLaunch(t *testing.T) {
+	f := newLifecycleFixture(t)
+	schema := "/private/tmp/review.schema.json"
+	f.input.OutputSchemaPath = &schema
+	f.run()
+	if len(f.launch.params) != 1 || f.launch.params[0].OutputSchemaPath == nil || *f.launch.params[0].OutputSchemaPath != schema {
+		t.Fatalf("params=%#v", f.launch.params)
+	}
+}
+
 func TestTaskLifecycleRunImplRewritesPromptBeforeRecordingAndLaunch(t *testing.T) {
 	f := newLifecycleFixture(t)
 	f.input.PromptText = "edit /private/tmp/source/a.go and verify /private/tmp/source/b.go"

@@ -34,6 +34,7 @@ type LaunchParams struct {
 	PTYEnabled       bool
 	CodexBinaryPath  string
 	ReasoningEffort  *string
+	OutputSchemaPath *string
 }
 
 // LaunchedProcess is the launched child process handle and its one-shot waiter.
@@ -99,6 +100,9 @@ func buildLaunchArgs(p LaunchParams, skipGitRepoCheck bool) (headProcess string,
 		"--model", p.Model)
 	if p.ReasoningEffort != nil {
 		args = append(args, "-c", "model_reasoning_effort="+*p.ReasoningEffort)
+	}
+	if p.OutputSchemaPath != nil {
+		args = append(args, "--output-schema", *p.OutputSchemaPath)
 	}
 	args = append(args, "--output-last-message", filepath.Join(p.TaskDirPath, "last-message.md"), "--", p.PromptText)
 	if p.PTYEnabled {

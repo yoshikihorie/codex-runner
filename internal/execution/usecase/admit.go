@@ -50,6 +50,7 @@ func (u *AdmitTaskUseCase) Execute(_ context.Context, input execution.TaskAdmiss
 		Task: task, Model: input.Model, ReasoningEffort: copyReasoningEffort(input.ReasoningEffort), PromptText: input.PromptText,
 		NormalizedPaths: copyNormalizedPaths(input.NormalizedPaths), ResolvedTimeout: input.ResolvedTimeout,
 		SandboxMode: input.SandboxMode, SourceWorkingDir: input.SourceWorkingDir, WorktreeMode: input.WorktreeMode,
+		OutputSchemaPath: copyOutputSchemaPath(input.OutputSchemaPath),
 	}
 	if input.Subcommand != domain.SubcommandImpl || input.WorktreeMode == domain.WorktreeModeCurrent {
 		workingDir := input.SourceWorkingDir
@@ -66,6 +67,14 @@ func (u *AdmitTaskUseCase) Execute(_ context.Context, input execution.TaskAdmiss
 	}
 	position := u.queue.Enqueue(payload)
 	return execution.TaskAdmissionResult{State: domain.StateQueued, QueuePosition: &position, Events: events}, nil
+}
+
+func copyOutputSchemaPath(path *string) *string {
+	if path == nil {
+		return nil
+	}
+	value := *path
+	return &value
 }
 
 func copyReasoningEffort(value *string) *string {

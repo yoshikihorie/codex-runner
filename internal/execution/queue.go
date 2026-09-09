@@ -21,6 +21,7 @@ type TaskAdmissionInput struct {
 	SandboxMode      string
 	SourceWorkingDir string
 	WorktreeMode     domain.WorktreeMode
+	OutputSchemaPath *string
 }
 
 // TaskLaunchPayload carries all task data required by lifecycle orchestration.
@@ -35,6 +36,7 @@ type TaskLaunchPayload struct {
 	SourceWorkingDir string
 	WorkingDir       *string
 	WorktreeMode     domain.WorktreeMode
+	OutputSchemaPath *string
 }
 
 // TaskAdmissionResult distinguishes immediate admission from queued admission.

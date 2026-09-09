@@ -112,6 +112,29 @@ func TestBuildLaunchArgs(t *testing.T) {
 	}
 }
 
+func TestBuildLaunchArgsAddsOutputSchemaBeforeLastMessageAndTerminator(t *testing.T) {
+	p := launchTestParams(t, nil)
+	schema := filepath.Join(p.TaskDirPath, "output-schema.json")
+	p.OutputSchemaPath = &schema
+	for _, pty := range []bool{false, true} {
+		p.PTYEnabled = pty
+		_, args := buildLaunchArgs(p, false)
+		index := slices.Index(args, "--output-schema")
+		if index < 0 || index+1 >= len(args) || args[index+1] != schema || index >= slices.Index(args, "--output-last-message") || index >= slices.Index(args, "--") {
+			t.Fatalf("args=%q", args)
+		}
+		count := 0
+		for _, arg := range args {
+			if arg == "--output-schema" {
+				count++
+			}
+		}
+		if count != 1 {
+			t.Fatalf("args=%q", args)
+		}
+	}
+}
+
 func TestBuildLaunchArgsAddsSkipGitRepoCheckAtStablePosition(t *testing.T) {
 	reasoning := "high"
 	for _, pty := range []bool{false, true} {

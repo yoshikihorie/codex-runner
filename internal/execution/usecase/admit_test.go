@@ -183,6 +183,28 @@ func TestAdmitTaskUseCaseCopiesQueuedPayloadReferences(t *testing.T) {
 	}
 }
 
+func TestAdmitTaskUseCasePreservesOutputSchemaPathForImmediateAndQueuedTasks(t *testing.T) {
+	queue, registry, mutex := execution.NewTaskQueue(), execution.NewActiveTaskRegistry(), &sync.Mutex{}
+	useCase := newAdmitTaskUseCaseForTest(queue, registry, execution.NewLaunchingTaskRegistry(), mutex, 1, 1, 2)
+	schema := "/private/tmp/review.schema.json"
+	immediateInput := testAdmissionInput(t, domain.SubcommandReview, "schema-immediate")
+	immediateInput.OutputSchemaPath = &schema
+	immediate, err := useCase.Execute(context.Background(), immediateInput)
+	if err != nil || immediate.LaunchPayload == nil || immediate.LaunchPayload.OutputSchemaPath == nil || *immediate.LaunchPayload.OutputSchemaPath != schema {
+		t.Fatalf("result=%#v err=%v", immediate, err)
+	}
+	queuedInput := testAdmissionInput(t, domain.SubcommandResearch, "schema-queued")
+	queuedInput.OutputSchemaPath = &schema
+	queued, err := useCase.Execute(context.Background(), queuedInput)
+	if err != nil || queued.QueuePosition == nil {
+		t.Fatalf("result=%#v err=%v", queued, err)
+	}
+	payload, found := queue.Dequeue()
+	if !found || payload.OutputSchemaPath == nil || *payload.OutputSchemaPath != schema {
+		t.Fatalf("payload=%#v", payload)
+	}
+}
+
 func TestAdmitTaskUseCaseEmitsOneQueuedEventAndHonorsCapacityBoundary(t *testing.T) {
 	for _, tc := range []struct {
 		name            string

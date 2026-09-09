@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
@@ -23,6 +24,7 @@ const (
 	// Canonical identifiers registered in the published error-code and message catalogs.
 	admissionUnavailableCode       = "ADMISSION_UNAVAILABLE"
 	admissionUnavailableMessageKey = "error.admission.unavailable"
+	outputSchemaSnapshotFileName   = "output-schema.json"
 )
 
 type SubmitTaskStore interface {
@@ -43,6 +45,9 @@ type TaskOptionResolver interface {
 	ResolveModel(domain.Subcommand, *string) (string, bool)
 	ResolveReasoningEffort(domain.Subcommand, *string) (*string, bool)
 }
+type taskPlacementRootProvider interface {
+	TaskPlacementRoot() string
+}
 
 type SubmitTaskInput struct {
 	Subcommand              string
@@ -54,6 +59,7 @@ type SubmitTaskInput struct {
 	ReasoningEffort         *string
 	RawWorkingDir           string
 	RawWorktreeMode         *string
+	OutputSchemaPath        *string
 	RequestedAt             time.Time
 }
 type SubmitTaskOutput struct {
@@ -99,6 +105,7 @@ type submitWireInput struct {
 	ReasoningEffort         *string  `json:"reasoning_effort"`
 	WorkingDir              string   `json:"working_dir"`
 	WorktreeMode            *string  `json:"worktree_mode"`
+	OutputSchemaPath        *string  `json:"output_schema_path"`
 }
 
 type submitError struct {
@@ -119,11 +126,17 @@ func (uc *SubmitTaskUseCase) Handle(req transport.Request) transport.Response {
 	if err := json.Unmarshal(req.Params, &object); err != nil || object == nil {
 		return submitErrorResponse(req.RequestID, submitFailure("SUBMIT_PARAMS_MALFORMED", "error.submit.paramsMalformed", nil))
 	}
+	if rawSchema, present := object["output_schema_path"]; present {
+		var schema string
+		if strings.TrimSpace(string(rawSchema)) == "null" || json.Unmarshal(rawSchema, &schema) != nil {
+			return submitErrorResponse(req.RequestID, submitFailure("SUBMIT_PARAMS_MALFORMED", "error.submit.paramsMalformed", nil))
+		}
+	}
 	var wire submitWireInput
 	if err := json.Unmarshal(req.Params, &wire); err != nil {
 		return submitErrorResponse(req.RequestID, submitFailure("SUBMIT_PARAMS_MALFORMED", "error.submit.paramsMalformed", nil))
 	}
-	out, err := uc.Execute(context.Background(), SubmitTaskInput{Subcommand: wire.Subcommand, RawSlug: wire.Slug, Prompt: wire.Prompt, RequestedTimeoutSeconds: wire.RequestedTimeoutSeconds, RawPaths: wire.Paths, Model: wire.Model, ReasoningEffort: wire.ReasoningEffort, RawWorkingDir: wire.WorkingDir, RawWorktreeMode: wire.WorktreeMode, RequestedAt: uc.clock.Now()})
+	out, err := uc.Execute(context.Background(), SubmitTaskInput{Subcommand: wire.Subcommand, RawSlug: wire.Slug, Prompt: wire.Prompt, RequestedTimeoutSeconds: wire.RequestedTimeoutSeconds, RawPaths: wire.Paths, Model: wire.Model, ReasoningEffort: wire.ReasoningEffort, RawWorkingDir: wire.WorkingDir, RawWorktreeMode: wire.WorktreeMode, OutputSchemaPath: wire.OutputSchemaPath, RequestedAt: uc.clock.Now()})
 	if err != nil {
 		return submitErrorResponse(req.RequestID, uc.mapError(err))
 	}
@@ -153,6 +166,9 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 	subcommand := domain.Subcommand(in.Subcommand)
 	if !domain.IsSubmittable(subcommand) {
 		return SubmitTaskOutput{}, submitFailure("SUBCOMMAND_NOT_SUBMITTABLE", "error.subcommand.notSubmittable", map[string]any{"subcommand": in.Subcommand})
+	}
+	if err := validateOutputSchemaPath(subcommand, in.OutputSchemaPath); err != nil {
+		return SubmitTaskOutput{}, err
 	}
 	model, ok := uc.options.ResolveModel(subcommand, in.Model)
 	if !ok {
@@ -189,28 +205,38 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 	acquired := false
 	if subcommand == domain.SubcommandImpl {
 		if uc.pathLocks == nil {
-			uc.releaseReservation(id)
+			uc.releaseReservation(id, nil)
 			return SubmitTaskOutput{}, fmt.Errorf("submit path lock acquirer is required for impl")
 		}
 		normalizedPaths, err = uc.pathLocks.Acquire(id, in.RawPaths)
 		if err != nil {
-			uc.releaseReservation(id)
+			uc.releaseReservation(id, nil)
 			return SubmitTaskOutput{}, uc.mapPathLockError(err, id)
 		}
 		acquired = true
+	}
+	outputSchemaPath, err := uc.snapshotOutputSchema(id, in.OutputSchemaPath)
+	if err != nil {
+		if acquired {
+			if cleanupErr := uc.pathLockReleaser.Release(context.WithoutCancel(ctx), id); cleanupErr != nil {
+				uc.logger.Error("release path lock after output schema snapshot failure", "task_id", id.String(), "error", execution.ErrorTypeName(cleanupErr))
+			}
+		}
+		uc.releaseReservation(id, nil)
+		return SubmitTaskOutput{}, err
 	}
 	sandbox := "read-only"
 	if subcommand == domain.SubcommandImpl {
 		sandbox = "workspace-write"
 	}
-	result, err := uc.admitter.Admit(execution.TaskAdmissionInput{TaskID: id, Subcommand: subcommand, Slug: slug, RequestedTimeout: in.RequestedTimeoutSeconds, RequestedAt: in.RequestedAt, PromptText: in.Prompt, NormalizedPaths: normalizedPaths, ResolvedTimeout: timeout, Model: model, ReasoningEffort: effort, SandboxMode: sandbox, SourceWorkingDir: workingDir, WorktreeMode: worktreeMode})
+	result, err := uc.admitter.Admit(execution.TaskAdmissionInput{TaskID: id, Subcommand: subcommand, Slug: slug, RequestedTimeout: in.RequestedTimeoutSeconds, RequestedAt: in.RequestedAt, PromptText: in.Prompt, NormalizedPaths: normalizedPaths, ResolvedTimeout: timeout, Model: model, ReasoningEffort: effort, SandboxMode: sandbox, SourceWorkingDir: workingDir, WorktreeMode: worktreeMode, OutputSchemaPath: outputSchemaPath})
 	if err != nil {
 		if acquired {
 			if cleanupErr := uc.pathLockReleaser.Release(context.WithoutCancel(ctx), id); cleanupErr != nil {
 				uc.logger.Error("release path lock after admission failure", "task_id", id.String(), "error", execution.ErrorTypeName(cleanupErr))
 			}
 		}
-		uc.releaseReservation(id)
+		uc.releaseReservation(id, outputSchemaPath)
 		return SubmitTaskOutput{}, err
 	}
 	if result.LaunchPayload != nil {
@@ -223,7 +249,7 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 					uc.logger.Error("release path lock after rejected lifecycle start", "task_id", id.String(), "error", execution.ErrorTypeName(cleanupErr))
 				}
 			}
-			uc.releaseReservation(id)
+			uc.releaseReservation(id, outputSchemaPath)
 			return SubmitTaskOutput{}, &submitError{
 				code:    admissionUnavailableCode,
 				message: admissionUnavailableMessageKey,
@@ -233,6 +259,61 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 		}
 	}
 	return SubmitTaskOutput{TaskID: id, State: domain.StateQueued, QueuePosition: result.QueuePosition, Events: result.Events}, nil
+}
+
+func validateOutputSchemaPath(subcommand domain.Subcommand, path *string) error {
+	if path == nil {
+		return nil
+	}
+	if subcommand != domain.SubcommandReview && subcommand != domain.SubcommandResearch {
+		return submitFailure("OUTPUT_SCHEMA_SUBCOMMAND_NOT_ALLOWED", "error.outputSchema.subcommandNotAllowed", nil)
+	}
+	if *path == "" || !filepath.IsAbs(*path) {
+		return submitFailure("OUTPUT_SCHEMA_NOT_ABSOLUTE", "error.outputSchema.notAbsolute", nil)
+	}
+	info, err := os.Lstat(*path)
+	if err != nil || !info.Mode().IsRegular() {
+		return submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+	}
+	return nil
+}
+
+func (uc *SubmitTaskUseCase) snapshotOutputSchema(id domain.TaskID, source *string) (*string, error) {
+	if source == nil {
+		return nil, nil
+	}
+	rootProvider, ok := uc.options.(taskPlacementRootProvider)
+	if !ok {
+		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+	}
+	root, err := domain.NewNormalizedPath(rootProvider.TaskPlacementRoot())
+	if err != nil {
+		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+	}
+	sourceFile, err := os.OpenFile(*source, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+	}
+	defer sourceFile.Close()
+	info, err := sourceFile.Stat()
+	if err != nil || !info.Mode().IsRegular() {
+		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+	}
+	snapshot := filepath.Join(root.String(), id.String(), outputSchemaSnapshotFileName)
+	destination, err := os.OpenFile(snapshot, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+	}
+	if _, err := io.Copy(destination, sourceFile); err != nil {
+		_ = destination.Close()
+		_ = os.Remove(snapshot)
+		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+	}
+	if err := destination.Close(); err != nil {
+		_ = os.Remove(snapshot)
+		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+	}
+	return &snapshot, nil
 }
 
 type taskReservationError struct {
@@ -261,7 +342,12 @@ func (uc *SubmitTaskUseCase) reserveTaskID(subcommand domain.Subcommand, slug do
 	}
 	return last, &taskReservationError{TaskID: last, Err: fmt.Errorf("reserve task directory: %w", os.ErrExist)}
 }
-func (uc *SubmitTaskUseCase) releaseReservation(id domain.TaskID) {
+func (uc *SubmitTaskUseCase) releaseReservation(id domain.TaskID, outputSchemaPath *string) {
+	if outputSchemaPath != nil {
+		if err := os.Remove(*outputSchemaPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			uc.logger.Error("remove output schema snapshot before reservation release", "task_id", id.String(), "error", execution.ErrorTypeName(err))
+		}
+	}
 	if err := uc.tasks.Release(id); err != nil {
 		uc.logger.Error("release task reservation", "task_id", id.String(), "error", execution.ErrorTypeName(err))
 	}

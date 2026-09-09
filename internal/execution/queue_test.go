@@ -45,6 +45,18 @@ func TestTaskQueueFIFOAndReindex(t *testing.T) {
 	}
 }
 
+func TestTaskQueuePreservesOutputSchemaPath(t *testing.T) {
+	queue := NewTaskQueue()
+	payload := queueTestPayload(t, "schema")
+	schema := "/private/tmp/review.schema.json"
+	payload.OutputSchemaPath = &schema
+	queue.Enqueue(payload)
+	got, found := queue.Dequeue()
+	if !found || got.OutputSchemaPath == nil || *got.OutputSchemaPath != schema {
+		t.Fatalf("payload=%#v", got)
+	}
+}
+
 func TestTaskQueueQueuePositionIsOneBasedAndNonDestructive(t *testing.T) {
 	queue := NewTaskQueue().(*taskQueue)
 	payloads := []TaskLaunchPayload{queueTestPayload(t, "position-first"), queueTestPayload(t, "position-middle"), queueTestPayload(t, "position-last")}

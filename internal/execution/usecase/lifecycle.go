@@ -192,7 +192,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		return
 	}
 	launchCtx := context.WithoutCancel(ctx)
-	launched, err := o.deps.Launch.Execute(launchCtx, execution.LaunchParams{TaskID: taskID, Subcommand: input.Task.Subcommand(), Model: input.Model, SandboxMode: input.SandboxMode, WorkingDir: *workingDir, PromptText: launchPrompt, TaskDirPath: input.TaskDirPath, AllowResume: true, LivenessLockFile: lock, PTYEnabled: o.launchConfig.PTYEnabled, CodexBinaryPath: o.launchConfig.CodexBinaryPath, ReasoningEffort: input.ReasoningEffort})
+	launched, err := o.deps.Launch.Execute(launchCtx, execution.LaunchParams{TaskID: taskID, Subcommand: input.Task.Subcommand(), Model: input.Model, SandboxMode: input.SandboxMode, WorkingDir: *workingDir, PromptText: launchPrompt, TaskDirPath: input.TaskDirPath, AllowResume: true, LivenessLockFile: lock, PTYEnabled: o.launchConfig.PTYEnabled, CodexBinaryPath: o.launchConfig.CodexBinaryPath, ReasoningEffort: input.ReasoningEffort, OutputSchemaPath: input.OutputSchemaPath})
 	if ctx.Err() != nil {
 		return
 	}

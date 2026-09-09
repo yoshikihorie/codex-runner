@@ -24,6 +24,7 @@ import (
 )
 
 type submitStoreFake struct {
+	root          string
 	reserveErrors []error
 	reserved      []domain.TaskID
 	released      []domain.TaskID
@@ -33,19 +34,30 @@ type submitStoreFake struct {
 
 func (f *submitStoreFake) Reserve(id domain.TaskID) error {
 	f.reserved = append(f.reserved, id)
-	if len(f.reserveErrors) == 0 {
-		return nil
+	if len(f.reserveErrors) > 0 {
+		err := f.reserveErrors[0]
+		f.reserveErrors = f.reserveErrors[1:]
+		if err != nil {
+			return err
+		}
 	}
-	err := f.reserveErrors[0]
-	f.reserveErrors = f.reserveErrors[1:]
-	return err
+	if f.root != "" {
+		return os.Mkdir(filepath.Join(f.root, id.String()), 0o700)
+	}
+	return nil
 }
 func (f *submitStoreFake) Release(id domain.TaskID) error {
 	f.released = append(f.released, id)
 	if f.events != nil {
 		*f.events = append(*f.events, "reservation")
 	}
-	return f.releaseErr
+	if f.releaseErr != nil {
+		return f.releaseErr
+	}
+	if f.root != "" {
+		return os.Remove(filepath.Join(f.root, id.String()))
+	}
+	return nil
 }
 
 type submitPathLockFake struct {
@@ -149,7 +161,10 @@ type submitOptionsFake struct {
 	model, effort     string
 	modelOK, effortOK bool
 	effortValue       *string
+	taskPlacementRoot string
 }
+
+func (f submitOptionsFake) TaskPlacementRoot() string { return f.taskPlacementRoot }
 
 func (f submitOptionsFake) ResolveModel(domain.Subcommand, *string) (string, bool) {
 	return f.model, f.modelOK
@@ -225,6 +240,8 @@ func TestSubmitHandleMalformedParams(t *testing.T) {
 		`{"requested_timeout_seconds":"bad"}`,
 		`{"paths":"bad"}`,
 		`{"paths":[1]}`,
+		`{"output_schema_path":null}`,
+		`{"output_schema_path":1}`,
 		`null`, `[]`, `"scalar"`, `1`, `true`, ``,
 	}
 	for _, params := range cases {
@@ -241,6 +258,100 @@ func TestSubmitHandleMalformedParams(t *testing.T) {
 				t.Fatalf("side effects occurred")
 			}
 		})
+	}
+}
+
+func TestSubmitExecuteValidatesAndForwardsOutputSchemaPath(t *testing.T) {
+	schema := filepath.Join(t.TempDir(), "review.schema.json")
+	if err := os.WriteFile(schema, []byte(`{"type":"object"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct {
+		name, subcommand, path, code, message string
+	}{
+		{"allowed review", "review", schema, "", ""},
+		{"allowed research", "research", schema, "", ""},
+		{"disallowed subcommand", "plan", schema, "OUTPUT_SCHEMA_SUBCOMMAND_NOT_ALLOWED", "error.outputSchema.subcommandNotAllowed"},
+		{"empty", "review", "", "OUTPUT_SCHEMA_NOT_ABSOLUTE", "error.outputSchema.notAbsolute"},
+		{"relative", "review", "schema.json", "OUTPUT_SCHEMA_NOT_ABSOLUTE", "error.outputSchema.notAbsolute"},
+		{"missing", "review", filepath.Join(t.TempDir(), "missing.json"), "OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound"},
+		{"directory", "review", t.TempDir(), "OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newSubmitFixture()
+			fixture.store.root = t.TempDir()
+			fixture.uc.options = submitOptionsFake{model: "test-model", modelOK: true, effortOK: true, taskPlacementRoot: fixture.store.root}
+			in := validSubmitInput(t)
+			in.Subcommand, in.OutputSchemaPath = tc.subcommand, &tc.path
+			_, err := fixture.uc.Execute(context.Background(), in)
+			if tc.code != "" {
+				assertSubmitError(t, err, tc.code, tc.message, nil)
+				if len(fixture.store.reserved) != 0 || fixture.admitter.calls != 0 {
+					t.Fatalf("side effects occurred")
+				}
+				return
+			}
+			wantSnapshot := filepath.Join(fixture.store.root, fixture.store.reserved[0].String(), outputSchemaSnapshotFileName)
+			contents, readErr := os.ReadFile(wantSnapshot)
+			if err != nil || readErr != nil || fixture.admitter.input.OutputSchemaPath == nil || *fixture.admitter.input.OutputSchemaPath != wantSnapshot || string(contents) != `{"type":"object"}` {
+				t.Fatalf("err=%v input=%#v", err, fixture.admitter.input)
+			}
+		})
+	}
+}
+
+func TestSubmitHandleDecodesOutputSchemaPath(t *testing.T) {
+	schema := filepath.Join(t.TempDir(), "review.schema.json")
+	if err := os.WriteFile(schema, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newSubmitFixture()
+	fixture.store.root = t.TempDir()
+	fixture.uc.options = submitOptionsFake{model: "test-model", modelOK: true, effortOK: true, taskPlacementRoot: fixture.store.root}
+	params := fmt.Sprintf(`{"subcommand":"review","slug":"valid-slug","prompt":"safe","working_dir":%q,"output_schema_path":%q}`, t.TempDir(), schema)
+	response := fixture.uc.Handle(transport.Request{RequestID: "request", Params: json.RawMessage(params)})
+	wantSnapshot := filepath.Join(fixture.store.root, fixture.store.reserved[0].String(), outputSchemaSnapshotFileName)
+	if !response.OK || fixture.admitter.input.OutputSchemaPath == nil || *fixture.admitter.input.OutputSchemaPath != wantSnapshot {
+		t.Fatalf("response=%#v input=%#v", response, fixture.admitter.input)
+	}
+}
+
+func TestSubmitExecuteRejectsSymlinkOutputSchemaPath(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "target.schema.json")
+	if err := os.WriteFile(target, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(t.TempDir(), "link.schema.json")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newSubmitFixture()
+	in := validSubmitInput(t)
+	in.OutputSchemaPath = &link
+	_, err := fixture.uc.Execute(context.Background(), in)
+	assertSubmitError(t, err, "OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+}
+
+func TestSubmitExecuteSnapshotsOutputSchemaBeforeSourceReplacement(t *testing.T) {
+	source := filepath.Join(t.TempDir(), "review.schema.json")
+	if err := os.WriteFile(source, []byte(`{"title":"original"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newSubmitFixture()
+	fixture.store.root = t.TempDir()
+	fixture.uc.options = submitOptionsFake{model: "test-model", modelOK: true, effortOK: true, taskPlacementRoot: fixture.store.root}
+	in := validSubmitInput(t)
+	in.OutputSchemaPath = &source
+	if _, err := fixture.uc.Execute(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(source, []byte(`{"title":"replacement"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := *fixture.admitter.input.OutputSchemaPath
+	contents, err := os.ReadFile(snapshot)
+	if err != nil || string(contents) != `{"title":"original"}` || snapshot == source {
+		t.Fatalf("snapshot=%q contents=%q err=%v", snapshot, contents, err)
 	}
 }
 
