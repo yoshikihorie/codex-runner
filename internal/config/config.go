@@ -31,7 +31,7 @@ const (
 	defaultTotalTaskDiskBudgetMB                = 5_000
 	defaultModel                                = "gpt-5.6-terra"
 	readOnlyModel                               = "gpt-5.6-luna"
-	thinkOnlyModel                              = "gpt-5.6-astra"
+	thinkOnlyModel                              = "gpt-6-astra"
 	defaultPtyEnabled                           = false
 	// Canonical source: 10-shared/validation-rules.yaml constants.TASK_PLACEMENT_ROOT
 	defaultTaskPlacementRoot = "/tmp/codex-tasks"

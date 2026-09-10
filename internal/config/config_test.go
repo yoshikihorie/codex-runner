@@ -129,7 +129,7 @@ func TestResolveModelAllowsLunaOnlyForRead(t *testing.T) {
 }
 
 func TestResolveModelAllowsAstraOnlyForThink(t *testing.T) {
-	requested := "gpt-5.6-astra"
+	requested := "gpt-6-astra"
 	c := Config{}
 	for _, tt := range []struct {
 		name       string
@@ -154,7 +154,7 @@ func TestResolveModelAllowsAstraOnlyForThink(t *testing.T) {
 
 func TestResolveModelThinkPolicyAndDefaults(t *testing.T) {
 	defaultConfig := loadExplicitFile(t, "")
-	if model, ok := defaultConfig.ResolveModel(domain.SubcommandThink, nil); !ok || model != "gpt-5.6-astra" {
+	if model, ok := defaultConfig.ResolveModel(domain.SubcommandThink, nil); !ok || model != "gpt-6-astra" {
 		t.Fatalf("default think model = %q, %t", model, ok)
 	}
 
@@ -164,8 +164,8 @@ func TestResolveModelThinkPolicyAndDefaults(t *testing.T) {
 		model  string
 		want   bool
 	}{
-		{name: "default", config: Config{model: "gpt-5.6-astra"}, model: "gpt-5.6-astra", want: true},
-		{name: "override", config: Config{model: "gpt-5.6-terra", modelOverrides: map[domain.Subcommand]string{domain.SubcommandThink: "gpt-5.6-astra"}}, model: "gpt-5.6-astra", want: true},
+		{name: "default", config: Config{model: "gpt-6-astra"}, model: "gpt-6-astra", want: true},
+		{name: "override", config: Config{model: "gpt-5.6-terra", modelOverrides: map[domain.Subcommand]string{domain.SubcommandThink: "gpt-6-astra"}}, model: "gpt-6-astra", want: true},
 		{name: "terra", config: Config{}, model: "gpt-5.6-terra", want: true},
 		{name: "sol", config: Config{}, model: "gpt-5.6-sol", want: true},
 		{name: "luna", config: Config{}, model: "gpt-5.6-luna", want: false},
@@ -190,7 +190,7 @@ func TestLoadExplicitResolvesThinkModel(t *testing.T) {
 		want   string
 	}{
 		{name: "global model", config: `model = "gpt-5.6-sol"`, want: "gpt-5.6-sol"},
-		{name: "no global model", want: "gpt-5.6-astra"},
+		{name: "no global model", want: "gpt-6-astra"},
 		{name: "think override", config: "model = \"gpt-5.6-terra\"\n[model_overrides]\nthink = \"gpt-5.6-sol\"", want: "gpt-5.6-sol"},
 	}
 
@@ -562,7 +562,7 @@ func TestOverrideAccessorsReturnCopies(t *testing.T) {
 }
 
 func TestAllowedValues(t *testing.T) {
-	if !IsModelAllowed("gpt-5.6-terra") || !IsModelAllowed("gpt-5.6-sol") || !IsModelAllowed("gpt-5.6-luna") || !IsModelAllowed("gpt-5.6-astra") || IsModelAllowed("other") {
+	if !IsModelAllowed("gpt-5.6-terra") || !IsModelAllowed("gpt-5.6-sol") || !IsModelAllowed("gpt-5.6-luna") || !IsModelAllowed("gpt-6-astra") || IsModelAllowed("other") {
 		t.Fatal("model allowlist is incorrect")
 	}
 	if !IsReasoningEffortAllowed("low") || !IsReasoningEffortAllowed("medium") || !IsReasoningEffortAllowed("high") || !IsReasoningEffortAllowed("xhigh") || IsReasoningEffortAllowed("other") {
