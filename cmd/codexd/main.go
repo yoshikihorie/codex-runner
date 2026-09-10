@@ -330,7 +330,7 @@ func validStatsMonth(value *string) bool {
 
 func isStatsSubcommand(value domain.Subcommand) bool {
 	switch value {
-	case domain.SubcommandImpl, domain.SubcommandReview, domain.SubcommandPlan, domain.SubcommandResearch, domain.SubcommandRead, domain.SubcommandStatus, domain.SubcommandLogs, domain.SubcommandCancel, domain.SubcommandDoctor, domain.SubcommandCleanup, domain.SubcommandStats:
+	case domain.SubcommandImpl, domain.SubcommandReview, domain.SubcommandPlan, domain.SubcommandResearch, domain.SubcommandRead, domain.SubcommandThink, domain.SubcommandStatus, domain.SubcommandLogs, domain.SubcommandCancel, domain.SubcommandDoctor, domain.SubcommandCleanup, domain.SubcommandStats:
 		return true
 	default:
 		return false

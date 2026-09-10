@@ -116,7 +116,7 @@ func TestOutputContractGolden(t *testing.T) {
 		family        domain.Subcommand
 		rawExit       int
 		resumeSuccess bool
-	}{{"research-normal", domain.SubcommandResearch, 0, false}, {"research-recovered", domain.SubcommandResearch, 124, true}, {"research-recovery-failed", domain.SubcommandResearch, 137, false}, {"review-normal", domain.SubcommandReview, 0, false}}
+	}{{"research-normal", domain.SubcommandResearch, 0, false}, {"research-recovered", domain.SubcommandResearch, 124, true}, {"research-recovery-failed", domain.SubcommandResearch, 137, false}, {"review-normal", domain.SubcommandReview, 0, false}, {"think-normal", domain.SubcommandThink, 0, false}}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			runGoldenScenario(t, tc.name, tc.family, tc.rawExit, tc.resumeSuccess)

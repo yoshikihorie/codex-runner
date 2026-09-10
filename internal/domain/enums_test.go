@@ -12,7 +12,7 @@ func TestPublishedEnumValues(t *testing.T) {
 	if got := []ProtocolVerb{ProtocolVerbSubmit, ProtocolVerbStatus, ProtocolVerbCancel, ProtocolVerbTail, ProtocolVerbPing}; len(got) != 5 {
 		t.Fatal("ProtocolVerb values changed")
 	}
-	if got := []Subcommand{SubcommandImpl, SubcommandReview, SubcommandPlan, SubcommandResearch, SubcommandRead, SubcommandStatus, SubcommandLogs, SubcommandCancel, SubcommandDoctor, SubcommandCleanup, SubcommandStats}; len(got) != 11 {
+	if got := []Subcommand{SubcommandImpl, SubcommandReview, SubcommandPlan, SubcommandResearch, SubcommandRead, SubcommandThink, SubcommandStatus, SubcommandLogs, SubcommandCancel, SubcommandDoctor, SubcommandCleanup, SubcommandStats}; len(got) != 12 {
 		t.Fatal("Subcommand values changed")
 	}
 	if got := []ExecutionRoute{ExecutionRouteDaemon, ExecutionRouteLegacy}; len(got) != 2 {
@@ -26,6 +26,12 @@ func TestPublishedEnumValues(t *testing.T) {
 	}
 	if got := []RecoveryOrigin{RecoveryOriginTimeout, RecoveryOriginOrphan}; len(got) != 2 {
 		t.Fatal("RecoveryOrigin values changed")
+	}
+}
+
+func TestThinkIsSubmittable(t *testing.T) {
+	if SubcommandThink != "think" || !IsSubmittable(SubcommandThink) {
+		t.Fatalf("think subcommand is not submittable: %q", SubcommandThink)
 	}
 }
 

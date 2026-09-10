@@ -44,7 +44,7 @@
 `codex.sh` は、Claude（Opus）が実装・レビュー・調査を Codex CLI（`codex exec`）へ委譲するときの
 唯一の入口である。運用ルール上 `codex exec` の直接実行は禁止されており、すべての委譲がここを通る。
 
-サブコマンドは 11 個（`review` / `impl` / `plan` / `research` / `read` / `status` / `logs` /
+サブコマンドは 12 個（`review` / `impl` / `plan` / `research` / `read` / `think` / `status` / `logs` /
 `cancel` / `doctor` / `cleanup` / `parallel`（廃止済み））。
 
 ### 1.2 2026-07-31 に起きた事故
@@ -611,7 +611,7 @@ Codex には「実作業をせずに終了コード 0 で終わる」不具合�
 
 | サブコマンド | 扱い | 理由 |
 |---|---|---|
-| impl / review / plan / research / read | 常駐プロセス経由 | 実行系。親の移転が目的そのもの |
+| impl / review / plan / research / read / think | 常駐プロセス経由 | 実行系。親の移転が目的そのもの |
 | cancel | 常駐プロセス経由 | **現行の「中断できない」欠陥も同時に直る** |
 | status | 入口で完結（ファイル読み）+ 常駐プロセスが応答すれば生死情報で上書き | 常駐プロセスが落ちていても最低限の一覧を出せることを優先 |
 | logs / doctor / cleanup | 入口で完結 | `doctor` に「常駐プロセスの生存・ソケット応答・起動設定」の検査を追加 |

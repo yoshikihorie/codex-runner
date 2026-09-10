@@ -79,7 +79,7 @@ func decodeManifest(b []byte) (outputManifest, error) {
 }
 
 func validateManifest(m outputManifest) error {
-	if m.SchemaVersion != manifestSchemaVersion || m.Scenario == "" || !oneOf(m.SubcommandFamily, "research", "review") {
+	if m.SchemaVersion != manifestSchemaVersion || m.Scenario == "" || !oneOf(m.SubcommandFamily, "research", "review", "think") {
 		return fmt.Errorf("invalid manifest header")
 	}
 	if len(m.Files) != len(requiredOutputFiles) {

@@ -38,6 +38,7 @@ const (
 	SubcommandPlan     Subcommand = "plan"
 	SubcommandResearch Subcommand = "research"
 	SubcommandRead     Subcommand = "read"
+	SubcommandThink    Subcommand = "think"
 	SubcommandStatus   Subcommand = "status"
 	SubcommandLogs     Subcommand = "logs"
 	SubcommandCancel   Subcommand = "cancel"
@@ -86,5 +87,5 @@ const (
 )
 
 func IsSubmittable(s Subcommand) bool {
-	return s == SubcommandImpl || s == SubcommandReview || s == SubcommandPlan || s == SubcommandResearch || s == SubcommandRead
+	return s == SubcommandImpl || s == SubcommandReview || s == SubcommandPlan || s == SubcommandResearch || s == SubcommandRead || s == SubcommandThink
 }

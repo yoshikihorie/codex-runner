@@ -490,6 +490,28 @@ func TestSubmitExecuteResolvesOptionsAndBuildsAdmissionInput(t *testing.T) {
 	}
 }
 
+func TestSubmitExecuteThinkIsReadOnlyAndRejectsOutputSchema(t *testing.T) {
+	fixture := newSubmitFixture()
+	in := validSubmitInput(t)
+	in.Subcommand = string(domain.SubcommandThink)
+	if _, err := fixture.uc.Execute(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	if fixture.admitter.input.SandboxMode != "read-only" || fixture.locks.calls != 0 {
+		t.Fatalf("admission=%#v path_lock_calls=%d", fixture.admitter.input, fixture.locks.calls)
+	}
+
+	schema := filepath.Join(t.TempDir(), "think.schema.json")
+	if err := os.WriteFile(schema, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture = newSubmitFixture()
+	in = validSubmitInput(t)
+	in.Subcommand, in.OutputSchemaPath = string(domain.SubcommandThink), &schema
+	_, err := fixture.uc.Execute(context.Background(), in)
+	assertSubmitError(t, err, "OUTPUT_SCHEMA_SUBCOMMAND_NOT_ALLOWED", "error.outputSchema.subcommandNotAllowed", nil)
+}
+
 func TestSubmitExecuteRejectsDisallowedOptions(t *testing.T) {
 	for _, tc := range []struct {
 		name, code string

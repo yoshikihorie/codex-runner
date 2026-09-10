@@ -9,7 +9,7 @@ import (
 
 type TaskID struct{ value string }
 
-var taskIDPattern = regexp.MustCompile(`^(impl|review|plan|research|read)-([0-9]{8})-([0-9]{6})-([0-9a-f]{4})-([a-z0-9]+(?:-[a-z0-9]+)*)$`)
+var taskIDPattern = regexp.MustCompile(`^(impl|review|plan|research|read|think)-([0-9]{8})-([0-9]{6})-([0-9a-f]{4})-([a-z0-9]+(?:-[a-z0-9]+)*)$`)
 
 func NewTaskID(value string) (TaskID, error) {
 	m := taskIDPattern.FindStringSubmatch(value)

@@ -43,6 +43,9 @@ func TestTaskIDBoundaries(t *testing.T) {
 	if _, err := NewTaskID(valid); err != nil {
 		t.Fatal(err)
 	}
+	if _, err := NewTaskID("think-20260806-120000-a1b2-example"); err != nil {
+		t.Fatal(err)
+	}
 	for _, value := range []string{"status-20260806-120000-a1b2-example", "impl-20260230-120000-a1b2-example", "impl-20260806-250000-a1b2-example", "impl-20260806-120000-a1b-example", "impl-20260806-120000-a1bz-example", "impl-20260806-120000-a1b2-Upper"} {
 		if _, err := NewTaskID(value); err == nil {
 			t.Errorf("NewTaskID(%q) unexpectedly succeeded", value)

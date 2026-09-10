@@ -120,6 +120,15 @@ func TestComputeTaskStats_Filter(t *testing.T) { // T-A7, SCN-04
 	}
 }
 
+func TestComputeTaskStats_FilterThink(t *testing.T) {
+	f := domain.SubcommandThink
+	reader := &fakeMetricsReader{files: []string{"a"}, contents: map[string]string{"a": statsLine(t, func(r *taskMetricsRecord) { r.Subcommand = domain.SubcommandThink })}}
+	r, err := newStatsUseCase(reader, nil).Execute(StatsQuery{SubcommandFilter: &f})
+	if err != nil || r.TotalRecords != 1 || r.SuccessRateBySubcommand[domain.SubcommandThink].Total != 1 {
+		t.Fatalf("report = %#v, %v", r, err)
+	}
+}
+
 func TestComputeTaskStats_NonRecordingFilter(t *testing.T) { // T-A8, SCN-13
 	f := domain.SubcommandStats
 	r, err := newStatsUseCase(&fakeMetricsReader{files: []string{"a"}, contents: map[string]string{"a": statsLine(t, nil)}}, nil).Execute(StatsQuery{SubcommandFilter: &f})

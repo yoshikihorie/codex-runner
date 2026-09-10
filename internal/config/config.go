@@ -31,6 +31,7 @@ const (
 	defaultTotalTaskDiskBudgetMB                = 5_000
 	defaultModel                                = "gpt-5.6-terra"
 	readOnlyModel                               = "gpt-5.6-luna"
+	thinkOnlyModel                              = "gpt-5.6-astra"
 	defaultPtyEnabled                           = false
 	// Canonical source: 10-shared/validation-rules.yaml constants.TASK_PLACEMENT_ROOT
 	defaultTaskPlacementRoot = "/tmp/codex-tasks"
@@ -42,7 +43,7 @@ var (
 	ErrInvalidConfig          = errors.New("config: invalid value")
 	ErrExplicitConfigNotFound = errors.New("config: explicit config file not found")
 
-	allowedModels           = []string{"gpt-5.6-terra", "gpt-5.6-sol", readOnlyModel}
+	allowedModels           = []string{"gpt-5.6-terra", "gpt-5.6-sol", readOnlyModel, thinkOnlyModel}
 	allowedReasoningEfforts = []string{"low", "medium", "high", "xhigh"}
 
 	// This is a variable so package tests can replace the candidates safely.
@@ -198,7 +199,7 @@ func resolve(raw rawConfig) (Config, error) {
 		metricsRetentionMonths: defaultMetricsRetentionMonths, metricsMaxFileBytes: defaultMetricsMaxFileBytes,
 		taskPlacementRetentionDays: defaultTaskPlacementRetentionDays, totalTaskDiskBudgetMB: defaultTotalTaskDiskBudgetMB,
 		socketPath: socketPath, model: defaultModel,
-		modelOverrides: make(map[domain.Subcommand]string), reasoningEffortOverrides: make(map[domain.Subcommand]string),
+		modelOverrides: map[domain.Subcommand]string{domain.SubcommandThink: thinkOnlyModel}, reasoningEffortOverrides: make(map[domain.Subcommand]string),
 		ptyEnabled:        defaultPtyEnabled,
 		taskPlacementRoot: defaultTaskPlacementRoot,
 	}
@@ -443,9 +444,11 @@ func isModelAllowedForSubcommand(subcommand domain.Subcommand, model string) boo
 
 	switch subcommand {
 	case domain.SubcommandRead:
-		return true
-	case domain.SubcommandImpl, domain.SubcommandReview, domain.SubcommandPlan, domain.SubcommandResearch:
+		return model != thinkOnlyModel
+	case domain.SubcommandThink:
 		return model != readOnlyModel
+	case domain.SubcommandImpl, domain.SubcommandReview, domain.SubcommandPlan, domain.SubcommandResearch:
+		return model != readOnlyModel && model != thinkOnlyModel
 	default:
 		return false
 	}

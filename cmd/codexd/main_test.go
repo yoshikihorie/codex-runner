@@ -182,7 +182,7 @@ func TestRunStatsValidationTC1TC2TC3TC8(t *testing.T) {
 
 func TestRunStatsTC4TC5TC9TC17(t *testing.T) {
 	withStatsDependencies(t, t.TempDir(), store.NewFileMetricsReader())
-	for _, subcommand := range []string{"", "stats", "logs", "doctor", "cleanup"} {
+	for _, subcommand := range []string{"", "stats", "logs", "doctor", "cleanup", "think"} {
 		args := []string{"--json"}
 		if subcommand != "" {
 			args = append(args, "--subcommand", subcommand)
