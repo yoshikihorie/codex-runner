@@ -7,8 +7,10 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
+	"unicode"
 
 	"github.com/BurntSushi/toml"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
@@ -30,8 +32,7 @@ const (
 	defaultTaskPlacementRetentionDays           = 14
 	defaultTotalTaskDiskBudgetMB                = 5_000
 	defaultModel                                = "gpt-5.6-terra"
-	readOnlyModel                               = "gpt-5.6-luna"
-	thinkOnlyModel                              = "gpt-6-astra"
+	defaultThinkModel                           = "gpt-6-astra"
 	defaultPtyEnabled                           = false
 	// Canonical source: 10-shared/validation-rules.yaml constants.TASK_PLACEMENT_ROOT
 	defaultTaskPlacementRoot = "/tmp/codex-tasks"
@@ -43,8 +44,8 @@ var (
 	ErrInvalidConfig          = errors.New("config: invalid value")
 	ErrExplicitConfigNotFound = errors.New("config: explicit config file not found")
 
-	allowedModels           = []string{"gpt-5.6-terra", "gpt-5.6-sol", readOnlyModel, thinkOnlyModel}
 	allowedReasoningEfforts = []string{"low", "medium", "high", "xhigh"}
+	modelIDPattern          = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
 	// This is a variable so package tests can replace the candidates safely.
 	codexBinaryPathCandidates = []string{
@@ -102,6 +103,8 @@ type Config struct {
 	codexBinaryPath                string
 	model                          string
 	modelOverrides                 map[domain.Subcommand]string
+	modelAllowlist                 map[string]map[domain.Subcommand]struct{}
+	modelAllowlistDefaulted        bool
 	reasoningEffort                *string
 	reasoningEffortOverrides       map[domain.Subcommand]string
 	ptyEnabled                     bool
@@ -109,28 +112,29 @@ type Config struct {
 }
 
 type rawConfig struct {
-	MaxConcurrentTasks             *int              `toml:"max_concurrent_tasks"`
-	MaxConcurrentImplTasks         *int              `toml:"max_concurrent_impl_tasks"`
-	QueueMaxDepth                  *int              `toml:"queue_max_depth"`
-	MetricsRecordContentEnabled    *bool             `toml:"metrics_record_content_enabled"`
-	LogRotationMaxSizeBytes        *int64            `toml:"log_rotation_max_size_bytes"`
-	LogRotationIntervalSeconds     *int              `toml:"log_rotation_interval_seconds"`
-	LogEvictionScanIntervalSeconds *int              `toml:"log_eviction_scan_interval_seconds"`
-	LogRotationRetentionDays       *int              `toml:"log_rotation_retention_days"`
-	LogRotationRetentionCount      *int              `toml:"log_rotation_retention_count"`
-	LogRotationCompress            *bool             `toml:"log_rotation_compress"`
-	MetricsRetentionMonths         *int              `toml:"metrics_retention_months"`
-	MetricsMaxFileBytes            *int64            `toml:"metrics_max_file_bytes"`
-	TaskPlacementRetentionDays     *int              `toml:"task_placement_retention_days"`
-	TotalTaskDiskBudgetMB          *int              `toml:"total_task_disk_budget_mb"`
-	SocketPath                     *string           `toml:"socket_path"`
-	CodexBinaryPath                *string           `toml:"codex_binary_path"`
-	Model                          *string           `toml:"model"`
-	ModelOverrides                 map[string]string `toml:"model_overrides"`
-	ReasoningEffort                *string           `toml:"reasoning_effort"`
-	ReasoningEffortOverrides       map[string]string `toml:"reasoning_effort_overrides"`
-	PtyEnabled                     *bool             `toml:"pty_enabled"`
-	TaskPlacementRoot              *string           `toml:"task_placement_root"`
+	MaxConcurrentTasks             *int                `toml:"max_concurrent_tasks"`
+	MaxConcurrentImplTasks         *int                `toml:"max_concurrent_impl_tasks"`
+	QueueMaxDepth                  *int                `toml:"queue_max_depth"`
+	MetricsRecordContentEnabled    *bool               `toml:"metrics_record_content_enabled"`
+	LogRotationMaxSizeBytes        *int64              `toml:"log_rotation_max_size_bytes"`
+	LogRotationIntervalSeconds     *int                `toml:"log_rotation_interval_seconds"`
+	LogEvictionScanIntervalSeconds *int                `toml:"log_eviction_scan_interval_seconds"`
+	LogRotationRetentionDays       *int                `toml:"log_rotation_retention_days"`
+	LogRotationRetentionCount      *int                `toml:"log_rotation_retention_count"`
+	LogRotationCompress            *bool               `toml:"log_rotation_compress"`
+	MetricsRetentionMonths         *int                `toml:"metrics_retention_months"`
+	MetricsMaxFileBytes            *int64              `toml:"metrics_max_file_bytes"`
+	TaskPlacementRetentionDays     *int                `toml:"task_placement_retention_days"`
+	TotalTaskDiskBudgetMB          *int                `toml:"total_task_disk_budget_mb"`
+	SocketPath                     *string             `toml:"socket_path"`
+	CodexBinaryPath                *string             `toml:"codex_binary_path"`
+	Model                          *string             `toml:"model"`
+	ModelOverrides                 map[string]string   `toml:"model_overrides"`
+	ModelAllowlist                 map[string][]string `toml:"model_allowlist"`
+	ReasoningEffort                *string             `toml:"reasoning_effort"`
+	ReasoningEffortOverrides       map[string]string   `toml:"reasoning_effort_overrides"`
+	PtyEnabled                     *bool               `toml:"pty_enabled"`
+	TaskPlacementRoot              *string             `toml:"task_placement_root"`
 }
 
 type missingFilePolicy bool
@@ -203,8 +207,18 @@ func resolve(raw rawConfig) (Config, error) {
 		ptyEnabled:        defaultPtyEnabled,
 		taskPlacementRoot: defaultTaskPlacementRoot,
 	}
-	if raw.Model == nil {
-		c.modelOverrides[domain.SubcommandThink] = thinkOnlyModel
+	var err error
+	if raw.ModelAllowlist == nil {
+		c.modelAllowlist = compatibilityModelAllowlist()
+		c.modelAllowlistDefaulted = true
+	} else {
+		c.modelAllowlist, err = validateModelAllowlist(raw.ModelAllowlist)
+		if err != nil {
+			return Config{}, err
+		}
+	}
+	if raw.Model == nil && raw.ModelAllowlist == nil {
+		c.modelOverrides[domain.SubcommandThink] = defaultThinkModel
 	}
 	if raw.MaxConcurrentTasks != nil {
 		c.maxConcurrentTasks = *raw.MaxConcurrentTasks
@@ -286,13 +300,13 @@ func resolve(raw rawConfig) (Config, error) {
 	if err := copyOverrides(raw.ReasoningEffortOverrides, c.reasoningEffortOverrides, "reasoning_effort_overrides"); err != nil {
 		return Config{}, err
 	}
-	if !IsModelAllowed(c.model) {
+	if !c.isModelAllowed(c.model) {
 		return Config{}, invalid("model", "model is not allowed", nil)
 	}
 	if c.reasoningEffort != nil && !IsReasoningEffortAllowed(*c.reasoningEffort) {
 		return Config{}, invalid("reasoning_effort", "reasoning effort is not allowed", nil)
 	}
-	if err := validateOverrideValues(c.modelOverrides, "model_overrides", IsModelAllowed, "model is not allowed"); err != nil {
+	if err := validateOverrideValues(c.modelOverrides, "model_overrides", c.isModelAllowed, "model is not allowed"); err != nil {
 		return Config{}, err
 	}
 	if err := validateOverrideValues(c.reasoningEffortOverrides, "reasoning_effort_overrides", IsReasoningEffortAllowed, "reasoning effort is not allowed"); err != nil {
@@ -411,13 +425,80 @@ func invalid(key, reason string, cause error) *LoadError {
 	return &LoadError{Key: key, Reason: reason, Err: &invalidValueError{cause: cause}}
 }
 
-func IsModelAllowed(model string) bool {
-	for _, allowed := range allowedModels {
-		if model == allowed {
-			return true
+func compatibilityModelAllowlist() map[string]map[domain.Subcommand]struct{} {
+	all := []domain.Subcommand{
+		domain.SubcommandImpl,
+		domain.SubcommandReview,
+		domain.SubcommandPlan,
+		domain.SubcommandResearch,
+		domain.SubcommandRead,
+		domain.SubcommandThink,
+	}
+	return map[string]map[domain.Subcommand]struct{}{
+		"gpt-5.6-terra": subcommandSet(all),
+		"gpt-5.6-sol":   subcommandSet(all),
+		"gpt-5.6-luna":  subcommandSet([]domain.Subcommand{domain.SubcommandRead}),
+		"gpt-6-astra":   subcommandSet([]domain.Subcommand{domain.SubcommandThink}),
+	}
+}
+
+func subcommandSet(subcommands []domain.Subcommand) map[domain.Subcommand]struct{} {
+	set := make(map[domain.Subcommand]struct{}, len(subcommands))
+	for _, subcommand := range subcommands {
+		set[subcommand] = struct{}{}
+	}
+	return set
+}
+
+func validateModelAllowlist(raw map[string][]string) (map[string]map[domain.Subcommand]struct{}, error) {
+	if len(raw) == 0 {
+		return nil, invalid("model_allowlist", "must not be empty", nil)
+	}
+	modelIDs := make([]string, 0, len(raw))
+	for modelID := range raw {
+		modelIDs = append(modelIDs, modelID)
+	}
+	sort.Strings(modelIDs)
+	validated := make(map[string]map[domain.Subcommand]struct{}, len(raw))
+	for _, modelID := range modelIDs {
+		if !validModelID(modelID) {
+			return nil, invalid("model_allowlist."+modelID, "model ID is invalid", nil)
+		}
+		commands := raw[modelID]
+		if len(commands) == 0 {
+			return nil, invalid("model_allowlist."+modelID, "must contain at least one subcommand", nil)
+		}
+		set := make(map[domain.Subcommand]struct{}, len(commands))
+		for _, command := range commands {
+			subcommand := domain.Subcommand(command)
+			if !domain.IsSubmittable(subcommand) {
+				return nil, invalid("model_allowlist."+modelID, "subcommand is not submittable", nil)
+			}
+			if _, duplicate := set[subcommand]; duplicate {
+				return nil, invalid("model_allowlist."+modelID, "subcommand must not be duplicated", nil)
+			}
+			set[subcommand] = struct{}{}
+		}
+		validated[modelID] = set
+	}
+	return validated, nil
+}
+
+func validModelID(modelID string) bool {
+	if !modelIDPattern.MatchString(modelID) {
+		return false
+	}
+	for _, r := range modelID {
+		if unicode.IsControl(r) {
+			return false
 		}
 	}
-	return false
+	return true
+}
+
+func (c Config) isModelAllowed(model string) bool {
+	_, ok := c.modelAllowlist[model]
+	return ok
 }
 func IsReasoningEffortAllowed(effort string) bool {
 	for _, allowed := range allowedReasoningEfforts {
@@ -437,24 +518,12 @@ func (c Config) ResolveModel(subcommand domain.Subcommand, requested *string) (s
 	if requested != nil {
 		model = *requested
 	}
-	return model, isModelAllowedForSubcommand(subcommand, model)
-}
-
-func isModelAllowedForSubcommand(subcommand domain.Subcommand, model string) bool {
-	if !IsModelAllowed(model) {
-		return false
+	allowedSubcommands, modelAllowed := c.modelAllowlist[model]
+	if !modelAllowed || !domain.IsSubmittable(subcommand) {
+		return model, false
 	}
-
-	switch subcommand {
-	case domain.SubcommandRead:
-		return model != thinkOnlyModel
-	case domain.SubcommandThink:
-		return model != readOnlyModel
-	case domain.SubcommandImpl, domain.SubcommandReview, domain.SubcommandPlan, domain.SubcommandResearch:
-		return model != readOnlyModel && model != thinkOnlyModel
-	default:
-		return false
-	}
+	_, allowed := allowedSubcommands[subcommand]
+	return model, allowed
 }
 
 // ResolveReasoningEffort applies request, subcommand, then global defaults.
@@ -495,6 +564,7 @@ func (c Config) TotalTaskDiskBudgetMB() int          { return c.totalTaskDiskBud
 func (c Config) SocketPath() string                  { return c.socketPath }
 func (c Config) CodexBinaryPath() string             { return c.codexBinaryPath }
 func (c Config) Model() string                       { return c.model }
+func (c Config) ModelAllowlistDefaulted() bool       { return c.modelAllowlistDefaulted }
 func (c Config) PtyEnabled() bool                    { return c.ptyEnabled }
 func (c Config) TaskPlacementRoot() string           { return c.taskPlacementRoot }
 func (c Config) ReasoningEffort() (string, bool) {

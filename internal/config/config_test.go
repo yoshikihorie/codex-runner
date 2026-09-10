@@ -73,11 +73,7 @@ func TestResolveTaskPlacementRootValidation(t *testing.T) {
 
 func TestResolveSubmitOptions(t *testing.T) {
 	requestedModel := "gpt-5.6-sol"
-	requestedEffort := "high"
-	c := Config{
-		model: "gpt-5.6-terra", modelOverrides: map[domain.Subcommand]string{domain.SubcommandReview: "gpt-5.6-sol"},
-		reasoningEffort: &requestedEffort, reasoningEffortOverrides: map[domain.Subcommand]string{domain.SubcommandReview: "low"},
-	}
+	c := loadExplicitFile(t, "model = \"gpt-5.6-terra\"\nreasoning_effort = \"high\"\n[model_overrides]\nreview = \"gpt-5.6-sol\"\n[reasoning_effort_overrides]\nreview = \"low\"")
 	if model, ok := c.ResolveModel(domain.SubcommandReview, &requestedModel); !ok || model != requestedModel {
 		t.Fatalf("model = %q, %t", model, ok)
 	}
@@ -102,9 +98,144 @@ func TestResolveSubmitOptions(t *testing.T) {
 	}
 }
 
+func TestLoadExplicitUsesCompatibilityModelAllowlistWhenOmitted(t *testing.T) {
+	c := loadExplicitFile(t, "")
+	if !c.ModelAllowlistDefaulted() {
+		t.Fatal("compatibility model allowlist was not reported")
+	}
+	for _, model := range []string{"gpt-5.6-terra", "gpt-5.6-sol"} {
+		for _, subcommand := range []domain.Subcommand{domain.SubcommandImpl, domain.SubcommandReview, domain.SubcommandPlan, domain.SubcommandResearch, domain.SubcommandRead, domain.SubcommandThink} {
+			if _, ok := c.ResolveModel(subcommand, &model); !ok {
+				t.Fatalf("%q was rejected for %q", model, subcommand)
+			}
+		}
+	}
+	for _, tt := range []struct {
+		model      string
+		subcommand domain.Subcommand
+		want       bool
+	}{
+		{"gpt-5.6-luna", domain.SubcommandRead, true},
+		{"gpt-5.6-luna", domain.SubcommandImpl, false},
+		{"gpt-6-astra", domain.SubcommandThink, true},
+		{"gpt-6-astra", domain.SubcommandReview, false},
+		{"gpt-5.6-terra", domain.SubcommandStatus, false},
+	} {
+		if _, ok := c.ResolveModel(tt.subcommand, &tt.model); ok != tt.want {
+			t.Fatalf("ResolveModel(%q, %q) ok = %t; want %t", tt.subcommand, tt.model, ok, tt.want)
+		}
+	}
+}
+
+func TestLoadExplicitUsesConfiguredModelAllowlist(t *testing.T) {
+	c := loadExplicitFile(t, `model = "test-future-model"
+[model_allowlist]
+"test-future-model" = ["review", "research"]`)
+	if c.ModelAllowlistDefaulted() {
+		t.Fatal("explicit model allowlist was reported as defaulted")
+	}
+	model := "test-future-model"
+	for _, subcommand := range []domain.Subcommand{domain.SubcommandReview, domain.SubcommandResearch} {
+		if _, ok := c.ResolveModel(subcommand, &model); !ok {
+			t.Fatalf("configured model was rejected for %q", subcommand)
+		}
+	}
+	for _, subcommand := range []domain.Subcommand{domain.SubcommandImpl, domain.SubcommandPlan, domain.SubcommandRead, domain.SubcommandThink} {
+		if _, ok := c.ResolveModel(subcommand, &model); ok {
+			t.Fatalf("configured model was accepted for %q", subcommand)
+		}
+	}
+}
+
+func TestLoadExplicitUsesGlobalDefaultForThinkWithConfiguredModelAllowlist(t *testing.T) {
+	c := loadExplicitFile(t, `[model_allowlist]
+"gpt-5.6-terra" = ["impl", "review", "plan", "research", "read", "think"]`)
+
+	model, ok := c.ResolveModel(domain.SubcommandThink, nil)
+	if !ok || model != defaultModel {
+		t.Fatalf("ResolveModel(think, nil) = %q, %t; want %q, true", model, ok, defaultModel)
+	}
+	if _, exists := c.ModelOverrides()[domain.SubcommandThink]; exists {
+		t.Fatal("configured model allowlist added an implicit think override")
+	}
+}
+
+func TestLoadExplicitRejectsInvalidModelAllowlist(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		contents string
+	}{
+		{"empty table", "[model_allowlist]"},
+		{"empty model", "[model_allowlist]\n\"\" = [\"read\"]"},
+		{"leading whitespace", "[model_allowlist]\n\" model\" = [\"read\"]"},
+		{"trailing whitespace", "[model_allowlist]\n\"model \" = [\"read\"]"},
+		{"control character", "[model_allowlist]\n\"model\\tname\" = [\"read\"]"},
+		{"invalid leading dot", "[model_allowlist]\n\".model\" = [\"read\"]"},
+		{"invalid leading underscore", "[model_allowlist]\n\"_model\" = [\"read\"]"},
+		{"invalid leading hyphen", "[model_allowlist]\n\"-model\" = [\"read\"]"},
+		{"empty commands", "[model_allowlist]\nmodel = []"},
+		{"status", "[model_allowlist]\nmodel = [\"status\"]"},
+		{"cancel", "[model_allowlist]\nmodel = [\"cancel\"]"},
+		{"tail", "[model_allowlist]\nmodel = [\"tail\"]"},
+		{"unknown command", "[model_allowlist]\nmodel = [\"unknown\"]"},
+		{"duplicate command", "[model_allowlist]\nmodel = [\"read\", \"read\"]"},
+		{"not a string array", "[model_allowlist]\nmodel = [1]"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			withCodexBinaryCandidate(t)
+			_, err := LoadExplicit(writeConfig(t, tt.contents))
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("LoadExplicit error = %v; want ErrInvalidConfig", err)
+			}
+		})
+	}
+}
+
+func TestLoadExplicitRejectsDuplicateModelAllowlistKey(t *testing.T) {
+	withCodexBinaryCandidate(t)
+	_, err := LoadExplicit(writeConfig(t, "[model_allowlist]\n\"model\" = [\"read\"]\n\"model\" = [\"review\"]"))
+	if !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("LoadExplicit error = %v; want ErrInvalidConfig", err)
+	}
+}
+
+func TestLoadExplicitRejectsModelMissingFromAllowlist(t *testing.T) {
+	withCodexBinaryCandidate(t)
+	_, err := LoadExplicit(writeConfig(t, "model = \"missing\"\n[model_allowlist]\nmodel = [\"read\"]"))
+	var loadErr *LoadError
+	if !errors.As(err, &loadErr) || loadErr.Key != "model" {
+		t.Fatalf("LoadExplicit error = %#v; want model LoadError", err)
+	}
+}
+
+func TestLoadExplicitRejectsModelOverrideMissingFromAllowlist(t *testing.T) {
+	withCodexBinaryCandidate(t)
+	_, err := LoadExplicit(writeConfig(t, "model = \"model\"\n[model_overrides]\nreview = \"missing\"\n[model_allowlist]\nmodel = [\"review\"]"))
+	var loadErr *LoadError
+	if !errors.As(err, &loadErr) || loadErr.Key != "model_overrides.review" {
+		t.Fatalf("LoadExplicit error = %#v; want model_overrides.review LoadError", err)
+	}
+}
+
+func TestConfiguredModelAllowlistIsCopied(t *testing.T) {
+	model := "model"
+	raw := rawConfig{Model: &model, ModelAllowlist: map[string][]string{model: {"read"}}}
+	c, err := resolve(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw.ModelAllowlist[model][0] = "review"
+	if _, ok := c.ResolveModel(domain.SubcommandRead, &model); !ok {
+		t.Fatal("mutating raw input changed configured policy")
+	}
+	if _, ok := c.ResolveModel(domain.SubcommandReview, &model); ok {
+		t.Fatal("mutating raw input changed configured policy")
+	}
+}
+
 func TestResolveModelAllowsLunaOnlyForRead(t *testing.T) {
 	requested := "gpt-5.6-luna"
-	c := Config{}
+	c := loadExplicitFile(t, "")
 
 	tests := []struct {
 		name       string
@@ -130,7 +261,7 @@ func TestResolveModelAllowsLunaOnlyForRead(t *testing.T) {
 
 func TestResolveModelAllowsAstraOnlyForThink(t *testing.T) {
 	requested := "gpt-6-astra"
-	c := Config{}
+	c := loadExplicitFile(t, "")
 	for _, tt := range []struct {
 		name       string
 		subcommand domain.Subcommand
@@ -164,11 +295,11 @@ func TestResolveModelThinkPolicyAndDefaults(t *testing.T) {
 		model  string
 		want   bool
 	}{
-		{name: "default", config: Config{model: "gpt-6-astra"}, model: "gpt-6-astra", want: true},
-		{name: "override", config: Config{model: "gpt-5.6-terra", modelOverrides: map[domain.Subcommand]string{domain.SubcommandThink: "gpt-6-astra"}}, model: "gpt-6-astra", want: true},
-		{name: "terra", config: Config{}, model: "gpt-5.6-terra", want: true},
-		{name: "sol", config: Config{}, model: "gpt-5.6-sol", want: true},
-		{name: "luna", config: Config{}, model: "gpt-5.6-luna", want: false},
+		{name: "default", config: loadExplicitFile(t, "model = \"gpt-6-astra\""), model: "gpt-6-astra", want: true},
+		{name: "override", config: loadExplicitFile(t, "model = \"gpt-5.6-terra\"\n[model_overrides]\nthink = \"gpt-6-astra\""), model: "gpt-6-astra", want: true},
+		{name: "terra", config: loadExplicitFile(t, ""), model: "gpt-5.6-terra", want: true},
+		{name: "sol", config: loadExplicitFile(t, ""), model: "gpt-5.6-sol", want: true},
+		{name: "luna", config: loadExplicitFile(t, ""), model: "gpt-5.6-luna", want: false},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			var requested *string
@@ -207,7 +338,7 @@ func TestLoadExplicitResolvesThinkModel(t *testing.T) {
 
 func TestResolveModelRejectsNonSubmittableSubcommand(t *testing.T) {
 	requested := "gpt-5.6-terra"
-	if model, ok := (Config{}).ResolveModel(domain.SubcommandStatus, &requested); ok || model != requested {
+	if model, ok := loadExplicitFile(t, "").ResolveModel(domain.SubcommandStatus, &requested); ok || model != requested {
 		t.Fatalf("ResolveModel(%q, %q) = %q, %t; want %q, false", domain.SubcommandStatus, requested, model, ok, requested)
 	}
 }
@@ -219,9 +350,9 @@ func TestResolveModelAppliesSubcommandPolicyToConfiguredValues(t *testing.T) {
 		subcommand domain.Subcommand
 		wantOK     bool
 	}{
-		{name: "global default allowed for read", config: Config{model: "gpt-5.6-luna"}, subcommand: domain.SubcommandRead, wantOK: true},
-		{name: "global default rejected for impl", config: Config{model: "gpt-5.6-luna"}, subcommand: domain.SubcommandImpl, wantOK: false},
-		{name: "override rejected for review", config: Config{model: "gpt-5.6-terra", modelOverrides: map[domain.Subcommand]string{domain.SubcommandReview: "gpt-5.6-luna"}}, subcommand: domain.SubcommandReview, wantOK: false},
+		{name: "global default allowed for read", config: loadExplicitFile(t, "model = \"gpt-5.6-luna\""), subcommand: domain.SubcommandRead, wantOK: true},
+		{name: "global default rejected for impl", config: loadExplicitFile(t, "model = \"gpt-5.6-luna\""), subcommand: domain.SubcommandImpl, wantOK: false},
+		{name: "override rejected for review", config: loadExplicitFile(t, "[model_overrides]\nreview = \"gpt-5.6-luna\""), subcommand: domain.SubcommandReview, wantOK: false},
 	}
 
 	for _, tt := range tests {
@@ -562,9 +693,6 @@ func TestOverrideAccessorsReturnCopies(t *testing.T) {
 }
 
 func TestAllowedValues(t *testing.T) {
-	if !IsModelAllowed("gpt-5.6-terra") || !IsModelAllowed("gpt-5.6-sol") || !IsModelAllowed("gpt-5.6-luna") || !IsModelAllowed("gpt-6-astra") || IsModelAllowed("other") {
-		t.Fatal("model allowlist is incorrect")
-	}
 	if !IsReasoningEffortAllowed("low") || !IsReasoningEffortAllowed("medium") || !IsReasoningEffortAllowed("high") || !IsReasoningEffortAllowed("xhigh") || IsReasoningEffortAllowed("other") {
 		t.Fatal("reasoning effort allowlist is incorrect")
 	}

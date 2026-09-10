@@ -28,6 +28,45 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/transport/client"
 )
 
+func TestModelAllowlistDefaultedStartupLog(t *testing.T) {
+	root := t.TempDir()
+	cfg, err := config.LoadExplicit(writeTestConfig(t, root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	logModelAllowlistDefaulted(slog.New(slog.NewJSONHandler(&logs, nil)), cfg)
+	var record map[string]any
+	if err := json.Unmarshal(logs.Bytes(), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record["msg"] != "model allowlist compatibility defaults active" || record["model_allowlist_defaulted"] != true {
+		t.Fatalf("startup log = %#v", record)
+	}
+}
+
+func TestExplicitModelAllowlistDoesNotWriteDefaultedStartupLog(t *testing.T) {
+	root := t.TempDir()
+	path := writeTestConfig(t, root)
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents = append(contents, []byte("model = \"gpt-5.6-terra\"\n[model_allowlist]\n\"gpt-5.6-terra\" = [\"impl\"]\n")...)
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadExplicit(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	logModelAllowlistDefaulted(slog.New(slog.NewJSONHandler(&logs, nil)), cfg)
+	if logs.Len() != 0 {
+		t.Fatalf("unexpected startup log: %s", logs.String())
+	}
+}
+
 func TestBuildDependenciesWiresEvictWorkDirAtDefaultWorktreeRoot(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	home, err := os.UserHomeDir()

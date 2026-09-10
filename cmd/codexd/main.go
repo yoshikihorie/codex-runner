@@ -678,6 +678,7 @@ func runMain(ctx context.Context, args []string, stderr io.Writer) error {
 		fmt.Fprintln(stderr, safeConfigErrorMessage(err))
 		return &reportedError{cause: err}
 	}
+	logModelAllowlistDefaulted(logger, cfg)
 	taskPlacementRoot := cfg.TaskPlacementRoot()
 	managedRunDir := filepath.Join(home, ".claude", "run")
 	if err := ensureManagedPrivateDir(managedRunDir); err != nil {
@@ -753,6 +754,12 @@ func runMain(ctx context.Context, args []string, stderr io.Writer) error {
 	}
 	background.Wait()
 	return errors.Join(result.serveErr, result.socketRemoveErr, deps.watcher.Close())
+}
+
+func logModelAllowlistDefaulted(logger *slog.Logger, cfg config.Config) {
+	if cfg.ModelAllowlistDefaulted() {
+		logger.Info("model allowlist compatibility defaults active", "model_allowlist_defaulted", true)
+	}
 }
 
 type daemonDependencies struct {
