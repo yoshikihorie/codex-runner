@@ -183,6 +183,28 @@ func TestResolveModelThinkPolicyAndDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadExplicitResolvesThinkModel(t *testing.T) {
+	tests := []struct {
+		name   string
+		config string
+		want   string
+	}{
+		{name: "global model", config: `model = "gpt-5.6-sol"`, want: "gpt-5.6-sol"},
+		{name: "no global model", want: "gpt-5.6-astra"},
+		{name: "think override", config: "model = \"gpt-5.6-terra\"\n[model_overrides]\nthink = \"gpt-5.6-sol\"", want: "gpt-5.6-sol"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := loadExplicitFile(t, tt.config)
+			model, ok := c.ResolveModel(domain.SubcommandThink, nil)
+			if !ok || model != tt.want {
+				t.Fatalf("ResolveModel(think, nil) = %q, %t; want %q, true", model, ok, tt.want)
+			}
+		})
+	}
+}
+
 func TestResolveModelRejectsNonSubmittableSubcommand(t *testing.T) {
 	requested := "gpt-5.6-terra"
 	if model, ok := (Config{}).ResolveModel(domain.SubcommandStatus, &requested); ok || model != requested {

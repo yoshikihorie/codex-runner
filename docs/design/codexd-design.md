@@ -45,7 +45,7 @@
 唯一の入口である。運用ルール上 `codex exec` の直接実行は禁止されており、すべての委譲がここを通る。
 
 サブコマンドは 12 個（`review` / `impl` / `plan` / `research` / `read` / `think` / `status` / `logs` /
-`cancel` / `doctor` / `cleanup` / `parallel`（廃止済み））。
+`cancel` / `doctor` / `cleanup` / `stats`）。
 
 ### 1.2 2026-07-31 に起きた事故
 

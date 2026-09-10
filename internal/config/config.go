@@ -199,9 +199,12 @@ func resolve(raw rawConfig) (Config, error) {
 		metricsRetentionMonths: defaultMetricsRetentionMonths, metricsMaxFileBytes: defaultMetricsMaxFileBytes,
 		taskPlacementRetentionDays: defaultTaskPlacementRetentionDays, totalTaskDiskBudgetMB: defaultTotalTaskDiskBudgetMB,
 		socketPath: socketPath, model: defaultModel,
-		modelOverrides: map[domain.Subcommand]string{domain.SubcommandThink: thinkOnlyModel}, reasoningEffortOverrides: make(map[domain.Subcommand]string),
+		modelOverrides: make(map[domain.Subcommand]string), reasoningEffortOverrides: make(map[domain.Subcommand]string),
 		ptyEnabled:        defaultPtyEnabled,
 		taskPlacementRoot: defaultTaskPlacementRoot,
+	}
+	if raw.Model == nil {
+		c.modelOverrides[domain.SubcommandThink] = thinkOnlyModel
 	}
 	if raw.MaxConcurrentTasks != nil {
 		c.maxConcurrentTasks = *raw.MaxConcurrentTasks
