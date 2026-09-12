@@ -59,7 +59,8 @@ type SubmitTaskInput struct {
 	ReasoningEffort         *string
 	RawWorkingDir           string
 	RawWorktreeMode         *string
-	OutputSchemaPath        *string
+	OutputSchemaPath        OptionalString
+	SandboxMode             OptionalString
 	RequestedAt             time.Time
 }
 type SubmitTaskOutput struct {
@@ -96,16 +97,38 @@ func NewSubmitTaskUseCase(tasks SubmitTaskStore, pathLocks SubmitPathLockAcquire
 }
 
 type submitWireInput struct {
-	Subcommand              string   `json:"subcommand"`
-	Slug                    string   `json:"slug"`
-	Prompt                  string   `json:"prompt"`
-	RequestedTimeoutSeconds *int     `json:"requested_timeout_seconds"`
-	Paths                   []string `json:"paths"`
-	Model                   *string  `json:"model"`
-	ReasoningEffort         *string  `json:"reasoning_effort"`
-	WorkingDir              string   `json:"working_dir"`
-	WorktreeMode            *string  `json:"worktree_mode"`
-	OutputSchemaPath        *string  `json:"output_schema_path"`
+	Subcommand              string         `json:"subcommand"`
+	Slug                    string         `json:"slug"`
+	Prompt                  string         `json:"prompt"`
+	RequestedTimeoutSeconds *int           `json:"requested_timeout_seconds"`
+	Paths                   []string       `json:"paths"`
+	Model                   *string        `json:"model"`
+	ReasoningEffort         *string        `json:"reasoning_effort"`
+	WorkingDir              string         `json:"working_dir"`
+	WorktreeMode            *string        `json:"worktree_mode"`
+	OutputSchemaPath        OptionalString `json:"output_schema_path"`
+	SandboxMode             OptionalString `json:"sandbox_mode"`
+}
+
+// OptionalString retains whether an optional string was omitted, null, or a string.
+type OptionalString struct {
+	Present bool
+	Null    bool
+	Value   string
+}
+
+func (value *OptionalString) UnmarshalJSON(data []byte) error {
+	*value = OptionalString{Present: true}
+	if string(data) == "null" {
+		value.Null = true
+		return nil
+	}
+	var decoded string
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	value.Value = decoded
+	return nil
 }
 
 type submitError struct {
@@ -126,17 +149,11 @@ func (uc *SubmitTaskUseCase) Handle(req transport.Request) transport.Response {
 	if err := json.Unmarshal(req.Params, &object); err != nil || object == nil {
 		return submitErrorResponse(req.RequestID, submitFailure("SUBMIT_PARAMS_MALFORMED", "error.submit.paramsMalformed", nil))
 	}
-	if rawSchema, present := object["output_schema_path"]; present {
-		var schema string
-		if strings.TrimSpace(string(rawSchema)) == "null" || json.Unmarshal(rawSchema, &schema) != nil {
-			return submitErrorResponse(req.RequestID, submitFailure("SUBMIT_PARAMS_MALFORMED", "error.submit.paramsMalformed", nil))
-		}
-	}
 	var wire submitWireInput
 	if err := json.Unmarshal(req.Params, &wire); err != nil {
 		return submitErrorResponse(req.RequestID, submitFailure("SUBMIT_PARAMS_MALFORMED", "error.submit.paramsMalformed", nil))
 	}
-	out, err := uc.Execute(context.Background(), SubmitTaskInput{Subcommand: wire.Subcommand, RawSlug: wire.Slug, Prompt: wire.Prompt, RequestedTimeoutSeconds: wire.RequestedTimeoutSeconds, RawPaths: wire.Paths, Model: wire.Model, ReasoningEffort: wire.ReasoningEffort, RawWorkingDir: wire.WorkingDir, RawWorktreeMode: wire.WorktreeMode, OutputSchemaPath: wire.OutputSchemaPath, RequestedAt: uc.clock.Now()})
+	out, err := uc.Execute(context.Background(), SubmitTaskInput{Subcommand: wire.Subcommand, RawSlug: wire.Slug, Prompt: wire.Prompt, RequestedTimeoutSeconds: wire.RequestedTimeoutSeconds, RawPaths: wire.Paths, Model: wire.Model, ReasoningEffort: wire.ReasoningEffort, RawWorkingDir: wire.WorkingDir, RawWorktreeMode: wire.WorktreeMode, OutputSchemaPath: wire.OutputSchemaPath, SandboxMode: wire.SandboxMode, RequestedAt: uc.clock.Now()})
 	if err != nil {
 		return submitErrorResponse(req.RequestID, uc.mapError(err))
 	}
@@ -152,6 +169,9 @@ func (uc *SubmitTaskUseCase) Handle(req transport.Request) transport.Response {
 }
 
 func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (SubmitTaskOutput, error) {
+	if in.OutputSchemaPath.Null || in.SandboxMode.Null {
+		return SubmitTaskOutput{}, submitFailure("SUBMIT_PARAMS_MALFORMED", "error.submit.paramsMalformed", nil)
+	}
 	slug, err := domain.NewSlug(in.RawSlug)
 	if err != nil {
 		return SubmitTaskOutput{}, submitFailure("SLUG_INVALID_FORMAT", "error.slug.invalidFormat", map[string]any{"slug": in.RawSlug})
@@ -197,6 +217,10 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 		}
 		worktreeMode = resolved
 	}
+	sandbox, err := resolveSandboxMode(subcommand, in.SandboxMode)
+	if err != nil {
+		return SubmitTaskOutput{}, err
+	}
 	id, err := uc.reserveTaskID(subcommand, slug, in.RequestedAt)
 	if err != nil {
 		return SubmitTaskOutput{}, uc.mapError(err)
@@ -224,10 +248,6 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 		}
 		uc.releaseReservation(id, nil)
 		return SubmitTaskOutput{}, err
-	}
-	sandbox := "read-only"
-	if subcommand == domain.SubcommandImpl {
-		sandbox = "workspace-write"
 	}
 	result, err := uc.admitter.Admit(execution.TaskAdmissionInput{TaskID: id, Subcommand: subcommand, Slug: slug, RequestedTimeout: in.RequestedTimeoutSeconds, RequestedAt: in.RequestedAt, PromptText: in.Prompt, NormalizedPaths: normalizedPaths, ResolvedTimeout: timeout, Model: model, ReasoningEffort: effort, SandboxMode: sandbox, SourceWorkingDir: workingDir, WorktreeMode: worktreeMode, OutputSchemaPath: outputSchemaPath})
 	if err != nil {
@@ -261,25 +281,41 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 	return SubmitTaskOutput{TaskID: id, State: domain.StateQueued, QueuePosition: result.QueuePosition, Events: result.Events}, nil
 }
 
-func validateOutputSchemaPath(subcommand domain.Subcommand, path *string) error {
-	if path == nil {
+func validateOutputSchemaPath(subcommand domain.Subcommand, path OptionalString) error {
+	if !path.Present {
 		return nil
 	}
 	if subcommand != domain.SubcommandReview && subcommand != domain.SubcommandResearch {
 		return submitFailure("OUTPUT_SCHEMA_SUBCOMMAND_NOT_ALLOWED", "error.outputSchema.subcommandNotAllowed", nil)
 	}
-	if *path == "" || !filepath.IsAbs(*path) {
+	if path.Value == "" || !filepath.IsAbs(path.Value) {
 		return submitFailure("OUTPUT_SCHEMA_NOT_ABSOLUTE", "error.outputSchema.notAbsolute", nil)
 	}
-	info, err := os.Lstat(*path)
+	info, err := os.Lstat(path.Value)
 	if err != nil || !info.Mode().IsRegular() {
 		return submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
 	}
 	return nil
 }
 
-func (uc *SubmitTaskUseCase) snapshotOutputSchema(id domain.TaskID, source *string) (*string, error) {
-	if source == nil {
+func resolveSandboxMode(subcommand domain.Subcommand, requested OptionalString) (string, error) {
+	if !requested.Present {
+		if subcommand == domain.SubcommandImpl {
+			return "workspace-write", nil
+		}
+		return "read-only", nil
+	}
+	if requested.Value != "read-only" && requested.Value != "workspace-write" {
+		return "", submitFailure("SANDBOX_MODE_NOT_ALLOWED", "error.sandboxMode.notAllowed", map[string]any{"sandbox_mode": requested.Value})
+	}
+	if subcommand == domain.SubcommandPlan || (requested.Value == "read-only" && subcommand != domain.SubcommandImpl) {
+		return requested.Value, nil
+	}
+	return "", submitFailure("SANDBOX_MODE_NOT_ALLOWED", "error.sandboxMode.notAllowed", map[string]any{"sandbox_mode": requested.Value})
+}
+
+func (uc *SubmitTaskUseCase) snapshotOutputSchema(id domain.TaskID, source OptionalString) (*string, error) {
+	if !source.Present {
 		return nil, nil
 	}
 	rootProvider, ok := uc.options.(taskPlacementRootProvider)
@@ -290,7 +326,7 @@ func (uc *SubmitTaskUseCase) snapshotOutputSchema(id domain.TaskID, source *stri
 	if err != nil {
 		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
 	}
-	sourceFile, err := os.OpenFile(*source, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	sourceFile, err := os.OpenFile(source.Value, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
 	}

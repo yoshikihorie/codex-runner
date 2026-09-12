@@ -112,6 +112,25 @@ func TestBuildLaunchArgs(t *testing.T) {
 	}
 }
 
+func TestProcessRunnerRejectsInvalidSandboxModeBeforeLaunching(t *testing.T) {
+	lock := launchTestLock(t)
+	params := launchTestParams(t, lock)
+	params.SandboxMode = "danger-full-access"
+	called := false
+	original := launchNewSession
+	t.Cleanup(func() { launchNewSession = original })
+	launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+		called = true
+		return nil, errors.New("must not launch")
+	}
+	if _, err := NewProcessRunner(launchTestLogs{logs: launchTestLogsFor(t)}).Launch(context.Background(), params); err == nil || called {
+		t.Fatalf("err=%v launched=%t", err, called)
+	}
+	if _, err := lock.Stat(); err == nil {
+		t.Fatal("lock remains open")
+	}
+}
+
 func TestBuildLaunchArgsAddsOutputSchemaBeforeLastMessageAndTerminator(t *testing.T) {
 	p := launchTestParams(t, nil)
 	schema := filepath.Join(p.TaskDirPath, "output-schema.json")

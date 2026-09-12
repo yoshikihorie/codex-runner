@@ -282,7 +282,7 @@ func TestSubmitExecuteValidatesAndForwardsOutputSchemaPath(t *testing.T) {
 			fixture.store.root = t.TempDir()
 			fixture.uc.options = submitOptionsFake{model: "test-model", modelOK: true, effortOK: true, taskPlacementRoot: fixture.store.root}
 			in := validSubmitInput(t)
-			in.Subcommand, in.OutputSchemaPath = tc.subcommand, &tc.path
+			in.Subcommand, in.OutputSchemaPath = tc.subcommand, optionalString(tc.path)
 			_, err := fixture.uc.Execute(context.Background(), in)
 			if tc.code != "" {
 				assertSubmitError(t, err, tc.code, tc.message, nil)
@@ -327,7 +327,7 @@ func TestSubmitExecuteRejectsSymlinkOutputSchemaPath(t *testing.T) {
 	}
 	fixture := newSubmitFixture()
 	in := validSubmitInput(t)
-	in.OutputSchemaPath = &link
+	in.OutputSchemaPath = optionalString(link)
 	_, err := fixture.uc.Execute(context.Background(), in)
 	assertSubmitError(t, err, "OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
 }
@@ -341,7 +341,7 @@ func TestSubmitExecuteSnapshotsOutputSchemaBeforeSourceReplacement(t *testing.T)
 	fixture.store.root = t.TempDir()
 	fixture.uc.options = submitOptionsFake{model: "test-model", modelOK: true, effortOK: true, taskPlacementRoot: fixture.store.root}
 	in := validSubmitInput(t)
-	in.OutputSchemaPath = &source
+	in.OutputSchemaPath = optionalString(source)
 	if _, err := fixture.uc.Execute(context.Background(), in); err != nil {
 		t.Fatal(err)
 	}
@@ -507,7 +507,7 @@ func TestSubmitExecuteThinkIsReadOnlyAndRejectsOutputSchema(t *testing.T) {
 	}
 	fixture = newSubmitFixture()
 	in = validSubmitInput(t)
-	in.Subcommand, in.OutputSchemaPath = string(domain.SubcommandThink), &schema
+	in.Subcommand, in.OutputSchemaPath = string(domain.SubcommandThink), optionalString(schema)
 	_, err := fixture.uc.Execute(context.Background(), in)
 	assertSubmitError(t, err, "OUTPUT_SCHEMA_SUBCOMMAND_NOT_ALLOWED", "error.outputSchema.subcommandNotAllowed", nil)
 }
@@ -550,6 +550,88 @@ func TestSubmitExecuteImplPathLockAndSandbox(t *testing.T) {
 	}
 	if len(fixture.store.released) != 0 || fixture.releaser.calls != 0 {
 		t.Fatal("successful submit released resources")
+	}
+}
+
+func TestSubmitExecuteResolvesSandboxModeAndRejectsInvalidRequestsBeforeSideEffects(t *testing.T) {
+	for _, tc := range []struct {
+		name, subcommand, want string
+		requested              OptionalString
+		err                    bool
+	}{
+		{name: "impl omitted", subcommand: "impl", want: "workspace-write"},
+		{name: "plan omitted", subcommand: "plan", want: "read-only"},
+		{name: "plan read only", subcommand: "plan", requested: optionalString("read-only"), want: "read-only"},
+		{name: "plan workspace write", subcommand: "plan", requested: optionalString("workspace-write"), want: "workspace-write"},
+		{name: "review read only", subcommand: "review", requested: optionalString("read-only"), want: "read-only"},
+		{name: "research read only", subcommand: "research", requested: optionalString("read-only"), want: "read-only"},
+		{name: "read read only", subcommand: "read", requested: optionalString("read-only"), want: "read-only"},
+		{name: "think read only", subcommand: "think", requested: optionalString("read-only"), want: "read-only"},
+		{name: "impl read only", subcommand: "impl", requested: optionalString("read-only"), err: true},
+		{name: "impl workspace write", subcommand: "impl", requested: optionalString("workspace-write"), err: true},
+		{name: "review workspace write", subcommand: "review", requested: optionalString("workspace-write"), err: true},
+		{name: "research workspace write", subcommand: "research", requested: optionalString("workspace-write"), err: true},
+		{name: "read workspace write", subcommand: "read", requested: optionalString("workspace-write"), err: true},
+		{name: "think workspace write", subcommand: "think", requested: optionalString("workspace-write"), err: true},
+		{name: "empty", subcommand: "plan", requested: optionalString(""), err: true},
+		{name: "unknown", subcommand: "plan", requested: optionalString("danger-full-access"), err: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := newSubmitFixture()
+			in := validSubmitInput(t)
+			in.Subcommand, in.SandboxMode = tc.subcommand, tc.requested
+			if tc.subcommand == "impl" {
+				in.RawPaths = []string{t.TempDir()}
+			}
+			_, err := fixture.uc.Execute(context.Background(), in)
+			if tc.err {
+				assertSubmitError(t, err, "SANDBOX_MODE_NOT_ALLOWED", "error.sandboxMode.notAllowed", nil)
+				if len(fixture.store.reserved) != 0 || fixture.locks.calls != 0 || fixture.admitter.calls != 0 {
+					t.Fatalf("side effects occurred")
+				}
+				return
+			}
+			if err != nil || fixture.admitter.input.SandboxMode != tc.want {
+				t.Fatalf("err=%v sandbox=%q want=%q", err, fixture.admitter.input.SandboxMode, tc.want)
+			}
+		})
+	}
+}
+
+func TestSubmitHandleRejectsMalformedSandboxMode(t *testing.T) {
+	for _, raw := range []string{"null", "42", "true", "[]"} {
+		t.Run(raw, func(t *testing.T) {
+			fixture := newSubmitFixture()
+			params := fmt.Sprintf(`{"subcommand":"plan","slug":"valid-slug","prompt":"safe","working_dir":%q,"sandbox_mode":%s}`, t.TempDir(), raw)
+			response := fixture.uc.Handle(transport.Request{RequestID: "request", Params: json.RawMessage(params)})
+			if response.OK || response.Error == nil || response.Error.Code != "SUBMIT_PARAMS_MALFORMED" {
+				t.Fatalf("response=%#v", response)
+			}
+			if len(fixture.store.reserved) != 0 || fixture.locks.calls != 0 || fixture.admitter.calls != 0 {
+				t.Fatal("side effects occurred")
+			}
+		})
+	}
+}
+
+func TestOptionalStringRetainsOmittedNullAndStringStates(t *testing.T) {
+	for _, tc := range []struct {
+		name, params string
+		want         OptionalString
+	}{
+		{name: "omitted", params: `{}`, want: OptionalString{}},
+		{name: "null", params: `{"sandbox_mode":null}`, want: OptionalString{Present: true, Null: true}},
+		{name: "string", params: `{"sandbox_mode":"read-only"}`, want: optionalString("read-only")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var wire submitWireInput
+			if err := json.Unmarshal([]byte(tc.params), &wire); err != nil {
+				t.Fatal(err)
+			}
+			if wire.SandboxMode != tc.want {
+				t.Fatalf("sandbox_mode=%#v want=%#v", wire.SandboxMode, tc.want)
+			}
+		})
 	}
 }
 
@@ -825,6 +907,10 @@ func mapSubmitMessage(code string) string {
 }
 func intPtr(value int) *int          { return &value }
 func ptrString(value string) *string { return &value }
+
+func optionalString(value string) OptionalString {
+	return OptionalString{Present: true, Value: value}
+}
 func boolCount(value bool) int {
 	if value {
 		return 1

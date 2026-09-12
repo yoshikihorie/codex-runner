@@ -342,6 +342,10 @@ func (r *processRunner) Launch(ctx context.Context, p LaunchParams) (*LaunchedPr
 	if p.LivenessLockFile == nil {
 		return nil, fmt.Errorf("liveness lock file is required")
 	}
+	if p.SandboxMode != "read-only" && p.SandboxMode != "workspace-write" {
+		_ = p.LivenessLockFile.Close()
+		return nil, fmt.Errorf("sandbox mode is invalid")
+	}
 	info, err := os.Stat(p.TaskDirPath)
 	if err != nil || !info.IsDir() {
 		_ = p.LivenessLockFile.Close()

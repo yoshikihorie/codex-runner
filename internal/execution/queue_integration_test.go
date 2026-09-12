@@ -267,6 +267,27 @@ func TestSubmitQueueIntegrationEnqueuesWhenSlotsAreFull(t *testing.T) {
 	}
 }
 
+func TestSubmitQueueIntegrationPreservesExplicitPlanWorkspaceWrite(t *testing.T) {
+	fixture := newQueueIntegrationFixture(t, 1, 1, queueIntegrationOptions{model: "gpt-5.6-terra"})
+	active, err := domain.NewTaskID("review-20260809-120000-a1b2-sandbox-active")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.registry.Add(active, domain.SubcommandReview)
+	input := queueIntegrationInput(t, "sandbox-queued")
+	input.Subcommand = "plan"
+	requested := "workspace-write"
+	input.SandboxMode = transportusecase.OptionalString{Present: true, Value: requested}
+	out, err := fixture.submit.Execute(context.Background(), input)
+	if err != nil || out.QueuePosition == nil || len(fixture.starter.payloads) != 0 {
+		t.Fatalf("out=%#v err=%v", out, err)
+	}
+	payload, found := fixture.queue.Dequeue()
+	if !found || payload.Task.ID() != out.TaskID || payload.SandboxMode != requested {
+		t.Fatalf("payload=%#v found=%t", payload, found)
+	}
+}
+
 // SCN-proto-01-19.
 func TestSubmitQueueIntegrationKeepsRepeatedSubmissionsDistinct(t *testing.T) {
 	fixture := newQueueIntegrationFixture(t, 2, 2, queueIntegrationOptions{model: "gpt-5.6-terra"})
