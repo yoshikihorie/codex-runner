@@ -678,6 +678,7 @@ func runMain(ctx context.Context, args []string, stderr io.Writer) error {
 		fmt.Fprintln(stderr, safeConfigErrorMessage(err))
 		return &reportedError{cause: err}
 	}
+	logGitStubUnavailable(logger, proc.GitStubStatus())
 	logModelAllowlistDefaulted(logger, cfg)
 	taskPlacementRoot := cfg.TaskPlacementRoot()
 	managedRunDir := filepath.Join(home, ".claude", "run")
@@ -759,6 +760,12 @@ func runMain(ctx context.Context, args []string, stderr io.Writer) error {
 func logModelAllowlistDefaulted(logger *slog.Logger, cfg config.Config) {
 	if cfg.ModelAllowlistDefaulted() {
 		logger.Info("model allowlist compatibility defaults active", "model_allowlist_defaulted", true)
+	}
+}
+
+func logGitStubUnavailable(logger *slog.Logger, status proc.GitStubPathStatus) {
+	if !status.Eligible {
+		logger.Warn("git stub directory excluded from child PATH", "directory", status.Directory, "reason", status.Reason)
 	}
 }
 

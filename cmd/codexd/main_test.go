@@ -67,6 +67,26 @@ func TestExplicitModelAllowlistDoesNotWriteDefaultedStartupLog(t *testing.T) {
 	}
 }
 
+func TestLogGitStubUnavailableWarnsWithReason(t *testing.T) {
+	var logs bytes.Buffer
+	logGitStubUnavailable(slog.New(slog.NewJSONHandler(&logs, nil)), proc.GitStubPathStatus{Directory: "/test/stubs", Reason: "directory does not exist"})
+	var record map[string]any
+	if err := json.Unmarshal(logs.Bytes(), &record); err != nil {
+		t.Fatal(err)
+	}
+	if record["msg"] != "git stub directory excluded from child PATH" || record["directory"] != "/test/stubs" || record["reason"] != "directory does not exist" {
+		t.Fatalf("startup warning = %#v", record)
+	}
+}
+
+func TestLogGitStubUnavailableSkipsEligibleDirectory(t *testing.T) {
+	var logs bytes.Buffer
+	logGitStubUnavailable(slog.New(slog.NewJSONHandler(&logs, nil)), proc.GitStubPathStatus{Directory: "/test/stubs", Eligible: true})
+	if logs.Len() != 0 {
+		t.Fatalf("unexpected startup warning: %s", logs.String())
+	}
+}
+
 func TestBuildDependenciesWiresEvictWorkDirAtDefaultWorktreeRoot(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	home, err := os.UserHomeDir()

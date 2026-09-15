@@ -98,6 +98,9 @@ func buildLaunchArgs(p LaunchParams, skipGitRepoCheck bool) (headProcess string,
 	args = append(args,
 		"-C", p.WorkingDir,
 		"--model", p.Model)
+	if p.Subcommand == domain.SubcommandImpl && p.SandboxMode == "workspace-write" {
+		args = append(args, "-c", "sandbox_workspace_write.network_access=true")
+	}
 	if p.ReasoningEffort != nil {
 		args = append(args, "-c", "model_reasoning_effort="+*p.ReasoningEffort)
 	}

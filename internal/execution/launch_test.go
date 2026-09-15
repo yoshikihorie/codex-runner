@@ -112,6 +112,82 @@ func TestBuildLaunchArgs(t *testing.T) {
 	}
 }
 
+func TestBuildLaunchArgsNetworkAccess(t *testing.T) {
+	reasoning := "high"
+	for _, tt := range []struct {
+		name       string
+		subcommand domain.Subcommand
+		sandbox    string
+		want       []string
+	}{
+		{
+			name:       "impl workspace write",
+			subcommand: domain.SubcommandImpl,
+			sandbox:    "workspace-write",
+			want: []string{
+				"-oL", "/bin/echo", "exec", "--json", "--sandbox", "workspace-write",
+				"-C", "/working-dir", "--model", "test-model",
+				"-c", "sandbox_workspace_write.network_access=true",
+				"-c", "model_reasoning_effort=high",
+				"--output-schema", "/task-dir/output-schema.json",
+				"--output-last-message", "/task-dir/last-message.md", "--", "prompt",
+			},
+		},
+		{
+			name:       "plan workspace write",
+			subcommand: domain.SubcommandPlan,
+			sandbox:    "workspace-write",
+			want: []string{
+				"-oL", "/bin/echo", "exec", "--json", "--sandbox", "workspace-write",
+				"-C", "/working-dir", "--model", "test-model",
+				"-c", "model_reasoning_effort=high",
+				"--output-schema", "/task-dir/output-schema.json",
+				"--output-last-message", "/task-dir/last-message.md", "--", "prompt",
+			},
+		},
+		{
+			name:       "review read only",
+			subcommand: domain.SubcommandReview,
+			sandbox:    "read-only",
+			want: []string{
+				"-oL", "/bin/echo", "exec", "--json", "--sandbox", "read-only",
+				"-C", "/working-dir", "--model", "test-model",
+				"-c", "model_reasoning_effort=high",
+				"--output-schema", "/task-dir/output-schema.json",
+				"--output-last-message", "/task-dir/last-message.md", "--", "prompt",
+			},
+		},
+		{
+			name:       "impl read only",
+			subcommand: domain.SubcommandImpl,
+			sandbox:    "read-only",
+			want: []string{
+				"-oL", "/bin/echo", "exec", "--json", "--sandbox", "read-only",
+				"-C", "/working-dir", "--model", "test-model",
+				"-c", "model_reasoning_effort=high",
+				"--output-schema", "/task-dir/output-schema.json",
+				"--output-last-message", "/task-dir/last-message.md", "--", "prompt",
+			},
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p := launchTestParams(t, nil)
+			p.Subcommand = tt.subcommand
+			p.SandboxMode = tt.sandbox
+			p.WorkingDir = "/working-dir"
+			p.TaskDirPath = "/task-dir"
+			p.ReasoningEffort = &reasoning
+			schema := "/task-dir/output-schema.json"
+			p.OutputSchemaPath = &schema
+
+			_, args := buildLaunchArgs(p, false)
+			if !slices.Equal(args, tt.want) {
+				t.Fatalf("args = %q, want %q", args, tt.want)
+			}
+		})
+	}
+}
+
 func TestProcessRunnerRejectsInvalidSandboxModeBeforeLaunching(t *testing.T) {
 	lock := launchTestLock(t)
 	params := launchTestParams(t, lock)

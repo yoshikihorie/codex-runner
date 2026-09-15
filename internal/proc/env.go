@@ -1,11 +1,16 @@
 package proc
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
+
+const gitStubDirectoryName = "codex-blocked-stubs"
 
 var (
 	fixedPathDirs = []string{
@@ -20,17 +25,96 @@ var (
 		"/usr/local/bin/git",
 		"/opt/homebrew/bin/git",
 	}
-	userHomeDir    = os.UserHomeDir
-	allowedEnvKeys = []string{"HOME"}
+	userHomeDir              = os.UserHomeDir
+	allowedEnvKeys           = []string{"HOME"}
+	gitStubDirectoryOwnerUID = func(info os.FileInfo) (uint32, bool) {
+		stat, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return 0, false
+		}
+		return stat.Uid, true
+	}
 )
+
+// GitStubPathStatus reports whether the git-stub directory can safely precede the child PATH.
+type GitStubPathStatus struct {
+	Directory string
+	Eligible  bool
+	Reason    string
+}
 
 // FixedPath returns the fixed child-process PATH.
 func FixedPath() string {
 	dirs := append([]string{}, fixedPathDirs...)
 	if home, err := userHomeDir(); err == nil && isValidHomeDir(home) {
+		if status := GitStubStatus(); status.Eligible {
+			dirs = append([]string{status.Directory}, dirs...)
+		}
 		dirs = append(dirs, filepath.Join(home, ".npm-global", "bin"))
 	}
 	return strings.Join(dirs, ":")
+}
+
+// GitStubStatus enforces the security-spec.md §4 prerequisite and the
+// FD-exec-08.md §5.3.3 and 「判断で決めた点」2 decision to retain the git-stub PATH precedence.
+func GitStubStatus() GitStubPathStatus {
+	home, err := userHomeDir()
+	if err != nil {
+		return GitStubPathStatus{Reason: "user home directory is unavailable"}
+	}
+	if !isValidHomeDir(home) {
+		return GitStubPathStatus{Reason: "user home directory is invalid"}
+	}
+	directory := filepath.Join(home, ".claude", "scripts", gitStubDirectoryName)
+	info, err := os.Stat(directory)
+	if errors.Is(err, fs.ErrNotExist) {
+		return GitStubPathStatus{Directory: directory, Reason: "directory does not exist"}
+	}
+	if err != nil {
+		return GitStubPathStatus{Directory: directory, Reason: "directory cannot be inspected"}
+	}
+	if !info.IsDir() {
+		return GitStubPathStatus{Directory: directory, Reason: "path is not a directory"}
+	}
+	ownerUID, ok := gitStubDirectoryOwnerUID(info)
+	if !ok {
+		return GitStubPathStatus{Directory: directory, Reason: "directory owner cannot be determined"}
+	}
+	if ownerUID != uint32(os.Getuid()) {
+		return GitStubPathStatus{Directory: directory, Reason: "directory is not owned by the executing user"}
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return GitStubPathStatus{Directory: directory, Reason: "directory is writable by group or other"}
+	}
+	entries, err := os.ReadDir(directory)
+	if err != nil {
+		return GitStubPathStatus{Directory: directory, Reason: "directory entries cannot be inspected"}
+	}
+	// An empty directory has no PATH-overriding entries to audit, so it is safe to retain.
+	// Script contents are out of scope because owner and permission checks prevent unauthorized modification.
+	for _, entry := range entries {
+		if !entry.Type().IsRegular() {
+			return GitStubPathStatus{Directory: directory, Reason: fmt.Sprintf("entry %q is not a regular file", entry.Name())}
+		}
+		entryInfo, err := entry.Info()
+		if err != nil {
+			return GitStubPathStatus{Directory: directory, Reason: fmt.Sprintf("entry %q cannot be inspected", entry.Name())}
+		}
+		if !entryInfo.Mode().IsRegular() {
+			return GitStubPathStatus{Directory: directory, Reason: fmt.Sprintf("entry %q is not a regular file", entry.Name())}
+		}
+		entryOwnerUID, ok := gitStubDirectoryOwnerUID(entryInfo)
+		if !ok {
+			return GitStubPathStatus{Directory: directory, Reason: fmt.Sprintf("entry %q owner cannot be determined", entry.Name())}
+		}
+		if entryOwnerUID != uint32(os.Getuid()) {
+			return GitStubPathStatus{Directory: directory, Reason: fmt.Sprintf("entry %q is not owned by the executing user", entry.Name())}
+		}
+		if entryInfo.Mode().Perm()&0o022 != 0 {
+			return GitStubPathStatus{Directory: directory, Reason: fmt.Sprintf("entry %q is writable by group or other", entry.Name())}
+		}
+	}
+	return GitStubPathStatus{Directory: directory, Eligible: true}
 }
 
 // isValidHomeDir reports whether value is an absolute path to an existing directory
