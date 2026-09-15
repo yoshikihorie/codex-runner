@@ -169,12 +169,12 @@ func (uc *RecoverViaResumeUseCase) Execute(ctx context.Context, in RecoverViaRes
 		return RecoverViaResumeOutput{}, ErrRecoveryAlreadyInFlight
 	}
 	defer release()
-	origin, err := uc.begin(in)
+	origin, subcommand, err := uc.begin(in)
 	if err != nil {
 		return RecoverViaResumeOutput{}, err
 	}
 	result := RecoveryResult{ExitCode: failureExitCodeFor(origin)}
-	if in.SessionRef != nil {
+	if in.SessionRef != nil && !(subcommand == domain.SubcommandImpl && origin == domain.RecoveryOriginTimeout) {
 		resumeResult, resumeErr := uc.recoverer.Resume(ctx, in.TaskID, in.SessionRef, origin)
 		if resumeErr != nil {
 			uc.logger.Warn("resume recovery failed", "task_id", in.TaskID.String(), "error", resumeErr)
@@ -195,34 +195,34 @@ func (uc *RecoverViaResumeUseCase) Execute(ctx context.Context, in RecoverViaRes
 	return output, nil
 }
 
-func (uc *RecoverViaResumeUseCase) begin(in RecoverViaResumeInput) (domain.RecoveryOrigin, error) {
+func (uc *RecoverViaResumeUseCase) begin(in RecoverViaResumeInput) (domain.RecoveryOrigin, domain.Subcommand, error) {
 	uc.taskMu.Lock(in.TaskID)
 	defer uc.taskMu.Unlock(in.TaskID)
 	snapshot, err := uc.tasks.Load(in.TaskID)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	task, err := snapshot.Restore()
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	events, err := task.BeginRecovery(in.SessionRef, in.OccurredAt)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	attempted := events[0].(domain.RecoveryAttempted)
 	updated, err := snapshot.WithTask(task, in.OccurredAt)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 	if err := uc.tasks.Save(in.TaskID, updated); err != nil {
-		return "", err
+		return "", "", err
 	}
 	writer := uc.contract
 	if err := writer.AppendEvent(in.TaskID, attempted); err != nil {
 		uc.logger.Warn("append recovery attempted event failed", "task_id", in.TaskID.String(), "error", err)
 	}
-	return attempted.Origin, nil
+	return attempted.Origin, task.Subcommand(), nil
 }
 
 func (uc *RecoverViaResumeUseCase) finish(ctx context.Context, in RecoverViaResumeInput, origin domain.RecoveryOrigin, result RecoveryResult, at time.Time) (RecoverViaResumeOutput, bool) {

@@ -1322,10 +1322,6 @@ func TestSCNDaemon0118RetriesPathLockReleaseBeforeDispatchingTimeoutRecovery(t *
 	resume, store, _, recoverer, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
 	store.snapshot = snapshot
 	uc.resume = resume
-	started := make(chan struct{}, 1)
-	release := make(chan struct{})
-	recoverer.started = started
-	recoverer.release = release
 
 	pathLocks.err = errors.New("release path lock")
 	termination.confirmDead = true
@@ -1341,15 +1337,9 @@ func TestSCNDaemon0118RetriesPathLockReleaseBeforeDispatchingTimeoutRecovery(t *
 
 	pathLocks.err = nil
 	uc.reconcileOne(context.Background(), pending.List()[0])
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("timeout recovery was not dispatched after path lock release succeeded")
-	}
-	close(release)
 	waitForPendingRemoval(t, pending)
 
-	if pathLocks.calls != 2 || termination.confirm != 2 || recoverer.calls != 1 {
+	if pathLocks.calls != 2 || termination.confirm != 2 || recoverer.calls != 0 || store.snapshot.State != domain.StateTimeoutLost {
 		t.Fatalf("pathLocks=%d confirms=%d recoveries=%d", pathLocks.calls, termination.confirm, recoverer.calls)
 	}
 }

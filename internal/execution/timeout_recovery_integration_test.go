@@ -307,6 +307,10 @@ func (f metricsAcceptanceFixture) newRecorder(content bool, writer metrics.Metri
 }
 
 func (f metricsAcceptanceFixture) prepare(t *testing.T, suffix string, state domain.TaskState, occurredAt time.Time, lastMessage []byte) (domain.TaskID, *domain.SessionRef) {
+	return f.prepareWithSubcommand(t, suffix, domain.SubcommandImpl, state, occurredAt, lastMessage)
+}
+
+func (f metricsAcceptanceFixture) prepareWithSubcommand(t *testing.T, suffix string, subcommand domain.Subcommand, state domain.TaskState, occurredAt time.Time, lastMessage []byte) (domain.TaskID, *domain.SessionRef) {
 	t.Helper()
 	id, err := domain.NewTaskID("impl-20260814-120000-a1b2-" + suffix)
 	if err != nil {
@@ -320,7 +324,7 @@ func (f metricsAcceptanceFixture) prepare(t *testing.T, suffix string, state dom
 		t.Fatal(err)
 	}
 	requested := occurredAt.Add(-2 * time.Minute)
-	task, _, err := domain.NewTask(id, domain.SubcommandImpl, slug, nil, requested, 1)
+	task, _, err := domain.NewTask(id, subcommand, slug, nil, requested, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -436,6 +440,10 @@ func (f metricsAcceptanceFixture) finishE(ctx context.Context, id domain.TaskID,
 }
 
 func (f metricsAcceptanceFixture) record(t *testing.T, suffix string, route metricsTerminalRoute, expected domain.TaskState, occurredAt time.Time, lastMessage []byte, content bool) metricsAcceptanceResult {
+	return f.recordWithSubcommand(t, suffix, domain.SubcommandImpl, route, expected, occurredAt, lastMessage, content)
+}
+
+func (f metricsAcceptanceFixture) recordWithSubcommand(t *testing.T, suffix string, subcommand domain.Subcommand, route metricsTerminalRoute, expected domain.TaskState, occurredAt time.Time, lastMessage []byte, content bool) metricsAcceptanceResult {
 	t.Helper()
 	preState := domain.StateRunning
 	if route == metricsRouteConfirmKilled {
@@ -451,7 +459,7 @@ func (f metricsAcceptanceFixture) record(t *testing.T, suffix string, route metr
 	if route == metricsRouteAdoptRecovering {
 		preState = domain.StateRecovering
 	}
-	id, session := f.prepare(t, suffix, preState, occurredAt, lastMessage)
+	id, session := f.prepareWithSubcommand(t, suffix, subcommand, preState, occurredAt, lastMessage)
 	result := f.finishE(context.Background(), id, session, route, expected, occurredAt, content, nil)
 	if result.Err != nil {
 		t.Fatal(result.Err)
@@ -524,12 +532,20 @@ func TestMetricsAcceptance_SCNMetrics0102_FailedWithoutLastMessageWritesZeroLeng
 
 func TestMetricsAcceptance_SCNMetrics0103_RecoveryAndKilledTerminalRoutesShareContract(t *testing.T) {
 	for _, tc := range []struct {
-		state domain.TaskState
-		route metricsTerminalRoute
-	}{{domain.StateRecovered, metricsRouteResume}, {domain.StateTimeoutLost, metricsRouteResume}, {domain.StateLost, metricsRouteResume}, {domain.StateKilled, metricsRouteConfirmKilled}} {
+		state      domain.TaskState
+		route      metricsTerminalRoute
+		subcommand domain.Subcommand
+	}{
+		// FD-recover-02: timeout-origin impl recovery does not resume. Keep the
+		// timeout-origin recovered route covered with a non-impl subcommand.
+		{domain.StateRecovered, metricsRouteResume, domain.SubcommandReview},
+		{domain.StateTimeoutLost, metricsRouteResume, domain.SubcommandImpl},
+		{domain.StateLost, metricsRouteResume, domain.SubcommandImpl},
+		{domain.StateKilled, metricsRouteConfirmKilled, domain.SubcommandImpl},
+	} {
 		t.Run(string(tc.state), func(t *testing.T) {
 			f := newMetricsAcceptanceFixture(t)
-			result := f.record(t, "scn0103"+string(tc.state), tc.route, tc.state, f.now, []byte("acceptance answer"), true)
+			result := f.recordWithSubcommand(t, "scn0103"+string(tc.state), tc.subcommand, tc.route, tc.state, f.now, []byte("acceptance answer"), true)
 			if result.Snapshot.State != tc.state || !result.Output.Recorded || f.slots.count() != 1 {
 				t.Fatal("terminal route did not record")
 			}
@@ -884,7 +900,9 @@ func TestTimeoutRecoveryIntegrationCarriesLifecycleGeneration(t *testing.T) {
 
 func TestTimeoutRecoveryIntegrationReconcileSkipsOwnedRecoveringTask(t *testing.T) {
 	fixture := newMetricsAcceptanceFixture(t)
-	id, session := fixture.prepare(t, "owned-recovery", domain.StateTimeout, fixture.now, nil)
+	// FD-recover-02: timeout-origin impl recovery does not resume. Use a non-impl
+	// subcommand so this test can exercise ownership during a blocked resume.
+	id, session := fixture.prepareWithSubcommand(t, "owned-recovery", domain.SubcommandReview, domain.StateTimeout, fixture.now, nil)
 	pending := &recovery.PendingReconciliationSet{}
 	if err := pending.Register(id, recovery.PendingSendConfirmOnly, nil); err != nil {
 		t.Fatal(err)

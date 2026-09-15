@@ -427,7 +427,9 @@ func recoverySnapshot(t *testing.T, state domain.TaskState, session *domain.Sess
 
 func newRecoveryUseCaseFixture(t *testing.T, state domain.TaskState, session *domain.SessionRef, result RecoveryResult) (*RecoverViaResumeUseCase, *recoveryStoreFake, *recoveryWriterFake, *recovererFake, *recoveryMetricsFake, *recoverySlotFake, *recoveryMutexFake) {
 	t.Helper()
-	store := &recoveryStoreFake{snapshot: recoverySnapshot(t, state, session)}
+	snapshot := recoverySnapshot(t, state, session)
+	snapshot.Subcommand = domain.SubcommandReview
+	store := &recoveryStoreFake{snapshot: snapshot}
 	writer := &recoveryWriterFake{}
 	mutex := &recoveryMutexFake{}
 	recoverer := &recovererFake{result: result, mutex: mutex}
@@ -731,11 +733,34 @@ func TestRecoverViaResumeUseCaseTimeoutSuccess(t *testing.T) {
 	}
 }
 
+func TestRecoverViaResumeUseCaseImplTimeoutSkipsResume(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, store, writer, recoverer, recorded, slots, mutex := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	store.snapshot.Subcommand = domain.SubcommandImpl
+	writer.stderr = []byte("incomplete output")
+
+	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Date(2026, 8, 13, 12, 0, 30, 0, time.UTC)})
+
+	if err != nil || out.Succeeded || out.ExitCode.Raw() != 6 || out.FinalState != domain.StateTimeoutLost || !out.PartialOutputSaved {
+		t.Fatalf("result = (%+v, %v)", out, err)
+	}
+	if recoverer.calls != 0 || writer.partialCalls != 1 || writer.markerCalls != 0 || writer.exitCodeCalls != 1 || writer.exitCode.Raw() != 6 || store.loads != 2 || store.saves != 2 {
+		t.Fatalf("calls = recoverer:%d partial:%d marker:%d exit:%d loads:%d saves:%d", recoverer.calls, writer.partialCalls, writer.markerCalls, writer.exitCodeCalls, store.loads, store.saves)
+	}
+	if len(recorded.inputs) != 1 || recorded.inputs[0].FinalState != domain.StateTimeoutLost || slots.calls != 1 || mutex.locks != 2 || mutex.unlocks != 2 {
+		t.Fatalf("metrics=%+v slots=%d locks=%d unlocks=%d", recorded.inputs, slots.calls, mutex.locks, mutex.unlocks)
+	}
+	if attempted := recoveryEvent[domain.RecoveryAttempted](t, writer.events); attempted.Origin != domain.RecoveryOriginTimeout {
+		t.Fatalf("attempted origin=%q", attempted.Origin)
+	}
+}
+
 func TestRecoverViaResumeUseCaseOrphanSuccess(t *testing.T) {
 	session := recoveryTestSession(t)
-	uc, _, writer, recoverer, recorded, slots, _ := newRecoveryUseCaseFixture(t, domain.StateOrphaned, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	uc, store, writer, recoverer, recorded, slots, _ := newRecoveryUseCaseFixture(t, domain.StateOrphaned, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	store.snapshot.Subcommand = domain.SubcommandImpl
 	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginOrphan, OccurredAt: time.Now()})
-	if err != nil || out.FinalState != domain.StateRecovered || recoverer.origin != domain.RecoveryOriginOrphan || writer.markerCalls != 1 || slots.calls != 1 || len(recorded.inputs) != 1 || !recorded.inputs[0].Estimated {
+	if err != nil || out.FinalState != domain.StateRecovered || recoverer.calls != 1 || recoverer.origin != domain.RecoveryOriginOrphan || writer.markerCalls != 1 || slots.calls != 1 || len(recorded.inputs) != 1 || !recorded.inputs[0].Estimated {
 		t.Fatalf("result=(%+v, %v), origin=%q marker=%d slots=%d metrics=%+v", out, err, recoverer.origin, writer.markerCalls, slots.calls, recorded.inputs)
 	}
 	if attempted := recoveryEvent[domain.RecoveryAttempted](t, writer.events); attempted.Origin != domain.RecoveryOriginOrphan {
