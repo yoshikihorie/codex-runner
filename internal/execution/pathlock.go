@@ -126,12 +126,18 @@ func (uc *AcquirePathLockUseCase) Execute(_ context.Context, in AcquirePathLockI
 		if errors.Is(livenessErr, fs.ErrNotExist) {
 			task, loadErr := uc.tasks.Load(snapshot.TaskID)
 			switch {
-			case loadErr != nil:
-				uc.logger.Warn("treat path lock as stale because task state cannot be read", "task_id", in.TaskID.String(), "confirmed_task_id", snapshot.TaskID.String(), "stage", "load_task_state", "error", ErrorTypeName(loadErr))
+			case errors.Is(loadErr, domain.ErrTaskNotFound):
+				// ① The task record is gone, so this path lock is stale.
 				dead = true
+			case loadErr != nil:
+				// ④ An unreadable task record must preserve the lock and fail closed.
+				uc.logger.Error("load task state for path lock liveness", "task_id", in.TaskID.String(), "confirmed_task_id", snapshot.TaskID.String(), "stage", "load-task-state", "error", ErrorTypeName(loadErr))
+				return AcquirePathLockOutput{}, fmt.Errorf("%w: %v", domain.ErrPathLockInfraFailure, loadErr)
 			case task.State == domain.StateQueued || task.State == domain.StateStarting:
+				// ② A task awaiting launch is still live without a task.lock.
 				dead = false
 			default:
+				// ③ Every other recorded state without a task.lock is stale.
 				dead = true
 			}
 		} else if livenessErr != nil {

@@ -116,29 +116,34 @@ func TestAcquirePathLockUseCaseDisambiguatesMissingTaskLockWithTaskState(t *test
 		t.Fatal(err)
 	}
 	for _, tc := range []struct {
-		name       string
-		state      domain.TaskState
-		loadErr    error
-		conflicted bool
+		name        string
+		state       domain.TaskState
+		loadErr     error
+		conflicted  bool
+		wantInfra   bool
+		wantDeleted int
 	}{
 		{name: "queued survives", state: domain.StateQueued, conflicted: true},
 		{name: "starting survives", state: domain.StateStarting, conflicted: true},
-		{name: "not found is stale", loadErr: domain.ErrTaskNotFound},
-		{name: "unreadable task state is stale", loadErr: errors.New("unsupported task schema")},
-		{name: "running is stale", state: domain.StateRunning},
+		{name: "not found is stale", loadErr: domain.ErrTaskNotFound, wantDeleted: 1},
+		{name: "unreadable task state rejects and preserves lock", loadErr: errors.New("unsupported task schema"), wantInfra: true},
+		{name: "running is stale", state: domain.StateRunning, wantDeleted: 1},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{path.String()}}}}
 			uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, store, domain.LivenessLockFunc(func(string) (bool, error) { return false, fs.ErrNotExist }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{snapshot: domain.TaskSnapshot{State: tc.state}, err: tc.loadErr})
 			out, acquireErr := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{path.String()}})
-			if acquireErr != nil || out.Acquired == tc.conflicted {
+			if errors.Is(acquireErr, domain.ErrPathLockInfraFailure) != tc.wantInfra {
 				t.Fatalf("Execute=(%+v,%v)", out, acquireErr)
 			}
-			if tc.conflicted && len(store.deleted) != 0 {
-				t.Fatal("live path lock was deleted")
+			if tc.wantInfra && out.Acquired {
+				t.Fatalf("Execute=(%+v,%v), want fail-closed output", out, acquireErr)
 			}
-			if !tc.conflicted && len(store.deleted) != 1 {
-				t.Fatal("stale path lock was not deleted")
+			if !tc.wantInfra && (acquireErr != nil || out.Acquired == tc.conflicted) {
+				t.Fatalf("Execute=(%+v,%v)", out, acquireErr)
+			}
+			if len(store.deleted) != tc.wantDeleted {
+				t.Fatalf("deleted=%v, want %d", store.deleted, tc.wantDeleted)
 			}
 		})
 	}
@@ -470,14 +475,14 @@ func TestReleasePathLockUseCaseSecondReleaseSucceedsAndLogsInfo_SCNLock0111(t *t
 	}
 }
 
-func TestAcquirePathLockUseCaseRemovesStaleLockWhenTaskStateReadFails(t *testing.T) {
+func TestAcquirePathLockUseCaseRejectsAndPreservesLockWhenTaskStateReadFails(t *testing.T) {
 	owner, _ := domain.NewTaskID("impl-20260809-120000-a1b2-owner")
 	requester, _ := domain.NewTaskID("impl-20260809-120001-a1b2-requester")
 	path, _ := domain.NewNormalizedPath(t.TempDir())
 	store := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{path.String()}}}}
 	uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, store, domain.LivenessLockFunc(func(string) (bool, error) { return false, fs.ErrNotExist }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{err: errors.New("task store unavailable")})
 	out, err := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{path.String()}})
-	if err != nil || !out.Acquired || len(store.deleted) != 1 || !store.saved {
+	if !errors.Is(err, domain.ErrPathLockInfraFailure) || out.Acquired || len(store.deleted) != 0 || store.saved {
 		t.Fatalf("Execute output=%+v error=%v deleted=%v saved=%v", out, err, store.deleted, store.saved)
 	}
 }
