@@ -1,12 +1,54 @@
 package proc
 
 import (
+	"bytes"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+// These tests deliberately do not call t.Parallel because they modify process-wide
+// environment variables, the default logger, and package-level test seams.
+
+var childEnvAdditionalKeys = []string{
+	"HTTP_PROXY",
+	"http_proxy",
+	"HTTPS_PROXY",
+	"https_proxy",
+	"NO_PROXY",
+	"no_proxy",
+	"SSL_CERT_FILE",
+	"NODE_EXTRA_CA_CERTS",
+}
+
+func unsetChildEnvAdditionalKeys(t *testing.T) {
+	t.Helper()
+	type savedEnv struct {
+		value string
+		set   bool
+	}
+	saved := make(map[string]savedEnv, len(childEnvAdditionalKeys))
+	for _, key := range childEnvAdditionalKeys {
+		value, set := os.LookupEnv(key)
+		saved[key] = savedEnv{value: value, set: set}
+		if err := os.Unsetenv(key); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Cleanup(func() {
+		for _, key := range childEnvAdditionalKeys {
+			original := saved[key]
+			if original.set {
+				_ = os.Setenv(key, original.value)
+			} else {
+				_ = os.Unsetenv(key)
+			}
+		}
+	})
+}
 
 func TestFixedPathIgnoresAmbientPathAndRelativeHome(t *testing.T) {
 	t.Setenv("PATH", "/unsafe/bin")
@@ -217,12 +259,12 @@ func TestGitStubStatusRejectsForeignOwner(t *testing.T) {
 	if err := os.MkdirAll(stubDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	originalHomeDir, originalOwnerUID := userHomeDir, gitStubDirectoryOwnerUID
+	originalHomeDir, originalOwnerUID := userHomeDir, fileOwnerUID
 	userHomeDir = func() (string, error) { return home, nil }
-	gitStubDirectoryOwnerUID = func(os.FileInfo) (uint32, bool) { return uint32(os.Getuid()) + 1, true }
+	fileOwnerUID = func(os.FileInfo) (uint32, bool) { return uint32(os.Getuid()) + 1, true }
 	t.Cleanup(func() {
 		userHomeDir = originalHomeDir
-		gitStubDirectoryOwnerUID = originalOwnerUID
+		fileOwnerUID = originalOwnerUID
 	})
 
 	if status := GitStubStatus(); status.Eligible || status.Reason != "directory is not owned by the executing user" {
@@ -279,11 +321,291 @@ func TestFixedPathSkipsNonexistentAbsoluteHome(t *testing.T) {
 }
 
 func TestSafeChildEnvOnlyIncludesAllowlistedKeys(t *testing.T) {
+	unsetChildEnvAdditionalKeys(t)
 	t.Setenv("HOME", t.TempDir())
 	t.Setenv("FAKE_API_KEY", "secret")
 	if got, want := envKeys(strings.Join(SafeChildEnv(), "\n")), map[string]bool{"PATH": true, "HOME": true}; !equalStringSets(got, want) {
 		t.Fatalf("SafeChildEnv() keys = %v, want %v", got, want)
 	}
+}
+
+func TestSafeChildEnvUnchangedWhenAdditionalKeysAreUnset(t *testing.T) {
+	unsetChildEnvAdditionalKeys(t)
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+
+	if got, want := SafeChildEnv(), []string{"PATH=" + FixedPath(), "HOME=" + home}; !equalStringSlices(got, want) {
+		t.Fatalf("SafeChildEnv() = %q, want %q", got, want)
+	}
+}
+
+func TestSafeChildEnvIncludesConfiguredAdditionalKeys(t *testing.T) {
+	unsetChildEnvAdditionalKeys(t)
+	certificate := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(certificate, []byte("test certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		key   string
+		value string
+	}{
+		{"HTTP_PROXY", "http://proxy.example:8080"},
+		{"http_proxy", "proxy.example:8080"},
+		{"HTTPS_PROXY", "https://user:password@proxy.example"},
+		{"https_proxy", ""},
+		{"NO_PROXY", "example.com,127.0.0.1,::1,10.0.0.0/8,*"},
+		{"no_proxy", ".internal.example"},
+		{"SSL_CERT_FILE", certificate},
+		{"NODE_EXTRA_CA_CERTS", certificate},
+	} {
+		t.Run(test.key, func(t *testing.T) {
+			unsetChildEnvAdditionalKeys(t)
+			t.Setenv(test.key, test.value)
+			if got, ok := envValue(SafeChildEnv(), test.key); !ok || got != test.value {
+				t.Fatalf("SafeChildEnv() value for %s = %q, exists = %t, want %q", test.key, got, ok, test.value)
+			}
+		})
+	}
+}
+
+func TestSafeChildEnvPreservesProxyKeyCasingAndValues(t *testing.T) {
+	unsetChildEnvAdditionalKeys(t)
+	values := map[string]string{
+		"HTTP_PROXY":  "http://upper.example",
+		"http_proxy":  "lower.example:3128",
+		"HTTPS_PROXY": "https://user:password@upper.example",
+		"https_proxy": "",
+		"NO_PROXY":    "example.com,127.0.0.1,::1,10.0.0.0/8,*",
+		"no_proxy":    ".internal.example",
+	}
+	for key, value := range values {
+		t.Setenv(key, value)
+	}
+	for key, want := range values {
+		if got, ok := envValue(SafeChildEnv(), key); !ok || got != want {
+			t.Fatalf("SafeChildEnv() value for %s = %q, exists = %t, want %q", key, got, ok, want)
+		}
+	}
+}
+
+func TestSafeChildEnvExcludesInvalidCAFilesAndWarnsWithoutValue(t *testing.T) {
+	unsafeFile := filepath.Join(t.TempDir(), "unsafe-ca.pem")
+	if err := os.WriteFile(unsafeFile, []byte("test certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unsafeFile, 0o622); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(t.TempDir(), "missing-ca.pem")
+	for _, test := range []struct {
+		name   string
+		value  string
+		reason string
+	}{
+		{"relative", "relative-ca.pem", caFileReasonNotAbsolute},
+		{"missing", missing, caFileReasonNotFound},
+		{"directory", t.TempDir(), caFileReasonNotRegular},
+		{"group writable", unsafeFile, caFileReasonGroupOrOtherWritable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, key := range []string{"SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"} {
+				t.Run(key, func(t *testing.T) {
+					unsetChildEnvAdditionalKeys(t)
+					var logs bytes.Buffer
+					previous := slog.Default()
+					slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+					t.Cleanup(func() { slog.SetDefault(previous) })
+					t.Setenv(key, test.value)
+
+					if got, ok := envValue(SafeChildEnv(), key); ok {
+						t.Fatalf("SafeChildEnv() %s = %q, want excluded", key, got)
+					}
+					if got := logs.String(); !strings.Contains(got, key) || !strings.Contains(got, test.reason) || strings.Contains(got, test.value) || strings.Count(got, "\n") != 1 {
+						t.Fatalf("warning = %q, want one line with key and reason without value", got)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestSafeChildEnvExcludesCAFileWithForeignOwner(t *testing.T) {
+	unsetChildEnvAdditionalKeys(t)
+	certificate := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(certificate, []byte("test certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalOwnerUID := fileOwnerUID
+	fileOwnerUID = func(os.FileInfo) (uint32, bool) { return uint32(os.Getuid()) + 1, true }
+	t.Cleanup(func() { fileOwnerUID = originalOwnerUID })
+	t.Setenv("SSL_CERT_FILE", certificate)
+
+	if _, ok := envValue(SafeChildEnv(), "SSL_CERT_FILE"); ok {
+		t.Fatal("SafeChildEnv() includes foreign-owned SSL_CERT_FILE")
+	}
+}
+
+func TestSafeChildEnvAcceptsRootOwnedCAFile(t *testing.T) {
+	unsetChildEnvAdditionalKeys(t)
+	certificate := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(certificate, []byte("test certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalOwnerUID := fileOwnerUID
+	fileOwnerUID = func(os.FileInfo) (uint32, bool) { return 0, true }
+	t.Cleanup(func() { fileOwnerUID = originalOwnerUID })
+	t.Setenv("SSL_CERT_FILE", certificate)
+
+	if got, ok := envValue(SafeChildEnv(), "SSL_CERT_FILE"); !ok || got != certificate {
+		t.Fatalf("SafeChildEnv() SSL_CERT_FILE = %q, exists = %t, want %q", got, ok, certificate)
+	}
+}
+
+func TestSafeChildEnvCAFileParentDirectorySafety(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		mode    os.FileMode
+		allowed bool
+	}{
+		{name: "group writable without sticky bit", mode: 0o770, allowed: false},
+		{name: "group writable with sticky bit", mode: os.ModeSticky | 0o777, allowed: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			unsetChildEnvAdditionalKeys(t)
+			directory := t.TempDir()
+			certificate := filepath.Join(directory, "ca.pem")
+			if err := os.WriteFile(certificate, []byte("test certificate"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(directory, test.mode); err != nil {
+				t.Fatal(err)
+			}
+			t.Setenv("SSL_CERT_FILE", certificate)
+
+			got, ok := envValue(SafeChildEnv(), "SSL_CERT_FILE")
+			if ok != test.allowed || test.allowed && got != certificate {
+				t.Fatalf("SafeChildEnv() SSL_CERT_FILE = %q, exists = %t, allowed = %t", got, ok, test.allowed)
+			}
+		})
+	}
+}
+
+func TestSafeChildEnvWarnsForInvalidHome(t *testing.T) {
+	unsetChildEnvAdditionalKeys(t)
+	t.Setenv("HOME", "relative-home")
+	var logs bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelWarn})))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	SafeChildEnv()
+
+	if got := logs.String(); !strings.Contains(got, "HOME") || strings.Count(got, "\n") != 1 {
+		t.Fatalf("warning = %q, want one line for HOME", got)
+	}
+}
+
+func TestValidateSafeEnvAcceptsConfiguredAdditionalKeys(t *testing.T) {
+	certificate := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(certificate, []byte("test certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	env := []string{"PATH=" + FixedPath(), "HTTP_PROXY=http://proxy.example", "http_proxy=proxy.example:3128", "HTTPS_PROXY=https://user:password@proxy.example", "https_proxy=", "NO_PROXY=example.com,127.0.0.1,::1,10.0.0.0/8,*", "no_proxy=.internal.example", "SSL_CERT_FILE=" + certificate, "NODE_EXTRA_CA_CERTS=" + certificate}
+	if err := validateSafeEnv(env); err != nil {
+		t.Fatalf("validateSafeEnv() error = %v", err)
+	}
+}
+
+func TestValidateSafeEnvRejectsInvalidCAFiles(t *testing.T) {
+	unsafeFile := filepath.Join(t.TempDir(), "unsafe-ca.pem")
+	if err := os.WriteFile(unsafeFile, []byte("test certificate"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(unsafeFile, 0o622); err != nil {
+		t.Fatal(err)
+	}
+	missing := filepath.Join(t.TempDir(), "missing-ca.pem")
+	for _, test := range []struct {
+		name   string
+		value  string
+		reason string
+	}{
+		{"relative", "relative-ca.pem", caFileReasonNotAbsolute},
+		{"missing", missing, caFileReasonNotFound},
+		{"directory", t.TempDir(), caFileReasonNotRegular},
+		{"group writable", unsafeFile, caFileReasonGroupOrOtherWritable},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			for _, key := range []string{"SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS"} {
+				t.Run(key, func(t *testing.T) {
+					env := []string{"PATH=" + FixedPath(), key + "=" + test.value}
+					if err := validateSafeEnv(env); err == nil || !strings.Contains(err.Error(), test.reason) {
+						t.Fatalf("validateSafeEnv() error = %v, want reason %q", err, test.reason)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestValidateSafeEnvRejectsUnsafeCAFileOwnershipAndParentDirectory(t *testing.T) {
+	for _, test := range []struct {
+		name       string
+		ownerUID   uint32
+		directory  os.FileMode
+		wantReason string
+	}{
+		{name: "foreign owner", ownerUID: uint32(os.Getuid()) + 1, directory: 0o700, wantReason: caFileReasonNotOwnedByUserOrRoot},
+		{name: "unsafe parent directory", ownerUID: uint32(os.Getuid()), directory: 0o770, wantReason: caFileReasonUnsafeParentDirectory},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			directory := t.TempDir()
+			certificate := filepath.Join(directory, "ca.pem")
+			if err := os.WriteFile(certificate, []byte("test certificate"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(directory, test.directory); err != nil {
+				t.Fatal(err)
+			}
+			originalOwnerUID := fileOwnerUID
+			fileOwnerUID = func(os.FileInfo) (uint32, bool) { return test.ownerUID, true }
+			t.Cleanup(func() { fileOwnerUID = originalOwnerUID })
+
+			err := validateSafeEnv([]string{"PATH=" + FixedPath(), "SSL_CERT_FILE=" + certificate})
+			if err == nil || !strings.Contains(err.Error(), test.wantReason) {
+				t.Fatalf("validateSafeEnv() error = %v, want reason %q", err, test.wantReason)
+			}
+		})
+	}
+}
+
+func TestValidateSafeEnvRejectsUnallowlistedMixedCaseKey(t *testing.T) {
+	env := []string{"PATH=" + FixedPath(), "HTTP_Proxy=http://proxy.example", "FAKE_API_KEY=secret"}
+	if err := validateSafeEnv(env); err == nil {
+		t.Fatal("validateSafeEnv() error = nil")
+	}
+}
+
+func envValue(env []string, wantKey string) (string, bool) {
+	for _, entry := range env {
+		key, value, found := strings.Cut(entry, "=")
+		if found && key == wantKey {
+			return value, true
+		}
+	}
+	return "", false
+}
+
+func equalStringSlices(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range got {
+		if got[index] != want[index] {
+			return false
+		}
+	}
+	return true
 }
 
 func TestSafeChildEnvSkipsNonexistentHome(t *testing.T) {

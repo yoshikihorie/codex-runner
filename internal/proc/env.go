@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +12,18 @@ import (
 )
 
 const gitStubDirectoryName = "codex-blocked-stubs"
+
+const (
+	caFileReasonNotAbsolute             = "not absolute"
+	caFileReasonNotFound                = "not found"
+	caFileReasonNotRegular              = "not a regular file"
+	caFileReasonGroupOrOtherWritable    = "group or other writable"
+	caFileReasonOwnerCannotBeDetermined = "owner cannot be determined"
+	caFileReasonNotOwnedByUserOrRoot    = "not owned by the executing user or root"
+	caFileReasonParentCannotBeInspected = "parent directory cannot be inspected"
+	caFileReasonParentNotDirectory      = "parent path is not a directory"
+	caFileReasonUnsafeParentDirectory   = "parent directory is writable by group or other without sticky bit"
+)
 
 var (
 	fixedPathDirs = []string{
@@ -25,9 +38,19 @@ var (
 		"/usr/local/bin/git",
 		"/opt/homebrew/bin/git",
 	}
-	userHomeDir              = os.UserHomeDir
-	allowedEnvKeys           = []string{"HOME"}
-	gitStubDirectoryOwnerUID = func(info os.FileInfo) (uint32, bool) {
+	userHomeDir    = os.UserHomeDir
+	allowedEnvKeys = []string{
+		"HOME",
+		"HTTP_PROXY",
+		"http_proxy",
+		"HTTPS_PROXY",
+		"https_proxy",
+		"NO_PROXY",
+		"no_proxy",
+		"SSL_CERT_FILE",
+		"NODE_EXTRA_CA_CERTS",
+	}
+	fileOwnerUID = func(info os.FileInfo) (uint32, bool) {
 		stat, ok := info.Sys().(*syscall.Stat_t)
 		if !ok {
 			return 0, false
@@ -76,7 +99,7 @@ func GitStubStatus() GitStubPathStatus {
 	if !info.IsDir() {
 		return GitStubPathStatus{Directory: directory, Reason: "path is not a directory"}
 	}
-	ownerUID, ok := gitStubDirectoryOwnerUID(info)
+	ownerUID, ok := fileOwnerUID(info)
 	if !ok {
 		return GitStubPathStatus{Directory: directory, Reason: "directory owner cannot be determined"}
 	}
@@ -103,7 +126,7 @@ func GitStubStatus() GitStubPathStatus {
 		if !entryInfo.Mode().IsRegular() {
 			return GitStubPathStatus{Directory: directory, Reason: fmt.Sprintf("entry %q is not a regular file", entry.Name())}
 		}
-		entryOwnerUID, ok := gitStubDirectoryOwnerUID(entryInfo)
+		entryOwnerUID, ok := fileOwnerUID(entryInfo)
 		if !ok {
 			return GitStubPathStatus{Directory: directory, Reason: fmt.Sprintf("entry %q owner cannot be determined", entry.Name())}
 		}
@@ -127,6 +150,52 @@ func isValidHomeDir(value string) bool {
 	return err == nil && info.IsDir()
 }
 
+func validateAllowedEnvValue(key, value string) error {
+	switch key {
+	case "HOME":
+		if !isValidHomeDir(value) {
+			return errors.New("must be an absolute path to an existing directory")
+		}
+	case "SSL_CERT_FILE", "NODE_EXTRA_CA_CERTS":
+		return validateCAFile(value)
+	}
+	return nil
+}
+
+func validateCAFile(value string) error {
+	if !filepath.IsAbs(value) {
+		return errors.New(caFileReasonNotAbsolute)
+	}
+	info, err := os.Stat(value)
+	if err != nil {
+		return errors.New(caFileReasonNotFound)
+	}
+	if !info.Mode().IsRegular() {
+		return errors.New(caFileReasonNotRegular)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return errors.New(caFileReasonGroupOrOtherWritable)
+	}
+	ownerUID, ok := fileOwnerUID(info)
+	if !ok {
+		return errors.New(caFileReasonOwnerCannotBeDetermined)
+	}
+	if ownerUID != uint32(os.Getuid()) && ownerUID != 0 {
+		return errors.New(caFileReasonNotOwnedByUserOrRoot)
+	}
+	parentInfo, err := os.Stat(filepath.Dir(value))
+	if err != nil {
+		return errors.New(caFileReasonParentCannotBeInspected)
+	}
+	if !parentInfo.IsDir() {
+		return errors.New(caFileReasonParentNotDirectory)
+	}
+	if parentInfo.Mode().Perm()&0o022 != 0 && parentInfo.Mode()&os.ModeSticky == 0 {
+		return errors.New(caFileReasonUnsafeParentDirectory)
+	}
+	return nil
+}
+
 // SafeChildEnv builds the allowlisted child-process environment.
 func SafeChildEnv() []string {
 	env := []string{"PATH=" + FixedPath()}
@@ -135,7 +204,8 @@ func SafeChildEnv() []string {
 		if !ok {
 			continue
 		}
-		if key == "HOME" && !isValidHomeDir(value) {
+		if err := validateAllowedEnvValue(key, value); err != nil {
+			slog.Warn("excluded unsafe child environment value", "key", key, "reason", err.Error())
 			continue
 		}
 		env = append(env, key+"="+value)
@@ -174,8 +244,8 @@ func validateSafeEnv(env []string) error {
 		if !allowed[key] {
 			return fmt.Errorf("env key %q is not in the allowlist", key)
 		}
-		if key == "HOME" && !isValidHomeDir(value) {
-			return fmt.Errorf("HOME must be an absolute path to an existing directory")
+		if err := validateAllowedEnvValue(key, value); err != nil {
+			return fmt.Errorf("env key %q has invalid value: %w", key, err)
 		}
 	}
 	return nil
