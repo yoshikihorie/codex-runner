@@ -58,6 +58,68 @@ func TestRecoveryAttemptAttemptsResumeAndChecksLastMessage(t *testing.T) {
 	}
 }
 
+func TestRecoveryAttemptSetsPromptExceptForImpl(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		subcommand domain.Subcommand
+		wantPrompt bool
+	}{
+		{name: "impl", subcommand: domain.SubcommandImpl},
+		{name: "read", subcommand: domain.SubcommandRead, wantPrompt: true},
+		{name: "review", subcommand: domain.SubcommandReview, wantPrompt: true},
+	} {
+		for _, origin := range []domain.RecoveryOrigin{domain.RecoveryOriginTimeout, domain.RecoveryOriginOrphan} {
+			t.Run(tc.name+"/"+string(origin), func(t *testing.T) {
+				launcher := &resumeLauncherFake{}
+				attempt := RecoveryAttempt{TaskID: recoveryTestTaskID(t), Origin: origin, SessionRef: recoveryTestSession(t), CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: t.TempDir(), Subcommand: tc.subcommand}
+				if _, err := attempt.Attempt(context.Background(), launcher, &resumeReaderFake{present: true}); err != nil {
+					t.Fatal(err)
+				}
+				if (launcher.params.PromptText != "") != tc.wantPrompt {
+					t.Fatalf("prompt = %q, want present=%t", launcher.params.PromptText, tc.wantPrompt)
+				}
+				if tc.wantPrompt && launcher.params.PromptText != RecoveryResumePrompt {
+					t.Fatalf("prompt = %q, want %q", launcher.params.PromptText, RecoveryResumePrompt)
+				}
+			})
+		}
+	}
+}
+
+func TestRecoveryResumePromptMatchesLegacyLiteral(t *testing.T) {
+	const want = "実行時間の上限で中断された。追加の調査・コマンド実行は一切せず、ここまでの分析内容だけで、依頼された最終成果物を今すぐ出力せよ。"
+	if RecoveryResumePrompt != want {
+		t.Fatalf("RecoveryResumePrompt = %q, want %q", RecoveryResumePrompt, want)
+	}
+}
+
+func TestRecoveryAttemptDerivesOutputSchemaCandidateOnlyForSupportedSubcommands(t *testing.T) {
+	root := t.TempDir()
+	for _, tc := range []struct {
+		name       string
+		subcommand domain.Subcommand
+		wantSchema bool
+	}{
+		{name: "review", subcommand: domain.SubcommandReview, wantSchema: true},
+		{name: "research", subcommand: domain.SubcommandResearch, wantSchema: true},
+		{name: "read", subcommand: domain.SubcommandRead},
+	} {
+		for _, origin := range []domain.RecoveryOrigin{domain.RecoveryOriginTimeout, domain.RecoveryOriginOrphan} {
+			t.Run(tc.name+"/"+string(origin), func(t *testing.T) {
+				launcher := &resumeLauncherFake{}
+				id := recoveryTestTaskID(t)
+				attempt := RecoveryAttempt{TaskID: id, Origin: origin, SessionRef: recoveryTestSession(t), CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: root, Subcommand: tc.subcommand}
+				if _, err := attempt.Attempt(context.Background(), launcher, &resumeReaderFake{present: true}); err != nil {
+					t.Fatal(err)
+				}
+				if (launcher.params.OutputSchemaPath != nil) != tc.wantSchema {
+					t.Fatalf("schema = %v, want present=%t", launcher.params.OutputSchemaPath, tc.wantSchema)
+				}
+			})
+		}
+	}
+}
+
 func TestRecoveryAttemptDoesNotReadOutputAfterLaunchFailure(t *testing.T) {
 	id, _ := domain.NewTaskID("impl-20260813-120001-abcd-resume")
 	session, _ := domain.NewSessionRef("123e4567-e89b-12d3-a456-426614174000", time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC), false)
@@ -811,6 +873,35 @@ func TestRecoverViaResumeUseCaseFailureUsesDomainOrigin(t *testing.T) {
 			}
 			failed := recoveryEvent[domain.RecoveryFailed](t, writer.events)
 			if failed.Origin != recoverer.origin || failed.PartialOutputSaved != (tc.wantPartialCall == 1) {
+				t.Fatalf("failed event=%#v", failed)
+			}
+		})
+	}
+}
+
+func TestRecoverViaResumeUseCaseSchemaInspectionFailureUsesOriginOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		state           domain.TaskState
+		origin          domain.RecoveryOrigin
+		wantState       domain.TaskState
+		wantPartialCall int
+	}{
+		{name: "timeout", state: domain.StateTimeout, origin: domain.RecoveryOriginTimeout, wantState: domain.StateTimeoutLost, wantPartialCall: 1},
+		{name: "orphan", state: domain.StateOrphaned, origin: domain.RecoveryOriginOrphan, wantState: domain.StateLost, wantPartialCall: 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := recoveryTestSession(t)
+			uc, _, writer, recoverer, _, _, _ := newRecoveryUseCaseFixture(t, tc.state, &session, RecoveryResult{})
+			recoverer.err = errors.New("inspect resume output schema: permission denied")
+			writer.stderr = []byte("incomplete output")
+
+			out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: tc.origin, OccurredAt: time.Now()})
+			if err != nil || out.Succeeded || out.FinalState != tc.wantState || writer.partialCalls != tc.wantPartialCall {
+				t.Fatalf("out=(%+v, %v) partial=%d", out, err, writer.partialCalls)
+			}
+			failed := recoveryEvent[domain.RecoveryFailed](t, writer.events)
+			if failed.Origin != tc.origin || failed.PartialOutputSaved != (tc.wantPartialCall == 1) {
 				t.Fatalf("failed event=%#v", failed)
 			}
 		})

@@ -756,9 +756,145 @@ func TestProcessRunnerSignalDelegatesArgumentsAndError(t *testing.T) {
 func TestResumeLaunchArgs(t *testing.T) {
 	id := launchTestID(t)
 	effort := "high"
-	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", OutputLastMessagePath: "/tmp/codex-tasks/last-message.md", Subcommand: domain.SubcommandReview, SandboxMode: "read-only", Model: "gpt-5", ReasoningEffort: &effort}
-	if got, want := buildResumeArgs(params), []string{"exec", "resume", "session-id", "--skip-git-repo-check", "-c", "sandbox_mode=read-only", "--model", "gpt-5", "-c", "model_reasoning_effort=high", "--output-last-message", "/tmp/codex-tasks/last-message.md"}; !slices.Equal(got, want) {
+	schema := "/tmp/codex-tasks/output-schema.json"
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", OutputLastMessagePath: "/tmp/codex-tasks/last-message.md", OutputSchemaPath: &schema, PromptText: recovery.RecoveryResumePrompt, Subcommand: domain.SubcommandReview, SandboxMode: "read-only", Model: "gpt-5", ReasoningEffort: &effort}
+	if got, want := buildResumeArgs(params), []string{"exec", "resume", "session-id", "--skip-git-repo-check", "-c", "sandbox_mode=read-only", "--model", "gpt-5", "-c", "model_reasoning_effort=high", "--output-schema", "/tmp/codex-tasks/output-schema.json", "--output-last-message", "/tmp/codex-tasks/last-message.md", recovery.RecoveryResumePrompt}; !slices.Equal(got, want) {
 		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
+func TestResumeLaunchArgsImplOmitsPromptAndSchema(t *testing.T) {
+	params := recovery.ResumeLaunchParams{SessionID: "session-id", OutputLastMessagePath: "/tmp/codex-tasks/last-message.md", Subcommand: domain.SubcommandImpl, SandboxMode: "workspace-write", Model: "gpt-5"}
+	if got, want := buildResumeArgs(params), []string{"exec", "resume", "session-id", "--skip-git-repo-check", "-c", "sandbox_mode=workspace-write", "--model", "gpt-5", "-c", "sandbox_workspace_write.network_access=true", "--output-last-message", "/tmp/codex-tasks/last-message.md"}; !slices.Equal(got, want) {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
+func TestResumeLaunchArgsReadIncludesPromptWithoutSchema(t *testing.T) {
+	params := recovery.ResumeLaunchParams{
+		SessionID:             "session-id",
+		OutputLastMessagePath: "/tmp/codex-tasks/last-message.md",
+		PromptText:            "実行時間の上限で中断された。追加の調査・コマンド実行は一切せず、ここまでの分析内容だけで、依頼された最終成果物を今すぐ出力せよ。",
+		Subcommand:            domain.SubcommandRead,
+		SandboxMode:           "read-only",
+		Model:                 "gpt-5",
+	}
+	want := []string{"exec", "resume", "session-id", "--skip-git-repo-check", "-c", "sandbox_mode=read-only", "--model", "gpt-5", "--output-last-message", "/tmp/codex-tasks/last-message.md", "実行時間の上限で中断された。追加の調査・コマンド実行は一切せず、ここまでの分析内容だけで、依頼された最終成果物を今すぐ出力せよ。"}
+	if got := buildResumeArgs(params); !slices.Equal(got, want) {
+		t.Fatalf("args = %q, want %q", got, want)
+	}
+}
+
+func TestResumeLauncherValidatesOutputSchemaBeforeLaunch(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		subcommand domain.Subcommand
+		setup      func(t *testing.T, schemaPath string)
+		wantLaunch bool
+		wantSchema bool
+	}{
+		{name: "review regular file", subcommand: domain.SubcommandReview, setup: func(t *testing.T, schemaPath string) {
+			if err := os.WriteFile(schemaPath, []byte(`{}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, wantLaunch: true, wantSchema: true},
+		{name: "research regular file", subcommand: domain.SubcommandResearch, setup: func(t *testing.T, schemaPath string) {
+			if err := os.WriteFile(schemaPath, []byte(`{}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}, wantLaunch: true, wantSchema: true},
+		{name: "review missing file", subcommand: domain.SubcommandReview, setup: func(*testing.T, string) {}, wantLaunch: true},
+		{name: "review symlink rejected", subcommand: domain.SubcommandReview, setup: func(t *testing.T, schemaPath string) {
+			target := filepath.Join(filepath.Dir(schemaPath), "schema-target.json")
+			if err := os.WriteFile(target, []byte(`{}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, schemaPath); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "plan regular file rejected", subcommand: domain.SubcommandPlan, setup: func(t *testing.T, schemaPath string) {
+			if err := os.WriteFile(schemaPath, []byte(`{}`), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "review directory rejected", subcommand: domain.SubcommandReview, setup: func(t *testing.T, schemaPath string) {
+			if err := os.Mkdir(schemaPath, 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			originalLaunch := launchNewSession
+			t.Cleanup(func() { launchNewSession = originalLaunch })
+			id := launchTestID(t)
+			root := t.TempDir()
+			taskDir := filepath.Join(root, id.String())
+			if err := os.MkdirAll(taskDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(taskDir, "task.lock"), nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			schemaPath := filepath.Join(taskDir, "output-schema.json")
+			tc.setup(t, schemaPath)
+			launchCalls := 0
+			var gotArgs []string
+			launchNewSession = func(_ context.Context, _ string, _ []string, _ *os.File, _ io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
+				launchCalls++
+				gotArgs = args
+				return nil, errors.New("launch stopped")
+			}
+			params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), OutputSchemaPath: &schemaPath, PromptText: recovery.RecoveryResumePrompt, Subcommand: tc.subcommand, SandboxMode: "read-only", Model: "gpt-5"}
+			err := NewResumeLauncher(&timeoutProcessFake{}).LaunchAndWait(context.Background(), params)
+			if (launchCalls == 1) != tc.wantLaunch {
+				t.Fatalf("launch calls = %d, want launch=%t, err=%v", launchCalls, tc.wantLaunch, err)
+			}
+			if tc.wantSchema && (!slices.Contains(gotArgs, "--output-schema") || !slices.Contains(gotArgs, schemaPath)) {
+				t.Fatalf("args = %q, want schema path", gotArgs)
+			}
+			if !tc.wantSchema && slices.Contains(gotArgs, "--output-schema") {
+				t.Fatalf("args = %q, want no schema flag", gotArgs)
+			}
+			if !tc.wantLaunch && err == nil {
+				t.Fatal("invalid schema was accepted")
+			}
+		})
+	}
+}
+
+func TestResumeLauncherRejectsOutputSchemaInspectionFailure(t *testing.T) {
+	originalLaunch := launchNewSession
+	originalLstat := lstat
+	t.Cleanup(func() {
+		launchNewSession = originalLaunch
+		lstat = originalLstat
+	})
+	id := launchTestID(t)
+	root := t.TempDir()
+	taskDir := filepath.Join(root, id.String())
+	if err := os.MkdirAll(taskDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(taskDir, "task.lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	schemaPath := filepath.Join(taskDir, "output-schema.json")
+	lstat = func(path string) (os.FileInfo, error) {
+		if path == schemaPath {
+			return nil, syscall.EACCES
+		}
+		return originalLstat(path)
+	}
+	launchCalls := 0
+	launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+		launchCalls++
+		return nil, nil
+	}
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), OutputSchemaPath: &schemaPath, Subcommand: domain.SubcommandReview, SandboxMode: "read-only", Model: "gpt-5"}
+	err := NewResumeLauncher(&timeoutProcessFake{}).LaunchAndWait(context.Background(), params)
+	if !errors.Is(err, syscall.EACCES) || launchCalls != 0 {
+		t.Fatalf("err=%v launch calls=%d, want EACCES and 0", err, launchCalls)
 	}
 }
 

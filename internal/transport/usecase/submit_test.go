@@ -291,7 +291,10 @@ func TestSubmitExecuteValidatesAndForwardsOutputSchemaPath(t *testing.T) {
 				}
 				return
 			}
-			wantSnapshot := filepath.Join(fixture.store.root, fixture.store.reserved[0].String(), outputSchemaSnapshotFileName)
+			wantSnapshot, pathErr := store.OutputSchemaPath(fixture.store.root, fixture.store.reserved[0])
+			if pathErr != nil {
+				t.Fatal(pathErr)
+			}
 			contents, readErr := os.ReadFile(wantSnapshot)
 			if err != nil || readErr != nil || fixture.admitter.input.OutputSchemaPath == nil || *fixture.admitter.input.OutputSchemaPath != wantSnapshot || string(contents) != `{"type":"object"}` {
 				t.Fatalf("err=%v input=%#v", err, fixture.admitter.input)
@@ -310,7 +313,10 @@ func TestSubmitHandleDecodesOutputSchemaPath(t *testing.T) {
 	fixture.uc.options = submitOptionsFake{model: "test-model", modelOK: true, effortOK: true, taskPlacementRoot: fixture.store.root}
 	params := fmt.Sprintf(`{"subcommand":"review","slug":"valid-slug","prompt":"safe","working_dir":%q,"output_schema_path":%q}`, t.TempDir(), schema)
 	response := fixture.uc.Handle(transport.Request{RequestID: "request", Params: json.RawMessage(params)})
-	wantSnapshot := filepath.Join(fixture.store.root, fixture.store.reserved[0].String(), outputSchemaSnapshotFileName)
+	wantSnapshot, err := store.OutputSchemaPath(fixture.store.root, fixture.store.reserved[0])
+	if err != nil {
+		t.Fatal(err)
+	}
 	if !response.OK || fixture.admitter.input.OutputSchemaPath == nil || *fixture.admitter.input.OutputSchemaPath != wantSnapshot {
 		t.Fatalf("response=%#v input=%#v", response, fixture.admitter.input)
 	}

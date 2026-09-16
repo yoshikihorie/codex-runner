@@ -15,6 +15,7 @@ import (
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/execution"
+	"github.com/yoshikihorie/codex-runner/internal/store"
 	"github.com/yoshikihorie/codex-runner/internal/transport"
 )
 
@@ -24,7 +25,6 @@ const (
 	// Canonical identifiers registered in the published error-code and message catalogs.
 	admissionUnavailableCode       = "ADMISSION_UNAVAILABLE"
 	admissionUnavailableMessageKey = "error.admission.unavailable"
-	outputSchemaSnapshotFileName   = "output-schema.json"
 )
 
 type SubmitTaskStore interface {
@@ -285,7 +285,7 @@ func validateOutputSchemaPath(subcommand domain.Subcommand, path OptionalString)
 	if !path.Present {
 		return nil
 	}
-	if subcommand != domain.SubcommandReview && subcommand != domain.SubcommandResearch {
+	if !domain.SupportsOutputSchema(subcommand) {
 		return submitFailure("OUTPUT_SCHEMA_SUBCOMMAND_NOT_ALLOWED", "error.outputSchema.subcommandNotAllowed", nil)
 	}
 	if path.Value == "" || !filepath.IsAbs(path.Value) {
@@ -335,7 +335,10 @@ func (uc *SubmitTaskUseCase) snapshotOutputSchema(id domain.TaskID, source Optio
 	if err != nil || !info.Mode().IsRegular() {
 		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
 	}
-	snapshot := filepath.Join(root.String(), id.String(), outputSchemaSnapshotFileName)
+	snapshot, err := store.OutputSchemaPath(root.String(), id)
+	if err != nil {
+		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+	}
 	destination, err := os.OpenFile(snapshot, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
 		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)

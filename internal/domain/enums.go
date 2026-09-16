@@ -90,6 +90,11 @@ func IsSubmittable(s Subcommand) bool {
 	return s == SubcommandImpl || s == SubcommandReview || s == SubcommandPlan || s == SubcommandResearch || s == SubcommandRead || s == SubcommandThink
 }
 
+// SupportsOutputSchema reports whether a subcommand may use an output schema.
+func SupportsOutputSchema(s Subcommand) bool {
+	return s == SubcommandReview || s == SubcommandResearch
+}
+
 // IsValidSandboxMode reports whether a persisted launch sandbox mode is accepted.
 func IsValidSandboxMode(mode string) bool {
 	return mode == "read-only" || mode == "workspace-write"

@@ -35,6 +35,24 @@ func TestThinkIsSubmittable(t *testing.T) {
 	}
 }
 
+func TestSupportsOutputSchema(t *testing.T) {
+	for _, test := range []struct {
+		subcommand Subcommand
+		want       bool
+	}{
+		{SubcommandReview, true},
+		{SubcommandResearch, true},
+		{SubcommandImpl, false},
+		{SubcommandPlan, false},
+		{SubcommandRead, false},
+		{SubcommandThink, false},
+	} {
+		if got := SupportsOutputSchema(test.subcommand); got != test.want {
+			t.Errorf("SupportsOutputSchema(%q) = %t, want %t", test.subcommand, got, test.want)
+		}
+	}
+}
+
 func TestSentinelErrorsAndTerminalStates(t *testing.T) {
 	for _, err := range []error{ErrInvalidStateTransition, ErrTaskAlreadyTerminal, ErrSessionNotResumable} {
 		if !errors.Is(err, err) {

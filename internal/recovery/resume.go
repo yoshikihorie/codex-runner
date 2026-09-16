@@ -4,16 +4,18 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"path/filepath"
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/metrics"
+	"github.com/yoshikihorie/codex-runner/internal/store"
 )
 
 const (
 	// Canonical source: validation-rules.md RESUME_RECOVERY_TIMEOUT_SECONDS.
 	resumeRecoveryTimeout = 300 * time.Second
+	// Canonical source: validation-rules.md RECOVERY_RESUME_PROMPT.
+	RecoveryResumePrompt = "実行時間の上限で中断された。追加の調査・コマンド実行は一切せず、ここまでの分析内容だけで、依頼された最終成果物を今すぐ出力せよ。"
 )
 
 type TaskStore interface {
@@ -36,6 +38,8 @@ type ResumeLaunchParams struct {
 	SessionID             string
 	TaskPlacementRoot     string
 	OutputLastMessagePath string
+	OutputSchemaPath      *string
+	PromptText            string
 	Subcommand            domain.Subcommand
 	SandboxMode           string
 	Model                 string
@@ -93,7 +97,21 @@ func (r *RecoveryAttempt) Attempt(ctx context.Context, launcher ResumeLauncher, 
 		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, fmt.Errorf("resume task placement root: %w", err)
 	}
 	taskPlacementRoot := path.String()
-	params := ResumeLaunchParams{TaskID: r.TaskID, CodexBinaryPath: r.CodexBinaryPath, SessionID: r.SessionRef.SessionID(), TaskPlacementRoot: taskPlacementRoot, OutputLastMessagePath: filepath.Join(taskPlacementRoot, r.TaskID.String(), "last-message.md"), Subcommand: r.Subcommand, SandboxMode: r.SandboxMode, Model: r.Model, ReasoningEffort: r.ReasoningEffort}
+	outputLastMessagePath, err := store.LastMessageMDPath(taskPlacementRoot, r.TaskID)
+	if err != nil {
+		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, fmt.Errorf("resume output last message path: %w", err)
+	}
+	params := ResumeLaunchParams{TaskID: r.TaskID, CodexBinaryPath: r.CodexBinaryPath, SessionID: r.SessionRef.SessionID(), TaskPlacementRoot: taskPlacementRoot, OutputLastMessagePath: outputLastMessagePath, Subcommand: r.Subcommand, SandboxMode: r.SandboxMode, Model: r.Model, ReasoningEffort: r.ReasoningEffort}
+	if domain.SupportsOutputSchema(r.Subcommand) {
+		outputSchemaPath, err := store.OutputSchemaPath(taskPlacementRoot, r.TaskID)
+		if err != nil {
+			return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, fmt.Errorf("resume output schema path: %w", err)
+		}
+		params.OutputSchemaPath = &outputSchemaPath
+	}
+	if r.Subcommand != domain.SubcommandImpl {
+		params.PromptText = RecoveryResumePrompt
+	}
 	if err := launcher.LaunchAndWait(ctx, params); err != nil {
 		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, err
 	}

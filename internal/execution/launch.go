@@ -19,6 +19,7 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/proc"
 	"github.com/yoshikihorie/codex-runner/internal/recovery"
+	"github.com/yoshikihorie/codex-runner/internal/store"
 )
 
 type LaunchParams struct {
@@ -68,6 +69,7 @@ var decideSkipGitRepoCheck = detectSkipGitRepoCheck
 var newResumeProcessWaiter = func(cmd *exec.Cmd) ProcessWaiter {
 	return &processWaiter{cmd: cmd}
 }
+var lstat = os.Lstat
 
 func allowsWorkspaceWriteNetworkAccess(subcommand domain.Subcommand, sandboxMode string) bool {
 	return subcommand == domain.SubcommandImpl && sandboxMode == "workspace-write"
@@ -111,7 +113,7 @@ func buildLaunchArgs(p LaunchParams, skipGitRepoCheck bool) (headProcess string,
 	if p.OutputSchemaPath != nil {
 		args = append(args, "--output-schema", *p.OutputSchemaPath)
 	}
-	args = append(args, "--output-last-message", filepath.Join(p.TaskDirPath, "last-message.md"), "--", p.PromptText)
+	args = append(args, "--output-last-message", store.LastMessageMDPathInTaskDir(p.TaskDirPath), "--", p.PromptText)
 	if p.PTYEnabled {
 		return scriptBinaryPath, append([]string{"-q", "/dev/null", stdbufBinaryPath}, args...)
 	}
@@ -150,7 +152,38 @@ func buildResumeArgs(params recovery.ResumeLaunchParams) []string {
 	if params.ReasoningEffort != nil {
 		args = append(args, "-c", "model_reasoning_effort="+*params.ReasoningEffort)
 	}
-	return append(args, "--output-last-message", params.OutputLastMessagePath)
+	if params.OutputSchemaPath != nil {
+		args = append(args, "--output-schema", *params.OutputSchemaPath)
+	}
+	args = append(args, "--output-last-message", params.OutputLastMessagePath)
+	if params.PromptText != "" {
+		args = append(args, params.PromptText)
+	}
+	return args
+}
+
+func (l *resumeLauncher) resolveOutputSchemaPath(params recovery.ResumeLaunchParams) (*string, error) {
+	expectedPath, err := store.OutputSchemaPath(params.TaskPlacementRoot, params.TaskID)
+	if err != nil {
+		return nil, fmt.Errorf("derive resume output schema path: %w", err)
+	}
+	if params.OutputSchemaPath != nil && *params.OutputSchemaPath != expectedPath {
+		return nil, fmt.Errorf("resume output schema path is invalid: %s", expectedPath)
+	}
+	info, err := lstat(expectedPath)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("inspect resume output schema %s: %w", expectedPath, err)
+	}
+	if !domain.SupportsOutputSchema(params.Subcommand) {
+		return nil, fmt.Errorf("resume output schema is not allowed for %s: %s (%s)", params.Subcommand, expectedPath, info.Mode().Type())
+	}
+	if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("resume output schema is not a regular file: %s (%s)", expectedPath, info.Mode().Type())
+	}
+	return &expectedPath, nil
 }
 
 func runGitRepositoryCheckCommand(ctx context.Context, gitBinary string, env []string, stdout io.Writer, stderr io.Writer, args ...string) error {
@@ -191,7 +224,10 @@ func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.Resu
 		return fmt.Errorf("resume launch task placement root: %w", rootErr)
 	}
 	taskDirPath := filepath.Join(root.String(), params.TaskID.String())
-	expectedOutputPath := filepath.Join(taskDirPath, "last-message.md")
+	expectedOutputPath, expectedOutputPathErr := store.LastMessageMDPath(root.String(), params.TaskID)
+	if expectedOutputPathErr != nil {
+		return fmt.Errorf("derive resume output last message path: %w", expectedOutputPathErr)
+	}
 	if !filepath.IsAbs(params.CodexBinaryPath) || params.OutputLastMessagePath != expectedOutputPath {
 		return fmt.Errorf("resume launch paths are invalid")
 	}
@@ -211,6 +247,17 @@ func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.Resu
 		l.logger.Error("inspect worktree eviction marker", "task_id", params.TaskID.String(), "marker_path", markerPath, "error", err)
 		return err
 	}
+	outputSchemaPath, err := l.resolveOutputSchemaPath(params)
+	if err != nil {
+		_ = lock.Close()
+		schemaPath, schemaPathErr := store.OutputSchemaPath(root.String(), params.TaskID)
+		if schemaPathErr != nil {
+			schemaPath = ""
+		}
+		l.logger.Warn("reject resume output schema", "task_id", params.TaskID.String(), "schema_path", schemaPath, "error", err)
+		return err
+	}
+	params.OutputSchemaPath = outputSchemaPath
 	if err := ctx.Err(); err != nil {
 		_ = lock.Close()
 		return err
