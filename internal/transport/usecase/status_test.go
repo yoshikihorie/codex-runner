@@ -38,7 +38,7 @@ func statusSnapshot(t *testing.T, state domain.TaskState) domain.TaskSnapshot {
 	}
 	requestedAt := time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC)
 	pid := 7
-	return domain.TaskSnapshot{TaskID: id, Subcommand: domain.SubcommandReview, PID: &pid, ProcessStartedAt: &requestedAt, ResolvedTimeoutSeconds: 1800, Model: "gpt-5", RequestedAt: requestedAt, Route: domain.ExecutionRouteDaemon, State: state, StateUpdatedAt: requestedAt, SchemaVersion: 1}
+	return domain.TaskSnapshot{TaskID: id, Subcommand: domain.SubcommandReview, PID: &pid, ProcessStartedAt: &requestedAt, ResolvedTimeoutSeconds: 1800, Model: "gpt-5", SandboxMode: "workspace-write", RequestedAt: requestedAt, Route: domain.ExecutionRouteDaemon, State: state, StateUpdatedAt: requestedAt, SchemaVersion: 2}
 }
 
 func TestGetTaskStatusExecuteMapsQueuedSnapshotAndPosition(t *testing.T) {

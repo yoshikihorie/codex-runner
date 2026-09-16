@@ -306,7 +306,7 @@ func finalizeSnapshot(t *testing.T, state domain.TaskState) domain.TaskSnapshot 
 	id := finalizeID(t)
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
 	pid := 1
-	return domain.TaskSnapshot{TaskID: id, Subcommand: domain.SubcommandImpl, PID: &pid, ProcessStartedAt: &now, ResolvedTimeoutSeconds: 1800, Model: "gpt-5", RequestedAt: now, Route: domain.ExecutionRouteDaemon, State: state, StateUpdatedAt: now, SchemaVersion: 1}
+	return domain.TaskSnapshot{TaskID: id, Subcommand: domain.SubcommandImpl, PID: &pid, ProcessStartedAt: &now, ResolvedTimeoutSeconds: 1800, Model: "gpt-5", SandboxMode: "workspace-write", RequestedAt: now, Route: domain.ExecutionRouteDaemon, State: state, StateUpdatedAt: now, SchemaVersion: 2}
 }
 func finalizeFixtures(t *testing.T, state domain.TaskState, now time.Time) (*finalizeStoreFake, *finalizeReaderFake, *finalizeWriterFake, *finalizeSlotFake, *finalizeTimeoutFake, *FinalizeTaskUseCase) {
 	t.Helper()

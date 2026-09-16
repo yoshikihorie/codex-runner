@@ -126,11 +126,9 @@ func (uc *AcquirePathLockUseCase) Execute(_ context.Context, in AcquirePathLockI
 		if errors.Is(livenessErr, fs.ErrNotExist) {
 			task, loadErr := uc.tasks.Load(snapshot.TaskID)
 			switch {
-			case errors.Is(loadErr, domain.ErrTaskNotFound):
-				dead = true
 			case loadErr != nil:
-				uc.logger.Error("read task state for path lock liveness", "task_id", in.TaskID.String(), "confirmed_task_id", snapshot.TaskID.String(), "stage", "load_task_state", "error", ErrorTypeName(loadErr))
-				return AcquirePathLockOutput{}, fmt.Errorf("%w: %v", domain.ErrPathLockInfraFailure, loadErr)
+				uc.logger.Warn("treat path lock as stale because task state cannot be read", "task_id", in.TaskID.String(), "confirmed_task_id", snapshot.TaskID.String(), "stage", "load_task_state", "error", ErrorTypeName(loadErr))
+				dead = true
 			case task.State == domain.StateQueued || task.State == domain.StateStarting:
 				dead = false
 			default:

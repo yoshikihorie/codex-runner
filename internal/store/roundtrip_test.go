@@ -21,9 +21,9 @@ func TestRoundTripLoadRestoreTransitionSave(t *testing.T) {
 	requestedAt := time.Date(2026, time.August, 6, 12, 0, 0, 0, time.UTC)
 	snapshot := domain.TaskSnapshot{
 		TaskID: id, Subcommand: domain.SubcommandImpl, ResolvedTimeoutSeconds: 1920,
-		RequestedTimeoutSeconds: &requested, Model: "gpt-5", RequestedAt: requestedAt,
+		RequestedTimeoutSeconds: &requested, Model: "gpt-5", SandboxMode: "workspace-write", RequestedAt: requestedAt,
 		Route: domain.ExecutionRouteDaemon, State: domain.StateQueued,
-		StateUpdatedAt: requestedAt, SchemaVersion: 1,
+		StateUpdatedAt: requestedAt, SchemaVersion: 2,
 	}
 	if err := store.Reserve(id); err != nil {
 		t.Fatal(err)

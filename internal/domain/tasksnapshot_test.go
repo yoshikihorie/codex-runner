@@ -15,7 +15,7 @@ func snapshotInt(value int) *int { return &value }
 
 func TestNewInitialTaskSnapshot(t *testing.T) {
 	reasoning := "high"
-	snapshot := NewInitialTaskSnapshot(ExecutionRouteDaemon, &reasoning)
+	snapshot := NewInitialTaskSnapshot(ExecutionRouteDaemon, &reasoning, "workspace-write")
 	if snapshot.Route != ExecutionRouteDaemon || snapshot.ReasoningEffort == nil || *snapshot.ReasoningEffort != reasoning || snapshot.ReasoningEffort == &reasoning || snapshot.SchemaVersion != taskSnapshotSchemaVersion {
 		t.Fatalf("initial snapshot = %#v", snapshot)
 	}
@@ -26,8 +26,16 @@ func TestNewInitialTaskSnapshot(t *testing.T) {
 	if snapshot.TaskID.String() != "" || snapshot.Subcommand != "" || snapshot.PID != nil || snapshot.ProcessStartedAt != nil || snapshot.Model != "" || !snapshot.RequestedAt.IsZero() || snapshot.State != "" || !snapshot.StateUpdatedAt.IsZero() {
 		t.Fatalf("initial snapshot has non-zero task fields: %#v", snapshot)
 	}
-	if NewInitialTaskSnapshot(ExecutionRouteDaemon, nil).ReasoningEffort != nil {
+	if NewInitialTaskSnapshot(ExecutionRouteDaemon, nil, "workspace-write").ReasoningEffort != nil {
 		t.Fatal("nil reasoning effort was not retained")
+	}
+}
+
+func TestTaskSnapshotSchemaVersionOneFailsClosed(t *testing.T) {
+	snapshot := validRunningSnapshot(t)
+	snapshot.SchemaVersion = 1
+	if err := snapshot.Validate(); err == nil {
+		t.Fatal("schema version 1 snapshot was accepted")
 	}
 }
 
@@ -55,7 +63,7 @@ func TestNewTaskSnapshotFromAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", &reasoning, ExecutionRouteDaemon, snapshotTime(1))
+	snapshot, err := NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", &reasoning, "workspace-write", ExecutionRouteDaemon, snapshotTime(1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -87,7 +95,7 @@ func TestNewTaskSnapshotFromAdmission_RejectsInvalidInput(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			before := *task
-			if _, err := NewTaskSnapshotFromAdmission(tc.task, tc.timeout, tc.model, nil, tc.route, tc.at); err == nil {
+			if _, err := NewTaskSnapshotFromAdmission(tc.task, tc.timeout, tc.model, nil, "workspace-write", tc.route, tc.at); err == nil {
 				t.Fatal("invalid input accepted")
 			}
 			if tc.task != nil && !reflect.DeepEqual(*task, before) {
@@ -104,7 +112,7 @@ func TestNewTaskSnapshotFromAdmission_DefensivelyCopiesPointers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", &reasoning, ExecutionRouteDaemon, snapshotTime(1))
+	snapshot, err := NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", &reasoning, "workspace-write", ExecutionRouteDaemon, snapshotTime(1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -126,7 +134,7 @@ func validRunningSnapshot(t *testing.T) TaskSnapshot {
 	return TaskSnapshot{
 		TaskID: id, Subcommand: SubcommandImpl, PID: &pid, ProcessStartedAt: &started,
 		ResolvedTimeoutSeconds: timeoutMinSeconds + 120, RequestedTimeoutSeconds: &requested,
-		Model: "gpt-5", RequestedAt: snapshotTime(0), Route: ExecutionRouteDaemon,
+		Model: "gpt-5", SandboxMode: "workspace-write", RequestedAt: snapshotTime(0), Route: ExecutionRouteDaemon,
 		State: StateRunning, StateUpdatedAt: snapshotTime(2), SchemaVersion: taskSnapshotSchemaVersion,
 	}
 }
@@ -202,6 +210,8 @@ func TestTaskSnapshotValidateRejectsInvalidFields(t *testing.T) {
 	}{
 		{"unknown subcommand", func(s *TaskSnapshot) { s.Subcommand = SubcommandStatus }},
 		{"empty model", func(s *TaskSnapshot) { s.Model = "" }},
+		{"empty sandbox mode", func(s *TaskSnapshot) { s.SandboxMode = "" }},
+		{"unknown sandbox mode", func(s *TaskSnapshot) { s.SandboxMode = "danger-full-access" }},
 		{"unknown state", func(s *TaskSnapshot) { s.State = TaskState("other") }},
 		{"non-daemon route", func(s *TaskSnapshot) { s.Route = ExecutionRouteLegacy }},
 		{"pid without started at", func(s *TaskSnapshot) { s.ProcessStartedAt = nil }},
@@ -290,7 +300,7 @@ func TestTaskSnapshotJSONFieldNames(t *testing.T) {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"task_id", "subcommand", "pid", "process_started_at", "resolved_timeout_seconds", "requested_timeout_seconds", "model", "reasoning_effort", "requested_at", "route", "state", "state_updated_at", "session_ref", "last_event_at", "exit_code", "recovered", "adopted_after_restart", "recovery_origin", "schema_version"}
+	want := []string{"task_id", "subcommand", "pid", "process_started_at", "resolved_timeout_seconds", "requested_timeout_seconds", "model", "reasoning_effort", "sandbox_mode", "requested_at", "route", "state", "state_updated_at", "session_ref", "last_event_at", "exit_code", "recovered", "adopted_after_restart", "recovery_origin", "schema_version"}
 	if len(fields) != len(want) {
 		t.Fatalf("field count = %d, want %d: %s", len(fields), len(want), data)
 	}

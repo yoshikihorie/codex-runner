@@ -101,7 +101,7 @@ func recordSnapshot(t *testing.T, state domain.TaskState) domain.TaskSnapshot {
 	requested := time.Date(2026, 7, 31, 23, 59, 0, 0, time.UTC)
 	started := requested.Add(time.Minute)
 	finished := started.Add(2 * time.Minute)
-	return domain.TaskSnapshot{TaskID: recordID(t), Subcommand: domain.SubcommandImpl, Model: "test-model", RequestedAt: requested, ProcessStartedAt: &started, State: state, StateUpdatedAt: finished, Route: domain.ExecutionRouteDaemon}
+	return domain.TaskSnapshot{TaskID: recordID(t), Subcommand: domain.SubcommandImpl, Model: "test-model", SandboxMode: "workspace-write", RequestedAt: requested, ProcessStartedAt: &started, State: state, StateUpdatedAt: finished, Route: domain.ExecutionRouteDaemon}
 }
 
 func newRecordUseCase(t *testing.T, state domain.TaskState, content bool) (*RecordTaskMetricsUseCase, *recordStoreFake, *recordEventsFake, *recordContractFake, *recordWriterFake) {

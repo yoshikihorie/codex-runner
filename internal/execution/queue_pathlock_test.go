@@ -237,7 +237,7 @@ func TestSubmitPathLockIntegrationKeepsQueuedOwnerWithoutTaskLock(t *testing.T) 
 	if err := tasks.Reserve(owner); err != nil {
 		t.Fatal(err)
 	}
-	if err := tasks.Save(owner, domain.TaskSnapshot{TaskID: owner, Subcommand: domain.SubcommandImpl, ResolvedTimeoutSeconds: 1800, Model: "gpt-5.6-terra", RequestedAt: at, Route: domain.ExecutionRouteDaemon, State: domain.StateQueued, StateUpdatedAt: at, SchemaVersion: 1}); err != nil {
+	if err := tasks.Save(owner, domain.TaskSnapshot{TaskID: owner, Subcommand: domain.SubcommandImpl, ResolvedTimeoutSeconds: 1800, Model: "gpt-5.6-terra", SandboxMode: "workspace-write", RequestedAt: at, Route: domain.ExecutionRouteDaemon, State: domain.StateQueued, StateUpdatedAt: at, SchemaVersion: 2}); err != nil {
 		t.Fatal(err)
 	}
 	if err := fixture.pathStore.Save(owner, []domain.NormalizedPath{normalized}); err != nil {

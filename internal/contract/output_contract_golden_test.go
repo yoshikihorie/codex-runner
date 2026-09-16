@@ -38,7 +38,7 @@ type goldenRunner struct {
 
 func (r *goldenRunner) Launch(_ context.Context, p execution.LaunchParams) (*execution.LaunchedProcess, error) {
 	r.launches++
-	if p.TaskID != r.taskID || p.Subcommand != r.family || p.TaskDirPath != r.taskDir || !p.AllowResume || p.Model != r.model || p.PromptText != r.prompt || p.SandboxMode != "" || p.WorkingDir != "" || p.PTYEnabled || p.CodexBinaryPath != "" || p.ReasoningEffort != nil || p.LivenessLockFile != nil {
+	if p.TaskID != r.taskID || p.Subcommand != r.family || p.TaskDirPath != r.taskDir || !p.AllowResume || p.Model != r.model || p.PromptText != r.prompt || p.SandboxMode != "read-only" || p.WorkingDir != "" || p.PTYEnabled || p.CodexBinaryPath != "" || p.ReasoningEffort != nil || p.LivenessLockFile != nil {
 		return nil, errors.New("invalid golden launch parameters")
 	}
 	logs, err := r.writer.OpenExecutionLogs(p.TaskID)
@@ -71,6 +71,7 @@ type goldenResumeLauncher struct {
 	taskID          domain.TaskID
 	sessionID       string
 	codexBinaryPath string
+	family          domain.Subcommand
 	calls           int
 	params          []recovery.ResumeLaunchParams
 }
@@ -78,7 +79,7 @@ type goldenResumeLauncher struct {
 func (l *goldenResumeLauncher) LaunchAndWait(_ context.Context, p recovery.ResumeLaunchParams) error {
 	l.calls++
 	l.params = append(l.params, p)
-	if p.TaskID != l.taskID || p.SessionID != l.sessionID || p.CodexBinaryPath != l.codexBinaryPath || p.OutputLastMessagePath != filepath.Join(l.taskDir, "last-message.md") {
+	if p.TaskID != l.taskID || p.SessionID != l.sessionID || p.CodexBinaryPath != l.codexBinaryPath || p.OutputLastMessagePath != filepath.Join(l.taskDir, "last-message.md") || p.SandboxMode != "read-only" || p.Model != "test-model" || p.Subcommand != l.family || p.ReasoningEffort != nil {
 		return errors.New("invalid golden resume launch parameters")
 	}
 	if !l.success {
@@ -161,7 +162,7 @@ func runGoldenScenario(t *testing.T, scenario string, family domain.Subcommand, 
 		t.Fatal(err)
 	}
 	dir := filepath.Join(root, id.String())
-	if err := usecase.NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), task, timeout, "test-model", nil, domain.ExecutionRouteDaemon, "golden prompt\n", now); err != nil {
+	if err := usecase.NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), task, timeout, "test-model", nil, "read-only", domain.ExecutionRouteDaemon, "golden prompt\n", now); err != nil {
 		t.Fatal(err)
 	}
 	if family == domain.SubcommandReview {
@@ -193,7 +194,7 @@ func runGoldenScenario(t *testing.T, scenario string, family domain.Subcommand, 
 		}
 	}
 	runner := &goldenRunner{writer: writer, taskDir: dir, taskID: id, family: family, rawExit: rawExit, model: "test-model", prompt: "golden prompt\n"}
-	launched, err := usecase.NewLaunchWithPTYUseCase(runner).Execute(context.Background(), execution.LaunchParams{TaskID: id, Subcommand: family, TaskDirPath: dir, AllowResume: true, Model: "test-model", PromptText: "golden prompt\n"})
+	launched, err := usecase.NewLaunchWithPTYUseCase(runner).Execute(context.Background(), execution.LaunchParams{TaskID: id, Subcommand: family, TaskDirPath: dir, AllowResume: true, Model: "test-model", SandboxMode: "read-only", PromptText: "golden prompt\n"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -255,7 +256,7 @@ func runGoldenScenario(t *testing.T, scenario string, family domain.Subcommand, 
 				t.Fatal(err)
 			}
 		}
-		launcher := &goldenResumeLauncher{taskDir: dir, success: resumeSuccess, taskID: id, sessionID: session.SessionID(), codexBinaryPath: "/usr/bin/false"}
+		launcher := &goldenResumeLauncher{taskDir: dir, success: resumeSuccess, taskID: id, sessionID: session.SessionID(), codexBinaryPath: "/usr/bin/false", family: family}
 		recoverer, err := recovery.NewResumeRecoverer(launcher, reader, "/usr/bin/false", root, clock)
 		if err != nil {
 			t.Fatal(err)

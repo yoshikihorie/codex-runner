@@ -124,6 +124,7 @@ func TestAcquirePathLockUseCaseDisambiguatesMissingTaskLockWithTaskState(t *test
 		{name: "queued survives", state: domain.StateQueued, conflicted: true},
 		{name: "starting survives", state: domain.StateStarting, conflicted: true},
 		{name: "not found is stale", loadErr: domain.ErrTaskNotFound},
+		{name: "unreadable task state is stale", loadErr: errors.New("unsupported task schema")},
 		{name: "running is stale", state: domain.StateRunning},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -469,16 +470,15 @@ func TestReleasePathLockUseCaseSecondReleaseSucceedsAndLogsInfo_SCNLock0111(t *t
 	}
 }
 
-func TestAcquirePathLockUseCaseFailsClosedWhenTaskStateReadFails(t *testing.T) {
+func TestAcquirePathLockUseCaseRemovesStaleLockWhenTaskStateReadFails(t *testing.T) {
 	owner, _ := domain.NewTaskID("impl-20260809-120000-a1b2-owner")
 	requester, _ := domain.NewTaskID("impl-20260809-120001-a1b2-requester")
 	path, _ := domain.NewNormalizedPath(t.TempDir())
 	store := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{path.String()}}}}
 	uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, store, domain.LivenessLockFunc(func(string) (bool, error) { return false, fs.ErrNotExist }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{err: errors.New("task store unavailable")})
-	_, err := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{path.String()}})
-	var liveness *LivenessCheckError
-	if !errors.Is(err, domain.ErrPathLockInfraFailure) || errors.As(err, &liveness) || len(store.deleted) != 0 || store.saved {
-		t.Fatalf("Execute error=%v deleted=%v saved=%v", err, store.deleted, store.saved)
+	out, err := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{path.String()}})
+	if err != nil || !out.Acquired || len(store.deleted) != 1 || !store.saved {
+		t.Fatalf("Execute output=%+v error=%v deleted=%v saved=%v", out, err, store.deleted, store.saved)
 	}
 }
 

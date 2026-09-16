@@ -424,7 +424,7 @@ func cancelQueuedPayload(t *testing.T) execution.TaskLaunchPayload {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return execution.TaskLaunchPayload{Task: task, Model: "gpt-5", PromptText: "prompt", ResolvedTimeout: timeout}
+	return execution.TaskLaunchPayload{Task: task, Model: "gpt-5", SandboxMode: "workspace-write", PromptText: "prompt", ResolvedTimeout: timeout}
 }
 func cancelFixture(t *testing.T, payload execution.TaskLaunchPayload, removed bool) (*cancelStoreFake, *cancelQueueFake, *cancelEventsFake, *cancelTerminatorFake, *cancelDisarmerFake, *CancelTaskUseCase) {
 	t.Helper()
@@ -455,7 +455,7 @@ func cancelFixtureWithQueueMutexAndSlots(t *testing.T, payload execution.TaskLau
 func cancelPersistedSnapshot(t *testing.T, state domain.TaskState, withPID bool) domain.TaskSnapshot {
 	t.Helper()
 	payload := cancelQueuedPayload(t)
-	snapshot, err := domain.NewTaskSnapshotFromAdmission(payload.Task, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, domain.ExecutionRouteDaemon, time.Date(2026, 8, 11, 12, 1, 0, 0, time.UTC))
+	snapshot, err := domain.NewTaskSnapshotFromAdmission(payload.Task, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, payload.SandboxMode, domain.ExecutionRouteDaemon, time.Date(2026, 8, 11, 12, 1, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -474,7 +474,7 @@ func cancelPersistedSnapshot(t *testing.T, state domain.TaskState, withPID bool)
 func cancelLiveAdoptedWithoutPIDSnapshot(t *testing.T, payload execution.TaskLaunchPayload, stalled bool) domain.TaskSnapshot {
 	t.Helper()
 	at := time.Date(2026, 8, 11, 12, 1, 0, 0, time.UTC)
-	snapshot, err := domain.NewTaskSnapshotFromAdmission(payload.Task, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, domain.ExecutionRouteDaemon, at)
+	snapshot, err := domain.NewTaskSnapshotFromAdmission(payload.Task, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, payload.SandboxMode, domain.ExecutionRouteDaemon, at)
 	if err != nil {
 		t.Fatal(err)
 	}

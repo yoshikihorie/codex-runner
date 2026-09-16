@@ -29,11 +29,14 @@ func TestFailTaskLaunchUseCaseRejectsNilTaskAndZeroOccurredAtBeforeSideEffects(t
 func TestFailTaskLaunchUseCaseRejectsInvalidTimeoutAndModelBeforeSideEffects(t *testing.T) {
 	task := lifecycleTask(t, domain.SubcommandReview)
 	uc := &FailTaskLaunchUseCase{}
-	if err := uc.Execute(context.Background(), FailTaskLaunchInput{Task: task, Model: "gpt-5", OccurredAt: testLifecycleTime}); err == nil {
+	if err := uc.Execute(context.Background(), FailTaskLaunchInput{Task: task, Model: "gpt-5", SandboxMode: "workspace-write", OccurredAt: testLifecycleTime}); err == nil {
 		t.Fatal("zero timeout was accepted")
 	}
 	if err := uc.Execute(context.Background(), FailTaskLaunchInput{Task: task, ResolvedTimeout: lifecycleTimeout(t), OccurredAt: testLifecycleTime}); err == nil {
 		t.Fatal("empty model was accepted")
+	}
+	if err := uc.Execute(context.Background(), FailTaskLaunchInput{Task: task, ResolvedTimeout: lifecycleTimeout(t), Model: "gpt-5", SandboxMode: "danger-full-access", OccurredAt: testLifecycleTime}); err == nil {
+		t.Fatal("invalid sandbox mode was accepted")
 	}
 }
 func TestFailTaskLaunchInputPreservesOptionalReasoningEffort(t *testing.T) {
@@ -66,7 +69,7 @@ func TestFailTaskLaunchUseCaseTransitionsAndReleases(t *testing.T) {
 			paths := &lifecycleRecordingPathLockReleaser{trace: &trace}
 			clock := &lifecycleRecordingClock{now: testLifecycleTime, trace: &trace}
 			uc := NewFailTaskLaunchUseCase(storeFake, locker, writer, &lifecycleRecordingContractReader{}, slots, paths, clock)
-			if err := uc.Execute(context.Background(), FailTaskLaunchInput{Task: inputTask, ResolvedTimeout: lifecycleTimeout(t), Model: "gpt-5", OccurredAt: testLifecycleTime}); err != nil {
+			if err := uc.Execute(context.Background(), FailTaskLaunchInput{Task: inputTask, ResolvedTimeout: lifecycleTimeout(t), Model: "gpt-5", SandboxMode: "workspace-write", OccurredAt: testLifecycleTime}); err != nil {
 				t.Fatal(err)
 			}
 			if storeFake.saveCalls != 1 || storeFake.saved[0].State != domain.StateFailed || writer.appendCalls != 2 || locker.lockCalls != 1 || locker.unlockCalls != 1 || slots.calls != 1 || slots.nows[0] != testLifecycleTime {
@@ -104,7 +107,7 @@ func TestFailTaskLaunchUseCaseExecuteLockedDoesNotManageResources(t *testing.T) 
 	paths := &lifecycleRecordingPathLockReleaser{trace: &trace}
 	uc := NewFailTaskLaunchUseCase(storeFake, locker, writer, &lifecycleRecordingContractReader{}, slots, paths, &lifecycleRecordingClock{now: testLifecycleTime, trace: &trace})
 
-	result, err := uc.ExecuteLocked(context.Background(), FailTaskLaunchInput{Task: task, ResolvedTimeout: lifecycleTimeout(t), Model: "gpt-5", OccurredAt: testLifecycleTime})
+	result, err := uc.ExecuteLocked(context.Background(), FailTaskLaunchInput{Task: task, ResolvedTimeout: lifecycleTimeout(t), Model: "gpt-5", SandboxMode: "workspace-write", OccurredAt: testLifecycleTime})
 	if err != nil || !result.Terminal || !result.Impl {
 		t.Fatalf("ExecuteLocked() = %+v, %v", result, err)
 	}
@@ -124,7 +127,7 @@ func TestFailTaskLaunchUseCaseExecuteLockedRetainsTerminalResultOnSaveFailure(t 
 	slots := &lifecycleRecordingSlotReleaser{}
 	paths := &lifecycleRecordingPathLockReleaser{}
 	uc := NewFailTaskLaunchUseCase(storeFake, locker, &lifecycleRecordingContractWriter{}, &lifecycleRecordingContractReader{}, slots, paths, &lifecycleRecordingClock{now: testLifecycleTime})
-	result, err := uc.ExecuteLocked(context.Background(), FailTaskLaunchInput{Task: task, ResolvedTimeout: lifecycleTimeout(t), Model: "gpt-5", OccurredAt: testLifecycleTime})
+	result, err := uc.ExecuteLocked(context.Background(), FailTaskLaunchInput{Task: task, ResolvedTimeout: lifecycleTimeout(t), Model: "gpt-5", SandboxMode: "workspace-write", OccurredAt: testLifecycleTime})
 	if err == nil || !result.Terminal || result.Impl {
 		t.Fatalf("ExecuteLocked() = %+v, %v", result, err)
 	}
@@ -150,7 +153,7 @@ func TestFailTaskLaunchUseCaseExecuteLockedCompletesUnderCallerHeldRealTaskMutex
 		close(contenderAcquired)
 		shared.Unlock(task.ID())
 	}()
-	result, err := uc.ExecuteLocked(context.Background(), FailTaskLaunchInput{Task: task, ResolvedTimeout: lifecycleTimeout(t), Model: "gpt-5", OccurredAt: testLifecycleTime})
+	result, err := uc.ExecuteLocked(context.Background(), FailTaskLaunchInput{Task: task, ResolvedTimeout: lifecycleTimeout(t), Model: "gpt-5", SandboxMode: "workspace-write", OccurredAt: testLifecycleTime})
 	if err != nil || !result.Terminal || !result.Impl {
 		shared.Unlock(task.ID())
 		t.Fatalf("ExecuteLocked() = %+v, %v", result, err)

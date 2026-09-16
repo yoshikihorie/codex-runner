@@ -1,8 +1,10 @@
 package store
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -34,7 +36,7 @@ func storeSnapshot(t *testing.T, id domain.TaskID, state domain.TaskState) domai
 		t.Fatal(err)
 	}
 	origin := domain.RecoveryOriginTimeout
-	v := domain.TaskSnapshot{TaskID: id, Subcommand: domain.SubcommandImpl, PID: &pid, ProcessStartedAt: &started, ResolvedTimeoutSeconds: 1920, RequestedTimeoutSeconds: &requested, Model: "gpt-5", ReasoningEffort: &reasoning, RequestedAt: at, Route: domain.ExecutionRouteDaemon, State: state, StateUpdatedAt: at.Add(3 * time.Second), SessionRef: &session, LastEventAt: &event, ExitCode: &code, Recovered: state == domain.StateRecovered, AdoptedAfterRestart: true, RecoveryOrigin: &origin, SchemaVersion: 1}
+	v := domain.TaskSnapshot{TaskID: id, Subcommand: domain.SubcommandImpl, PID: &pid, ProcessStartedAt: &started, ResolvedTimeoutSeconds: 1920, RequestedTimeoutSeconds: &requested, Model: "gpt-5", ReasoningEffort: &reasoning, SandboxMode: "workspace-write", RequestedAt: at, Route: domain.ExecutionRouteDaemon, State: state, StateUpdatedAt: at.Add(3 * time.Second), SessionRef: &session, LastEventAt: &event, ExitCode: &code, Recovered: state == domain.StateRecovered, AdoptedAfterRestart: true, RecoveryOrigin: &origin, SchemaVersion: 2}
 	if state != domain.StateRecovered {
 		v.RecoveryOrigin = nil
 	}
@@ -255,6 +257,27 @@ func TestTaskStoreListByStatesSkipsCorruptedSnapshot(t *testing.T) {
 	got, err := s.ListByStates([]domain.TaskState{domain.StateQueued})
 	if err != nil || len(got) != 0 {
 		t.Fatalf("list = %#v, %v", got, err)
+	}
+}
+
+func TestNewFileTaskStoreWarnsAboutCorruptedSnapshots(t *testing.T) {
+	root := t.TempDir()
+	id := storeID(t, "warn-corrupted")
+	if err := os.Mkdir(filepath.Join(root, id.String()), taskDirPerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, id.String(), "task.json"), []byte("{"), taskFilePerm); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&output, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+	if _, err := NewFileTaskStore(root); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(output.String(), "corrupted task snapshots ignored during startup") || !strings.Contains(output.String(), "count=1") || !strings.Contains(output.String(), id.String()) {
+		t.Fatalf("startup warning = %q", output.String())
 	}
 }
 func TestTaskStoreListByStatesFiltersDeduplicatesAndSorts(t *testing.T) {

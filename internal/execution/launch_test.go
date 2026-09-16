@@ -755,8 +755,9 @@ func TestProcessRunnerSignalDelegatesArgumentsAndError(t *testing.T) {
 
 func TestResumeLaunchArgs(t *testing.T) {
 	id := launchTestID(t)
-	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", OutputLastMessagePath: "/tmp/codex-tasks/last-message.md"}
-	if got, want := buildResumeArgs(params), []string{"exec", "resume", "session-id", "--skip-git-repo-check", "--output-last-message", "/tmp/codex-tasks/last-message.md"}; !slices.Equal(got, want) {
+	effort := "high"
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", OutputLastMessagePath: "/tmp/codex-tasks/last-message.md", Subcommand: domain.SubcommandReview, SandboxMode: "read-only", Model: "gpt-5", ReasoningEffort: &effort}
+	if got, want := buildResumeArgs(params), []string{"exec", "resume", "session-id", "--skip-git-repo-check", "-c", "sandbox_mode=read-only", "--model", "gpt-5", "-c", "model_reasoning_effort=high", "--output-last-message", "/tmp/codex-tasks/last-message.md"}; !slices.Equal(got, want) {
 		t.Fatalf("args = %q, want %q", got, want)
 	}
 }
@@ -813,10 +814,42 @@ func TestResumeLauncherRejectsInvalidOutputLastMessagePathBeforeLaunch(t *testin
 				SessionID:             "session-id",
 				TaskPlacementRoot:     root,
 				OutputLastMessagePath: tt.outputLastMessagePath,
+				SandboxMode:           "read-only",
+				Model:                 "gpt-5",
 			}
 			err := NewResumeLauncher(&timeoutProcessFake{}).LaunchAndWait(context.Background(), params)
 			if err == nil || err.Error() != "resume launch paths are invalid" {
 				t.Fatalf("error = %v, want resume launch paths are invalid", err)
+			}
+			if launchCalls != 0 {
+				t.Fatalf("launch calls = %d, want 0", launchCalls)
+			}
+		})
+	}
+}
+
+func TestResumeLauncherRejectsInvalidSandboxModeOrModelBeforeLaunch(t *testing.T) {
+	id := launchTestID(t)
+	root := t.TempDir()
+	taskDir := filepath.Join(root, id.String())
+	if err := os.MkdirAll(taskDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(taskDir, "task.lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, tc := range []struct{ name, sandboxMode, model string }{{"empty sandbox mode", "", "gpt-5"}, {"unknown sandbox mode", "danger-full-access", "gpt-5"}, {"empty model", "read-only", ""}} {
+		t.Run(tc.name, func(t *testing.T) {
+			originalLaunch := launchNewSession
+			t.Cleanup(func() { launchNewSession = originalLaunch })
+			launchCalls := 0
+			launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+				launchCalls++
+				return nil, nil
+			}
+			params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), SandboxMode: tc.sandboxMode, Model: tc.model}
+			if err := NewResumeLauncher(&timeoutProcessFake{}).LaunchAndWait(context.Background(), params); err == nil {
+				t.Fatal("invalid resume launch parameters were accepted")
 			}
 			if launchCalls != 0 {
 				t.Fatalf("launch calls = %d, want 0", launchCalls)
@@ -863,7 +896,7 @@ func TestResumeLauncherDoesNotLaunchWhenContextCanceledAfterLockAcquisition(t *t
 		return nil, nil
 	}
 
-	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), SandboxMode: "read-only", Model: "gpt-5"}
 	err = NewResumeLauncher(&timeoutProcessFake{}).LaunchAndWait(ctx, params)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
@@ -907,7 +940,7 @@ func TestResumeLauncherRejectsEvictedWorktreeBeforeContextCancellation(t *testin
 	var logOutput bytes.Buffer
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), SandboxMode: "read-only", Model: "gpt-5"}
 	err = NewResumeLauncher(&timeoutProcessFake{}, slog.New(slog.NewTextHandler(&logOutput, nil))).LaunchAndWait(ctx, params)
 	if !errors.Is(err, ErrWorktreeEvicted) || errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want eviction error only", err)
@@ -967,7 +1000,7 @@ func TestResumeLauncherRejectsMarkerInspectionPermissionFailure(t *testing.T) {
 		return nil, nil
 	}
 	var logOutput bytes.Buffer
-	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), SandboxMode: "read-only", Model: "gpt-5"}
 	err = NewResumeLauncher(&timeoutProcessFake{}, slog.New(slog.NewTextHandler(&logOutput, nil))).LaunchAndWait(context.Background(), params)
 	if !errors.Is(err, syscall.EACCES) {
 		t.Fatalf("error = %v, want EACCES", err)
@@ -1049,7 +1082,7 @@ func TestResumeLauncherLogsCapturedStderrMetadataOnLaunchFailure(t *testing.T) {
 	if err := lock.Close(); err != nil {
 		t.Fatal(err)
 	}
-	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md")}
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), SandboxMode: "read-only", Model: "gpt-5"}
 	if err := NewResumeLauncher(&timeoutProcessFake{}, logger).LaunchAndWait(context.Background(), params); err == nil {
 		t.Fatal("launch failure was accepted")
 	}

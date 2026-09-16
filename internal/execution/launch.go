@@ -69,6 +69,10 @@ var newResumeProcessWaiter = func(cmd *exec.Cmd) ProcessWaiter {
 	return &processWaiter{cmd: cmd}
 }
 
+func allowsWorkspaceWriteNetworkAccess(subcommand domain.Subcommand, sandboxMode string) bool {
+	return subcommand == domain.SubcommandImpl && sandboxMode == "workspace-write"
+}
+
 // Canonical source: validation-rules.md GIT_REPOSITORY_CHECK_TIMEOUT_SECONDS.
 var gitRepositoryCheckTimeout = 30 * time.Second
 
@@ -98,7 +102,7 @@ func buildLaunchArgs(p LaunchParams, skipGitRepoCheck bool) (headProcess string,
 	args = append(args,
 		"-C", p.WorkingDir,
 		"--model", p.Model)
-	if p.Subcommand == domain.SubcommandImpl && p.SandboxMode == "workspace-write" {
+	if allowsWorkspaceWriteNetworkAccess(p.Subcommand, p.SandboxMode) {
 		args = append(args, "-c", "sandbox_workspace_write.network_access=true")
 	}
 	if p.ReasoningEffort != nil {
@@ -139,7 +143,14 @@ func NewResumeLauncher(runner ProcessRunner, loggers ...*slog.Logger) recovery.R
 }
 
 func buildResumeArgs(params recovery.ResumeLaunchParams) []string {
-	return []string{"exec", "resume", params.SessionID, "--skip-git-repo-check", "--output-last-message", params.OutputLastMessagePath}
+	args := []string{"exec", "resume", params.SessionID, "--skip-git-repo-check", "-c", "sandbox_mode=" + params.SandboxMode, "--model", params.Model}
+	if allowsWorkspaceWriteNetworkAccess(params.Subcommand, params.SandboxMode) {
+		args = append(args, "-c", "sandbox_workspace_write.network_access=true")
+	}
+	if params.ReasoningEffort != nil {
+		args = append(args, "-c", "model_reasoning_effort="+*params.ReasoningEffort)
+	}
+	return append(args, "--output-last-message", params.OutputLastMessagePath)
 }
 
 func runGitRepositoryCheckCommand(ctx context.Context, gitBinary string, env []string, stdout io.Writer, stderr io.Writer, args ...string) error {
@@ -172,6 +183,9 @@ func detectSkipGitRepoCheck(workingDir string) (bool, gitRepoCheckReason) {
 }
 
 func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.ResumeLaunchParams) (retErr error) {
+	if !domain.IsValidSandboxMode(params.SandboxMode) || params.Model == "" {
+		return fmt.Errorf("resume launch sandbox mode or model is invalid")
+	}
 	root, rootErr := domain.NewNormalizedPath(params.TaskPlacementRoot)
 	if rootErr != nil {
 		return fmt.Errorf("resume launch task placement root: %w", rootErr)

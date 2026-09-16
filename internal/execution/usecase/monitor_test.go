@@ -207,7 +207,7 @@ func testSnapshot(t *testing.T, id domain.TaskID, state domain.TaskState, start 
 	if _, e = task.Start(timeout, "gpt-5", start); e != nil {
 		t.Fatal(e)
 	}
-	snap, e := domain.NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", nil, domain.ExecutionRouteDaemon, start)
+	snap, e := domain.NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", nil, "workspace-write", domain.ExecutionRouteDaemon, start)
 	if e != nil {
 		t.Fatal(e)
 	}

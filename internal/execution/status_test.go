@@ -53,7 +53,7 @@ func statusPayload(t *testing.T, suffix string) TaskLaunchPayload {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return TaskLaunchPayload{Task: task, Model: "gpt-5", ResolvedTimeout: timeout}
+	return TaskLaunchPayload{Task: task, Model: "gpt-5", SandboxMode: "workspace-write", ResolvedTimeout: timeout}
 }
 
 func TestTaskSnapshotProviderSearchesLaunchingBeforeQueue(t *testing.T) {
@@ -64,7 +64,7 @@ func TestTaskSnapshotProviderSearchesLaunchingBeforeQueue(t *testing.T) {
 	registry := NewLaunchingTaskRegistry()
 	launchingPayload := payload
 	launchingPayload.Model = "launching-model"
-	launching, err := domain.NewTaskSnapshotFromAdmission(launchingPayload.Task, launchingPayload.ResolvedTimeout, launchingPayload.Model, nil, domain.ExecutionRouteDaemon, launchingPayload.Task.RequestedAt())
+	launching, err := domain.NewTaskSnapshotFromAdmission(launchingPayload.Task, launchingPayload.ResolvedTimeout, launchingPayload.Model, nil, launchingPayload.SandboxMode, domain.ExecutionRouteDaemon, launchingPayload.Task.RequestedAt())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestTaskSnapshotProviderQueuePositionExcludesLaunching(t *testing.T) {
 	queue.Enqueue(payload)
 	registry := NewLaunchingTaskRegistry()
 	launchingPayload := statusPayload(t, "position-launching")
-	launching, err := domain.NewTaskSnapshotFromAdmission(launchingPayload.Task, launchingPayload.ResolvedTimeout, launchingPayload.Model, nil, domain.ExecutionRouteDaemon, launchingPayload.Task.RequestedAt())
+	launching, err := domain.NewTaskSnapshotFromAdmission(launchingPayload.Task, launchingPayload.ResolvedTimeout, launchingPayload.Model, nil, launchingPayload.SandboxMode, domain.ExecutionRouteDaemon, launchingPayload.Task.RequestedAt())
 	if err != nil {
 		t.Fatal(err)
 	}

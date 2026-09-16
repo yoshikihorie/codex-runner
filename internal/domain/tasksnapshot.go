@@ -5,10 +5,10 @@ import (
 	"time"
 )
 
-const taskSnapshotSchemaVersion = 1
+const taskSnapshotSchemaVersion = 2
 
 // NewInitialTaskSnapshot creates the base metadata for a task before its first persistence.
-func NewInitialTaskSnapshot(route ExecutionRoute, reasoningEffort *string) TaskSnapshot {
+func NewInitialTaskSnapshot(route ExecutionRoute, reasoningEffort *string, sandboxMode string) TaskSnapshot {
 	var reasoningEffortCopy *string
 	if reasoningEffort != nil {
 		value := *reasoningEffort
@@ -17,12 +17,13 @@ func NewInitialTaskSnapshot(route ExecutionRoute, reasoningEffort *string) TaskS
 	return TaskSnapshot{
 		Route:           route,
 		ReasoningEffort: reasoningEffortCopy,
+		SandboxMode:     sandboxMode,
 		SchemaVersion:   taskSnapshotSchemaVersion,
 	}
 }
 
 // NewTaskSnapshotFromAdmission creates the first persisted snapshot for an admitted task.
-func NewTaskSnapshotFromAdmission(task *Task, resolvedTimeout Timeout, model string, reasoningEffort *string, route ExecutionRoute, stateUpdatedAt time.Time) (TaskSnapshot, error) {
+func NewTaskSnapshotFromAdmission(task *Task, resolvedTimeout Timeout, model string, reasoningEffort *string, sandboxMode string, route ExecutionRoute, stateUpdatedAt time.Time) (TaskSnapshot, error) {
 	if task == nil {
 		return TaskSnapshot{}, fmt.Errorf("task is nil")
 	}
@@ -43,6 +44,7 @@ func NewTaskSnapshotFromAdmission(task *Task, resolvedTimeout Timeout, model str
 		RequestedTimeoutSeconds: requestedTimeoutCopy,
 		Model:                   model,
 		ReasoningEffort:         reasoningEffortCopy,
+		SandboxMode:             sandboxMode,
 		RequestedAt:             task.requestedAt,
 		Route:                   route,
 		State:                   task.State(),
@@ -66,6 +68,7 @@ type TaskSnapshot struct {
 	RequestedTimeoutSeconds *int            `json:"requested_timeout_seconds,omitempty"`
 	Model                   string          `json:"model"`
 	ReasoningEffort         *string         `json:"reasoning_effort"`
+	SandboxMode             string          `json:"sandbox_mode"`
 	RequestedAt             time.Time       `json:"requested_at"`
 	Route                   ExecutionRoute  `json:"route"`
 	State                   TaskState       `json:"state"`
@@ -96,6 +99,9 @@ func (s TaskSnapshot) Validate() error {
 	}
 	if s.Model == "" {
 		return bad("model is empty")
+	}
+	if !IsValidSandboxMode(s.SandboxMode) {
+		return bad("unknown sandbox mode %q", s.SandboxMode)
 	}
 	if !isKnownTaskState(s.State) {
 		return bad("unknown state %q", s.State)

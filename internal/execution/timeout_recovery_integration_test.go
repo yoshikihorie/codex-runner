@@ -23,7 +23,7 @@ import (
 
 type timeoutRecoveryIntegrationRecoverer struct{ calls int }
 
-func (r *timeoutRecoveryIntegrationRecoverer) Resume(context.Context, domain.TaskID, *domain.SessionRef, domain.RecoveryOrigin) (recovery.RecoveryResult, error) {
+func (r *timeoutRecoveryIntegrationRecoverer) Resume(context.Context, domain.TaskID, *domain.SessionRef, domain.RecoveryOrigin, recovery.ResumeSettings) (recovery.RecoveryResult, error) {
 	r.calls++
 	return recovery.RecoveryResult{}, nil
 }
@@ -33,7 +33,7 @@ type timeoutRecoveryBlockingRecoverer struct {
 	release <-chan struct{}
 }
 
-func (r *timeoutRecoveryBlockingRecoverer) Resume(context.Context, domain.TaskID, *domain.SessionRef, domain.RecoveryOrigin) (recovery.RecoveryResult, error) {
+func (r *timeoutRecoveryBlockingRecoverer) Resume(context.Context, domain.TaskID, *domain.SessionRef, domain.RecoveryOrigin, recovery.ResumeSettings) (recovery.RecoveryResult, error) {
 	r.started <- struct{}{}
 	<-r.release
 	return recovery.RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)}, nil
@@ -227,7 +227,7 @@ func (w *metricsAcceptanceFailingWriter) count() int {
 
 type metricsAcceptanceRecoverer struct{ result recovery.RecoveryResult }
 
-func (r *metricsAcceptanceRecoverer) Resume(context.Context, domain.TaskID, *domain.SessionRef, domain.RecoveryOrigin) (recovery.RecoveryResult, error) {
+func (r *metricsAcceptanceRecoverer) Resume(context.Context, domain.TaskID, *domain.SessionRef, domain.RecoveryOrigin, recovery.ResumeSettings) (recovery.RecoveryResult, error) {
 	return r.result, nil
 }
 
@@ -335,7 +335,7 @@ func (f metricsAcceptanceFixture) prepareWithSubcommand(t *testing.T, suffix str
 	if _, err = task.Start(timeout, "test-model", requested); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := domain.NewTaskSnapshotFromAdmission(task, timeout, "test-model", nil, domain.ExecutionRouteDaemon, requested)
+	snapshot, err := domain.NewTaskSnapshotFromAdmission(task, timeout, "test-model", nil, "workspace-write", domain.ExecutionRouteDaemon, requested)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -780,7 +780,7 @@ func TestTimeoutRecoveryIntegrationNilSessionTransitionsToTimeoutLost(t *testing
 		t.Fatal(err)
 	}
 	pid := 123
-	snapshot := domain.TaskSnapshot{TaskID: id, Subcommand: domain.SubcommandImpl, PID: &pid, ProcessStartedAt: &now, ResolvedTimeoutSeconds: 1800, Model: "gpt-5", RequestedAt: now, Route: domain.ExecutionRouteDaemon, State: domain.StateRunning, StateUpdatedAt: now, SchemaVersion: 1}
+	snapshot := domain.TaskSnapshot{TaskID: id, Subcommand: domain.SubcommandImpl, PID: &pid, ProcessStartedAt: &now, ResolvedTimeoutSeconds: 1800, Model: "gpt-5", SandboxMode: "workspace-write", RequestedAt: now, Route: domain.ExecutionRouteDaemon, State: domain.StateRunning, StateUpdatedAt: now, SchemaVersion: 2}
 	if err := tasks.Save(id, snapshot); err != nil {
 		t.Fatal(err)
 	}
@@ -870,7 +870,7 @@ func TestTimeoutRecoveryIntegrationCarriesLifecycleGeneration(t *testing.T) {
 	if err := tasks.Reserve(id); err != nil {
 		t.Fatal(err)
 	}
-	snapshot := domain.TaskSnapshot{TaskID: id, Subcommand: domain.SubcommandReview, PID: &pid, ProcessStartedAt: &now, ResolvedTimeoutSeconds: 1800, Model: "gpt-5", RequestedAt: now, Route: domain.ExecutionRouteDaemon, State: domain.StateRunning, StateUpdatedAt: now, SchemaVersion: 1}
+	snapshot := domain.TaskSnapshot{TaskID: id, Subcommand: domain.SubcommandReview, PID: &pid, ProcessStartedAt: &now, ResolvedTimeoutSeconds: 1800, Model: "gpt-5", SandboxMode: "workspace-write", RequestedAt: now, Route: domain.ExecutionRouteDaemon, State: domain.StateRunning, StateUpdatedAt: now, SchemaVersion: 2}
 	if err := tasks.Save(id, snapshot); err != nil {
 		t.Fatal(err)
 	}

@@ -38,6 +38,7 @@ type FailTaskLaunchInput struct {
 	ResolvedTimeout domain.Timeout
 	Model           string
 	ReasoningEffort *string
+	SandboxMode     string
 	OccurredAt      time.Time
 }
 
@@ -74,7 +75,7 @@ func NewFailTaskLaunchUseCase(tasks store.TaskStore, taskMu taskLocker, contract
 }
 
 func (uc *FailTaskLaunchUseCase) Execute(ctx context.Context, in FailTaskLaunchInput) error {
-	if in.Task == nil || in.OccurredAt.IsZero() || in.ResolvedTimeout.ResolvedSeconds() <= 0 || in.Model == "" {
+	if in.Task == nil || in.OccurredAt.IsZero() || in.ResolvedTimeout.ResolvedSeconds() <= 0 || in.Model == "" || !domain.IsValidSandboxMode(in.SandboxMode) {
 		return errors.New("fail task launch requires task, timeout, model, and occurred at")
 	}
 	taskID := in.Task.ID()
@@ -90,7 +91,7 @@ func (uc *FailTaskLaunchUseCase) Execute(ctx context.Context, in FailTaskLaunchI
 // ExecuteLocked performs launch-failure state transition and persistence while
 // the caller holds the task mutex. It never releases path locks or slots.
 func (uc *FailTaskLaunchUseCase) ExecuteLocked(_ context.Context, in FailTaskLaunchInput) (FailTaskLaunchLockedResult, error) {
-	if in.Task == nil || in.OccurredAt.IsZero() || in.ResolvedTimeout.ResolvedSeconds() <= 0 || in.Model == "" {
+	if in.Task == nil || in.OccurredAt.IsZero() || in.ResolvedTimeout.ResolvedSeconds() <= 0 || in.Model == "" || !domain.IsValidSandboxMode(in.SandboxMode) {
 		return FailTaskLaunchLockedResult{}, errors.New("fail task launch requires task, timeout, model, and occurred at")
 	}
 	taskID := in.Task.ID()
@@ -124,7 +125,7 @@ func (uc *FailTaskLaunchUseCase) ExecuteLocked(_ context.Context, in FailTaskLau
 		return result, fmt.Errorf("%w: exit-code: %v", domain.ErrContractWriteFailed, writeErr)
 	}
 	if snapshot.TaskID.String() == "" {
-		snapshot = domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, in.ReasoningEffort)
+		snapshot = domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, in.ReasoningEffort, in.SandboxMode)
 	}
 	updated, err := snapshot.WithTask(task, in.OccurredAt)
 	if err != nil {

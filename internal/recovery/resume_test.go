@@ -123,7 +123,7 @@ func TestResumeRecovererAllowsNilSessionRef(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	result, err := recoverer.Resume(context.Background(), recoveryTestTaskID(t), nil, domain.RecoveryOriginTimeout)
+	result, err := recoverer.Resume(context.Background(), recoveryTestTaskID(t), nil, domain.RecoveryOriginTimeout, ResumeSettings{})
 	if err != nil || result != (RecoveryResult{}) || launcher.calls != 0 {
 		t.Fatalf("result=(%+v, %v), launches=%d", result, err, launcher.calls)
 	}
@@ -174,23 +174,25 @@ func (f resumeLauncherFunc) LaunchAndWait(ctx context.Context, params ResumeLaun
 }
 
 type recovererFake struct {
-	result  RecoveryResult
-	err     error
-	calls   int
-	origin  domain.RecoveryOrigin
-	mutex   *recoveryMutexFake
-	cancel  context.CancelFunc
-	started chan<- struct{}
-	release <-chan struct{}
-	panic   any
+	result   RecoveryResult
+	err      error
+	calls    int
+	origin   domain.RecoveryOrigin
+	settings ResumeSettings
+	mutex    *recoveryMutexFake
+	cancel   context.CancelFunc
+	started  chan<- struct{}
+	release  <-chan struct{}
+	panic    any
 }
 
-func (f *recovererFake) Resume(_ context.Context, _ domain.TaskID, _ *domain.SessionRef, origin domain.RecoveryOrigin) (RecoveryResult, error) {
+func (f *recovererFake) Resume(_ context.Context, _ domain.TaskID, _ *domain.SessionRef, origin domain.RecoveryOrigin, settings ResumeSettings) (RecoveryResult, error) {
 	if f.mutex != nil && f.mutex.held {
 		panic("recoverer called while task mutex is held")
 	}
 	f.calls++
 	f.origin = origin
+	f.settings = settings
 	if f.started != nil {
 		f.started <- struct{}{}
 	}
@@ -204,6 +206,22 @@ func (f *recovererFake) Resume(_ context.Context, _ domain.TaskID, _ *domain.Ses
 		f.cancel()
 	}
 	return f.result, f.err
+}
+
+func TestRecoverViaResumeUseCaseUsesPersistedLaunchSettings(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, store, _, recoverer, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateOrphaned, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	effort := "high"
+	store.snapshot.Subcommand = domain.SubcommandImpl
+	store.snapshot.SandboxMode = "workspace-write"
+	store.snapshot.Model = "persisted-model"
+	store.snapshot.ReasoningEffort = &effort
+	if _, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginOrphan, OccurredAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if recoverer.calls != 1 || recoverer.settings.Subcommand != domain.SubcommandImpl || recoverer.settings.SandboxMode != "workspace-write" || recoverer.settings.Model != "persisted-model" || recoverer.settings.ReasoningEffort == nil || *recoverer.settings.ReasoningEffort != effort {
+		t.Fatalf("resume settings = %#v calls=%d", recoverer.settings, recoverer.calls)
+	}
 }
 
 type recoveryStoreFake struct {
@@ -395,7 +413,7 @@ func recoverySnapshot(t *testing.T, state domain.TaskState, session *domain.Sess
 	if _, err := task.Start(timeout, "gpt-5", requestedAt); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := domain.NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", nil, domain.ExecutionRouteDaemon, requestedAt)
+	snapshot, err := domain.NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", nil, "workspace-write", domain.ExecutionRouteDaemon, requestedAt)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -27,7 +27,7 @@ type TaskMutex interface {
 type Clock = domain.Clock
 
 type Recoverer interface {
-	Resume(context.Context, domain.TaskID, *domain.SessionRef, domain.RecoveryOrigin) (RecoveryResult, error)
+	Resume(context.Context, domain.TaskID, *domain.SessionRef, domain.RecoveryOrigin, ResumeSettings) (RecoveryResult, error)
 }
 
 type ResumeLaunchParams struct {
@@ -36,6 +36,10 @@ type ResumeLaunchParams struct {
 	SessionID             string
 	TaskPlacementRoot     string
 	OutputLastMessagePath string
+	Subcommand            domain.Subcommand
+	SandboxMode           string
+	Model                 string
+	ReasoningEffort       *string
 }
 type ResumeLauncher interface {
 	LaunchAndWait(context.Context, ResumeLaunchParams) error
@@ -52,6 +56,26 @@ type RecoveryAttempt struct {
 	StartedAt         time.Time
 	CodexBinaryPath   string
 	TaskPlacementRoot string
+	Subcommand        domain.Subcommand
+	SandboxMode       string
+	Model             string
+	ReasoningEffort   *string
+}
+
+type ResumeSettings struct {
+	Subcommand      domain.Subcommand
+	SandboxMode     string
+	Model           string
+	ReasoningEffort *string
+}
+
+func newResumeSettings(snapshot domain.TaskSnapshot) ResumeSettings {
+	settings := ResumeSettings{Subcommand: snapshot.Subcommand, SandboxMode: snapshot.SandboxMode, Model: snapshot.Model}
+	if snapshot.ReasoningEffort != nil {
+		value := *snapshot.ReasoningEffort
+		settings.ReasoningEffort = &value
+	}
+	return settings
 }
 
 func failureExitCodeFor(origin domain.RecoveryOrigin) domain.ExitCode {
@@ -69,7 +93,7 @@ func (r *RecoveryAttempt) Attempt(ctx context.Context, launcher ResumeLauncher, 
 		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, fmt.Errorf("resume task placement root: %w", err)
 	}
 	taskPlacementRoot := path.String()
-	params := ResumeLaunchParams{TaskID: r.TaskID, CodexBinaryPath: r.CodexBinaryPath, SessionID: r.SessionRef.SessionID(), TaskPlacementRoot: taskPlacementRoot, OutputLastMessagePath: filepath.Join(taskPlacementRoot, r.TaskID.String(), "last-message.md")}
+	params := ResumeLaunchParams{TaskID: r.TaskID, CodexBinaryPath: r.CodexBinaryPath, SessionID: r.SessionRef.SessionID(), TaskPlacementRoot: taskPlacementRoot, OutputLastMessagePath: filepath.Join(taskPlacementRoot, r.TaskID.String(), "last-message.md"), Subcommand: r.Subcommand, SandboxMode: r.SandboxMode, Model: r.Model, ReasoningEffort: r.ReasoningEffort}
 	if err := launcher.LaunchAndWait(ctx, params); err != nil {
 		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, err
 	}
@@ -101,11 +125,11 @@ func NewResumeRecoverer(launcher ResumeLauncher, reader ContractReader, codexBin
 	}
 	return &resumeRecoverer{launcher: launcher, reader: reader, codexBinaryPath: codexBinaryPath, taskPlacementRoot: path.String(), clock: clock}, nil
 }
-func (r *resumeRecoverer) Resume(ctx context.Context, taskID domain.TaskID, sessionRef *domain.SessionRef, origin domain.RecoveryOrigin) (RecoveryResult, error) {
+func (r *resumeRecoverer) Resume(ctx context.Context, taskID domain.TaskID, sessionRef *domain.SessionRef, origin domain.RecoveryOrigin, settings ResumeSettings) (RecoveryResult, error) {
 	if sessionRef == nil {
 		return RecoveryResult{}, nil
 	}
-	return (&RecoveryAttempt{TaskID: taskID, Origin: origin, SessionRef: *sessionRef, StartedAt: r.clock.Now(), CodexBinaryPath: r.codexBinaryPath, TaskPlacementRoot: r.taskPlacementRoot}).Attempt(ctx, r.launcher, r.reader)
+	return (&RecoveryAttempt{TaskID: taskID, Origin: origin, SessionRef: *sessionRef, StartedAt: r.clock.Now(), CodexBinaryPath: r.codexBinaryPath, TaskPlacementRoot: r.taskPlacementRoot, Subcommand: settings.Subcommand, SandboxMode: settings.SandboxMode, Model: settings.Model, ReasoningEffort: settings.ReasoningEffort}).Attempt(ctx, r.launcher, r.reader)
 }
 
 type recoveryContractWriter interface {
@@ -169,13 +193,13 @@ func (uc *RecoverViaResumeUseCase) Execute(ctx context.Context, in RecoverViaRes
 		return RecoverViaResumeOutput{}, ErrRecoveryAlreadyInFlight
 	}
 	defer release()
-	origin, subcommand, err := uc.begin(in)
+	origin, settings, err := uc.begin(in)
 	if err != nil {
 		return RecoverViaResumeOutput{}, err
 	}
 	result := RecoveryResult{ExitCode: failureExitCodeFor(origin)}
-	if in.SessionRef != nil && !(subcommand == domain.SubcommandImpl && origin == domain.RecoveryOriginTimeout) {
-		resumeResult, resumeErr := uc.recoverer.Resume(ctx, in.TaskID, in.SessionRef, origin)
+	if in.SessionRef != nil && !(settings.Subcommand == domain.SubcommandImpl && origin == domain.RecoveryOriginTimeout) {
+		resumeResult, resumeErr := uc.recoverer.Resume(ctx, in.TaskID, in.SessionRef, origin, settings)
 		if resumeErr != nil {
 			uc.logger.Warn("resume recovery failed", "task_id", in.TaskID.String(), "error", resumeErr)
 		} else {
@@ -195,34 +219,34 @@ func (uc *RecoverViaResumeUseCase) Execute(ctx context.Context, in RecoverViaRes
 	return output, nil
 }
 
-func (uc *RecoverViaResumeUseCase) begin(in RecoverViaResumeInput) (domain.RecoveryOrigin, domain.Subcommand, error) {
+func (uc *RecoverViaResumeUseCase) begin(in RecoverViaResumeInput) (domain.RecoveryOrigin, ResumeSettings, error) {
 	uc.taskMu.Lock(in.TaskID)
 	defer uc.taskMu.Unlock(in.TaskID)
 	snapshot, err := uc.tasks.Load(in.TaskID)
 	if err != nil {
-		return "", "", err
+		return "", ResumeSettings{}, err
 	}
 	task, err := snapshot.Restore()
 	if err != nil {
-		return "", "", err
+		return "", ResumeSettings{}, err
 	}
 	events, err := task.BeginRecovery(in.SessionRef, in.OccurredAt)
 	if err != nil {
-		return "", "", err
+		return "", ResumeSettings{}, err
 	}
 	attempted := events[0].(domain.RecoveryAttempted)
 	updated, err := snapshot.WithTask(task, in.OccurredAt)
 	if err != nil {
-		return "", "", err
+		return "", ResumeSettings{}, err
 	}
 	if err := uc.tasks.Save(in.TaskID, updated); err != nil {
-		return "", "", err
+		return "", ResumeSettings{}, err
 	}
 	writer := uc.contract
 	if err := writer.AppendEvent(in.TaskID, attempted); err != nil {
 		uc.logger.Warn("append recovery attempted event failed", "task_id", in.TaskID.String(), "error", err)
 	}
-	return attempted.Origin, task.Subcommand(), nil
+	return attempted.Origin, newResumeSettings(snapshot), nil
 }
 
 func (uc *RecoverViaResumeUseCase) finish(ctx context.Context, in RecoverViaResumeInput, origin domain.RecoveryOrigin, result RecoveryResult, at time.Time) (RecoverViaResumeOutput, bool) {

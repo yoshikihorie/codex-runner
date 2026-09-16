@@ -51,7 +51,7 @@ type lifecycleRecordingRecordStarting struct {
 	trace   *[]string
 }
 
-func (f *lifecycleRecordingRecordStarting) Execute(_ context.Context, _ *domain.Task, _ domain.Timeout, _ string, _ *string, _ domain.ExecutionRoute, prompt string, _ time.Time) error {
+func (f *lifecycleRecordingRecordStarting) Execute(_ context.Context, _ *domain.Task, _ domain.Timeout, _ string, _ *string, _ string, _ domain.ExecutionRoute, prompt string, _ time.Time) error {
 	f.calls++
 	f.prompts = append(f.prompts, prompt)
 	appendLifecycleTrace(f.trace, "record-starting")
@@ -786,7 +786,7 @@ func lifecycleSnapshotWithProcessStartedAt(t *testing.T, task *domain.Task, stat
 	if _, err := task.RecordProcessInfo(42, processStartedAt, testLifecycleTime); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil).WithTask(task, testLifecycleTime)
+	snapshot, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil, "workspace-write").WithTask(task, testLifecycleTime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -815,7 +815,7 @@ func lifecycleStartingSnapshotWithoutProcess(t *testing.T, task *domain.Task) do
 	if _, err := task.Start(lifecycleTimeout(t), "gpt-5", testLifecycleTime); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil).WithTask(task, testLifecycleTime)
+	snapshot, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil, "workspace-write").WithTask(task, testLifecycleTime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2260,7 +2260,7 @@ func TestTaskLifecycleConfirmTerminalCancellingPreReadTerminalAuthoritativeLoadR
 	if _, err := task.ConfirmKilled(domain.NewExitCode(130), true, testLifecycleTime); err != nil {
 		t.Fatal(err)
 	}
-	terminal, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil).WithTask(task, testLifecycleTime)
+	terminal, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil, "workspace-write").WithTask(task, testLifecycleTime)
 	if err != nil {
 		t.Fatal(err)
 	}

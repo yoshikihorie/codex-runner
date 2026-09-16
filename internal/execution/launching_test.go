@@ -100,8 +100,8 @@ func launchingSnapshot(t *testing.T, suffix string) domain.TaskSnapshot {
 	exitCode, recoveryOrigin := domain.NewExitCode(1), domain.RecoveryOriginTimeout
 	return domain.TaskSnapshot{
 		TaskID: id, Subcommand: domain.SubcommandReview, PID: &pid, ProcessStartedAt: &started,
-		ResolvedTimeoutSeconds: 1800, RequestedTimeoutSeconds: &timeout, Model: "model", ReasoningEffort: &effort,
+		ResolvedTimeoutSeconds: 1800, RequestedTimeoutSeconds: &timeout, Model: "model", SandboxMode: "workspace-write", ReasoningEffort: &effort,
 		RequestedAt: started, Route: domain.ExecutionRouteDaemon, State: domain.StateQueued, StateUpdatedAt: started,
-		SessionRef: &session, LastEventAt: &lastEvent, ExitCode: &exitCode, RecoveryOrigin: &recoveryOrigin, SchemaVersion: 1,
+		SessionRef: &session, LastEventAt: &lastEvent, ExitCode: &exitCode, RecoveryOrigin: &recoveryOrigin, SchemaVersion: 2,
 	}
 }

@@ -28,7 +28,7 @@ type stdoutFileSystem struct{}
 func (stdoutFileSystem) Open(path string) (*os.File, error) { return os.Open(path) }
 
 type lifecycleRecordStarting interface {
-	Execute(context.Context, *domain.Task, domain.Timeout, string, *string, domain.ExecutionRoute, string, time.Time) error
+	Execute(context.Context, *domain.Task, domain.Timeout, string, *string, string, domain.ExecutionRoute, string, time.Time) error
 }
 type lifecycleWorktree interface {
 	ResolveWorkingDir(domain.TaskID) (string, error)
@@ -161,7 +161,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		_ = lock.Close()
 		return
 	}
-	if err = o.deps.RecordStarting.Execute(ctx, input.Task, input.ResolvedTimeout, input.Model, input.ReasoningEffort, domain.ExecutionRouteDaemon, launchPrompt, input.Now); err != nil {
+	if err = o.deps.RecordStarting.Execute(ctx, input.Task, input.ResolvedTimeout, input.Model, input.ReasoningEffort, input.SandboxMode, domain.ExecutionRouteDaemon, launchPrompt, input.Now); err != nil {
 		_ = lock.Close()
 		o.fail(ctx, input, 130, true)
 		return
@@ -451,7 +451,7 @@ func (o *TaskLifecycleOrchestrator) fail(ctx context.Context, input TaskLifecycl
 		return true
 	}
 
-	result, failErr := o.deps.FailLaunch.ExecuteLocked(ctx, FailTaskLaunchInput{Task: input.Task, ResolvedTimeout: input.ResolvedTimeout, Model: input.Model, ReasoningEffort: input.ReasoningEffort, OccurredAt: input.Now})
+	result, failErr := o.deps.FailLaunch.ExecuteLocked(ctx, FailTaskLaunchInput{Task: input.Task, ResolvedTimeout: input.ResolvedTimeout, Model: input.Model, ReasoningEffort: input.ReasoningEffort, SandboxMode: input.SandboxMode, OccurredAt: input.Now})
 	o.deps.TaskMu.Unlock(taskID)
 	if failErr != nil {
 		o.logger.Warn("fail task launch", "task_id", taskID.String(), "error", failErr)

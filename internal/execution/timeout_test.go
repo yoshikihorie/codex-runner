@@ -408,7 +408,7 @@ func timeoutSnapshot(t *testing.T, state domain.TaskState, subcommand domain.Sub
 	t.Helper()
 	now := time.Date(2026, time.August, 10, 12, 0, 0, 0, time.UTC)
 	pid := 321
-	return domain.TaskSnapshot{TaskID: timeoutID(t, string(state)), Subcommand: subcommand, PID: &pid, ProcessStartedAt: &now, ResolvedTimeoutSeconds: 1800, Model: "gpt-5", RequestedAt: now, Route: domain.ExecutionRouteDaemon, State: state, StateUpdatedAt: now, SessionRef: session, SchemaVersion: 1}
+	return domain.TaskSnapshot{TaskID: timeoutID(t, string(state)), Subcommand: subcommand, PID: &pid, ProcessStartedAt: &now, ResolvedTimeoutSeconds: 1800, Model: "gpt-5", SandboxMode: "workspace-write", RequestedAt: now, Route: domain.ExecutionRouteDaemon, State: state, StateUpdatedAt: now, SessionRef: session, SchemaVersion: 2}
 }
 func timeoutLiveness(results ...struct {
 	dead bool

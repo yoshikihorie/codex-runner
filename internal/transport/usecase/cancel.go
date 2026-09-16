@@ -150,7 +150,7 @@ func (uc *CancelTaskUseCase) cancelQueued(in CancelTaskInput, payload execution.
 	if err != nil {
 		return CancelTaskOutput{}, err
 	}
-	snapshot, err := domain.NewTaskSnapshotFromAdmission(&candidate, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, domain.ExecutionRouteDaemon, in.OccurredAt)
+	snapshot, err := domain.NewTaskSnapshotFromAdmission(&candidate, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, payload.SandboxMode, domain.ExecutionRouteDaemon, in.OccurredAt)
 	if err != nil {
 		return CancelTaskOutput{}, err
 	}

@@ -54,7 +54,7 @@ func recordProcessTask(t *testing.T) (*domain.Task, domain.TaskSnapshot) {
 	if _, err := task.Start(recordStartingTimeout(t, nil), "gpt-5", now); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil).WithTask(task, now)
+	snapshot, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil, "workspace-write").WithTask(task, now)
 	if err != nil {
 		t.Fatal(err)
 	}

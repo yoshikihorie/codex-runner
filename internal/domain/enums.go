@@ -89,3 +89,8 @@ const (
 func IsSubmittable(s Subcommand) bool {
 	return s == SubcommandImpl || s == SubcommandReview || s == SubcommandPlan || s == SubcommandResearch || s == SubcommandRead || s == SubcommandThink
 }
+
+// IsValidSandboxMode reports whether a persisted launch sandbox mode is accepted.
+func IsValidSandboxMode(mode string) bool {
+	return mode == "read-only" || mode == "workspace-write"
+}

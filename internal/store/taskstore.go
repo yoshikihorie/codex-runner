@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"io"
+	"log/slog"
 	"os"
 	"sort"
 	"sync"
@@ -61,6 +62,13 @@ func NewFileTaskStore(root string) (*FileTaskStore, error) {
 			continue
 		}
 		s.index[id.String()] = v
+	}
+	if len(s.corrupted) != 0 {
+		taskIDs := make([]string, len(s.corrupted))
+		for i, id := range s.corrupted {
+			taskIDs[i] = id.String()
+		}
+		slog.Warn("corrupted task snapshots ignored during startup", "count", len(taskIDs), "task_ids", taskIDs)
 	}
 	return s, nil
 }

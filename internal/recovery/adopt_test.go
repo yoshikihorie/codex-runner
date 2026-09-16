@@ -385,7 +385,7 @@ func adoptionSnapshotWithSubcommand(t *testing.T, id domain.TaskID, subcommand d
 	if _, err = task.Start(timeout, "gpt-5", at); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := domain.NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", nil, domain.ExecutionRouteDaemon, at)
+	snapshot, err := domain.NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", nil, "workspace-write", domain.ExecutionRouteDaemon, at)
 	if err != nil {
 		t.Fatal(err)
 	}

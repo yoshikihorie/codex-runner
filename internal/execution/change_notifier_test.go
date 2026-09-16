@@ -33,7 +33,7 @@ func changeNotifierID(t *testing.T, suffix string) domain.TaskID {
 
 func changeNotifierSnapshot(id domain.TaskID) domain.TaskSnapshot {
 	now := time.Date(2026, 8, 14, 12, 0, 0, 0, time.UTC)
-	return domain.TaskSnapshot{TaskID: id, Subcommand: domain.SubcommandImpl, ResolvedTimeoutSeconds: 1800, Model: "gpt-5", RequestedAt: now, Route: domain.ExecutionRouteDaemon, State: domain.StateQueued, StateUpdatedAt: now, SchemaVersion: 1}
+	return domain.TaskSnapshot{TaskID: id, Subcommand: domain.SubcommandImpl, ResolvedTimeoutSeconds: 1800, Model: "gpt-5", SandboxMode: "workspace-write", RequestedAt: now, Route: domain.ExecutionRouteDaemon, State: domain.StateQueued, StateUpdatedAt: now, SchemaVersion: 2}
 }
 
 func requireWakeup(t *testing.T, ch <-chan struct{}) {

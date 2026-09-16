@@ -57,7 +57,7 @@ func (u *AdmitTaskUseCase) Execute(_ context.Context, input execution.TaskAdmiss
 		payload.WorkingDir = &workingDir
 	}
 	if immediate {
-		snapshot, snapshotErr := domain.NewTaskSnapshotFromAdmission(task, input.ResolvedTimeout, input.Model, input.ReasoningEffort, domain.ExecutionRouteDaemon, task.RequestedAt())
+		snapshot, snapshotErr := domain.NewTaskSnapshotFromAdmission(task, input.ResolvedTimeout, input.Model, input.ReasoningEffort, input.SandboxMode, domain.ExecutionRouteDaemon, task.RequestedAt())
 		if snapshotErr != nil {
 			return execution.TaskAdmissionResult{}, snapshotErr
 		}
