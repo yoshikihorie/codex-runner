@@ -6,6 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
+	"math/big"
+	"strconv"
+	"strings"
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
@@ -15,7 +19,11 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/transport/schema"
 )
 
-var errTailFromSeqInvalid = errors.New("tail from_seq is invalid")
+var (
+	errTailFromSeqInvalid  = errors.New("tail from_seq is invalid")
+	errTailParamsMalformed = errors.New("tail params malformed")
+	errTailReadFailed      = errors.New("tail read failed")
+)
 
 const (
 	tailIdleTimeout = 1500 * time.Second
@@ -23,6 +31,7 @@ const (
 	tailTerminalDrainRetryInterval = 250 * time.Millisecond
 	// TAIL_TERMINAL_DRAIN_MAX_WAIT_MS
 	tailTerminalDrainMaxWait = 2000 * time.Millisecond
+	tailFromSeqBeyondInt     = -1
 )
 
 type tailTimerFactory func(time.Duration) (<-chan time.Time, func())
@@ -32,20 +41,29 @@ type TailTaskUseCase struct {
 	provider transport.TaskSnapshotProvider
 	events   store.EventReader
 	notifier execution.TaskChangeNotifier
+	logger   *slog.Logger
 
 	timerFactory tailTimerFactory
 }
 
 // NewTailTaskUseCase creates a tail use case with its required dependencies.
-func NewTailTaskUseCase(provider transport.TaskSnapshotProvider, events store.EventReader, notifier execution.TaskChangeNotifier) *TailTaskUseCase {
+func NewTailTaskUseCase(provider transport.TaskSnapshotProvider, events store.EventReader, notifier execution.TaskChangeNotifier, loggers ...*slog.Logger) *TailTaskUseCase {
 	if isNilStatusUseCaseDependency(provider) || isNilStatusUseCaseDependency(events) || isNilStatusUseCaseDependency(notifier) {
 		panic("tail task use case requires non-nil dependencies")
+	}
+	if len(loggers) > 1 {
+		panic("tail task use case accepts at most one logger")
+	}
+	logger := slog.Default()
+	if len(loggers) == 1 && loggers[0] != nil {
+		logger = loggers[0]
 	}
 	return &TailTaskUseCase{
 		provider:     provider,
 		events:       events,
 		notifier:     notifier,
 		timerFactory: newTailTimer,
+		logger:       logger,
 	}
 }
 
@@ -58,6 +76,9 @@ func (uc *TailTaskUseCase) Handle(ctx context.Context, req transport.Request, ou
 
 	fromSeq, rawFromSeq, err := tailFromSeq(req.Params)
 	if err != nil {
+		if errors.Is(err, errTailParamsMalformed) {
+			return writeTailError(out, req.RequestID, "TAIL_PARAMS_MALFORMED", "error.tail.paramsMalformed", nil)
+		}
 		return writeTailError(out, req.RequestID, "TAIL_FROM_SEQ_INVALID", "error.tail.fromSeqInvalid", map[string]any{"from_seq": rawFromSeq})
 	}
 
@@ -66,6 +87,10 @@ func (uc *TailTaskUseCase) Handle(ctx context.Context, req transport.Request, ou
 	if errors.Is(err, domain.ErrTaskNotFound) {
 		return writeTailError(out, req.RequestID, "TASK_NOT_FOUND", "error.task.notFound", map[string]any{"task_id": id.String()})
 	}
+	if errors.Is(err, errTailReadFailed) {
+		uc.logger.Warn("task tail read failed", "task_id", id.String(), "error", err.Error())
+		return writeTailError(out, req.RequestID, "TAIL_READ_FAILED", "error.tail.readFailed", map[string]any{"task_id": id.String()})
+	}
 	return err
 }
 
@@ -73,13 +98,14 @@ func (uc *TailTaskUseCase) Handle(ctx context.Context, req transport.Request, ou
 func (uc *TailTaskUseCase) Execute(ctx context.Context, in schema.TailTaskInput, out schema.ProgressWriter) error {
 	snapshot, err := uc.provider.Snapshot(in.TaskID)
 	if err != nil {
-		return err
+		return tailReadError(err)
 	}
 
 	session := &tailSession{
-		taskID:    in.TaskID,
-		taskState: snapshot.State,
-		nextSeq:   in.FromSeq,
+		taskID:            in.TaskID,
+		taskState:         snapshot.State,
+		nextSeq:           in.FromSeq,
+		beyondReadableSeq: in.FromSeq == tailFromSeqBeyondInt,
 	}
 	defer session.stopTimers()
 
@@ -141,11 +167,12 @@ func (uc *TailTaskUseCase) Execute(ctx context.Context, in schema.TailTaskInput,
 }
 
 type tailSession struct {
-	taskID           domain.TaskID
-	taskState        domain.TaskState
-	nextSeq          int
-	lastDeliveredSeq int
-	changes          <-chan struct{}
+	taskID            domain.TaskID
+	taskState         domain.TaskState
+	nextSeq           int
+	beyondReadableSeq bool
+	lastDeliveredSeq  int
+	changes           <-chan struct{}
 
 	idleTimer             <-chan time.Time
 	stopIdleTimer         func()
@@ -162,9 +189,12 @@ func replayTailHistory(ctx context.Context, events store.EventReader, session *t
 }
 
 func replayTailHistoryWithCallback(ctx context.Context, events store.EventReader, session *tailSession, out schema.ProgressWriter, afterProgress func()) (int, error) {
+	if session.beyondReadableSeq {
+		return 0, nil
+	}
 	records, err := events.ReadFrom(session.taskID, session.nextSeq)
 	if err != nil {
-		return 0, err
+		return 0, tailReadError(err)
 	}
 	delivered := 0
 	for _, record := range records {
@@ -270,7 +300,7 @@ func (uc *TailTaskUseCase) followChange(ctx context.Context, session *tailSessio
 	if session.terminalPending {
 		snapshot, err := uc.provider.Snapshot(session.taskID)
 		if err != nil {
-			return false, err
+			return false, tailReadError(err)
 		}
 		session.taskState = snapshot.State
 		delivered, err := uc.replayUntilEmpty(ctx, session, out, nil)
@@ -297,7 +327,7 @@ func (uc *TailTaskUseCase) followChange(ctx context.Context, session *tailSessio
 	}
 	snapshot, err := uc.provider.Snapshot(session.taskID)
 	if err != nil {
-		return false, err
+		return false, tailReadError(err)
 	}
 	session.taskState = snapshot.State
 	if session.taskState.IsTerminal() {
@@ -319,7 +349,7 @@ func (uc *TailTaskUseCase) followChange(ctx context.Context, session *tailSessio
 func (uc *TailTaskUseCase) followTerminalDrain(ctx context.Context, session *tailSession, out schema.ProgressWriter) (bool, error) {
 	snapshot, err := uc.provider.Snapshot(session.taskID)
 	if err != nil {
-		return false, err
+		return false, tailReadError(err)
 	}
 	session.taskState = snapshot.State
 	delivered, err := uc.replayUntilEmpty(ctx, session, out, nil)
@@ -363,13 +393,19 @@ func tailFromSeq(params json.RawMessage) (int, any, error) {
 	if len(params) == 0 {
 		return 1, nil, nil
 	}
-	if bytes.Equal(bytes.TrimSpace(params), []byte("null")) {
-		return 0, nil, errTailFromSeqInvalid
-	}
 
+	decoder := json.NewDecoder(bytes.NewReader(params))
 	var input map[string]json.RawMessage
-	if err := json.Unmarshal(params, &input); err != nil {
-		return 0, nil, errTailFromSeqInvalid
+	if err := decoder.Decode(&input); err != nil || input == nil {
+		return 0, nil, errTailParamsMalformed
+	}
+	if decoder.Decode(&struct{}{}) != io.EOF {
+		return 0, nil, errTailParamsMalformed
+	}
+	for key := range input {
+		if key != "from_seq" {
+			return 0, nil, errTailParamsMalformed
+		}
 	}
 	rawFromSeq, ok := input["from_seq"]
 	if !ok {
@@ -377,16 +413,96 @@ func tailFromSeq(params json.RawMessage) (int, any, error) {
 	}
 
 	var detail any
-	decoder := json.NewDecoder(bytes.NewReader(rawFromSeq))
-	decoder.UseNumber()
-	if err := decoder.Decode(&detail); err != nil {
-		return 0, nil, errTailFromSeqInvalid
+	fieldDecoder := json.NewDecoder(bytes.NewReader(rawFromSeq))
+	fieldDecoder.UseNumber()
+	if err := fieldDecoder.Decode(&detail); err != nil {
+		return 0, nil, errTailParamsMalformed
 	}
-	var fromSeq int
-	if err := json.Unmarshal(rawFromSeq, &fromSeq); err != nil || fromSeq < 1 {
+	if fieldDecoder.Decode(&struct{}{}) != io.EOF {
+		return 0, nil, errTailParamsMalformed
+	}
+	number, ok := detail.(json.Number)
+	if !ok {
+		return 0, nil, errTailParamsMalformed
+	}
+	fromSeq, beyondInt, nonPositive, ok := parseTailFromSeqNumber(number.String())
+	if !ok {
+		return 0, nil, errTailParamsMalformed
+	}
+	if nonPositive {
 		return 0, detail, errTailFromSeqInvalid
 	}
+	if beyondInt {
+		return tailFromSeqBeyondInt, nil, nil
+	}
 	return fromSeq, detail, nil
+}
+
+// parseTailFromSeqNumber evaluates a JSON number exactly without converting it
+// through floating point, preserving the required treatment of exponent forms.
+func parseTailFromSeqNumber(number string) (value int, beyondInt, nonPositive, integer bool) {
+	if strings.HasPrefix(number, "-") {
+		unsigned, _, zero, integer := parseTailFromSeqNumber(number[1:])
+		_ = unsigned
+		return 0, false, zero || integer, integer
+	}
+	parts := strings.FieldsFunc(number, func(r rune) bool { return r == 'e' || r == 'E' })
+	mantissa := parts[0]
+	exponent := big.NewInt(0)
+	if len(parts) == 2 {
+		parsed, ok := new(big.Int).SetString(parts[1], 10)
+		if !ok {
+			return 0, false, false, false
+		}
+		exponent = parsed
+	}
+	integerPart, fractionPart, hasFraction := strings.Cut(mantissa, ".")
+	digits := strings.TrimLeft(integerPart+fractionPart, "0")
+	if digits == "" {
+		return 0, false, true, true
+	}
+	fractionDigits := int64(0)
+	if hasFraction {
+		fractionDigits = int64(len(fractionPart))
+	}
+	scale := new(big.Int).Sub(exponent, big.NewInt(fractionDigits))
+	if scale.Sign() < 0 {
+		needZeros := new(big.Int).Neg(scale)
+		if !needZeros.IsInt64() || needZeros.Int64() >= int64(len(digits)) {
+			return 0, false, false, false
+		}
+		zeroCount := int(needZeros.Int64())
+		if strings.Trim(digits[len(digits)-zeroCount:], "0") != "" {
+			return 0, false, false, false
+		}
+		digits = digits[:len(digits)-zeroCount]
+		scale.SetInt64(0)
+	}
+	max := strconv.FormatInt(int64(^uint(0)>>1), 10)
+	if !scale.IsInt64() || scale.Int64() > int64(len(max)) {
+		return 0, true, false, true
+	}
+	zeroCount := int(scale.Int64())
+	length := len(digits) + zeroCount
+	if length > len(max) {
+		return 0, true, false, true
+	}
+	integerDigits := digits + strings.Repeat("0", zeroCount)
+	if length == len(max) && integerDigits > max {
+		return 0, true, false, true
+	}
+	parsed, err := strconv.ParseInt(integerDigits, 10, 0)
+	if err != nil {
+		return 0, false, false, false
+	}
+	return int(parsed), false, false, true
+}
+
+func tailReadError(err error) error {
+	if errors.Is(err, domain.ErrTaskNotFound) {
+		return err
+	}
+	return errors.Join(errTailReadFailed, err)
 }
 
 func writeTailError(out io.Writer, requestID, code, messageKey string, detail map[string]any) error {

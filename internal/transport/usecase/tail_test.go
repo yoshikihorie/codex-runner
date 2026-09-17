@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"reflect"
 	"strings"
 	"sync"
@@ -58,17 +59,21 @@ func (f *tailProviderFake) setSnapshots(snapshots ...domain.TaskSnapshot) {
 func (*tailProviderFake) QueuePosition(domain.TaskID) (int, bool, error) { return 0, false, nil }
 
 type tailEventsFake struct {
-	mu      sync.Mutex
-	records []store.EventRecord
-	err     error
-	calls   []int
-	order   *[]string
+	mu        sync.Mutex
+	records   []store.EventRecord
+	err       error
+	errOnCall int
+	calls     []int
+	order     *[]string
 }
 
 func (f *tailEventsFake) ReadFrom(_ domain.TaskID, from int) ([]store.EventRecord, error) {
 	f.mu.Lock()
 	f.calls = append(f.calls, from)
 	err := f.err
+	if f.errOnCall > 0 && len(f.calls) != f.errOnCall {
+		err = nil
+	}
 	records := append([]store.EventRecord(nil), f.records...)
 	f.mu.Unlock()
 	tailOrderMu.Lock()
@@ -90,6 +95,19 @@ func (f *tailEventsFake) add(records ...store.EventRecord) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.records = append(f.records, records...)
+}
+
+func (f *tailEventsFake) failOnCall(call int, err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.errOnCall = call
+	f.err = err
+}
+
+func (f *tailEventsFake) callCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.calls)
 }
 
 type tailNotifierFake struct {
@@ -317,18 +335,22 @@ func TestTailTaskHandleRejectsInvalidTaskIDBeforeDependencies(t *testing.T) {
 
 func TestTailTaskHandleValidatesFromSeqBeforeDependencies(t *testing.T) {
 	invalid := []struct {
-		params      json.RawMessage
-		wantFromSeq any
+		params     json.RawMessage
+		wantCode   string
+		wantDetail map[string]any
 	}{
-		{params: []byte(`{"from_seq":0}`), wantFromSeq: float64(0)},
-		{params: []byte(`{"from_seq":-1}`), wantFromSeq: float64(-1)},
-		{params: []byte(`{"from_seq":"1"}`), wantFromSeq: "1"},
-		{params: []byte(`{"from_seq":1.5}`), wantFromSeq: 1.5},
-		{params: []byte(`{"from_seq":true}`), wantFromSeq: true},
-		{params: []byte(`null`), wantFromSeq: nil},
-		{params: []byte(`[]`), wantFromSeq: nil},
-		{params: []byte(`{"from_seq":null}`), wantFromSeq: nil},
-		{params: []byte(`{`), wantFromSeq: nil},
+		{params: []byte(`{"from_seq":0}`), wantCode: "TAIL_FROM_SEQ_INVALID", wantDetail: map[string]any{"from_seq": float64(0)}},
+		{params: []byte(`{"from_seq":-1}`), wantCode: "TAIL_FROM_SEQ_INVALID", wantDetail: map[string]any{"from_seq": float64(-1)}},
+		{params: []byte(`{"from_seq":"1"}`), wantCode: "TAIL_PARAMS_MALFORMED"},
+		{params: []byte(`{"from_seq":1.5}`), wantCode: "TAIL_PARAMS_MALFORMED"},
+		{params: []byte(`{"from_seq":true}`), wantCode: "TAIL_PARAMS_MALFORMED"},
+		{params: []byte(`null`), wantCode: "TAIL_PARAMS_MALFORMED"},
+		{params: []byte(`[]`), wantCode: "TAIL_PARAMS_MALFORMED"},
+		{params: []byte(`{"from_seq":null}`), wantCode: "TAIL_PARAMS_MALFORMED"},
+		{params: []byte(`{`), wantCode: "TAIL_PARAMS_MALFORMED"},
+		{params: []byte(`{"from_seq":8,"ignored":true}`), wantCode: "TAIL_PARAMS_MALFORMED"},
+		{params: []byte(`{"From_Seq":8}`), wantCode: "TAIL_PARAMS_MALFORMED"},
+		{params: []byte(`{} {}`), wantCode: "TAIL_PARAMS_MALFORMED"},
 	}
 	for _, tt := range invalid {
 		t.Run(string(tt.params), func(t *testing.T) {
@@ -339,7 +361,11 @@ func TestTailTaskHandleValidatesFromSeqBeforeDependencies(t *testing.T) {
 				t.Fatal(err)
 			}
 			response := decodeTailError(t, &output)
-			if response.OK || response.Error == nil || response.Error.Code != "TAIL_FROM_SEQ_INVALID" || response.Error.MessageKey != "error.tail.fromSeqInvalid" || !reflect.DeepEqual(response.Error.Detail, map[string]any{"from_seq": tt.wantFromSeq}) {
+			wantMessageKey := "error.tail.paramsMalformed"
+			if tt.wantCode == "TAIL_FROM_SEQ_INVALID" {
+				wantMessageKey = "error.tail.fromSeqInvalid"
+			}
+			if response.OK || response.Error == nil || response.Error.Code != tt.wantCode || response.Error.MessageKey != wantMessageKey || !reflect.DeepEqual(response.Error.Detail, tt.wantDetail) {
 				t.Fatalf("response = %#v", response)
 			}
 			if provider.calls != 0 || len(events.calls) != 0 || notifier.callCount() != 0 {
@@ -349,8 +375,68 @@ func TestTailTaskHandleValidatesFromSeqBeforeDependencies(t *testing.T) {
 	}
 }
 
+func TestTailFromSeqClassifiesJSONNumberValues(t *testing.T) {
+	for _, tt := range []struct {
+		name    string
+		params  json.RawMessage
+		want    int
+		wantErr error
+	}{
+		{name: "decimal integer", params: []byte(`{"from_seq":1.0}`), want: 1},
+		{name: "exponent integer", params: []byte(`{"from_seq":1e2}`), want: 100},
+		{name: "large exponent integer", params: []byte(`{"from_seq":1e18}`), want: 1000000000000000000},
+		{name: "non-integer", params: []byte(`{"from_seq":1.5}`), wantErr: errTailParamsMalformed},
+		{name: "negative", params: []byte(`{"from_seq":-1}`), wantErr: errTailFromSeqInvalid},
+		{name: "zero", params: []byte(`{"from_seq":0}`), wantErr: errTailFromSeqInvalid},
+		{name: "negative beyond int64", params: []byte(`{"from_seq":-9223372036854775809}`), wantErr: errTailFromSeqInvalid},
+		{name: "positive beyond int64", params: []byte(`{"from_seq":9223372036854775808}`), want: -1},
+		{name: "positive enormous exponent", params: []byte(`{"from_seq":1e999999999999999999}`), want: -1},
+		{name: "negative enormous exponent", params: []byte(`{"from_seq":-1e999999999999999999}`), wantErr: errTailFromSeqInvalid},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got, _, err := tailFromSeq(tt.params)
+			if !errors.Is(err, tt.wantErr) || got != tt.want {
+				t.Fatalf("tailFromSeq(%s) = (%d, %v), want (%d, %v)", tt.params, got, err, tt.want, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestTailTaskHandleMalformedParamsOmitFromSeqFromSerializedResponse(t *testing.T) {
+	uc, _, _, _ := newTailUseCase(domain.StateRunning)
+	var output bytes.Buffer
+	if err := uc.Handle(context.Background(), transport.Request{TaskID: tailTestID(t).String(), Params: []byte(`null`), RequestID: "request-null"}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(output.Bytes(), []byte("from_seq")) {
+		t.Fatalf("malformed params response leaked from_seq: %q", output.String())
+	}
+}
+
+func TestTailTaskHandleAcceptsPositiveIntegerBeyondIntRange(t *testing.T) {
+	uc, _, events, _ := newTailUseCase(domain.StateCompleted)
+	timers := &tailManualTimers{}
+	uc.timerFactory = timers.new
+	var output bytes.Buffer
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- uc.Handle(context.Background(), transport.Request{TaskID: tailTestID(t).String(), Params: []byte(`{"from_seq":9223372036854775808}`), RequestID: "request-beyond-int"}, &output)
+	}()
+	for timers.count() != 2 {
+		time.Sleep(time.Millisecond)
+	}
+	timers.fire(t, 1)
+	if err := <-errCh; err != nil {
+		t.Fatal(err)
+	}
+	lines := decodeTailSuccessLines(t, &output)
+	if len(lines) != 1 || lines[0].Complete == nil || len(events.calls) != 0 {
+		t.Fatalf("lines=%#v event calls=%v", lines, events.calls)
+	}
+}
+
 func TestTailTaskHandleDefaultsAndPassesFromSeq(t *testing.T) {
-	for _, params := range []json.RawMessage{nil, []byte(`{}`), []byte(`{"from_seq":8,"ignored":true}`)} {
+	for _, params := range []json.RawMessage{nil, []byte(`{}`), []byte(`{"from_seq":8}`)} {
 		t.Run(string(params), func(t *testing.T) {
 			uc, _, events, _ := newTailUseCase(domain.StateCompleted)
 			timers := &tailManualTimers{}
@@ -376,6 +462,169 @@ func TestTailTaskHandleDefaultsAndPassesFromSeq(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTailTaskHandleMapsReadFailuresToSingleResponse(t *testing.T) {
+	for _, tt := range []struct {
+		name            string
+		configure       func(*tailProviderFake, *tailEventsFake)
+		wantSubscribe   int
+		wantUnsubscribe int
+	}{
+		{
+			name: "snapshot",
+			configure: func(provider *tailProviderFake, _ *tailEventsFake) {
+				provider.err = errors.New("snapshot contains /private/secret")
+			},
+		},
+		{
+			name: "initial replay",
+			configure: func(_ *tailProviderFake, events *tailEventsFake) {
+				events.err = errors.New("events contains /private/secret")
+			},
+			wantSubscribe:   1,
+			wantUnsubscribe: 1,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			uc, provider, events, notifier := newTailUseCase(domain.StateRunning)
+			tt.configure(provider, events)
+			var output bytes.Buffer
+			err := uc.Handle(context.Background(), transport.Request{TaskID: tailTestID(t).String(), RequestID: "request-read-failed"}, &output)
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := decodeTailError(t, &output)
+			if response.ProtocolVersion != transport.ProtocolVersion || response.RequestID != "request-read-failed" || response.OK || response.Error == nil || response.Error.Code != "TAIL_READ_FAILED" || response.Error.MessageKey != "error.tail.readFailed" || !reflect.DeepEqual(response.Error.Detail, map[string]any{"task_id": tailTestID(t).String()}) || strings.Contains(output.String(), "secret") || strings.Contains(output.String(), "/private/") {
+				t.Fatalf("response=%#v output=%q", response, output.String())
+			}
+			if notifier.callCount() != tt.wantSubscribe || notifier.unsubscribeCount() != tt.wantUnsubscribe {
+				t.Fatalf("notifier=%d/%d", notifier.callCount(), notifier.unsubscribeCount())
+			}
+		})
+	}
+}
+
+func TestTailTaskHandleLogsReadFailureWithoutLeakingItToResponse(t *testing.T) {
+	var logs bytes.Buffer
+	uc, provider, _, _ := newTailUseCase(domain.StateRunning)
+	uc.logger = slog.New(slog.NewTextHandler(&logs, nil))
+	provider.err = errors.New("read cause /private/secret")
+	var output bytes.Buffer
+	if err := uc.Handle(context.Background(), transport.Request{TaskID: tailTestID(t).String(), RequestID: "request-log"}, &output); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(logs.String(), "read cause") || !strings.Contains(logs.String(), "task_id=") || strings.Contains(output.String(), "secret") || strings.Contains(output.String(), "/private/") {
+		t.Fatalf("logs=%q output=%q", logs.String(), output.String())
+	}
+}
+
+func decodeTailResponses(t *testing.T, output *bytes.Buffer) []transport.Response {
+	t.Helper()
+	decoder := json.NewDecoder(bytes.NewReader(output.Bytes()))
+	var responses []transport.Response
+	for {
+		var response transport.Response
+		if err := decoder.Decode(&response); errors.Is(err, io.EOF) {
+			return responses
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		responses = append(responses, response)
+	}
+}
+
+func TestTailTaskHandleMapsLiveAndTerminalDrainReadFailures(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		state    domain.TaskState
+		failCall int
+		timer    int
+	}{
+		{name: "live follow", state: domain.StateRunning, failCall: 2},
+		{name: "terminal drain", state: domain.StateCompleted, failCall: 3, timer: 1},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			order := []string{}
+			provider := &tailProviderFake{snapshot: tailSnapshot(t, tt.state), order: &order}
+			events := &tailEventsFake{order: &order, records: []store.EventRecord{{Seq: 1}}}
+			notifier := &tailNotifierFake{order: &order}
+			uc := NewTailTaskUseCase(provider, events, notifier)
+			timers := &tailManualTimers{}
+			uc.timerFactory = timers.new
+			var output bytes.Buffer
+			id := tailTestID(t)
+			_, errCh, done := startTailGoroutine(t, func(ctx context.Context) error {
+				return uc.Handle(ctx, transport.Request{TaskID: id.String(), RequestID: "request-phase"}, &output)
+			})
+			waitTailCondition(t, errCh, "waiting for initial replay", func() bool { return events.callCount() >= 1 && timers.count() >= 1 }, func() string { return output.String() })
+			events.failOnCall(tt.failCall, errors.New("later read /private/secret"))
+			if tt.state.IsTerminal() {
+				timers.fire(t, tt.timer)
+			} else {
+				notifier.wake()
+			}
+			waitTailExit(t, errCh, done, nil)
+			responses := decodeTailResponses(t, &output)
+			if len(responses) != 2 || !responses[0].OK || responses[1].OK || responses[1].Error == nil || responses[1].Error.Code != "TAIL_READ_FAILED" || responses[1].ProtocolVersion != transport.ProtocolVersion || responses[1].RequestID != "request-phase" || strings.Contains(output.String(), "secret") {
+				t.Fatalf("responses=%#v output=%q", responses, output.String())
+			}
+			wantUnsubscribes := 1
+			if tt.state.IsTerminal() {
+				wantUnsubscribes = 0
+			}
+			if notifier.unsubscribeCount() != wantUnsubscribes {
+				t.Fatalf("unsubscribe count=%d", notifier.unsubscribeCount())
+			}
+		})
+	}
+}
+
+type tailFailingWriter struct {
+	err   error
+	calls int
+}
+
+func (w *tailFailingWriter) Write([]byte) (int, error) {
+	w.calls++
+	return 0, w.err
+}
+
+func TestTailTaskHandleDoesNotMapCancellationOrWriterFailuresToReadFailure(t *testing.T) {
+	t.Run("cancellation", func(t *testing.T) {
+		uc, _, _, notifier := newTailUseCase(domain.StateRunning)
+		var output bytes.Buffer
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- uc.Handle(ctx, transport.Request{TaskID: tailTestID(t).String(), RequestID: "request-cancel"}, &output)
+		}()
+		waitTailCondition(t, errCh, "waiting for subscription", func() bool { return notifier.activeCount() == 1 }, func() string { return "not subscribed" })
+		cancel()
+		if err := <-errCh; !errors.Is(err, context.Canceled) || strings.Contains(output.String(), "TAIL_READ_FAILED") || notifier.unsubscribeCount() != 1 {
+			t.Fatalf("err=%v output=%q unsubscribes=%d", err, output.String(), notifier.unsubscribeCount())
+		}
+	})
+	t.Run("progress writer", func(t *testing.T) {
+		uc, _, events, notifier := newTailUseCase(domain.StateRunning)
+		events.add(store.EventRecord{Seq: 1})
+		want := errors.New("progress write failed")
+		out := &tailFailingWriter{err: want}
+		err := uc.Handle(context.Background(), transport.Request{TaskID: tailTestID(t).String(), RequestID: "request-progress-writer"}, out)
+		if !errors.Is(err, want) || out.calls != 1 || notifier.unsubscribeCount() != 1 {
+			t.Fatalf("err=%v calls=%d unsubscribes=%d", err, out.calls, notifier.unsubscribeCount())
+		}
+	})
+	t.Run("error writer", func(t *testing.T) {
+		uc, _, events, notifier := newTailUseCase(domain.StateRunning)
+		events.err = errors.New("read failed")
+		want := errors.New("error write failed")
+		out := &tailFailingWriter{err: want}
+		err := uc.Handle(context.Background(), transport.Request{TaskID: tailTestID(t).String(), RequestID: "request-error-writer"}, out)
+		if !errors.Is(err, want) || out.calls != 1 || notifier.unsubscribeCount() != 1 {
+			t.Fatalf("err=%v calls=%d unsubscribes=%d", err, out.calls, notifier.unsubscribeCount())
+		}
+	})
 }
 
 func TestTailTaskHandleMapsNotFoundToSingleResponse(t *testing.T) {
@@ -635,7 +884,7 @@ func TestTailTaskExecutePropagatesNonNotFoundSnapshotError(t *testing.T) {
 	want := errors.New("snapshot read failed")
 	provider.err = want
 	err := uc.Execute(context.Background(), schema.TailTaskInput{TaskID: tailTestID(t), FromSeq: 1}, &tailWriterFake{})
-	if !errors.Is(err, want) || len(events.calls) != 0 || notifier.callCount() != 0 {
+	if !errors.Is(err, errTailReadFailed) || !errors.Is(err, want) || len(events.calls) != 0 || notifier.callCount() != 0 {
 		t.Fatalf("err=%v events=%v notifier=%d", err, events.calls, notifier.callCount())
 	}
 }
@@ -646,7 +895,7 @@ func TestTailTaskExecuteUnsubscribesWhenReplayFails(t *testing.T) {
 	events.err = want
 
 	err := uc.Execute(context.Background(), schema.TailTaskInput{TaskID: tailTestID(t), FromSeq: 1}, &tailWriterFake{})
-	if !errors.Is(err, want) || notifier.callCount() != 1 || notifier.unsubscribeCount() != 1 {
+	if !errors.Is(err, errTailReadFailed) || !errors.Is(err, want) || notifier.callCount() != 1 || notifier.unsubscribeCount() != 1 {
 		t.Fatalf("err=%v notifier calls=%d unsubscribes=%d", err, notifier.callCount(), notifier.unsubscribeCount())
 	}
 }

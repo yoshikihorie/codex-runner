@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"math"
@@ -17,8 +18,13 @@ const (
 	MessageKeyStatsInvalidDateRange  = "error.stats.invalidDateRange"
 	MessageKeyStatsInvalidSubcommand = "error.stats.invalidSubcommand"
 	MessageKeyStatsSkippedLines      = "info.stats.skippedLines"
+	MessageKeyStatsReadFailedFiles   = "info.stats.readFailedFiles"
+	MessageKeyMetricsFileReadFailed  = "error.metrics.fileReadFailed"
 	machineCodeMetricsFileCorrupted  = "METRICS_FILE_CORRUPTED"
+	machineCodeMetricsFileReadFailed = "METRICS_FILE_READ_FAILED"
 )
+
+var ErrMetricsFileReadFailed = errors.New("metrics file read failed")
 
 type StatsQuery struct {
 	Since            *string
@@ -31,6 +37,7 @@ type StatsReport struct {
 	MatchedFiles                          int                               `json:"matched_files"`
 	TotalRecords                          int                               `json:"total_records"`
 	SkippedLines                          int                               `json:"skipped_lines"`
+	ReadFailedFiles                       int                               `json:"read_failed_files"`
 	SuccessRateBySubcommand               map[domain.Subcommand]SuccessStat `json:"success_rate_by_subcommand"`
 	SuccessRateByModel                    map[string]SuccessStat            `json:"success_rate_by_model"`
 	QueueWaitMedian                       *int                              `json:"queue_wait_median"`
@@ -90,6 +97,7 @@ func (u *ComputeTaskStatsUseCase) Execute(q StatsQuery) (StatsReport, error) {
 
 	records := make([]taskMetricsRecord, 0)
 	skippedLines := 0
+	readFailedFiles := 0
 	for _, path := range files {
 		func() {
 			stream, openErr := u.reader.OpenMonthlyFile(path)
@@ -106,25 +114,24 @@ func (u *ComputeTaskStatsUseCase) Execute(q StatsQuery) (StatsReport, error) {
 			reader := bufio.NewReader(stream)
 			for {
 				line, readErr := reader.ReadBytes('\n')
-				if len(line) > 0 {
-					if readErr == io.EOF {
+				switch {
+				case readErr == nil:
+					record, parseErr := parseTaskMetricsRecord(bytes.TrimSuffix(line, []byte{'\n'}))
+					if parseErr != nil {
+						skippedLines++
+						u.warnCorrupted(path, "parse-line", parseErr)
+					} else if q.SubcommandFilter == nil || record.Subcommand == *q.SubcommandFilter {
+						records = append(records, record)
+					}
+				case errors.Is(readErr, io.EOF):
+					if len(line) > 0 {
 						skippedLines++
 						u.warnCorrupted(path, "unterminated-line", readErr)
-					} else {
-						record, parseErr := parseTaskMetricsRecord(bytes.TrimSuffix(line, []byte{'\n'}))
-						if parseErr != nil {
-							skippedLines++
-							u.warnCorrupted(path, "parse-line", parseErr)
-						} else if q.SubcommandFilter == nil || record.Subcommand == *q.SubcommandFilter {
-							records = append(records, record)
-						}
 					}
-				}
-				if readErr == io.EOF {
 					return
-				}
-				if readErr != nil {
-					u.warnCorrupted(path, "read-line", readErr)
+				default:
+					readFailedFiles++
+					u.warnReadFailed(path, "read-line", errors.Join(ErrMetricsFileReadFailed, readErr))
 					return
 				}
 			}
@@ -134,11 +141,16 @@ func (u *ComputeTaskStatsUseCase) Execute(q StatsQuery) (StatsReport, error) {
 	report := buildStatsReport(records)
 	report.MatchedFiles = len(files)
 	report.SkippedLines = skippedLines
+	report.ReadFailedFiles = readFailedFiles
 	return report, nil
 }
 
 func (u *ComputeTaskStatsUseCase) warnCorrupted(path, stage string, err error) {
 	u.logger.Warn("metrics file is corrupted", "code", machineCodeMetricsFileCorrupted, "path", path, "stage", stage, "error", err)
+}
+
+func (u *ComputeTaskStatsUseCase) warnReadFailed(path, stage string, err error) {
+	u.logger.Warn("metrics file could not be fully read", "code", machineCodeMetricsFileReadFailed, "message_key", MessageKeyMetricsFileReadFailed, "path", path, "stage", stage, "error", err)
 }
 
 func buildStatsReport(records []taskMetricsRecord) StatsReport {

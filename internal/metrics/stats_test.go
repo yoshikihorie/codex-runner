@@ -1,17 +1,24 @@
 package metrics
 
 import (
+	"bufio"
 	"bytes"
+	"compress/gzip"
+	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
+	"github.com/yoshikihorie/codex-runner/internal/store"
 )
 
 type fakeMetricsReader struct {
@@ -49,9 +56,70 @@ func statsLine(t *testing.T, mutate func(*taskMetricsRecord)) string {
 	return string(b) + "\n"
 }
 
-func newStatsUseCase(reader *fakeMetricsReader, logger *slog.Logger) *ComputeTaskStatsUseCase {
+func newStatsUseCase(reader store.MetricsReader, logger *slog.Logger) *ComputeTaskStatsUseCase {
 	return NewComputeTaskStatsUseCase(reader, "/tmp/logs", logger)
 }
+
+type listedMetricsReader struct {
+	files  []string
+	reader store.MetricsReader
+}
+
+func (r listedMetricsReader) ListMonthlyFiles(string, *string, *string) ([]string, error) {
+	return r.files, nil
+}
+
+func (r listedMetricsReader) OpenMonthlyFile(path string) (io.ReadCloser, error) {
+	return r.reader.OpenMonthlyFile(path)
+}
+
+type wrappedEOFMetricsReader struct{ line string }
+
+func (r wrappedEOFMetricsReader) ListMonthlyFiles(string, *string, *string) ([]string, error) {
+	return []string{"wrapped-eof"}, nil
+}
+
+func (r wrappedEOFMetricsReader) OpenMonthlyFile(string) (io.ReadCloser, error) {
+	return io.NopCloser(wrappedEOFReader{data: []byte(r.line)}), nil
+}
+
+type wrappedEOFReader struct{ data []byte }
+
+func (r wrappedEOFReader) Read(p []byte) (int, error) {
+	n := copy(p, r.data)
+	return n, fmt.Errorf("wrapped eof: %w", io.EOF)
+}
+
+type readFailureMetricsReader struct {
+	cause error
+	data  []byte
+}
+
+func (r readFailureMetricsReader) ListMonthlyFiles(string, *string, *string) ([]string, error) {
+	return []string{"read-failure"}, nil
+}
+
+func (r readFailureMetricsReader) OpenMonthlyFile(string) (io.ReadCloser, error) {
+	return readFailureReadCloser{cause: r.cause, data: r.data}, nil
+}
+
+type readFailureReadCloser struct {
+	cause error
+	data  []byte
+}
+
+func (r readFailureReadCloser) Read(p []byte) (int, error) { return copy(p, r.data), r.cause }
+func (r readFailureReadCloser) Close() error               { return nil }
+
+type capturedLogHandler struct{ records []slog.Record }
+
+func (h *capturedLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *capturedLogHandler) Handle(_ context.Context, record slog.Record) error {
+	h.records = append(h.records, record.Clone())
+	return nil
+}
+func (h *capturedLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *capturedLogHandler) WithGroup(string) slog.Handler      { return h }
 
 func TestParseTaskMetricsRecord_AllFields(t *testing.T) { // T-A1, SCN-01
 	text, hash := "body", "hash"
@@ -229,7 +297,7 @@ func TestComputeTaskStats_CorruptionLog(t *testing.T) { // T-A17, SCN-06
 }
 
 func TestStatsMessageKeys(t *testing.T) { // T-A18
-	if MessageKeyStatsInvalidDateRange != "error.stats.invalidDateRange" || MessageKeyStatsInvalidSubcommand != "error.stats.invalidSubcommand" || MessageKeyStatsSkippedLines != "info.stats.skippedLines" {
+	if MessageKeyStatsInvalidDateRange != "error.stats.invalidDateRange" || MessageKeyStatsInvalidSubcommand != "error.stats.invalidSubcommand" || MessageKeyStatsSkippedLines != "info.stats.skippedLines" || MessageKeyStatsReadFailedFiles != "info.stats.readFailedFiles" || MessageKeyMetricsFileReadFailed != "error.metrics.fileReadFailed" {
 		t.Fatal("unexpected message key")
 	}
 }
@@ -249,6 +317,158 @@ func TestComputeTaskStats_UnterminatedLineIsSkipped(t *testing.T) { // T-A20, SC
 	if err != nil || r.SkippedLines != 1 || r.TotalRecords != 0 {
 		t.Fatalf("report = %#v, %v", r, err)
 	}
+}
+
+func TestComputeTaskStats_ReadFailureContinuesAfterTruncatedGzip(t *testing.T) { // T-A29, SCN-metrics-02-20
+	dir := t.TempDir()
+	precedingPath := filepath.Join(dir, "task-metrics-2025-12.jsonl")
+	failedPath := filepath.Join(dir, "task-metrics-2026-01.jsonl.gz")
+	followingPath := filepath.Join(dir, "task-metrics-2026-02.jsonl")
+	if err := os.WriteFile(precedingPath, []byte(statsLine(t, func(r *taskMetricsRecord) { r.Model = "preceding" })), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	firstMember := statsLine(t, nil)
+	secondMember := statsLine(t, func(r *taskMetricsRecord) { r.Model = "second-member-one" }) + statsLine(t, func(r *taskMetricsRecord) { r.Model = "second-member-two" })
+	writeTruncatedGzipMembers(t, failedPath, firstMember, secondMember)
+	if err := os.WriteFile(followingPath, []byte(statsLine(t, func(r *taskMetricsRecord) { r.Model = "following" })), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	assertTruncatedGzipHasNonEOFReadError(t, failedPath)
+
+	handler := &capturedLogHandler{}
+	reader := listedMetricsReader{files: []string{precedingPath, failedPath, followingPath}, reader: store.NewFileMetricsReader()}
+	report, err := newStatsUseCase(reader, slog.New(handler)).Execute(StatsQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.ReadFailedFiles != 1 || report.MatchedFiles != 3 || report.SkippedLines != 0 || report.TotalRecords != 5 {
+		t.Fatalf("report = %#v", report)
+	}
+	for _, model := range []string{"preceding", "model-a", "second-member-one", "second-member-two", "following"} {
+		if report.SuccessRateByModel[model].Total != 1 {
+			t.Fatalf("complete record for %q was not retained: %#v", model, report.SuccessRateByModel)
+		}
+	}
+	if !capturedReadFailure(t, handler.records) {
+		t.Fatal("missing METRICS_FILE_READ_FAILED log")
+	}
+	for _, record := range handler.records {
+		var code string
+		record.Attrs(func(attr slog.Attr) bool {
+			if attr.Key == "code" {
+				code = attr.Value.String()
+			}
+			return true
+		})
+		if code == machineCodeMetricsFileCorrupted {
+			t.Fatal("read failure was logged as corrupted")
+		}
+	}
+}
+
+func TestComputeTaskStats_WrappedEOFIsUnterminatedNotReadFailure(t *testing.T) { // T-A30, SCN-metrics-02-20
+	handler := &capturedLogHandler{}
+	report, err := newStatsUseCase(wrappedEOFMetricsReader{line: strings.TrimSuffix(statsLine(t, nil), "\n")}, slog.New(handler)).Execute(StatsQuery{})
+	if err != nil || report.ReadFailedFiles != 0 || report.SkippedLines != 1 || report.TotalRecords != 0 {
+		t.Fatalf("report = %#v, err = %v", report, err)
+	}
+	if len(handler.records) != 1 {
+		t.Fatalf("unterminated line warnings = %d, want 1", len(handler.records))
+	}
+}
+
+func TestComputeTaskStats_ReadFailureDropsDataAndJoinsSentinelAndCause(t *testing.T) { // T-A31, SCN-metrics-02-20
+	cause := errors.New("injected read failure")
+	handler := &capturedLogHandler{}
+	partialRecord := strings.TrimSuffix(statsLine(t, func(r *taskMetricsRecord) { r.Model = "must-not-count" }), "\n")
+	report, err := newStatsUseCase(readFailureMetricsReader{cause: cause, data: []byte(partialRecord)}, slog.New(handler)).Execute(StatsQuery{})
+	if err != nil || report.ReadFailedFiles != 1 || report.SkippedLines != 0 || report.TotalRecords != 0 {
+		t.Fatalf("report = %#v, err = %v", report, err)
+	}
+	if !capturedReadFailure(t, handler.records, cause) {
+		t.Fatal("missing joined read failure log")
+	}
+}
+
+func writeTruncatedGzipMembers(t *testing.T, path, first, second string) {
+	t.Helper()
+	firstMember := gzipMember(t, first)
+	secondMember := gzipMember(t, second)
+	secondMemberAfterTruncation := secondMember[:len(secondMember)-1]
+	if len(secondMemberAfterTruncation) == 0 {
+		t.Fatal("truncated second member must retain at least one byte")
+	}
+	if err := os.WriteFile(path, append(firstMember, secondMemberAfterTruncation...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func gzipMember(t *testing.T, contents string) []byte {
+	t.Helper()
+	var member bytes.Buffer
+	writer := gzip.NewWriter(&member)
+	if _, err := writer.Write([]byte(contents)); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return member.Bytes()
+}
+
+func assertTruncatedGzipHasNonEOFReadError(t *testing.T, path string) {
+	t.Helper()
+	stream, err := store.NewFileMetricsReader().OpenMonthlyFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer stream.Close()
+	reader := bufio.NewReader(stream)
+	if _, err := reader.ReadBytes('\n'); err != nil {
+		t.Fatalf("first member line error = %v", err)
+	}
+	for {
+		_, err := reader.ReadBytes('\n')
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			t.Fatalf("want non-EOF read error, got %v", err)
+		}
+		return
+	}
+}
+
+func capturedReadFailure(t *testing.T, records []slog.Record, causes ...error) bool {
+	t.Helper()
+	for _, record := range records {
+		var code, messageKey string
+		var loggedErr error
+		record.Attrs(func(attr slog.Attr) bool {
+			switch attr.Key {
+			case "code":
+				code = attr.Value.String()
+			case "message_key":
+				messageKey = attr.Value.String()
+			case "error":
+				loggedErr, _ = attr.Value.Any().(error)
+			}
+			return true
+		})
+		if code == machineCodeMetricsFileReadFailed && messageKey == MessageKeyMetricsFileReadFailed {
+			if !errors.Is(loggedErr, ErrMetricsFileReadFailed) {
+				t.Fatalf("sentinel missing from joined error: %v", loggedErr)
+			}
+			for _, cause := range causes {
+				if !errors.Is(loggedErr, cause) {
+					t.Fatalf("cause missing from joined error: %v", loggedErr)
+				}
+			}
+			return true
+		}
+	}
+	return false
 }
 
 func TestComputeTaskStats_MultipleSuccessGroups(t *testing.T) { // T-A21, SCN-01/02
