@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"os"
 	"strings"
@@ -24,13 +25,18 @@ import (
 type cancelStoreFake struct {
 	snapshot                      domain.TaskSnapshot
 	loadErr, saveErr, reservedErr error
+	loadErrs                      []error
 	reservedErrs                  []error
 	reserved                      bool
 	saves, loads, reservations    int
 }
 
 func (f *cancelStoreFake) Load(domain.TaskID) (domain.TaskSnapshot, error) {
+	idx := f.loads
 	f.loads++
+	if idx < len(f.loadErrs) && f.loadErrs[idx] != nil {
+		return domain.TaskSnapshot{}, f.loadErrs[idx]
+	}
 	if f.loadErr != nil {
 		return domain.TaskSnapshot{}, f.loadErr
 	}
@@ -440,10 +446,21 @@ func (f *cancelDisarmerFake) Disarm(domain.TaskID) {
 
 type cancelWriterFake struct {
 	contract.ContractWriter
-	events []domain.Event
+	events       []domain.Event
+	writeExitErr error
 }
 
-func (*cancelWriterFake) WriteExitCode(domain.TaskID, domain.ExitCode) error { return nil }
+type cancelConfirmerFake struct {
+	calls int
+	err   error
+}
+
+func (f *cancelConfirmerFake) Execute(context.Context, execution.ConfirmTaskKilledInput) (execution.ConfirmTaskKilledOutput, error) {
+	f.calls++
+	return execution.ConfirmTaskKilledOutput{}, f.err
+}
+
+func (f *cancelWriterFake) WriteExitCode(domain.TaskID, domain.ExitCode) error { return f.writeExitErr }
 func (f *cancelWriterFake) AppendEvent(_ domain.TaskID, e domain.Event) error {
 	f.events = append(f.events, e)
 	return nil
@@ -801,7 +818,7 @@ func TestCancelTaskExecute_PersistedRunningStalledAndAdoptedTerminateBeforeDisar
 	}
 }
 
-func TestCancelTaskExecute_RunningCompletesKilledInSingleCall(t *testing.T) {
+func TestCancelTaskExecute_WaiterOwnedRunningDefersConfirmation_SCNProto0332(t *testing.T) {
 	payload := cancelQueuedPayload(t)
 	tasks := &cancelStoreFake{reserved: true, snapshot: cancelPersistedSnapshot(t, domain.StateRunning, true)}
 	queueMu := &sync.Mutex{}
@@ -813,17 +830,14 @@ func TestCancelTaskExecute_RunningCompletesKilledInSingleCall(t *testing.T) {
 	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, writer, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, pending)
 	uc := NewCancelTaskUseCase(tasks, &cancelQueueFake{payload: payload, queueMu: queueMu}, queueMu, store.NewTaskMutex(), events, &cancelTerminatorFake{}, termination, pending, disarmer, confirmer, &cancelStalledTrackerFake{}, &cancelOwnershipFake{}, domain.ClockFunc(time.Now))
 	out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
-	if err != nil || out.State != domain.StateCancelling || tasks.snapshot.State != domain.StateKilled || termination.calls != 1 || disarmer.calls != 1 {
+	if err != nil || out.State != domain.StateCancelling || tasks.snapshot.State != domain.StateCancelling || termination.calls != 1 || disarmer.calls != 1 {
 		t.Fatalf("out=%#v err=%v snapshot=%#v termination=%#v disarmer=%#v", out, err, tasks.snapshot, termination, disarmer)
 	}
-	if len(events.events) != 1 || len(writer.events) != 1 {
+	if len(events.events) != 1 || len(writer.events) != 0 {
 		t.Fatalf("cancel events=%#v killed events=%#v", events.events, writer.events)
 	}
 	if _, ok := events.events[0].(domain.TaskCancelRequested); !ok {
 		t.Fatalf("cancel event=%T", events.events[0])
-	}
-	if _, ok := writer.events[0].(domain.TaskKilled); !ok {
-		t.Fatalf("killed event=%T", writer.events[0])
 	}
 }
 
@@ -893,7 +907,7 @@ func TestCancelTaskExecute_StartingConcurrentInitialSendClaimsConvergeToOneSende
 	}
 }
 
-func TestCancelTaskExecute_AlreadyExitedProcessStillConfirmsKilled(t *testing.T) {
+func TestCancelTaskExecute_DoesNotWriteSynthetic130BeforeWaiter_SCNProto0333(t *testing.T) {
 	payload := cancelQueuedPayload(t)
 	tasks := &cancelStoreFake{reserved: true, snapshot: cancelPersistedSnapshot(t, domain.StateRunning, true)}
 	queueMu := &sync.Mutex{}
@@ -905,11 +919,8 @@ func TestCancelTaskExecute_AlreadyExitedProcessStillConfirmsKilled(t *testing.T)
 	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, writer, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, pending)
 	uc := NewCancelTaskUseCase(tasks, &cancelQueueFake{payload: payload, queueMu: queueMu}, queueMu, store.NewTaskMutex(), events, &cancelTerminatorFake{}, termination, pending, disarmer, confirmer, &cancelStalledTrackerFake{}, &cancelOwnershipFake{}, domain.ClockFunc(time.Now))
 	out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
-	if err != nil || out.State != domain.StateCancelling || tasks.snapshot.State != domain.StateKilled || termination.calls != 1 || disarmer.calls != 1 || len(events.events) != 1 || len(writer.events) != 1 {
+	if err != nil || out.State != domain.StateCancelling || tasks.snapshot.State != domain.StateCancelling || termination.calls != 1 || disarmer.calls != 1 || len(events.events) != 1 || len(writer.events) != 0 {
 		t.Fatalf("out=%#v err=%v snapshot=%#v termination=%#v disarmer=%#v events=%#v killed=%#v", out, err, tasks.snapshot, termination, disarmer, events.events, writer.events)
-	}
-	if _, ok := writer.events[0].(domain.TaskKilled); !ok {
-		t.Fatalf("killed event=%T", writer.events[0])
 	}
 }
 
@@ -967,6 +978,53 @@ func TestCancelTaskExecute_PersistedStartingWithPIDClaimOutcomes(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCancelTaskClaimSentConfirmFailure(t *testing.T) {
+	newUseCase := func(t *testing.T, cause error, logs *bytes.Buffer) (*execution.TaskLaunchPayload, *cancelTerminationEnsurerFake, *CancelTaskUseCase) {
+		t.Helper()
+		payload := cancelQueuedPayload(t)
+		tasks, _, _, _, _, uc := cancelFixture(t, payload, false)
+		tasks.snapshot = cancelPersistedSnapshot(t, domain.StateStarting, true)
+		outcome := recovery.ClaimSent
+		uc.pendingRegistrar.(*cancelPendingRegistrarFake).initialOutcome = &outcome
+		termination := uc.termination.(*cancelTerminationEnsurerFake)
+		termination.confirmErr = cause
+		uc.logger = slog.New(slog.NewJSONHandler(logs, nil))
+		return &payload, termination, uc
+	}
+
+	t.Run("Execute propagates the confirmation failure", func(t *testing.T) {
+		cause := errors.New("claim-sent confirmation failure")
+		var logs bytes.Buffer
+		payload, termination, uc := newUseCase(t, cause, &logs)
+
+		out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+		if out.State != domain.StateCancelling || !errors.Is(err, cause) || termination.confirmCalls != 1 {
+			t.Fatalf("out=%#v err=%v confirmCalls=%d", out, err, termination.confirmCalls)
+		}
+		if !strings.Contains(logs.String(), "confirm cancelled task termination") || !strings.Contains(logs.String(), cause.Error()) {
+			t.Fatalf("logs=%q", logs.String())
+		}
+	})
+
+	t.Run("Handle returns sanitized cancel failed response", func(t *testing.T) {
+		cause := errors.New("claim-sent internal confirmation failure")
+		var logs bytes.Buffer
+		payload, termination, uc := newUseCase(t, cause, &logs)
+
+		response := uc.Handle(transport.Request{RequestID: "claim-sent-confirm-failure", TaskID: payload.Task.ID().String(), Params: json.RawMessage(`{}`)})
+		if response.OK || response.Error == nil || response.Error.Code != "CANCEL_FAILED" || response.Error.MessageKey != "error.cancel.failed" || termination.confirmCalls != 1 {
+			t.Fatalf("response=%#v confirmCalls=%d", response, termination.confirmCalls)
+		}
+		detail, err := json.Marshal(response.Error.Detail)
+		if err != nil || string(detail) != `{"task_id":"`+payload.Task.ID().String()+`"}` || strings.Contains(string(detail), cause.Error()) {
+			t.Fatalf("detail=%s err=%v", detail, err)
+		}
+		if !strings.Contains(logs.String(), "confirm cancelled task termination") || !strings.Contains(logs.String(), "cancel task failed") || !strings.Contains(logs.String(), cause.Error()) {
+			t.Fatalf("logs=%q", logs.String())
+		}
+	})
 }
 
 func TestCancelTaskExecute_PersistedOrphanedImmediatelyConfirmsKilled(t *testing.T) {
@@ -1044,7 +1102,7 @@ func TestCancelTaskHandle_IncompleteProcessIdentityFailsClosedWithoutPersistence
 	tasks.snapshot = snapshot
 
 	response := uc.Handle(transport.Request{RequestID: "incomplete-process-identity", TaskID: payload.Task.ID().String(), Params: json.RawMessage(`{}`)})
-	if response.OK || response.Error == nil || response.Error.Code != "CONTRACT_WRITE_FAILED" || response.Error.MessageKey != "error.contract.writeFailed" || tasks.saves != 0 || tasks.snapshot.PID == nil || tasks.snapshot.ProcessStartedAt != nil || tasks.snapshot.State != domain.StateRunning || terminator.calls != 0 || disarmer.calls != 0 {
+	if response.OK || response.Error == nil || response.Error.Code != "CANCEL_FAILED" || response.Error.MessageKey != "error.cancel.failed" || tasks.saves != 0 || tasks.snapshot.PID == nil || tasks.snapshot.ProcessStartedAt != nil || tasks.snapshot.State != domain.StateRunning || terminator.calls != 0 || disarmer.calls != 0 {
 		t.Fatalf("response=%#v snapshot=%#v saves=%d terminator=%#v disarmer=%#v", response, tasks.snapshot, tasks.saves, terminator, disarmer)
 	}
 }
@@ -1275,7 +1333,11 @@ func TestCancelTaskHandle_ContractWriteFailuresAreSanitized(t *testing.T) {
 			tasks, _, _, _, _, uc := cancelFixture(t, payload, false)
 			tc.setup(tasks)
 			response := uc.Handle(transport.Request{RequestID: tc.name, TaskID: payload.Task.ID().String(), Params: json.RawMessage(`{}`)})
-			if response.OK || response.Error == nil || response.Error.Code != "CONTRACT_WRITE_FAILED" || response.Error.MessageKey != "error.contract.writeFailed" {
+			wantCode, wantMessage := "CONTRACT_WRITE_FAILED", "error.contract.writeFailed"
+			if tc.name == "reservation" {
+				wantCode, wantMessage = "CANCEL_FAILED", "error.cancel.failed"
+			}
+			if response.OK || response.Error == nil || response.Error.Code != wantCode || response.Error.MessageKey != wantMessage {
 				t.Fatalf("response=%#v", response)
 			}
 			detail, err := json.Marshal(response.Error.Detail)
@@ -1312,13 +1374,143 @@ func TestCancelTaskExecute_ContractWriteFailuresRetainUnderlyingCause(t *testing
 
 			_, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
 			var pathErr *os.PathError
-			if !errors.Is(err, domain.ErrContractWriteFailed) || !errors.Is(err, cause) || !errors.As(err, &pathErr) || pathErr != cause {
+			wantContractWrite := tc.name == "queued-save" || tc.name == "persisted-save"
+			if errors.Is(err, domain.ErrContractWriteFailed) != wantContractWrite || !errors.Is(err, cause) || !errors.As(err, &pathErr) || pathErr != cause {
 				t.Fatalf("err=%v pathErr=%#v cause=%#v", err, pathErr, cause)
 			}
 			if tc.name == "rechecked-reservation" && tasks.reservations != 2 {
 				t.Fatalf("reservations=%d, want 2", tasks.reservations)
 			}
 		})
+	}
+}
+
+func TestCancelTaskHandle_UnclassifiedLoadFailureReturnsCancelFailed_SCNProto0329(t *testing.T) {
+	payload := cancelQueuedPayload(t)
+	tasks, _, _, _, _, uc := cancelFixture(t, payload, false)
+	tasks.snapshot = cancelPersistedSnapshot(t, domain.StateStarting, false)
+	tasks.loadErr = errors.New("load I/O failure")
+	var logs bytes.Buffer
+	uc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+
+	response := uc.Handle(transport.Request{RequestID: "load-failure", TaskID: payload.Task.ID().String(), Params: json.RawMessage(`{}`)})
+	if response.OK || response.Error == nil || response.Error.Code != "CANCEL_FAILED" || response.Error.MessageKey != "error.cancel.failed" {
+		t.Fatalf("response=%#v", response)
+	}
+	detail, err := json.Marshal(response.Error.Detail)
+	if err != nil || string(detail) != `{"task_id":"`+payload.Task.ID().String()+`"}` || strings.Contains(logs.String(), "load I/O failure") == false {
+		t.Fatalf("detail=%s err=%v logs=%q", detail, err, logs.String())
+	}
+}
+
+func TestCancelTaskHandle_ContractWriteFailureRemainsContractWriteFailed_SCNProto0330(t *testing.T) {
+	payload := cancelQueuedPayload(t)
+	tasks, _, _, _, _, uc := cancelFixture(t, payload, false)
+	tasks.snapshot = cancelPersistedSnapshot(t, domain.StateStarting, false)
+	tasks.saveErr = errors.Join(domain.ErrContractWriteFailed, errors.New("task.json write failure"))
+
+	response := uc.Handle(transport.Request{RequestID: "write-failure", TaskID: payload.Task.ID().String(), Params: json.RawMessage(`{}`)})
+	if response.OK || response.Error == nil || response.Error.Code != "CONTRACT_WRITE_FAILED" || response.Error.MessageKey != "error.contract.writeFailed" {
+		t.Fatalf("response=%#v", response)
+	}
+}
+
+func TestCancelTaskExecute_NonContractFailuresDoNotGainContractWriteSentinel(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		run  func(*testing.T, error) error
+	}{
+		{"initial-reservation", func(t *testing.T, cause error) error {
+			payload := cancelQueuedPayload(t)
+			tasks, _, _, _, _, uc := cancelFixture(t, payload, false)
+			tasks.reservedErr = cause
+			_, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+			return err
+		}},
+		{"rechecked-reservation", func(t *testing.T, cause error) error {
+			payload := cancelQueuedPayload(t)
+			tasks, _, _, _, _, uc := cancelFixture(t, payload, false)
+			tasks.loadErr, tasks.reservedErrs = domain.ErrTaskNotFound, []error{nil, cause}
+			_, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+			return err
+		}},
+		{"persisted-load", func(t *testing.T, cause error) error {
+			payload := cancelQueuedPayload(t)
+			tasks, _, _, _, _, uc := cancelFixture(t, payload, false)
+			tasks.loadErr = cause
+			_, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+			return err
+		}},
+		{"pidless-adopted-pending", func(t *testing.T, cause error) error {
+			payload := cancelQueuedPayload(t)
+			tasks, _, _, _, _, uc := cancelFixture(t, payload, false)
+			tasks.snapshot = cancelPersistedSnapshot(t, domain.StateAdopted, false)
+			uc.pendingRegistrar.(*cancelPendingRegistrarFake).err = cause
+			_, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+			return err
+		}},
+		{"dead-confirm-and-pending-join", func(t *testing.T, cause error) error {
+			payload := cancelQueuedPayload(t)
+			tasks, _, _, _, _, termination, uc := cancelFixtureWithTerminationEnsurer(t, payload, false)
+			tasks.snapshot = cancelPersistedSnapshot(t, domain.StateRunning, true)
+			tasks.snapshot.AdoptedAfterRestart = true
+			termination.result.Dead = true
+			uc.confirmer = &cancelConfirmerFake{err: errors.New("confirmation failure")}
+			uc.pendingRegistrar.(*cancelPendingRegistrarFake).err = cause
+			_, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+			return err
+		}},
+		{"not-dead-pending", func(t *testing.T, cause error) error {
+			payload := cancelQueuedPayload(t)
+			tasks, _, _, _, _, termination, uc := cancelFixtureWithTerminationEnsurer(t, payload, false)
+			tasks.snapshot = cancelPersistedSnapshot(t, domain.StateRunning, true)
+			termination.result.TerminateErr = nil
+			uc.pendingRegistrar.(*cancelPendingRegistrarFake).err = cause
+			_, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+			return err
+		}},
+		{"signal-and-pending-join", func(t *testing.T, cause error) error {
+			payload := cancelQueuedPayload(t)
+			tasks, _, _, _, _, termination, uc := cancelFixtureWithTerminationEnsurer(t, payload, false)
+			tasks.snapshot = cancelPersistedSnapshot(t, domain.StateRunning, true)
+			termination.result.TerminateErr = errors.New("signal failure")
+			uc.pendingRegistrar.(*cancelPendingRegistrarFake).err = cause
+			_, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+			return err
+		}},
+		{"starting-claimed-load", func(t *testing.T, cause error) error {
+			payload := cancelQueuedPayload(t)
+			tasks, _, _, _, _, uc := cancelFixture(t, payload, false)
+			tasks.snapshot = cancelPersistedSnapshot(t, domain.StateStarting, true)
+			tasks.loadErrs = []error{nil, cause}
+			_, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cause := errors.New(tc.name + " failure")
+			err := tc.run(t, cause)
+			if !errors.Is(err, cause) || errors.Is(err, domain.ErrContractWriteFailed) {
+				t.Fatalf("err=%v cause=%v", err, cause)
+			}
+			response := (&CancelTaskUseCase{logger: slog.New(slog.NewTextHandler(io.Discard, nil))}).cancelMappedError("request", cancelTaskID(t), err)
+			if response.OK || response.Error == nil || response.Error.Code != "CANCEL_FAILED" || response.Error.MessageKey != "error.cancel.failed" {
+				t.Fatalf("response=%#v", response)
+			}
+		})
+	}
+}
+
+func TestCancelTaskExecute_AdoptedAfterRestartWithPIDUsesEstimated130_SCNProto0331(t *testing.T) {
+	payload := cancelQueuedPayload(t)
+	tasks, _, _, _, disarmer, termination, uc := cancelFixtureWithTerminationEnsurer(t, payload, false)
+	tasks.snapshot = cancelPersistedSnapshot(t, domain.StateRunning, true)
+	tasks.snapshot.AdoptedAfterRestart = true
+	termination.result.Dead = true
+
+	out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
+	if err != nil || !out.TerminationTriggered || tasks.snapshot.State != domain.StateKilled || disarmer.calls != 1 {
+		t.Fatalf("out=%#v err=%v snapshot=%#v disarmer=%#v", out, err, tasks.snapshot, disarmer)
 	}
 }
 

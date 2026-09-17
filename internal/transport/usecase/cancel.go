@@ -46,6 +46,9 @@ type stalledTimeTracker interface {
 type cancelLifecycleOwnership interface {
 	Current(domain.TaskID) (domain.LifecycleGeneration, bool)
 }
+type cancelTaskKilledConfirmer interface {
+	Execute(context.Context, execution.ConfirmTaskKilledInput) (execution.ConfirmTaskKilledOutput, error)
+}
 
 type CancelTaskInput struct {
 	TaskID     domain.TaskID
@@ -79,14 +82,14 @@ type CancelTaskUseCase struct {
 	termination      cancelTerminationEnsurer
 	pendingRegistrar recovery.PendingRegistrar
 	timeoutDisarmer  execution.TimeoutDisarmer
-	confirmer        *execution.ConfirmTaskKilledUseCase
+	confirmer        cancelTaskKilledConfirmer
 	stalledTracker   stalledTimeTracker
 	ownership        cancelLifecycleOwnership
 	clock            domain.Clock
 	logger           *slog.Logger
 }
 
-func NewCancelTaskUseCase(tasks CancelTaskStore, queue CancelTaskQueue, queueMu *sync.Mutex, taskMu CancelTaskMutex, events CancelEventAppender, terminator CancelProcessTerminator, termination cancelTerminationEnsurer, pendingRegistrar recovery.PendingRegistrar, disarmer execution.TimeoutDisarmer, confirmer *execution.ConfirmTaskKilledUseCase, stalledTracker stalledTimeTracker, ownership cancelLifecycleOwnership, clock domain.Clock, options ...any) *CancelTaskUseCase {
+func NewCancelTaskUseCase(tasks CancelTaskStore, queue CancelTaskQueue, queueMu *sync.Mutex, taskMu CancelTaskMutex, events CancelEventAppender, terminator CancelProcessTerminator, termination cancelTerminationEnsurer, pendingRegistrar recovery.PendingRegistrar, disarmer execution.TimeoutDisarmer, confirmer cancelTaskKilledConfirmer, stalledTracker stalledTimeTracker, ownership cancelLifecycleOwnership, clock domain.Clock, options ...any) *CancelTaskUseCase {
 	if isNilStatusUseCaseDependency(tasks) || isNilStatusUseCaseDependency(queue) || isNilStatusUseCaseDependency(queueMu) || isNilStatusUseCaseDependency(taskMu) || isNilStatusUseCaseDependency(events) || isNilStatusUseCaseDependency(terminator) || isNilStatusUseCaseDependency(termination) || isNilStatusUseCaseDependency(pendingRegistrar) || isNilStatusUseCaseDependency(disarmer) || isNilStatusUseCaseDependency(confirmer) || isNilStatusUseCaseDependency(stalledTracker) || isNilStatusUseCaseDependency(ownership) || isNilStatusUseCaseDependency(clock) {
 		panic("cancel task use case requires non-nil dependencies")
 	}
@@ -131,7 +134,7 @@ func (uc *CancelTaskUseCase) Execute(ctx context.Context, in CancelTaskInput) (C
 	queueLocked = false
 	reserved, err := uc.tasks.IsReserved(in.TaskID)
 	if err != nil {
-		return CancelTaskOutput{}, contractWriteError(err)
+		return CancelTaskOutput{}, err
 	}
 	if !reserved {
 		return CancelTaskOutput{}, domain.ErrTaskNotFound
@@ -209,14 +212,14 @@ func (uc *CancelTaskUseCase) cancelPersisted(ctx context.Context, in CancelTaskI
 		if errors.Is(err, domain.ErrTaskNotFound) {
 			reserved, checkErr := uc.tasks.IsReserved(in.TaskID)
 			if checkErr != nil {
-				return out, contractWriteError(checkErr)
+				return out, checkErr
 			}
 			if reserved {
 				return out, errCancelStateChanged
 			}
 			return out, domain.ErrTaskNotFound
 		}
-		return out, contractWriteError(err)
+		return out, err
 	}
 	previous = snapshot.State
 	if cancelNeedsGeneration(snapshot) {
@@ -278,7 +281,7 @@ func (uc *CancelTaskUseCase) cancelPersisted(ctx context.Context, in CancelTaskI
 				(previous == domain.StateRunning || previous == domain.StateStalled)))
 	if pidlessAdopted {
 		if err := uc.pendingRegistrar.Register(in.TaskID, recovery.PendingSendConfirmOnly, nil); err != nil {
-			return out, contractWriteError(err)
+			return out, err
 		}
 		uc.timeoutDisarmer.Disarm(in.TaskID)
 		return out, nil
@@ -298,12 +301,16 @@ func (uc *CancelTaskUseCase) cancelPersisted(ctx context.Context, in CancelTaskI
 				uc.logger.Warn("confirm cancelled task termination", "task_id", in.TaskID.String(), "error", result.ConfirmErr)
 			}
 			if result.Dead {
+				if cancelWaiterOwnsTerminal(generation, previous) {
+					uc.timeoutDisarmer.Disarm(in.TaskID)
+					return out, nil
+				}
 				_, confirmErr := uc.confirmer.Execute(ctx, execution.ConfirmTaskKilledInput{TaskID: in.TaskID, RawExitCode: 130, Estimated: true, OccurredAt: uc.clock.Now()})
 				if confirmErr == nil {
 					return out, nil
 				}
 				if registerErr := uc.pendingRegistrar.Register(in.TaskID, recovery.PendingSendConfirmOnly, nil); registerErr != nil {
-					return out, errors.Join(confirmErr, contractWriteError(registerErr))
+					return out, errors.Join(confirmErr, registerErr)
 				}
 				uc.timeoutDisarmer.Disarm(in.TaskID)
 				return out, confirmErr
@@ -318,7 +325,6 @@ func (uc *CancelTaskUseCase) cancelPersisted(ctx context.Context, in CancelTaskI
 				disposition, pendingAuthority = cancelPendingRegistration(in.TaskID, pid, processStartedAt, generation)
 			}
 			if registerErr := uc.pendingRegistrar.Register(in.TaskID, disposition, pendingAuthority); registerErr != nil {
-				registerErr = contractWriteError(registerErr)
 				if result.TerminateErr != nil {
 					return out, errors.Join(result.TerminateErr, registerErr)
 				}
@@ -332,7 +338,7 @@ func (uc *CancelTaskUseCase) cancelPersisted(ctx context.Context, in CancelTaskI
 				uc.logger.Warn("terminate cancelled task", "task_id", in.TaskID.String(), "error", terminateErr)
 				disposition, authority := cancelPendingRegistration(in.TaskID, pid, processStartedAt, generation)
 				if registerErr := uc.pendingRegistrar.Register(in.TaskID, disposition, authority); registerErr != nil {
-					return out, errors.Join(terminateErr, contractWriteError(registerErr))
+					return out, errors.Join(terminateErr, registerErr)
 				}
 			}
 			if previous == domain.StateStarting {
@@ -350,6 +356,10 @@ func cancelNeedsGeneration(snapshot domain.TaskSnapshot) bool {
 	return snapshot.State == domain.StateStarting || snapshot.State == domain.StateRunning || snapshot.State == domain.StateStalled || snapshot.State == domain.StateAdopted
 }
 
+func cancelWaiterOwnsTerminal(generation *domain.LifecycleGeneration, previous domain.TaskState) bool {
+	return generation != nil && (previous == domain.StateStarting || previous == domain.StateRunning || previous == domain.StateStalled)
+}
+
 func (uc *CancelTaskUseCase) finishStartingClaim(ctx context.Context, in CancelTaskInput, previous domain.TaskState, pid *int, processStartedAt *time.Time, generation domain.LifecycleGeneration, authority recovery.ProcessSignalAuthority, claim recovery.SendClaim, outcome recovery.ClaimOutcome) (CancelTaskOutput, error) {
 	switch outcome {
 	case recovery.ClaimAcquired:
@@ -358,7 +368,7 @@ func (uc *CancelTaskUseCase) finishStartingClaim(ctx context.Context, in CancelT
 		if err != nil {
 			uc.taskMu.Unlock(in.TaskID)
 			uc.pendingRegistrar.RemoveClaim(claim)
-			return CancelTaskOutput{}, contractWriteError(err)
+			return CancelTaskOutput{}, err
 		}
 		current, owned := uc.ownership.Current(in.TaskID)
 		matchingCancellation := snapshot.State == domain.StateCancelling && sameCancelProcess(snapshot, pid, processStartedAt) && owned && current == generation
@@ -403,11 +413,12 @@ func (uc *CancelTaskUseCase) finishStartingClaim(ctx context.Context, in CancelT
 		dead, err := uc.termination.Confirm(ctx, in.TaskID)
 		if err != nil {
 			uc.logger.Warn("confirm cancelled task termination", "task_id", in.TaskID.String(), "error", err)
+			return CancelTaskOutput{State: domain.StateCancelling}, err
 		}
 		if dead {
-			_, err = uc.confirmer.Execute(ctx, execution.ConfirmTaskKilledInput{TaskID: in.TaskID, RawExitCode: 130, Estimated: true, OccurredAt: uc.clock.Now()})
+			return CancelTaskOutput{State: domain.StateCancelling}, nil
 		}
-		return CancelTaskOutput{State: domain.StateCancelling}, err
+		return CancelTaskOutput{State: domain.StateCancelling}, nil
 	case recovery.ClaimAlreadyClaimed, recovery.ClaimConfirmOnly, recovery.ClaimNotFound:
 		return CancelTaskOutput{State: domain.StateCancelling}, nil
 	default:
@@ -505,8 +516,11 @@ func (uc *CancelTaskUseCase) cancelMappedError(requestID string, id domain.TaskI
 		return cancelErrorResponse(requestID, "TASK_INVALID_TRANSITION", "error.task.invalidTransition", detail)
 	case errors.Is(err, errCancelStateChanged):
 		return cancelErrorResponse(requestID, "CANCEL_STATE_CHANGED", "error.cancel.stateChanged", detail)
-	default:
+	case errors.Is(err, domain.ErrContractWriteFailed):
 		return cancelErrorResponse(requestID, "CONTRACT_WRITE_FAILED", "error.contract.writeFailed", detail)
+	default:
+		uc.logger.Error("cancel task failed", "task_id", id.String(), "error", err)
+		return cancelErrorResponse(requestID, "CANCEL_FAILED", "error.cancel.failed", detail)
 	}
 }
 func cancelErrorResponse(requestID, code, message string, detail map[string]any) transport.Response {
