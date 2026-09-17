@@ -114,11 +114,14 @@ func (r *RecoveryAttempt) Attempt(ctx context.Context, launcher ResumeLauncher, 
 		params.PromptText = RecoveryResumePrompt
 	}
 	if err := launcher.LaunchAndWait(ctx, params); err != nil {
-		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, err
+		if isRecoverySessionUnavailable(err) {
+			return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, err
+		}
+		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, errors.Join(errRecoveryResumeLaunchFailed, err)
 	}
 	present, err := reader.ReadLastMessage(r.TaskID)
 	if err != nil {
-		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, err
+		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, errors.Join(errRecoveryOutputReadFailed, err)
 	}
 	if !present {
 		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, nil
@@ -224,7 +227,11 @@ func (uc *RecoverViaResumeUseCase) Execute(ctx context.Context, in RecoverViaRes
 	if in.SessionRef != nil && !(settings.Subcommand == domain.SubcommandImpl && origin == domain.RecoveryOriginTimeout) {
 		resumeResult, resumeErr := uc.recoverer.Resume(ctx, in.TaskID, in.SessionRef, origin, settings)
 		if resumeErr != nil {
-			if isRecoverySessionUnavailable(resumeErr) {
+			if isRecoveryOutputReadFailed(resumeErr) {
+				logRecoveryError(ctx, uc.logger, slog.LevelWarn, "resume recovery output read failed", machineCodeRecoveryOutputReadFailed, messageKeyRecoveryOutputReadFailed, in.TaskID, "resume", "read_last_message", resumeErr)
+			} else if isRecoveryResumeLaunchFailed(resumeErr) {
+				logRecoveryError(ctx, uc.logger, slog.LevelWarn, "resume recovery launch failed", machineCodeRecoveryResumeLaunchFailed, messageKeyRecoveryResumeLaunchFailed, in.TaskID, "resume", "launch", resumeErr)
+			} else if isRecoverySessionUnavailable(resumeErr) {
 				logRecoveryError(ctx, uc.logger, slog.LevelWarn, "resume recovery session unavailable", machineCodeRecoverySessionUnavailable, messageKeyRecoverySessionUnavailable, in.TaskID, "resume", "attempt", resumeErr)
 			} else {
 				uc.logger.Log(ctx, slog.LevelWarn, "resume recovery failed", "task_id", in.TaskID.String(), "error", resumeErr)

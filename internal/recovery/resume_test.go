@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 	"testing"
 	"time"
 
@@ -206,6 +207,159 @@ func TestRecoverViaResumeUseCaseLogsTimeoutImplResumeSkip(t *testing.T) {
 	}
 	assertRecoveryLogRecordWithoutCode(t, logs.String(), "resume skipped to avoid duplicate impl application", "skip_resume", "resume")
 	assertRecoveryLogCodeAbsent(t, logs.String(), "RECOVERY_SESSION_UNAVAILABLE")
+	assertRecoveryLogCodeAbsent(t, logs.String(), "RECOVERY_RESUME_LAUNCH_FAILED")
+	assertRecoveryLogCodeAbsent(t, logs.String(), "RECOVERY_OUTPUT_READ_FAILED")
+}
+
+func TestRecoverViaResumeUseCaseClassifiesNonTimeoutLaunchFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		state     domain.TaskState
+		origin    domain.RecoveryOrigin
+		wantState domain.TaskState
+		wantCode  int
+	}{
+		{name: "timeout", state: domain.StateTimeout, origin: domain.RecoveryOriginTimeout, wantState: domain.StateTimeoutLost, wantCode: 6},
+		{name: "orphan", state: domain.StateOrphaned, origin: domain.RecoveryOriginOrphan, wantState: domain.StateLost, wantCode: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := recoveryTestSession(t)
+			uc, store, writer, _, _, _, _ := newRecoveryUseCaseFixture(t, tc.state, &session, RecoveryResult{})
+			cause := errors.New("resume launch supervisor failed")
+			recoverer, err := NewResumeRecoverer(&resumeLauncherFake{err: cause}, &resumeReaderFake{}, "/usr/local/bin/codex", t.TempDir(), domain.ClockFunc(time.Now))
+			if err != nil {
+				t.Fatal(err)
+			}
+			uc.recoverer = recoverer
+			var logs bytes.Buffer
+			uc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+
+			out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: tc.origin, OccurredAt: time.Now()})
+			if err != nil || out.Succeeded || out.FinalState != tc.wantState || store.snapshot.State != tc.wantState {
+				t.Fatalf("out=(%+v, %v) snapshot=%#v", out, err, store.snapshot)
+			}
+			if writer.exitCodeCalls != 1 || writer.exitCode.Raw() != tc.wantCode {
+				t.Fatalf("exit code writes=%d code=%d, want %d", writer.exitCodeCalls, writer.exitCode.Raw(), tc.wantCode)
+			}
+			assertRecoveryLogRecordWithCause(t, logs.String(), "RECOVERY_RESUME_LAUNCH_FAILED", "error.recovery.resumeLaunchFailed", "resume", "launch", cause.Error())
+			assertRecoveryLogCodeAbsent(t, logs.String(), "RECOVERY_SESSION_UNAVAILABLE")
+		})
+	}
+}
+
+func TestRecoverViaResumeUseCasePreservesDeadlineAsSessionUnavailable(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, _, writer, _, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{})
+	recoverer, err := NewResumeRecoverer(&resumeLauncherFake{err: context.DeadlineExceeded}, &resumeReaderFake{}, "/usr/local/bin/codex", t.TempDir(), domain.ClockFunc(time.Now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	uc.recoverer = recoverer
+	var logs bytes.Buffer
+	uc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+
+	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
+	if err != nil || out.Succeeded || out.FinalState != domain.StateTimeoutLost {
+		t.Fatalf("out=(%+v, %v)", out, err)
+	}
+	if writer.exitCodeCalls != 1 || writer.exitCode.Raw() != 6 {
+		t.Fatalf("exit code writes=%d code=%d", writer.exitCodeCalls, writer.exitCode.Raw())
+	}
+	assertRecoveryLogRecordWithCause(t, logs.String(), "RECOVERY_SESSION_UNAVAILABLE", "error.recovery.sessionUnavailable", "resume", "attempt", context.DeadlineExceeded.Error())
+	assertRecoveryLogCodeAbsent(t, logs.String(), "RECOVERY_RESUME_LAUNCH_FAILED")
+}
+
+func TestRecoverViaResumeUseCaseClassifiesLastMessageReadFailure(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		state     domain.TaskState
+		origin    domain.RecoveryOrigin
+		wantState domain.TaskState
+		wantCode  int
+	}{
+		{name: "timeout", state: domain.StateTimeout, origin: domain.RecoveryOriginTimeout, wantState: domain.StateTimeoutLost, wantCode: 6},
+		{name: "orphan", state: domain.StateOrphaned, origin: domain.RecoveryOriginOrphan, wantState: domain.StateLost, wantCode: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := recoveryTestSession(t)
+			uc, store, writer, _, _, _, _ := newRecoveryUseCaseFixture(t, tc.state, &session, RecoveryResult{})
+			cause := errors.Join(errors.New("last message read failed"), context.DeadlineExceeded)
+			recoverer, err := NewResumeRecoverer(&resumeLauncherFake{}, &resumeReaderFake{err: cause}, "/usr/local/bin/codex", t.TempDir(), domain.ClockFunc(time.Now))
+			if err != nil {
+				t.Fatal(err)
+			}
+			uc.recoverer = recoverer
+			var logs bytes.Buffer
+			uc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+
+			out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: tc.origin, OccurredAt: time.Now()})
+			if err != nil || out.Succeeded || out.FinalState != tc.wantState || store.snapshot.State != tc.wantState {
+				t.Fatalf("out=(%+v, %v) snapshot=%#v", out, err, store.snapshot)
+			}
+			if writer.exitCodeCalls != 1 || writer.exitCode.Raw() != tc.wantCode {
+				t.Fatalf("exit code writes=%d code=%d, want %d", writer.exitCodeCalls, writer.exitCode.Raw(), tc.wantCode)
+			}
+			assertRecoveryLogRecordWithCause(t, logs.String(), "RECOVERY_OUTPUT_READ_FAILED", "error.recovery.outputReadFailed", "resume", "read_last_message", cause.Error())
+			assertRecoveryLogCodeAbsent(t, logs.String(), "RECOVERY_SESSION_UNAVAILABLE")
+		})
+	}
+}
+
+func TestRecoverViaResumeUseCasePreservesEmptyLastMessageAsSessionUnavailable(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, _, writer, _, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateOrphaned, &session, RecoveryResult{})
+	recoverer, err := NewResumeRecoverer(&resumeLauncherFake{}, &resumeReaderFake{present: false}, "/usr/local/bin/codex", t.TempDir(), domain.ClockFunc(time.Now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	uc.recoverer = recoverer
+	var logs bytes.Buffer
+	uc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+
+	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginOrphan, OccurredAt: time.Now()})
+	if err != nil || out.Succeeded || out.FinalState != domain.StateLost {
+		t.Fatalf("out=(%+v, %v)", out, err)
+	}
+	if writer.exitCodeCalls != 1 || writer.exitCode.Raw() != 1 {
+		t.Fatalf("exit code writes=%d code=%d", writer.exitCodeCalls, writer.exitCode.Raw())
+	}
+	assertRecoveryLogRecord(t, logs.String(), "RECOVERY_SESSION_UNAVAILABLE", "error.recovery.sessionUnavailable", "resume")
+	assertRecoveryLogCodeAbsent(t, logs.String(), "RECOVERY_OUTPUT_READ_FAILED")
+}
+
+func TestRecoverViaResumeUseCaseLeavesInvariantErrorsUnclassified(t *testing.T) {
+	for _, message := range []string{
+		"resume task placement root: invalid path",
+		"resume output last message path: invalid task id",
+		"resume output schema path: invalid task id",
+	} {
+		t.Run(message, func(t *testing.T) {
+			session := recoveryTestSession(t)
+			uc, _, _, recoverer, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateOrphaned, &session, RecoveryResult{})
+			recoverer.err = errors.New(message)
+			var logs bytes.Buffer
+			uc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+
+			if _, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginOrphan, OccurredAt: time.Now()}); err != nil {
+				t.Fatal(err)
+			}
+			assertRecoveryLogCodeAbsent(t, logs.String(), "RECOVERY_RESUME_LAUNCH_FAILED")
+			assertRecoveryLogCodeAbsent(t, logs.String(), "RECOVERY_OUTPUT_READ_FAILED")
+			if !strings.Contains(logs.String(), `"msg":"resume recovery failed"`) {
+				t.Fatalf("unclassified warning not found in %s", logs.String())
+			}
+		})
+	}
+
+	for _, attempt := range []*RecoveryAttempt{
+		{TaskID: recoveryTestTaskID(t), Origin: domain.RecoveryOriginOrphan, SessionRef: recoveryTestSession(t), TaskPlacementRoot: ""},
+		{Origin: domain.RecoveryOriginOrphan, SessionRef: recoveryTestSession(t), TaskPlacementRoot: t.TempDir()},
+	} {
+		_, err := attempt.Attempt(context.Background(), &resumeLauncherFake{}, &resumeReaderFake{})
+		if err == nil || strings.Contains(err.Error(), "recovery resume launch failed") || strings.Contains(err.Error(), "recovery output read failed") {
+			t.Fatalf("invariant error classification = %v", err)
+		}
+	}
 }
 
 func TestRecoverViaResumeUseCasePreservesLogContextThroughFinish(t *testing.T) {
@@ -1119,6 +1273,27 @@ func assertRecoveryLogRecordWithStage(t *testing.T, logs, code, messageKey, oper
 		}
 	}
 	t.Fatalf("log record code=%q message_key=%q operation=%q not found in %s", code, messageKey, operation, logs)
+}
+
+func assertRecoveryLogRecordWithCause(t *testing.T, logs, code, messageKey, operation, stage, cause string) {
+	t.Helper()
+	for _, line := range bytes.Split([]byte(logs), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatalf("decode log record %q: %v", line, err)
+		}
+		errorText, _ := record["error"].(string)
+		if record["code"] == code && record["message_key"] == messageKey && record["operation"] == operation && record["stage"] == stage && strings.Contains(errorText, cause) {
+			if err := validateRequiredRecoveryLogFields(record); err != nil {
+				t.Fatalf("incomplete recovery log record: %#v", record)
+			}
+			return
+		}
+	}
+	t.Fatalf("log record code=%q message_key=%q operation=%q stage=%q cause=%q not found in %s", code, messageKey, operation, stage, cause, logs)
 }
 
 func assertRecoveryLogCodeAbsent(t *testing.T, logs, code string) {
