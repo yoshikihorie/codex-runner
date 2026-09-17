@@ -138,14 +138,21 @@ func TestTaskStoreIsReserved_RejectsRegularFileAndSymlink(t *testing.T) {
 		})
 	}
 }
-func TestTaskStoreReleaseRejectsNonEmptyDirectory(t *testing.T) {
+func TestTaskStoreReleaseRemovesNonEmptyReservationAndIndex(t *testing.T) {
 	s, id := newReservedStore(t)
 	p, _ := newTaskPaths(s.root, id)
 	if err := os.WriteFile(p.taskJSON(), []byte("{}"), taskFilePerm); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Release(id); err == nil {
-		t.Fatal("Release removed non-empty directory")
+	s.index[id.String()] = storeSnapshot(t, id, domain.StateQueued)
+	if err := s.Release(id); err != nil {
+		t.Fatalf("Release non-empty reservation: %v", err)
+	}
+	if _, err := os.Stat(p.dir()); !os.IsNotExist(err) {
+		t.Fatalf("reservation directory still exists: %v", err)
+	}
+	if _, ok := s.index[id.String()]; ok {
+		t.Fatal("Release retained reservation index entry")
 	}
 }
 func TestTaskStoreSaveThenLoadPreservesAllFields(t *testing.T) {

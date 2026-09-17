@@ -21,6 +21,8 @@ import (
 
 const (
 	taskIDGenerationMaxAttempts = 10
+	// Canonical source: validation-rules.md OUTPUT_SCHEMA_MAX_BYTES.
+	outputSchemaMaxBytes = int64(1_000_000)
 
 	// Canonical identifiers registered in the published error-code and message catalogs.
 	admissionUnavailableCode       = "ADMISSION_UNAVAILABLE"
@@ -71,16 +73,19 @@ type SubmitTaskOutput struct {
 }
 
 type SubmitTaskUseCase struct {
-	tasks            SubmitTaskStore
-	pathLocks        SubmitPathLockAcquirer
-	pathLockReleaser SubmitPathLockReleaser
-	admitter         TaskAdmitter
-	queueMaxDepth    int
-	starter          execution.TaskLifecycleStarter
-	options          TaskOptionResolver
-	clock            domain.Clock
-	logger           *slog.Logger
-	random           io.Reader
+	tasks             SubmitTaskStore
+	pathLocks         SubmitPathLockAcquirer
+	pathLockReleaser  SubmitPathLockReleaser
+	admitter          TaskAdmitter
+	queueMaxDepth     int
+	starter           execution.TaskLifecycleStarter
+	options           TaskOptionResolver
+	clock             domain.Clock
+	logger            *slog.Logger
+	random            io.Reader
+	outputSchemaOpen  func(string, int, os.FileMode) (*os.File, error)
+	outputSchemaCopy  func(io.Writer, io.Reader) (int64, error)
+	outputSchemaClose func(*os.File) error
 }
 
 func NewSubmitTaskUseCase(tasks SubmitTaskStore, pathLocks SubmitPathLockAcquirer, pathLockReleaser SubmitPathLockReleaser, admitter TaskAdmitter, queueMaxDepth int, starter execution.TaskLifecycleStarter, options TaskOptionResolver, clock domain.Clock, logger *slog.Logger) *SubmitTaskUseCase {
@@ -93,7 +98,7 @@ func NewSubmitTaskUseCase(tasks SubmitTaskStore, pathLocks SubmitPathLockAcquire
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &SubmitTaskUseCase{tasks: tasks, pathLocks: pathLocks, pathLockReleaser: pathLockReleaser, admitter: admitter, queueMaxDepth: queueMaxDepth, starter: starter, options: options, clock: clock, logger: logger, random: productionTaskIDReader()}
+	return &SubmitTaskUseCase{tasks: tasks, pathLocks: pathLocks, pathLockReleaser: pathLockReleaser, admitter: admitter, queueMaxDepth: queueMaxDepth, starter: starter, options: options, clock: clock, logger: logger, random: productionTaskIDReader(), outputSchemaOpen: os.OpenFile, outputSchemaCopy: io.Copy, outputSchemaClose: func(file *os.File) error { return file.Close() }}
 }
 
 type submitWireInput struct {
@@ -187,8 +192,12 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 	if !domain.IsSubmittable(subcommand) {
 		return SubmitTaskOutput{}, submitFailure("SUBCOMMAND_NOT_SUBMITTABLE", "error.subcommand.notSubmittable", map[string]any{"subcommand": in.Subcommand})
 	}
-	if err := validateOutputSchemaPath(subcommand, in.OutputSchemaPath); err != nil {
+	sourceFile, err := validateOutputSchemaPath(subcommand, in.OutputSchemaPath)
+	if err != nil {
 		return SubmitTaskOutput{}, err
+	}
+	if sourceFile != nil {
+		defer sourceFile.Close()
 	}
 	model, ok := uc.options.ResolveModel(subcommand, in.Model)
 	if !ok {
@@ -225,29 +234,20 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 	if err != nil {
 		return SubmitTaskOutput{}, uc.mapError(err)
 	}
+	// Snapshot precedes PathLock acquisition so every post-reservation failure
+	// shares the same recursive reservation rollback path.
+	outputSchemaPath, err := uc.snapshotOutputSchema(id, sourceFile)
+	if err != nil {
+		uc.releaseReservation(id, nil)
+		return SubmitTaskOutput{}, uc.mapError(&taskReservationError{TaskID: id, Err: err})
+	}
 	normalizedPaths := []domain.NormalizedPath(nil)
 	acquired := false
 	if subcommand == domain.SubcommandImpl {
-		if uc.pathLocks == nil {
-			uc.releaseReservation(id, nil)
-			return SubmitTaskOutput{}, fmt.Errorf("submit path lock acquirer is required for impl")
-		}
-		normalizedPaths, err = uc.pathLocks.Acquire(id, in.RawPaths)
+		normalizedPaths, acquired, err = uc.acquirePathLocksAfterSnapshot(id, in.RawPaths, outputSchemaPath)
 		if err != nil {
-			uc.releaseReservation(id, nil)
 			return SubmitTaskOutput{}, uc.mapPathLockError(err, id)
 		}
-		acquired = true
-	}
-	outputSchemaPath, err := uc.snapshotOutputSchema(id, in.OutputSchemaPath)
-	if err != nil {
-		if acquired {
-			if cleanupErr := uc.pathLockReleaser.Release(context.WithoutCancel(ctx), id); cleanupErr != nil {
-				uc.logger.Error("release path lock after output schema snapshot failure", "task_id", id.String(), "error", execution.ErrorTypeName(cleanupErr))
-			}
-		}
-		uc.releaseReservation(id, nil)
-		return SubmitTaskOutput{}, err
 	}
 	result, err := uc.admitter.Admit(execution.TaskAdmissionInput{TaskID: id, Subcommand: subcommand, Slug: slug, RequestedTimeout: in.RequestedTimeoutSeconds, RequestedAt: in.RequestedAt, PromptText: in.Prompt, NormalizedPaths: normalizedPaths, ResolvedTimeout: timeout, Model: model, ReasoningEffort: effort, SandboxMode: sandbox, SourceWorkingDir: workingDir, WorktreeMode: worktreeMode, OutputSchemaPath: outputSchemaPath})
 	if err != nil {
@@ -281,21 +281,30 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 	return SubmitTaskOutput{TaskID: id, State: domain.StateQueued, QueuePosition: result.QueuePosition, Events: result.Events}, nil
 }
 
-func validateOutputSchemaPath(subcommand domain.Subcommand, path OptionalString) error {
+func validateOutputSchemaPath(subcommand domain.Subcommand, path OptionalString) (*os.File, error) {
 	if !path.Present {
-		return nil
+		return nil, nil
 	}
 	if !domain.SupportsOutputSchema(subcommand) {
-		return submitFailure("OUTPUT_SCHEMA_SUBCOMMAND_NOT_ALLOWED", "error.outputSchema.subcommandNotAllowed", nil)
+		return nil, submitFailure("OUTPUT_SCHEMA_SUBCOMMAND_NOT_ALLOWED", "error.outputSchema.subcommandNotAllowed", nil)
 	}
 	if path.Value == "" || !filepath.IsAbs(path.Value) {
-		return submitFailure("OUTPUT_SCHEMA_NOT_ABSOLUTE", "error.outputSchema.notAbsolute", nil)
+		return nil, submitFailure("OUTPUT_SCHEMA_NOT_ABSOLUTE", "error.outputSchema.notAbsolute", nil)
 	}
-	info, err := os.Lstat(path.Value)
+	file, err := os.OpenFile(path.Value, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+	}
+	info, err := file.Stat()
 	if err != nil || !info.Mode().IsRegular() {
-		return submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+		_ = file.Close()
+		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
 	}
-	return nil
+	if info.Size() > outputSchemaMaxBytes {
+		_ = file.Close()
+		return nil, submitFailure("OUTPUT_SCHEMA_TOO_LARGE", "error.outputSchema.tooLarge", map[string]any{"max_bytes": outputSchemaMaxBytes})
+	}
+	return file, nil
 }
 
 func resolveSandboxMode(subcommand domain.Subcommand, requested OptionalString) (string, error) {
@@ -314,8 +323,8 @@ func resolveSandboxMode(subcommand domain.Subcommand, requested OptionalString) 
 	return "", submitFailure("SANDBOX_MODE_NOT_ALLOWED", "error.sandboxMode.notAllowed", map[string]any{"sandbox_mode": requested.Value})
 }
 
-func (uc *SubmitTaskUseCase) snapshotOutputSchema(id domain.TaskID, source OptionalString) (*string, error) {
-	if !source.Present {
+func (uc *SubmitTaskUseCase) snapshotOutputSchema(id domain.TaskID, sourceFile *os.File) (*string, error) {
+	if sourceFile == nil {
 		return nil, nil
 	}
 	rootProvider, ok := uc.options.(taskPlacementRootProvider)
@@ -326,31 +335,33 @@ func (uc *SubmitTaskUseCase) snapshotOutputSchema(id domain.TaskID, source Optio
 	if err != nil {
 		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
 	}
-	sourceFile, err := os.OpenFile(source.Value, os.O_RDONLY|syscall.O_NOFOLLOW|syscall.O_NONBLOCK, 0)
-	if err != nil {
-		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
-	}
-	defer sourceFile.Close()
-	info, err := sourceFile.Stat()
-	if err != nil || !info.Mode().IsRegular() {
-		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
-	}
 	snapshot, err := store.OutputSchemaPath(root.String(), id)
 	if err != nil {
-		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+		return nil, fmt.Errorf("derive output schema snapshot path: %w", err)
 	}
-	destination, err := os.OpenFile(snapshot, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	destination, err := uc.outputSchemaOpen(snapshot, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+		return nil, fmt.Errorf("create output schema snapshot: %w", err)
 	}
-	if _, err := io.Copy(destination, sourceFile); err != nil {
-		_ = destination.Close()
+	if _, err := sourceFile.Seek(0, io.SeekStart); err != nil {
+		_ = uc.outputSchemaClose(destination)
 		_ = os.Remove(snapshot)
-		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+		return nil, fmt.Errorf("seek output schema source: %w", err)
 	}
-	if err := destination.Close(); err != nil {
+	written, err := uc.outputSchemaCopy(destination, io.LimitReader(sourceFile, outputSchemaMaxBytes+1))
+	if err != nil {
+		_ = uc.outputSchemaClose(destination)
 		_ = os.Remove(snapshot)
-		return nil, submitFailure("OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+		return nil, fmt.Errorf("copy output schema snapshot: %w", err)
+	}
+	if written > outputSchemaMaxBytes {
+		_ = uc.outputSchemaClose(destination)
+		_ = os.Remove(snapshot)
+		return nil, fmt.Errorf("output schema exceeds maximum size during snapshot")
+	}
+	if err := uc.outputSchemaClose(destination); err != nil {
+		_ = os.Remove(snapshot)
+		return nil, fmt.Errorf("close output schema snapshot: %w", err)
 	}
 	return &snapshot, nil
 }
@@ -391,6 +402,18 @@ func (uc *SubmitTaskUseCase) releaseReservation(id domain.TaskID, outputSchemaPa
 		uc.logger.Error("release task reservation", "task_id", id.String(), "error", execution.ErrorTypeName(err))
 	}
 }
+func (uc *SubmitTaskUseCase) acquirePathLocksAfterSnapshot(id domain.TaskID, paths []string, outputSchemaPath *string) ([]domain.NormalizedPath, bool, error) {
+	if uc.pathLocks == nil {
+		uc.releaseReservation(id, outputSchemaPath)
+		return nil, false, fmt.Errorf("submit path lock acquirer is required for impl")
+	}
+	normalized, err := uc.pathLocks.Acquire(id, paths)
+	if err != nil {
+		uc.releaseReservation(id, outputSchemaPath)
+		return nil, false, err
+	}
+	return normalized, true, nil
+}
 func (uc *SubmitTaskUseCase) mapPathLockError(err error, taskID domain.TaskID) error {
 	if errors.Is(err, domain.ErrPathLockConflict) {
 		var conflict *execution.PathLockConflictError
@@ -421,12 +444,12 @@ func (uc *SubmitTaskUseCase) mapError(err error) error {
 	if errors.As(err, &reservation) {
 		return submitFailure("TASK_DIR_CREATE_FAILED", "error.taskDir.createFailed", map[string]any{"task_id": reservation.TaskID.String()})
 	}
-	return submitFailure("TASK_DIR_CREATE_FAILED", "error.taskDir.createFailed", nil)
+	return err
 }
 func submitErrorResponse(requestID string, err error) transport.Response {
 	value, ok := err.(*submitError)
 	if !ok {
-		value = &submitError{code: "TASK_DIR_CREATE_FAILED", message: "error.taskDir.createFailed"}
+		panic(fmt.Errorf("submit response received unclassified error: %w", err))
 	}
 	return transport.Response{ProtocolVersion: transport.ProtocolVersion, RequestID: requestID, OK: false, Error: &transport.ErrorBody{Code: value.code, MessageKey: value.message, Detail: value.detail}}
 }

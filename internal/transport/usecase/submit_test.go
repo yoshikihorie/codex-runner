@@ -55,7 +55,11 @@ func (f *submitStoreFake) Release(id domain.TaskID) error {
 		return f.releaseErr
 	}
 	if f.root != "" {
-		return os.Remove(filepath.Join(f.root, id.String()))
+		path := filepath.Join(f.root, id.String())
+		if _, err := os.Lstat(path); err != nil {
+			return err
+		}
+		return os.RemoveAll(path)
 	}
 	return nil
 }
@@ -66,12 +70,16 @@ type submitPathLockFake struct {
 	calls      int
 	ids        []domain.TaskID
 	paths      [][]string
+	onAcquire  func()
 }
 
 func (f *submitPathLockFake) Acquire(id domain.TaskID, paths []string) ([]domain.NormalizedPath, error) {
 	f.calls++
 	f.ids = append(f.ids, id)
 	f.paths = append(f.paths, append([]string(nil), paths...))
+	if f.onAcquire != nil {
+		f.onAcquire()
+	}
 	return f.normalized, f.err
 }
 
@@ -220,6 +228,15 @@ func validSubmitInput(t *testing.T) SubmitTaskInput {
 	return SubmitTaskInput{Subcommand: string(domain.SubcommandReview), RawSlug: "valid-slug", Prompt: "safe prompt", RawWorkingDir: t.TempDir(), RequestedAt: time.Date(2026, 8, 9, 1, 2, 3, 0, time.UTC)}
 }
 
+func storeIDForSubmit(t *testing.T) domain.TaskID {
+	t.Helper()
+	id, err := domain.NewTaskID("review-20260809-010203-a1b2-schema")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
 func assertSubmitError(t *testing.T, err error, code, message string, detail map[string]any) {
 	t.Helper()
 	value, ok := err.(*submitError)
@@ -336,6 +353,212 @@ func TestSubmitExecuteRejectsSymlinkOutputSchemaPath(t *testing.T) {
 	in.OutputSchemaPath = optionalString(link)
 	_, err := fixture.uc.Execute(context.Background(), in)
 	assertSubmitError(t, err, "OUTPUT_SCHEMA_NOT_FOUND", "error.outputSchema.notFound", nil)
+}
+
+func TestSubmitExecuteEnforcesOutputSchemaSizeLimitBeforeReservation(t *testing.T) {
+	schema := filepath.Join(t.TempDir(), "too-large.schema.json")
+	if err := os.WriteFile(schema, bytes.Repeat([]byte("x"), int(outputSchemaMaxBytes+1)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newSubmitFixture()
+	in := validSubmitInput(t)
+	in.OutputSchemaPath = optionalString(schema)
+	_, err := fixture.uc.Execute(context.Background(), in)
+	assertSubmitError(t, err, "OUTPUT_SCHEMA_TOO_LARGE", "error.outputSchema.tooLarge", map[string]any{"max_bytes": outputSchemaMaxBytes})
+	if len(fixture.store.reserved) != 0 || fixture.admitter.calls != 0 || len(fixture.starter.payloads) != 0 {
+		t.Fatalf("side effects: reservations=%v admissions=%d starts=%d", fixture.store.reserved, fixture.admitter.calls, len(fixture.starter.payloads))
+	}
+}
+
+func TestSubmitExecuteAcceptsOutputSchemaAtSizeLimit(t *testing.T) {
+	schema := filepath.Join(t.TempDir(), "at-limit.schema.json")
+	if err := os.WriteFile(schema, bytes.Repeat([]byte("x"), int(outputSchemaMaxBytes)), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	fixture := newSubmitFixture()
+	fixture.store.root = t.TempDir()
+	fixture.uc.options = submitOptionsFake{model: "test-model", modelOK: true, effortOK: true, taskPlacementRoot: fixture.store.root}
+	in := validSubmitInput(t)
+	in.OutputSchemaPath = optionalString(schema)
+	if _, err := fixture.uc.Execute(context.Background(), in); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := store.OutputSchemaPath(fixture.store.root, fixture.store.reserved[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(snapshot)
+	if err != nil || info.Size() != outputSchemaMaxBytes {
+		t.Fatalf("snapshot size=%v err=%v", info.Size(), err)
+	}
+}
+
+func TestSnapshotOutputSchemaUsesValidatedFileDescriptorAndRejectsGrowth(t *testing.T) {
+	t.Run("path replacement retains validated contents", func(t *testing.T) {
+		root := t.TempDir()
+		source := filepath.Join(root, "source.schema.json")
+		if err := os.WriteFile(source, []byte("original"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := validateOutputSchemaPath(domain.SubcommandReview, optionalString(source))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		replacement := filepath.Join(root, "replacement.schema.json")
+		if err := os.WriteFile(replacement, []byte("replacement"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Rename(replacement, source); err != nil {
+			t.Fatal(err)
+		}
+		fixture := newSubmitFixture()
+		fixture.store.root = root
+		fixture.uc.options = submitOptionsFake{model: "test-model", modelOK: true, effortOK: true, taskPlacementRoot: root}
+		id := storeIDForSubmit(t)
+		if err := fixture.store.Reserve(id); err != nil {
+			t.Fatal(err)
+		}
+		snapshot, err := fixture.uc.snapshotOutputSchema(id, file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		contents, err := os.ReadFile(*snapshot)
+		if err != nil || string(contents) != "original" {
+			t.Fatalf("contents=%q err=%v", contents, err)
+		}
+	})
+	t.Run("growth after validation is rejected without a partial snapshot", func(t *testing.T) {
+		root := t.TempDir()
+		source := filepath.Join(root, "source.schema.json")
+		if err := os.WriteFile(source, bytes.Repeat([]byte("x"), int(outputSchemaMaxBytes)), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		file, err := validateOutputSchemaPath(domain.SubcommandReview, optionalString(source))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer file.Close()
+		writer, err := os.OpenFile(source, os.O_WRONLY|os.O_APPEND, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write([]byte("x")); err != nil {
+			_ = writer.Close()
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		fixture := newSubmitFixture()
+		fixture.store.root = root
+		fixture.uc.options = submitOptionsFake{model: "test-model", modelOK: true, effortOK: true, taskPlacementRoot: root}
+		id := storeIDForSubmit(t)
+		if err := fixture.store.Reserve(id); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := fixture.uc.snapshotOutputSchema(id, file); err == nil {
+			t.Fatal("growth during snapshot was accepted")
+		}
+		snapshot, err := store.OutputSchemaPath(root, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := os.Stat(snapshot); !os.IsNotExist(err) {
+			t.Fatalf("partial snapshot remains: %v", err)
+		}
+	})
+}
+
+func TestSubmitExecuteClassifiesSnapshotFailuresWithTaskID(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  func(*SubmitTaskUseCase)
+	}{
+		{"create", func(uc *SubmitTaskUseCase) {
+			uc.outputSchemaOpen = func(string, int, os.FileMode) (*os.File, error) { return nil, errors.New("create") }
+		}},
+		{"copy", func(uc *SubmitTaskUseCase) {
+			uc.outputSchemaCopy = func(io.Writer, io.Reader) (int64, error) { return 0, errors.New("copy") }
+		}},
+		{"close", func(uc *SubmitTaskUseCase) {
+			uc.outputSchemaClose = func(*os.File) error { return errors.New("close") }
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			schema := filepath.Join(t.TempDir(), "source.schema.json")
+			if err := os.WriteFile(schema, []byte("{}"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			fixture := newSubmitFixture()
+			fixture.store.root = t.TempDir()
+			fixture.uc.options = submitOptionsFake{model: "test-model", modelOK: true, effortOK: true, taskPlacementRoot: fixture.store.root}
+			tc.set(fixture.uc)
+			in := validSubmitInput(t)
+			in.OutputSchemaPath = optionalString(schema)
+			_, err := fixture.uc.Execute(context.Background(), in)
+			if len(fixture.store.reserved) != 1 {
+				t.Fatalf("reservations=%v", fixture.store.reserved)
+			}
+			assertSubmitError(t, err, "TASK_DIR_CREATE_FAILED", "error.taskDir.createFailed", map[string]any{"task_id": fixture.store.reserved[0].String()})
+			if len(fixture.store.released) != 1 {
+				t.Fatalf("releases=%v", fixture.store.released)
+			}
+		})
+	}
+}
+
+func TestSubmitErrorClassificationDoesNotUseCatchAll(t *testing.T) {
+	fixture := newSubmitFixture()
+	sentinel := errors.New("sentinel")
+	if got := fixture.uc.mapError(sentinel); !errors.Is(got, sentinel) {
+		t.Fatalf("mapError=%v, want original error", got)
+	}
+	defer func() {
+		if recover() == nil {
+			t.Fatal("submitErrorResponse accepted an unclassified error")
+		}
+	}()
+	_ = submitErrorResponse("request", sentinel)
+}
+
+func TestAcquirePathLocksAfterSnapshotRollsBackSnapshotAndReservation(t *testing.T) {
+	root := t.TempDir()
+	source := filepath.Join(root, "source.schema.json")
+	if err := os.WriteFile(source, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	file, err := validateOutputSchemaPath(domain.SubcommandReview, optionalString(source))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	fixture := newSubmitFixture()
+	fixture.store.root = root
+	fixture.uc.options = submitOptionsFake{model: "test-model", modelOK: true, effortOK: true, taskPlacementRoot: root}
+	id := storeIDForSubmit(t)
+	if err := fixture.store.Reserve(id); err != nil {
+		t.Fatal(err)
+	}
+	snapshot, err := fixture.uc.snapshotOutputSchema(id, file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.locks.err = errors.New("path lock failure")
+	fixture.locks.onAcquire = func() {
+		if _, err := os.Stat(*snapshot); err != nil {
+			t.Fatalf("snapshot was not created before path lock acquisition: %v", err)
+		}
+	}
+	if _, acquired, err := fixture.uc.acquirePathLocksAfterSnapshot(id, []string{"/private/tmp/locked"}, snapshot); err == nil || acquired {
+		t.Fatalf("acquired=%t err=%v", acquired, err)
+	}
+	if len(fixture.store.released) != 1 || fixture.store.released[0] != id {
+		t.Fatalf("releases=%v", fixture.store.released)
+	}
+	if _, err := os.Stat(filepath.Join(root, id.String())); !os.IsNotExist(err) {
+		t.Fatalf("reservation directory remains: %v", err)
+	}
 }
 
 func TestSubmitExecuteSnapshotsOutputSchemaBeforeSourceReplacement(t *testing.T) {

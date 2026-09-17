@@ -103,7 +103,10 @@ func (s *FileTaskStore) Release(id domain.TaskID) error {
 	if e != nil {
 		return e
 	}
-	if e = os.Remove(p.dir()); e != nil {
+	if _, e = os.Lstat(p.dir()); e != nil {
+		return e
+	}
+	if e = os.RemoveAll(p.dir()); e != nil {
 		return e
 	}
 	s.mu.Lock()
