@@ -375,6 +375,9 @@ func writeStatsText(out io.Writer, report metrics.StatsReport) error {
 	if report.OpenFailedFiles > 0 {
 		lines = append(lines, fmt.Sprintf("%s: %d", metrics.MessageKeyStatsOpenFailedFiles, report.OpenFailedFiles))
 	}
+	if report.CloseFailedFiles > 0 {
+		lines = append(lines, fmt.Sprintf("%s: %d", metrics.MessageKeyStatsCloseFailedFiles, report.CloseFailedFiles))
+	}
 	for _, line := range lines {
 		if _, err := fmt.Fprintln(out, line); err != nil {
 			return err

@@ -221,6 +221,13 @@ type statsReadFailureReadCloser struct{ cause error }
 func (r statsReadFailureReadCloser) Read([]byte) (int, error) { return 0, r.cause }
 func (r statsReadFailureReadCloser) Close() error             { return nil }
 
+type statsCloseFailureReadCloser struct {
+	*strings.Reader
+	cause error
+}
+
+func (r statsCloseFailureReadCloser) Close() error { return r.cause }
+
 func withStatsDependencies(t *testing.T, home string, reader store.MetricsReader) {
 	t.Helper()
 	oldHome, oldReader, oldLogger := statsUserHomeDir, newStatsMetricsReader, newStatsLogger
@@ -390,6 +397,96 @@ func TestRunStatsOpenFailedFilesOutputAndExitCode(t *testing.T) { // SCN-metrics
 			t.Fatalf("text = %q", text.String())
 		}
 	})
+}
+
+func TestRunStatsCloseFailedFilesOutputAndExitCode(t *testing.T) { // SCN-metrics-02-22, SCN-metrics-02-24
+	t.Run("json always includes zero", func(t *testing.T) { // SCN-metrics-02-24
+		withStatsDependencies(t, t.TempDir(), statsReaderFake{
+			list: func(string, *string, *string) ([]string, error) { return nil, nil },
+			open: func(string) (io.ReadCloser, error) { t.Fatal("open called"); return nil, nil },
+		})
+		var out bytes.Buffer
+		if code := runStats(context.Background(), []string{"--json"}, &out, io.Discard); code != 0 {
+			t.Fatalf("exit code = %d", code)
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(out.Bytes(), &raw); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := raw["close_failed_files"]; !ok || string(got) != "0" {
+			t.Fatalf("close_failed_files = %q, present = %t", got, ok)
+		}
+	})
+
+	t.Run("text reports nonzero and remains successful", func(t *testing.T) { // SCN-metrics-02-22
+		withStatsDependencies(t, t.TempDir(), statsReaderFake{
+			list: func(string, *string, *string) ([]string, error) { return []string{"failed"}, nil },
+			open: func(string) (io.ReadCloser, error) {
+				return statsCloseFailureReadCloser{Reader: strings.NewReader(""), cause: errors.New("close failed")}, nil
+			},
+		})
+		var text, stderr, logs bytes.Buffer
+		withStatsLogger(t, func(io.Writer) *slog.Logger {
+			return slog.New(slog.NewJSONHandler(&logs, nil))
+		})
+		if code := runStats(context.Background(), nil, &text, &stderr); code != 0 {
+			t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+		}
+		if !strings.Contains(text.String(), metrics.MessageKeyStatsCloseFailedFiles+": 1") {
+			t.Fatalf("text = %q", text.String())
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("unexpected stderr = %q", stderr.String())
+		}
+		assertRunStatsCloseFailureLog(t, logs.Bytes(), "failed")
+	})
+
+	t.Run("text omits zero", func(t *testing.T) { // SCN-metrics-02-24
+		withStatsDependencies(t, t.TempDir(), statsReaderFake{
+			list: func(string, *string, *string) ([]string, error) { return nil, nil },
+			open: func(string) (io.ReadCloser, error) { t.Fatal("open called"); return nil, nil },
+		})
+		var text bytes.Buffer
+		if code := runStats(context.Background(), nil, &text, io.Discard); code != 0 {
+			t.Fatalf("exit code = %d", code)
+		}
+		if strings.Contains(text.String(), metrics.MessageKeyStatsCloseFailedFiles) {
+			t.Fatalf("text = %q", text.String())
+		}
+	})
+}
+
+func assertRunStatsCloseFailureLog(t *testing.T, logs []byte, path string) {
+	t.Helper()
+	decoder := json.NewDecoder(bytes.NewReader(logs))
+	found := false
+	for {
+		var record map[string]any
+		err := decoder.Decode(&record)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("close failure log = %q: %v", logs, err)
+		}
+		if record["code"] == "METRICS_FILE_READ_FAILED" {
+			t.Fatalf("close failure was also logged as a read failure: %#v", record)
+		}
+		if record["code"] != "METRICS_FILE_CLOSE_FAILED" {
+			continue
+		}
+		found = true
+		if record["message_key"] != "error.metrics.fileCloseFailed" || record["path"] != path || record["stage"] != "close" {
+			t.Fatalf("close failure log = %#v", record)
+		}
+		errText, ok := record["error"].(string)
+		if !ok || errText == "" {
+			t.Fatalf("close failure error attribute = %#v, present = %t", record["error"], ok)
+		}
+	}
+	if !found {
+		t.Fatalf("missing METRICS_FILE_CLOSE_FAILED log: %q", logs)
+	}
 }
 
 func assertRunStatsOpenFailureLog(t *testing.T, logs []byte, path string) {

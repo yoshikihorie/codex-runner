@@ -111,6 +111,64 @@ type readFailureReadCloser struct {
 func (r readFailureReadCloser) Read(p []byte) (int, error) { return copy(p, r.data), r.cause }
 func (r readFailureReadCloser) Close() error               { return nil }
 
+type closeFailureMetricsReader struct {
+	files       []string
+	contents    map[string]string
+	closeCauses map[string]error
+}
+
+func (r closeFailureMetricsReader) ListMonthlyFiles(string, *string, *string) ([]string, error) {
+	return r.files, nil
+}
+
+func (r closeFailureMetricsReader) OpenMonthlyFile(path string) (io.ReadCloser, error) {
+	return closeFailureReadCloser{Reader: strings.NewReader(r.contents[path]), cause: r.closeCauses[path]}, nil
+}
+
+type closeFailureReadCloser struct {
+	*strings.Reader
+	cause error
+}
+
+func (r closeFailureReadCloser) Close() error { return r.cause }
+
+type readAndCloseFailureMetricsReader struct {
+	readCause  error
+	closeCause error
+}
+
+func (r readAndCloseFailureMetricsReader) ListMonthlyFiles(string, *string, *string) ([]string, error) {
+	return []string{"read-and-close-failure"}, nil
+}
+
+func (r readAndCloseFailureMetricsReader) OpenMonthlyFile(string) (io.ReadCloser, error) {
+	return readAndCloseFailureReadCloser{readCause: r.readCause, closeCause: r.closeCause}, nil
+}
+
+type readAndCloseFailureReadCloser struct {
+	readCause  error
+	closeCause error
+}
+
+func (r readAndCloseFailureReadCloser) Read([]byte) (int, error) { return 0, r.readCause }
+func (r readAndCloseFailureReadCloser) Close() error             { return r.closeCause }
+
+type readThenCloseFailureMetricsReader struct {
+	readAndCloseFailureMetricsReader
+	closeFailureMetricsReader
+}
+
+func (r readThenCloseFailureMetricsReader) ListMonthlyFiles(string, *string, *string) ([]string, error) {
+	return []string{"read-and-close-failure", "close-failure"}, nil
+}
+
+func (r readThenCloseFailureMetricsReader) OpenMonthlyFile(path string) (io.ReadCloser, error) {
+	if path == "read-and-close-failure" {
+		return r.readAndCloseFailureMetricsReader.OpenMonthlyFile(path)
+	}
+	return r.closeFailureMetricsReader.OpenMonthlyFile(path)
+}
+
 type openFailureMetricsReader struct{ cause error }
 
 func (r openFailureMetricsReader) ListMonthlyFiles(string, *string, *string) ([]string, error) {
@@ -307,7 +365,7 @@ func TestComputeTaskStats_CorruptionLog(t *testing.T) { // T-A17, SCN-06
 }
 
 func TestStatsMessageKeys(t *testing.T) { // T-A18
-	if MessageKeyStatsInvalidDateRange != "error.stats.invalidDateRange" || MessageKeyStatsInvalidSubcommand != "error.stats.invalidSubcommand" || MessageKeyStatsSkippedLines != "info.stats.skippedLines" || MessageKeyStatsReadFailedFiles != "info.stats.readFailedFiles" || MessageKeyStatsOpenFailedFiles != "info.stats.openFailedFiles" || MessageKeyMetricsFileReadFailed != "error.metrics.fileReadFailed" || MessageKeyMetricsFileOpenFailed != "error.metrics.fileOpenFailed" {
+	if MessageKeyStatsInvalidDateRange != "error.stats.invalidDateRange" || MessageKeyStatsInvalidSubcommand != "error.stats.invalidSubcommand" || MessageKeyStatsSkippedLines != "info.stats.skippedLines" || MessageKeyStatsReadFailedFiles != "info.stats.readFailedFiles" || MessageKeyStatsOpenFailedFiles != "info.stats.openFailedFiles" || MessageKeyStatsCloseFailedFiles != "info.stats.closeFailedFiles" || MessageKeyMetricsFileReadFailed != "error.metrics.fileReadFailed" || MessageKeyMetricsFileOpenFailed != "error.metrics.fileOpenFailed" || MessageKeyMetricsFileCloseFailed != "error.metrics.fileCloseFailed" {
 		t.Fatal("unexpected message key")
 	}
 }
@@ -398,6 +456,108 @@ func TestComputeTaskStats_ReadFailureDropsDataAndJoinsSentinelAndCause(t *testin
 	}
 	if !capturedReadFailure(t, handler.records, cause) {
 		t.Fatal("missing joined read failure log")
+	}
+}
+
+func TestComputeTaskStats_CloseFailureKeepsRecordsAndContinues(t *testing.T) { // SCN-metrics-02-22
+	cause := errors.New("injected close failure")
+	handler := &capturedLogHandler{}
+	reader := closeFailureMetricsReader{
+		files: []string{"first", "second"},
+		contents: map[string]string{
+			"first":  statsLine(t, func(r *taskMetricsRecord) { r.Model = "first" }),
+			"second": statsLine(t, func(r *taskMetricsRecord) { r.Model = "second" }),
+		},
+		closeCauses: map[string]error{"first": cause},
+	}
+	report, err := newStatsUseCase(reader, slog.New(handler)).Execute(StatsQuery{})
+	if err != nil || report.CloseFailedFiles != 1 || report.ReadFailedFiles != 0 || report.MatchedFiles != 2 || report.TotalRecords != 2 {
+		t.Fatalf("report = %#v, err = %v", report, err)
+	}
+	for _, model := range []string{"first", "second"} {
+		if report.SuccessRateByModel[model].Total != 1 {
+			t.Fatalf("record for %q was not retained: %#v", model, report.SuccessRateByModel)
+		}
+	}
+	if len(handler.records) != 1 {
+		t.Fatalf("close failure warnings = %d, want 1", len(handler.records))
+	}
+	for _, record := range handler.records {
+		assertCloseFailureRecord(t, record, "first", cause)
+	}
+}
+
+func TestComputeTaskStats_ReadAndCloseFailureCountsOnlyReadFailure(t *testing.T) { // SCN-metrics-02-23
+	handler := &capturedLogHandler{}
+	reader := readAndCloseFailureMetricsReader{readCause: errors.New("injected read failure"), closeCause: errors.New("injected close failure")}
+	report, err := newStatsUseCase(reader, slog.New(handler)).Execute(StatsQuery{})
+	if err != nil || report.ReadFailedFiles != 1 || report.CloseFailedFiles != 0 || report.SkippedLines != 0 || report.TotalRecords != 0 {
+		t.Fatalf("report = %#v, err = %v", report, err)
+	}
+	for _, record := range handler.records {
+		var code string
+		record.Attrs(func(attr slog.Attr) bool {
+			if attr.Key == "code" {
+				code = attr.Value.String()
+			}
+			return true
+		})
+		if code == machineCodeMetricsFileCloseFailed {
+			t.Fatalf("read failure was also logged as a close failure: %#v", record)
+		}
+	}
+	if len(handler.records) != 1 {
+		t.Fatalf("warnings = %d, want only the read failure", len(handler.records))
+	}
+}
+
+func TestComputeTaskStats_ReadFailureDoesNotSuppressLaterCloseFailure(t *testing.T) { // SCN-metrics-02-23, SCN-metrics-02-22
+	readCause := errors.New("injected read failure")
+	closeCause := errors.New("injected close failure")
+	handler := &capturedLogHandler{}
+	reader := readThenCloseFailureMetricsReader{
+		readAndCloseFailureMetricsReader: readAndCloseFailureMetricsReader{readCause: readCause, closeCause: errors.New("first close failure")},
+		closeFailureMetricsReader: closeFailureMetricsReader{
+			files:       []string{"close-failure"},
+			contents:    map[string]string{"close-failure": statsLine(t, nil)},
+			closeCauses: map[string]error{"close-failure": closeCause},
+		},
+	}
+	report, err := newStatsUseCase(reader, slog.New(handler)).Execute(StatsQuery{})
+	if err != nil || report.ReadFailedFiles != 1 || report.CloseFailedFiles != 1 {
+		t.Fatalf("report = %#v, err = %v", report, err)
+	}
+	if len(handler.records) != 2 {
+		t.Fatalf("warnings = %d, want read and close failures", len(handler.records))
+	}
+}
+
+func TestComputeTaskStats_TruncatedGzipMemberReadAndCloseFailureCountsOnlyReadFailure(t *testing.T) { // SCN-metrics-02-23
+	dir := t.TempDir()
+	failedPath := filepath.Join(dir, "task-metrics-2026-01.jsonl.gz")
+	writeDeeplyTruncatedGzipMembers(t, failedPath, statsLine(t, nil), statsLine(t, func(r *taskMetricsRecord) { r.Model = "second-member" }))
+	assertDeeplyTruncatedGzipHasNonEOFReadAndCloseError(t, failedPath)
+
+	handler := &capturedLogHandler{}
+	reader := listedMetricsReader{files: []string{failedPath}, reader: store.NewFileMetricsReader()}
+	report, err := newStatsUseCase(reader, slog.New(handler)).Execute(StatsQuery{})
+	if err != nil || report.ReadFailedFiles != 1 || report.CloseFailedFiles != 0 || report.TotalRecords != 2 {
+		t.Fatalf("report = %#v, err = %v", report, err)
+	}
+	if len(handler.records) != 1 {
+		t.Fatalf("warnings = %d, want only the read failure", len(handler.records))
+	}
+	for _, record := range handler.records {
+		var code string
+		record.Attrs(func(attr slog.Attr) bool {
+			if attr.Key == "code" {
+				code = attr.Value.String()
+			}
+			return true
+		})
+		if code == machineCodeMetricsFileCloseFailed {
+			t.Fatalf("truncated file was also logged as a close failure: %#v", record)
+		}
 	}
 }
 
@@ -512,6 +672,19 @@ func writeTruncatedGzipMembers(t *testing.T, path, first, second string) {
 	}
 }
 
+func writeDeeplyTruncatedGzipMembers(t *testing.T, path, first, second string) {
+	t.Helper()
+	firstMember := gzipMember(t, first)
+	secondMember := gzipMember(t, second)
+	const truncationBytes = 9
+	if len(secondMember) <= truncationBytes {
+		t.Fatalf("second member length = %d, need more than %d", len(secondMember), truncationBytes)
+	}
+	if err := os.WriteFile(path, append(firstMember, secondMember[:len(secondMember)-truncationBytes]...), 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func gzipMember(t *testing.T, contents string) []byte {
 	t.Helper()
 	var member bytes.Buffer
@@ -548,6 +721,31 @@ func assertTruncatedGzipHasNonEOFReadError(t *testing.T, path string) {
 	}
 }
 
+func assertDeeplyTruncatedGzipHasNonEOFReadAndCloseError(t *testing.T, path string) {
+	t.Helper()
+	stream, err := store.NewFileMetricsReader().OpenMonthlyFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reader := bufio.NewReader(stream)
+	if _, err := reader.ReadBytes('\n'); err != nil {
+		t.Fatalf("first member line error = %v", err)
+	}
+	for {
+		_, err := reader.ReadBytes('\n')
+		if err == nil {
+			continue
+		}
+		if errors.Is(err, io.EOF) {
+			t.Fatalf("want non-EOF read error, got %v", err)
+		}
+		break
+	}
+	if err := stream.Close(); err == nil || errors.Is(err, io.EOF) {
+		t.Fatalf("close error = %v, want non-EOF error", err)
+	}
+}
+
 func capturedReadFailure(t *testing.T, records []slog.Record, causes ...error) bool {
 	t.Helper()
 	for _, record := range records {
@@ -577,6 +775,33 @@ func capturedReadFailure(t *testing.T, records []slog.Record, causes ...error) b
 		}
 	}
 	return false
+}
+
+func assertCloseFailureRecord(t *testing.T, record slog.Record, path string, cause error) {
+	t.Helper()
+	var code, messageKey, loggedPath, stage string
+	var loggedErr error
+	record.Attrs(func(attr slog.Attr) bool {
+		switch attr.Key {
+		case "code":
+			code = attr.Value.String()
+		case "message_key":
+			messageKey = attr.Value.String()
+		case "path":
+			loggedPath = attr.Value.String()
+		case "stage":
+			stage = attr.Value.String()
+		case "error":
+			loggedErr, _ = attr.Value.Any().(error)
+		}
+		return true
+	})
+	if code != machineCodeMetricsFileCloseFailed || messageKey != MessageKeyMetricsFileCloseFailed || loggedPath != path || stage != "close" {
+		t.Fatalf("close failure record = %#v", record)
+	}
+	if loggedErr == nil || !errors.Is(loggedErr, ErrMetricsFileCloseFailed) || !errors.Is(loggedErr, cause) {
+		t.Fatalf("close failure error = %v", loggedErr)
+	}
 }
 
 func assertOpenFailureJSONLog(t *testing.T, logs []byte, path string) {
