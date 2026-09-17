@@ -216,12 +216,25 @@ type statsFailWriter struct{}
 
 func (statsFailWriter) Write([]byte) (int, error) { return 0, errors.New("write failed") }
 
+type statsReadFailureReadCloser struct{ cause error }
+
+func (r statsReadFailureReadCloser) Read([]byte) (int, error) { return 0, r.cause }
+func (r statsReadFailureReadCloser) Close() error             { return nil }
+
 func withStatsDependencies(t *testing.T, home string, reader store.MetricsReader) {
 	t.Helper()
-	oldHome, oldReader := statsUserHomeDir, newStatsMetricsReader
+	oldHome, oldReader, oldLogger := statsUserHomeDir, newStatsMetricsReader, newStatsLogger
 	statsUserHomeDir = func() (string, error) { return home, nil }
 	newStatsMetricsReader = func() store.MetricsReader { return reader }
-	t.Cleanup(func() { statsUserHomeDir, newStatsMetricsReader = oldHome, oldReader })
+	newStatsLogger = func(io.Writer) *slog.Logger { return slog.New(slog.NewJSONHandler(io.Discard, nil)) }
+	t.Cleanup(func() { statsUserHomeDir, newStatsMetricsReader, newStatsLogger = oldHome, oldReader, oldLogger })
+}
+
+func withStatsLogger(t *testing.T, logger func(io.Writer) *slog.Logger) {
+	t.Helper()
+	oldLogger := newStatsLogger
+	newStatsLogger = logger
+	t.Cleanup(func() { newStatsLogger = oldLogger })
 }
 
 func TestRunStatsValidationTC1TC2TC3TC8(t *testing.T) {
@@ -259,6 +272,69 @@ func TestRunStatsTC4TC5TC9TC17(t *testing.T) {
 	if runStats(context.Background(), nil, &text, io.Discard) != 0 || strings.Contains(text.String(), metrics.MessageKeyStatsSkippedLines) {
 		t.Fatalf("text=%q", text.String())
 	}
+}
+
+func TestRunStatsReadFailedFilesOutputAndExitCode(t *testing.T) { // SCN-metrics-02-20
+	t.Run("json always includes zero", func(t *testing.T) {
+		withStatsDependencies(t, t.TempDir(), statsReaderFake{
+			list: func(string, *string, *string) ([]string, error) { return nil, nil },
+			open: func(string) (io.ReadCloser, error) { t.Fatal("open called"); return nil, nil },
+		})
+		var out bytes.Buffer
+		if code := runStats(context.Background(), []string{"--json"}, &out, io.Discard); code != 0 {
+			t.Fatalf("exit code = %d", code)
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(out.Bytes(), &raw); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := raw["read_failed_files"]; !ok || string(got) != "0" {
+			t.Fatalf("read_failed_files = %q, present = %t", got, ok)
+		}
+	})
+
+	t.Run("text reports nonzero and remains successful", func(t *testing.T) {
+		withStatsDependencies(t, t.TempDir(), statsReaderFake{
+			list: func(string, *string, *string) ([]string, error) { return []string{"failed"}, nil },
+			open: func(string) (io.ReadCloser, error) {
+				return statsReadFailureReadCloser{cause: errors.New("read failed")}, nil
+			},
+		})
+		var text, stderr, logs bytes.Buffer
+		withStatsLogger(t, func(io.Writer) *slog.Logger {
+			return slog.New(slog.NewJSONHandler(&logs, nil))
+		})
+		if code := runStats(context.Background(), nil, &text, &stderr); code != 0 {
+			t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+		}
+		if !strings.Contains(text.String(), metrics.MessageKeyStatsReadFailedFiles+": 1") {
+			t.Fatalf("text = %q", text.String())
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("unexpected stderr = %q", stderr.String())
+		}
+		var record map[string]any
+		if err := json.Unmarshal(logs.Bytes(), &record); err != nil {
+			t.Fatalf("read failure log = %q: %v", logs.String(), err)
+		}
+		if record["code"] != "METRICS_FILE_READ_FAILED" || record["message_key"] != "error.metrics.fileReadFailed" {
+			t.Fatalf("read failure log = %#v", record)
+		}
+	})
+
+	t.Run("text omits zero", func(t *testing.T) {
+		withStatsDependencies(t, t.TempDir(), statsReaderFake{
+			list: func(string, *string, *string) ([]string, error) { return nil, nil },
+			open: func(string) (io.ReadCloser, error) { t.Fatal("open called"); return nil, nil },
+		})
+		var text bytes.Buffer
+		if code := runStats(context.Background(), nil, &text, io.Discard); code != 0 {
+			t.Fatalf("exit code = %d", code)
+		}
+		if strings.Contains(text.String(), "info.stats.readFailedFiles") {
+			t.Fatalf("text = %q", text.String())
+		}
+	})
 }
 
 func TestRunStatsTC6TC7TC10TC11TC18(t *testing.T) {

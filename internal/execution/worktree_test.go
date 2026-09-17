@@ -743,11 +743,14 @@ func TestEvictWorkDirRetainsMarkerAndReleasesDeathLeaseAfterRemoveFailure(t *tes
 
 func TestEvictWorkDirHandlesMissingDeathLockTaskDirectoryStates(t *testing.T) {
 	tests := []struct {
-		name       string
-		taskIDText string
-		setup      func(t *testing.T, taskDir string)
-		wantDelete bool
-		wantMarker bool
+		name               string
+		taskIDText         string
+		setup              func(t *testing.T, taskDir string)
+		wantDelete         bool
+		wantMarker         bool
+		wantMarkerNotExist bool
+		wantSkipped        []WorktreeSkipped
+		wantRemoves        int
 	}{
 		{
 			name:       "task directory is absent",
@@ -763,8 +766,8 @@ func TestEvictWorkDirHandlesMissingDeathLockTaskDirectoryStates(t *testing.T) {
 					t.Fatal(err)
 				}
 			},
-			wantDelete: true,
-			wantMarker: true,
+			wantMarkerNotExist: true,
+			wantSkipped:        []WorktreeSkipped{{Reason: WorktreeSkipTaskPlacementUnprotected}},
 		},
 		{
 			name:       "task directory is symbolic link",
@@ -814,13 +817,34 @@ func TestEvictWorkDirHandlesMissingDeathLockTaskDirectoryStates(t *testing.T) {
 			}
 
 			out, err := uc.Execute(context.Background(), validInput(TriggerExplicit), []string{path})
-			if err != nil || (len(out.Deleted) == 1) != tt.wantDelete || len(out.Skipped) != 0 {
+			if err != nil || (len(out.Deleted) == 1) != tt.wantDelete || len(out.Skipped) != len(tt.wantSkipped) {
 				t.Fatalf("Execute() = %#v, err=%v", out, err)
+			}
+			for i, want := range tt.wantSkipped {
+				if out.Skipped[i] != (WorktreeSkipped{Path: path, Reason: want.Reason}) {
+					t.Fatalf("Skipped[%d] = %#v, want path=%q reason=%q", i, out.Skipped[i], path, want.Reason)
+				}
 			}
 			markerPath := filepath.Join(taskDir, worktreeEvictionMarkerName)
 			_, markerErr := os.Lstat(markerPath)
 			if (markerErr == nil) != tt.wantMarker {
 				t.Fatalf("marker error = %v, want marker=%t", markerErr, tt.wantMarker)
+			}
+			if tt.wantMarkerNotExist && !errors.Is(markerErr, os.ErrNotExist) {
+				t.Fatalf("marker error = %v, want not exist", markerErr)
+			}
+			removeCount := 0
+			for _, removedPath := range store.removed {
+				if removedPath == path {
+					removeCount++
+				}
+			}
+			wantRemoves := tt.wantRemoves
+			if tt.wantDelete {
+				wantRemoves = 1
+			}
+			if removeCount != wantRemoves {
+				t.Fatalf("Remove(%q) calls = %d, want %d", path, removeCount, wantRemoves)
 			}
 			if tt.wantMarker {
 				info, err := os.Stat(markerPath)
@@ -832,6 +856,78 @@ func TestEvictWorkDirHandlesMissingDeathLockTaskDirectoryStates(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestEvictWorkDirSkipsUnprotectedTaskPlacementWithoutMarkerOrRemoveAndContinues(t *testing.T) {
+	unprotectedID, err := domain.NewTaskID("impl-20260917-120000-a1b2-unprotected")
+	if err != nil {
+		t.Fatal(err)
+	}
+	deletableID, err := domain.NewTaskID("impl-20260917-120001-a1b2-deletable")
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskRoot := t.TempDir()
+	unprotectedTaskDir := filepath.Join(taskRoot, unprotectedID.String())
+	if err := os.MkdirAll(unprotectedTaskDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	deletableTaskDir := filepath.Join(taskRoot, deletableID.String())
+	if err := os.MkdirAll(deletableTaskDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(deletableTaskDir, "task.lock"), nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	store := &fakeWorktreeStore{changes: map[string]bool{}, mtime: map[string]time.Time{}, links: map[string]bool{}, errs: map[string]error{}}
+	root := t.TempDir()
+	unprotectedPath := filepath.Join(root, unprotectedID.String())
+	deletablePath := filepath.Join(root, deletableID.String())
+	store.mtime[unprotectedPath] = validInput(TriggerExplicit).OccurredAt
+	store.mtime[deletablePath] = validInput(TriggerExplicit).OccurredAt
+	locks := NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }), func(id domain.TaskID) string {
+		return filepath.Join(taskRoot, id.String(), "task.lock")
+	})
+	uc, err := NewEvictWorkDirUseCase(store, locks, root, taskRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := uc.Execute(context.Background(), validInput(TriggerExplicit), []string{unprotectedPath, deletablePath})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, deletedPath := range out.Deleted {
+		if deletedPath == unprotectedPath {
+			t.Fatalf("Deleted unexpectedly contains unprotected path %q: %#v", unprotectedPath, out.Deleted)
+		}
+	}
+	if len(out.Skipped) != 1 || out.Skipped[0] != (WorktreeSkipped{Path: unprotectedPath, Reason: WorktreeSkipTaskPlacementUnprotected}) {
+		t.Fatalf("Skipped = %#v, want unprotected path %q with reason %q", out.Skipped, unprotectedPath, WorktreeSkipTaskPlacementUnprotected)
+	}
+	markerPath := filepath.Join(unprotectedTaskDir, worktreeEvictionMarkerName)
+	if _, err := os.Lstat(markerPath); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unprotected marker Lstat(%q) = %v, want not exist", markerPath, err)
+	}
+	unprotectedRemoveCalls, deletableRemoveCalls := 0, 0
+	for _, removedPath := range store.removed {
+		switch removedPath {
+		case unprotectedPath:
+			unprotectedRemoveCalls++
+		case deletablePath:
+			deletableRemoveCalls++
+		}
+	}
+	if unprotectedRemoveCalls != 0 {
+		t.Fatalf("Remove(%q) calls = %d, want 0", unprotectedPath, unprotectedRemoveCalls)
+	}
+	if len(out.Deleted) != 1 || out.Deleted[0] != deletablePath {
+		t.Fatalf("Deleted = %#v, want only %q", out.Deleted, deletablePath)
+	}
+	if deletableRemoveCalls != 1 {
+		t.Fatalf("Remove(%q) calls = %d, want 1", deletablePath, deletableRemoveCalls)
 	}
 }
 

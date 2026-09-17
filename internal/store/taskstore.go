@@ -114,6 +114,14 @@ func (s *FileTaskStore) Release(id domain.TaskID) error {
 	s.mu.Unlock()
 	return nil
 }
+
+// ForgetEvicted removes only the in-memory index after an independently
+// verified, FD-relative placement eviction. It intentionally performs no I/O.
+func (s *FileTaskStore) ForgetEvicted(id domain.TaskID) {
+	s.mu.Lock()
+	delete(s.index, id.String())
+	s.mu.Unlock()
+}
 func (s *FileTaskStore) IsReserved(id domain.TaskID) (bool, error) {
 	p, err := newTaskPaths(s.root, id)
 	if err != nil {

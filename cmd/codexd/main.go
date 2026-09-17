@@ -44,6 +44,7 @@ var (
 	dialAndSend           = client.DialAndSend
 	statsUserHomeDir      = os.UserHomeDir
 	newStatsMetricsReader = func() store.MetricsReader { return store.NewFileMetricsReader() }
+	newStatsLogger        = func(out io.Writer) *slog.Logger { return slog.New(slog.NewJSONHandler(out, nil)) }
 )
 
 const (
@@ -277,7 +278,7 @@ func runStats(ctx context.Context, args []string, stdout, stderr io.Writer) int 
 		reportMainError(stderr, err)
 		return 1
 	}
-	report, err := metrics.NewComputeTaskStatsUseCase(newStatsMetricsReader(), filepath.Join(home, ".claude", "logs")).Execute(query)
+	report, err := metrics.NewComputeTaskStatsUseCase(newStatsMetricsReader(), filepath.Join(home, ".claude", "logs"), newStatsLogger(stderr)).Execute(query)
 	if err != nil {
 		reportMainError(stderr, err)
 		return 1
@@ -367,6 +368,9 @@ func writeStatsText(out io.Writer, report metrics.StatsReport) error {
 	}
 	if report.SkippedLines > 0 {
 		lines = append(lines, fmt.Sprintf("%s: %d", metrics.MessageKeyStatsSkippedLines, report.SkippedLines))
+	}
+	if report.ReadFailedFiles > 0 {
+		lines = append(lines, fmt.Sprintf("%s: %d", metrics.MessageKeyStatsReadFailedFiles, report.ReadFailedFiles))
 	}
 	for _, line := range lines {
 		if _, err := fmt.Fprintln(out, line); err != nil {
@@ -734,6 +738,7 @@ func runMain(ctx context.Context, args []string, stderr io.Writer) error {
 	evictLogsInterval := time.Duration(cfg.LogEvictionScanIntervalSeconds()) * time.Second
 	startBackground(func(ctx context.Context) { deps.evictLogs.Run(ctx, evictLogsInterval) })
 	startBackground(func(ctx context.Context) { deps.evictWorkDir.Run(ctx, evictWorkDirInterval) })
+	startBackground(func(ctx context.Context) { deps.evictTaskPlacement.Run(ctx, evictLogsInterval) })
 
 	var result serveResult
 	serveReturned := false
@@ -770,18 +775,19 @@ func logGitStubUnavailable(logger *slog.Logger, status proc.GitStubPathStatus) {
 }
 
 type daemonDependencies struct {
-	taskStore       *store.FileTaskStore
-	resumeRecoverer recovery.Recoverer
-	adoption        *recovery.AdoptRunningTasksUseCase
-	stall           interface{ Run(context.Context) }
-	reconcile       *recovery.ReconcilePendingUseCase
-	evictLogs       *execution.EvictLogsUseCase
-	evictWorkDir    *execution.EvictWorkDirUseCase
-	watcher         *execution.TimeoutWatcher
-	starter         execution.TaskLifecycleStarter
-	shutdownStarter func(context.Context)
-	finalizer       transport.ShutdownFinalizer
-	serve           func(context.Context, chan<- error) serveResult
+	taskStore          *store.FileTaskStore
+	resumeRecoverer    recovery.Recoverer
+	adoption           *recovery.AdoptRunningTasksUseCase
+	stall              interface{ Run(context.Context) }
+	reconcile          *recovery.ReconcilePendingUseCase
+	evictLogs          *execution.EvictLogsUseCase
+	evictWorkDir       *execution.EvictWorkDirUseCase
+	evictTaskPlacement *execution.EvictTaskPlacementUseCase
+	watcher            *execution.TimeoutWatcher
+	starter            execution.TaskLifecycleStarter
+	shutdownStarter    func(context.Context)
+	finalizer          transport.ShutdownFinalizer
+	serve              func(context.Context, chan<- error) serveResult
 }
 
 // buildDependencies constructs every stateful collaborator once and shares the
@@ -873,6 +879,16 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	if err != nil {
 		return daemonDependencies{}, err
 	}
+	placementStore, err := store.NewTaskPlacementFileStore(taskPlacementRoot)
+	if err != nil {
+		return daemonDependencies{}, err
+	}
+	evictTaskPlacement, err := execution.NewEvictTaskPlacementUseCase(placementStore, rawTasks, execution.TaskPlacementEvictionPolicy{
+		RetentionDays: cfg.TaskPlacementRetentionDays(), DiskBudgetMB: cfg.TotalTaskDiskBudgetMB(), Now: time.Now,
+	}, logger)
+	if err != nil {
+		return daemonDependencies{}, err
+	}
 	orchestrator, err := usecase.NewTaskLifecycleOrchestrator(usecase.TaskLifecycleDependencies{
 		AcquireForChild: execution.AcquireForChild, RecordStarting: usecase.NewRecordTaskStartingUseCase(tasks, writer, logger), CreateWorktree: worktree,
 		Launch: usecase.NewLaunchWithPTYUseCase(processRunner), RecordProcess: usecase.NewRecordTaskProcessUseCase(tasks, writer, logger), FailLaunch: failLaunch,
@@ -908,7 +924,7 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 		result.socketRemoveErr = removeOwnedSocket(cfg.SocketPath(), expected)
 		return result
 	}
-	return daemonDependencies{taskStore: rawTasks, resumeRecoverer: resumeRecoverer, adoption: adoption, stall: stall, reconcile: reconcile, evictLogs: evictLogs, evictWorkDir: evictWorkDir, watcher: watcher, starter: starter, shutdownStarter: starterConcrete.Shutdown, finalizer: transport.NewShutdownFinalizer(connections, tailConns, acceptDone), serve: serve}, nil
+	return daemonDependencies{taskStore: rawTasks, resumeRecoverer: resumeRecoverer, adoption: adoption, stall: stall, reconcile: reconcile, evictLogs: evictLogs, evictWorkDir: evictWorkDir, evictTaskPlacement: evictTaskPlacement, watcher: watcher, starter: starter, shutdownStarter: starterConcrete.Shutdown, finalizer: transport.NewShutdownFinalizer(connections, tailConns, acceptDone), serve: serve}, nil
 }
 
 func newEvictLogsUseCase(cfg config.Config, home, logsDir string, reopenLog func(string) error, liveness *execution.CheckLivenessUseCase, logger *slog.Logger) (*execution.EvictLogsUseCase, error) {

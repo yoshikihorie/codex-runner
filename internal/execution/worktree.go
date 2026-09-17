@@ -28,7 +28,7 @@ const (
 
 const worktreeRootPermission os.FileMode = 0o700
 
-const worktreeEvictionMarkerName = ".eviction-marker"
+const worktreeEvictionMarkerName = storepkg.TaskPlacementEvictionMarkerName
 
 var ErrWorktreeEvicted = errors.New("worktree was evicted")
 
@@ -112,13 +112,14 @@ type WorktreeCandidate struct {
 type WorktreeSkipReason string
 
 const (
-	WorktreeSkipHasGitChanges      WorktreeSkipReason = "has_git_changes"
-	WorktreeSkipStillAlive         WorktreeSkipReason = "still_alive"
-	WorktreeSkipBelowAgeThreshold  WorktreeSkipReason = "below_age_threshold"
-	WorktreeSkipInvalidTaskID      WorktreeSkipReason = "invalid_task_id"
-	WorktreeSkipSymlink            WorktreeSkipReason = "symlink"
-	WorktreeSkipSymlinkCheckFailed WorktreeSkipReason = "symlink_check_failed"
-	WorktreeSkipRemoveFailed       WorktreeSkipReason = "remove_failed"
+	WorktreeSkipHasGitChanges            WorktreeSkipReason = "has_git_changes"
+	WorktreeSkipStillAlive               WorktreeSkipReason = "still_alive"
+	WorktreeSkipBelowAgeThreshold        WorktreeSkipReason = "below_age_threshold"
+	WorktreeSkipInvalidTaskID            WorktreeSkipReason = "invalid_task_id"
+	WorktreeSkipSymlink                  WorktreeSkipReason = "symlink"
+	WorktreeSkipSymlinkCheckFailed       WorktreeSkipReason = "symlink_check_failed"
+	WorktreeSkipRemoveFailed             WorktreeSkipReason = "remove_failed"
+	WorktreeSkipTaskPlacementUnprotected WorktreeSkipReason = "task_placement_unprotected"
 )
 
 type WorktreeSkipped struct {
@@ -397,7 +398,6 @@ func (uc *EvictWorkDirUseCase) deleteWithDeathLease(candidate WorktreeCandidate)
 		return false, &WorktreeSkipped{Path: candidate.Path, Reason: WorktreeSkipStillAlive}
 	}
 
-	writeMarker := false
 	if errors.Is(err, domain.ErrTaskNotFound) {
 		taskDirPath := filepath.Join(uc.taskPlacementRoot, candidate.TaskID.String())
 		info, lstatErr := os.Lstat(taskDirPath)
@@ -414,7 +414,10 @@ func (uc *EvictWorkDirUseCase) deleteWithDeathLease(candidate WorktreeCandidate)
 			uc.logger.Error("reject task directory before worktree eviction", "task_id", candidate.TaskID.String(), "path", candidate.Path, "error", fmt.Errorf("task directory is not a directory"))
 			return false, nil
 		default:
-			writeMarker = true
+			// A present task directory without task.lock has no death lease.  It
+			// must not be modified because task-placement eviction may be in its
+			// final unlink sequence.
+			return false, &WorktreeSkipped{Path: candidate.Path, Reason: WorktreeSkipTaskPlacementUnprotected}
 		}
 	} else if err != nil {
 		uc.logger.Error("acquire worktree death lease", "task_id", candidate.TaskID.String(), "path", candidate.Path, "error", err)
@@ -425,15 +428,12 @@ func (uc *EvictWorkDirUseCase) deleteWithDeathLease(candidate WorktreeCandidate)
 				uc.logger.Error("close worktree death lease", "task_id", candidate.TaskID.String(), "lock_path", uc.locks.resolveLockPath(candidate.TaskID), "error", closeErr)
 			}
 		}()
-		writeMarker = true
 	}
 
-	if writeMarker {
-		markerPath := filepath.Join(uc.taskPlacementRoot, candidate.TaskID.String(), worktreeEvictionMarkerName)
-		if writeErr := writeAtomic(markerPath, nil, 0o600); writeErr != nil {
-			uc.logger.Error("write worktree eviction marker", "task_id", candidate.TaskID.String(), "marker_path", markerPath, "error", writeErr)
-			return false, nil
-		}
+	markerPath := filepath.Join(uc.taskPlacementRoot, candidate.TaskID.String(), worktreeEvictionMarkerName)
+	if writeErr := writeAtomic(markerPath, nil, 0o600); writeErr != nil {
+		uc.logger.Error("write worktree eviction marker", "task_id", candidate.TaskID.String(), "marker_path", markerPath, "error", writeErr)
+		return false, nil
 	}
 	return uc.removeCandidate(candidate)
 }

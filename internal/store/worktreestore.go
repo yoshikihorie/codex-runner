@@ -29,6 +29,7 @@ var (
 	beforeWorktreePublish         = func() error { return nil }
 	afterWorktreeFileCopy         = func(string) error { return nil }
 	removeWorktreeTreeAtFn        = removeWorktreeTreeAt
+	removeTreeFchmod              = syscall.Fchmod
 	gitCommandTimeout             = 30 * time.Second
 )
 
@@ -430,40 +431,58 @@ func renameAtExclusive(parentFD uintptr, source, destination string) error {
 }
 
 func removeWorktreeTreeAt(parentFD uintptr, name string, rootFD uintptr) error {
-	if err := syscall.Fchmod(int(rootFD), 0o700); err != nil {
+	if err := removeTreeContentsAt(int(rootFD), 1, 0, nil); err != nil {
 		return err
-	}
-	readFD, err := syscall.Dup(int(rootFD))
-	if err != nil {
-		return err
-	}
-	root := os.NewFile(uintptr(readFD), name)
-	entries, err := root.ReadDir(-1)
-	closeErr := root.Close()
-	if err != nil {
-		return err
-	}
-	if closeErr != nil {
-		return closeErr
-	}
-	for _, entry := range entries {
-		if entry.IsDir() {
-			childFD, openErr := openAt(int(rootFD), entry.Name(), syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
-			if openErr != nil {
-				return openErr
-			}
-			if removeErr := removeWorktreeTreeAt(uintptr(rootFD), entry.Name(), uintptr(childFD)); removeErr != nil {
-				_ = syscall.Close(childFD)
-				return removeErr
-			}
-			_ = syscall.Close(childFD)
-			continue
-		}
-		if unlinkErr := unlinkAt(int(rootFD), entry.Name(), 0); unlinkErr != nil {
-			return unlinkErr
-		}
 	}
 	return unlinkAt(int(parentFD), name, atRemoveDir)
+}
+
+// removeTreeContentsAt removes entries below rootFD through descriptor-relative
+// operations.  It deliberately leaves rootFD itself in place so callers can
+// preserve protocol files until their own final unlink sequence.
+func removeTreeContentsAt(rootFD, depth, maxDepth int, preserve func(string) bool) error {
+	if maxDepth > 0 && depth > maxDepth {
+		return fmt.Errorf("tree delete depth exceeds %d", maxDepth)
+	}
+	if err := removeTreeFchmod(rootFD, 0o700); err != nil {
+		return err
+	}
+	entries, err := readDirFD(rootFD, "tree delete")
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if preserve != nil && preserve(name) {
+			continue
+		}
+		var st syscall.Stat_t
+		if err := fstatAt(rootFD, name, &st, atSymlinkNoFollow); err != nil {
+			return err
+		}
+		if st.Mode&syscall.S_IFMT == syscall.S_IFDIR {
+			childFD, err := openAt(rootFD, name, syscall.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+			if err != nil {
+				return err
+			}
+			err = removeTreeContentsAt(childFD, depth+1, maxDepth, nil)
+			closeErr := syscall.Close(childFD)
+			if err != nil {
+				return err
+			}
+			if closeErr != nil {
+				return closeErr
+			}
+			if err := unlinkAt(rootFD, name, atRemoveDir); err != nil {
+				return err
+			}
+			continue
+		}
+		if err := unlinkAt(rootFD, name, 0); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func unlinkAt(dirFD int, name string, flags int) error {
