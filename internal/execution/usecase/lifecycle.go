@@ -368,16 +368,8 @@ func (o *TaskLifecycleOrchestrator) handleStartingCancellation(ctx context.Conte
 		o.waitLaunched(taskID, launched)
 		return
 	}
-	o.deps.TaskMu.Lock(taskID)
-	result, confirmErr := o.deps.ConfirmKilled.ExecuteLocked(ctx, execution.ConfirmTaskKilledInput{TaskID: taskID, RawExitCode: 130, Estimated: true, OccurredAt: o.deps.Clock.Now()})
-	o.deps.TaskMu.Unlock(taskID)
-	if confirmErr != nil {
-		o.logger.Warn("confirm killed starting cancellation", "task_id", taskID.String(), "error", confirmErr)
-	}
-	if result.Confirmed {
-		o.deps.ConfirmKilled.ReleaseAfterConfirmation(ctx, result, taskID)
-	}
-	o.waitLaunched(taskID, launched)
+	raw, waitErr := o.waitLaunched(taskID, launched)
+	o.confirmTerminalWithPending(ctx, taskID, raw, waitErr, !send || terminateErr == nil)
 }
 
 func (o *TaskLifecycleOrchestrator) prepareStartingClaim(taskID domain.TaskID, handle *domain.ProcessHandle, generation domain.LifecycleGeneration, claim recovery.SendClaim) bool {
@@ -468,23 +460,34 @@ func (o *TaskLifecycleOrchestrator) handleRecordProcessFailure(ctx context.Conte
 	if terminateErr != nil {
 		o.logger.Warn("terminate after process record failure", "task_id", taskID.String(), "error", terminateErr)
 	}
-	dead, err := o.deps.CheckLiveness.Execute(ctx, taskID)
+	dead, livenessErr := o.deps.CheckLiveness.Execute(ctx, taskID)
 	if ctx.Err() != nil {
 		return
 	}
-
-	resolved := false
-	if err == nil && dead {
+	if dead && livenessErr == nil && o.recordFailureStateIsCancelling(ctx, taskID) {
+		rawExitCode, waitErr := o.waitLaunched(taskID, launched)
 		if ctx.Err() != nil {
 			return
 		}
-		resolved = o.fail(ctx, input, 130, true)
+		if waitErr != nil {
+			rawExitCode = 1
+		}
+		o.fail(ctx, input, rawExitCode, waitErr != nil)
+		return
 	}
 	if ctx.Err() != nil {
 		return
 	}
+	if dead && livenessErr == nil {
+		o.fail(ctx, input, 1, false)
+		if ctx.Err() != nil {
+			return
+		}
+		o.waitLaunched(taskID, launched)
+		return
+	}
 	rawExitCode, waitErr := o.waitLaunched(taskID, launched)
-	if ctx.Err() != nil || resolved {
+	if ctx.Err() != nil {
 		return
 	}
 	estimated := waitErr != nil
@@ -492,6 +495,20 @@ func (o *TaskLifecycleOrchestrator) handleRecordProcessFailure(ctx context.Conte
 		rawExitCode = 1
 	}
 	o.fail(ctx, input, rawExitCode, estimated)
+}
+
+func (o *TaskLifecycleOrchestrator) recordFailureStateIsCancelling(ctx context.Context, taskID domain.TaskID) bool {
+	o.deps.TaskMu.Lock(taskID)
+	defer o.deps.TaskMu.Unlock(taskID)
+	if ctx.Err() != nil {
+		return false
+	}
+	snapshot, err := o.deps.Tasks.Load(taskID)
+	if err != nil {
+		o.logger.Warn("reload task after process record failure", "task_id", taskID.String(), "error", err)
+		return false
+	}
+	return snapshot.State == domain.StateCancelling
 }
 
 func (o *TaskLifecycleOrchestrator) monitorAndFinalize(ctx context.Context, input TaskLifecycleInput, launched *execution.LaunchedProcess) {
@@ -510,6 +527,10 @@ func (o *TaskLifecycleOrchestrator) monitorAndFinalize(ctx context.Context, inpu
 }
 
 func (o *TaskLifecycleOrchestrator) confirmTerminal(ctx context.Context, taskID domain.TaskID, raw int, waitErr error) {
+	o.confirmTerminalWithPending(ctx, taskID, raw, waitErr, true)
+}
+
+func (o *TaskLifecycleOrchestrator) confirmTerminalWithPending(ctx context.Context, taskID domain.TaskID, raw int, waitErr error, registerPendingSent bool) {
 	if ctx.Err() != nil {
 		return
 	}
@@ -629,8 +650,10 @@ preparedOrCancelled:
 		}
 		if killResult.Confirmed {
 			o.deps.ConfirmKilled.ReleaseAfterConfirmation(ctx, killResult, taskID)
-		} else if registerErr := o.deps.Pending.Register(taskID, recovery.PendingSendSent, nil); registerErr != nil {
-			o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
+		} else if registerPendingSent {
+			if registerErr := o.deps.Pending.Register(taskID, recovery.PendingSendSent, nil); registerErr != nil {
+				o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
+			}
 		}
 		return
 	}
