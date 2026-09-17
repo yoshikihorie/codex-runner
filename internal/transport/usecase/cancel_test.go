@@ -88,6 +88,90 @@ func (f *cancelQueueFake) Restore(payload execution.TaskLaunchPayload, index int
 	return nil
 }
 
+type cancelPanickingLogHandler struct {
+	calls int
+}
+
+func (*cancelPanickingLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *cancelPanickingLogHandler) Handle(context.Context, slog.Record) error {
+	h.calls++
+	panic("log write panic")
+}
+func (h *cancelPanickingLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *cancelPanickingLogHandler) WithGroup(string) slog.Handler      { return h }
+
+type cancelQueueReindexLogObservation struct {
+	queueMu            *sync.Mutex
+	reindexLogUnlocked []bool
+}
+
+type cancelQueueUnlockLogHandler struct {
+	next        slog.Handler
+	observation *cancelQueueReindexLogObservation
+}
+
+func (h *cancelQueueUnlockLogHandler) Enabled(ctx context.Context, level slog.Level) bool {
+	return h.next.Enabled(ctx, level)
+}
+func (h *cancelQueueUnlockLogHandler) Handle(ctx context.Context, record slog.Record) error {
+	isQueueReindex := false
+	record.Attrs(func(attr slog.Attr) bool {
+		if attr.Key == "queue_reindex_source" {
+			isQueueReindex = true
+		}
+		return true
+	})
+	if isQueueReindex {
+		unlocked := h.observation.queueMu.TryLock()
+		if unlocked {
+			h.observation.queueMu.Unlock()
+		}
+		h.observation.reindexLogUnlocked = append(h.observation.reindexLogUnlocked, unlocked)
+	}
+	return h.next.Handle(ctx, record)
+}
+func (h *cancelQueueUnlockLogHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return &cancelQueueUnlockLogHandler{next: h.next.WithAttrs(attrs), observation: h.observation}
+}
+func (h *cancelQueueUnlockLogHandler) WithGroup(name string) slog.Handler {
+	return &cancelQueueUnlockLogHandler{next: h.next.WithGroup(name), observation: h.observation}
+}
+
+type cancelQueueReindexLogRecord struct {
+	EventType     string `json:"event_type"`
+	TaskID        string `json:"task_id"`
+	QueuePosition int    `json:"queue_position"`
+	Source        string `json:"queue_reindex_source"`
+}
+
+func queueReindexLogEvents(t *testing.T, logs *bytes.Buffer) []cancelQueueReindexLogRecord {
+	t.Helper()
+	var records []cancelQueueReindexLogRecord
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		if line == "" {
+			continue
+		}
+		var record cancelQueueReindexLogRecord
+		if err := json.Unmarshal([]byte(line), &record); err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, record)
+	}
+	return records
+}
+
+func allQueueReindexLogsUnlocked(observation *cancelQueueReindexLogObservation, count int) bool {
+	if len(observation.reindexLogUnlocked) != count {
+		return false
+	}
+	for _, unlocked := range observation.reindexLogUnlocked {
+		if !unlocked {
+			return false
+		}
+	}
+	return true
+}
+
 type cancelEventsFake struct {
 	events []domain.Event
 	err    error
@@ -410,8 +494,15 @@ func cancelTaskID(t *testing.T) domain.TaskID {
 	return id
 }
 func cancelQueuedPayload(t *testing.T) execution.TaskLaunchPayload {
+	return cancelQueuedPayloadForID(t, "impl-20260811-120000-a1b2-cancel", 1)
+}
+
+func cancelQueuedPayloadForID(t *testing.T, rawID string, position int) execution.TaskLaunchPayload {
 	t.Helper()
-	id := cancelTaskID(t)
+	id, err := domain.NewTaskID(rawID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	slug, err := domain.NewSlug("cancel")
 	if err != nil {
 		t.Fatal(err)
@@ -420,7 +511,7 @@ func cancelQueuedPayload(t *testing.T) execution.TaskLaunchPayload {
 	if err != nil {
 		t.Fatal(err)
 	}
-	task, _, err := domain.NewTask(id, domain.SubcommandImpl, slug, nil, time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC), 1)
+	task, _, err := domain.NewTask(id, domain.SubcommandImpl, slug, nil, time.Date(2026, 8, 11, 12, 0, 0, 0, time.UTC), position)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -450,6 +541,15 @@ func cancelFixtureWithQueueMutexAndSlots(t *testing.T, payload execution.TaskLau
 	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, writer, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), slots, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, &cancelPendingRegistrarFake{})
 	uc := NewCancelTaskUseCase(tasks, queue, queueMu, store.NewTaskMutex(), events, terminator, &cancelTerminationEnsurerFake{}, &cancelPendingRegistrarFake{}, disarmer, confirmer, &cancelStalledTrackerFake{}, &cancelOwnershipFake{}, domain.ClockFunc(func() time.Time { return time.Date(2026, 8, 11, 12, 1, 0, 0, time.UTC) }))
 	return tasks, queue, events, terminator, disarmer, uc
+}
+
+func cancelQueuedUseCase(t *testing.T, queue execution.TaskQueueReader, tasks *cancelStoreFake, logger *slog.Logger) (*cancelEventsFake, *CancelTaskUseCase) {
+	t.Helper()
+	events := &cancelEventsFake{}
+	disarmer := &cancelDisarmerFake{}
+	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, &cancelWriterFake{}, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, &cancelPendingRegistrarFake{})
+	uc := NewCancelTaskUseCase(tasks, queue, &sync.Mutex{}, store.NewTaskMutex(), events, &cancelTerminatorFake{}, &cancelTerminationEnsurerFake{}, &cancelPendingRegistrarFake{}, disarmer, confirmer, &cancelStalledTrackerFake{}, &cancelOwnershipFake{}, domain.ClockFunc(time.Now), logger)
+	return events, uc
 }
 
 func cancelPersistedSnapshot(t *testing.T, state domain.TaskState, withPID bool) domain.TaskSnapshot {
@@ -516,6 +616,99 @@ func TestCancelTaskExecute_QueuedReturnsOneTaskCancelRequestedEvent(t *testing.T
 	event, ok := out.Events[0].(domain.TaskCancelRequested)
 	if !ok || !event.Force || event.RequestedVia != domain.ProtocolVerbCancel || !event.OccurredAt.Equal(at) {
 		t.Fatalf("event=%#v", out.Events[0])
+	}
+}
+
+func TestCancelTaskExecute_QueuedSaveSuccessLogsOnlyCommittedRemoveReindex(t *testing.T) {
+	at := time.Date(2026, 9, 17, 12, 1, 0, 0, time.UTC)
+	payloadA := cancelQueuedPayloadForID(t, "impl-20260917-120000-a1b2-alpha", 1)
+	payloadB := cancelQueuedPayloadForID(t, "impl-20260917-120000-a1b2-bravo", 2)
+	payloadC := cancelQueuedPayloadForID(t, "impl-20260917-120000-a1b2-charlie", 3)
+	queue := execution.NewTaskQueue()
+	queue.Enqueue(payloadA)
+	queue.Enqueue(payloadB)
+	queue.Enqueue(payloadC)
+	tasks := &cancelStoreFake{reserved: true}
+	var logs bytes.Buffer
+	observation := &cancelQueueReindexLogObservation{}
+	unlockHandler := &cancelQueueUnlockLogHandler{next: slog.NewJSONHandler(&logs, nil), observation: observation}
+	events, uc := cancelQueuedUseCase(t, queue, tasks, slog.New(unlockHandler))
+	observation.queueMu = uc.queueMu
+
+	out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payloadB.Task.ID(), OccurredAt: at})
+	position, found, positionErr := queue.QueuePosition(payloadC.Task.ID())
+	records := queueReindexLogEvents(t, &logs)
+	matched, restored := 0, 0
+	for _, record := range records {
+		if record.TaskID == payloadC.Task.ID().String() && record.QueuePosition == 2 && record.Source == "remove" && record.EventType == "TaskQueued" {
+			matched++
+		}
+		if record.Source == "restore" {
+			restored++
+		}
+	}
+	if err != nil || out.State != domain.StateCancelling || positionErr != nil || !found || position != 2 || matched != 1 || restored != 0 || len(records) != 2 || len(events.events) != 1 || !allQueueReindexLogsUnlocked(observation, len(records)) {
+		t.Fatalf("out=%#v err=%v position=%d found=%t positionErr=%v logs=%q events=%#v observation=%#v", out, err, position, found, positionErr, logs.String(), events.events, observation)
+	}
+}
+
+func TestCancelTaskExecute_QueuedSaveFailureLogsOnlyRestoredFinalReindex(t *testing.T) {
+	at := time.Date(2026, 9, 17, 12, 1, 0, 0, time.UTC)
+	payloadA := cancelQueuedPayloadForID(t, "impl-20260917-120000-a1b2-alpha", 1)
+	payloadB := cancelQueuedPayloadForID(t, "impl-20260917-120000-a1b2-bravo", 2)
+	payloadC := cancelQueuedPayloadForID(t, "impl-20260917-120000-a1b2-charlie", 3)
+	queue := execution.NewTaskQueue()
+	queue.Enqueue(payloadA)
+	queue.Enqueue(payloadB)
+	queue.Enqueue(payloadC)
+	saveErr := errors.New("save failed")
+	tasks := &cancelStoreFake{reserved: true, saveErr: saveErr}
+	var logs bytes.Buffer
+	observation := &cancelQueueReindexLogObservation{}
+	unlockHandler := &cancelQueueUnlockLogHandler{next: slog.NewJSONHandler(&logs, nil), observation: observation}
+	_, uc := cancelQueuedUseCase(t, queue, tasks, slog.New(unlockHandler))
+	observation.queueMu = uc.queueMu
+
+	_, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payloadB.Task.ID(), OccurredAt: at})
+	position, found, positionErr := queue.QueuePosition(payloadC.Task.ID())
+	records := queueReindexLogEvents(t, &logs)
+	final, intermediate, removed := 0, 0, 0
+	for _, record := range records {
+		if record.TaskID != payloadC.Task.ID().String() {
+			continue
+		}
+		if record.QueuePosition == 3 && record.Source == "restore" {
+			final++
+		}
+		if record.QueuePosition == 2 {
+			intermediate++
+		}
+		if record.Source == "remove" {
+			removed++
+		}
+	}
+	if !errors.Is(err, saveErr) || positionErr != nil || !found || position != 3 || final != 1 || intermediate != 0 || removed != 0 || len(records) != 3 || !allQueueReindexLogsUnlocked(observation, len(records)) {
+		t.Fatalf("err=%v position=%d found=%t positionErr=%v logs=%q observation=%#v", err, position, found, positionErr, logs.String(), observation)
+	}
+}
+
+func TestCancelTaskExecute_QueueReindexLogFailureIsFailSoft(t *testing.T) {
+	at := time.Date(2026, 9, 17, 12, 1, 0, 0, time.UTC)
+	payloadA := cancelQueuedPayloadForID(t, "impl-20260917-120000-a1b2-alpha", 1)
+	payloadB := cancelQueuedPayloadForID(t, "impl-20260917-120000-a1b2-bravo", 2)
+	payloadC := cancelQueuedPayloadForID(t, "impl-20260917-120000-a1b2-charlie", 3)
+	queue := execution.NewTaskQueue()
+	queue.Enqueue(payloadA)
+	queue.Enqueue(payloadB)
+	queue.Enqueue(payloadC)
+	tasks := &cancelStoreFake{reserved: true}
+	logHandler := &cancelPanickingLogHandler{}
+	_, uc := cancelQueuedUseCase(t, queue, tasks, slog.New(logHandler))
+
+	out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payloadB.Task.ID(), OccurredAt: at})
+	position, found, positionErr := queue.QueuePosition(payloadC.Task.ID())
+	if err != nil || out.State != domain.StateCancelling || tasks.snapshot.State != domain.StateKilled || positionErr != nil || !found || position != 2 || logHandler.calls != 2 {
+		t.Fatalf("out=%#v err=%v snapshot=%#v position=%d found=%t positionErr=%v logHandler=%#v", out, err, tasks.snapshot, position, found, positionErr, logHandler)
 	}
 }
 
@@ -839,6 +1032,20 @@ func TestCancelTaskExecute_LiveAdoptedWithoutPIDRegistersConfirmOnly(t *testing.
 				t.Fatalf("out=%#v err=%v pending=%#v disarmer=%#v terminator=%#v snapshot=%#v", out, err, pending, disarmer, terminator, tasks.snapshot)
 			}
 		})
+	}
+}
+
+func TestCancelTaskHandle_IncompleteProcessIdentityFailsClosedWithoutPersistence(t *testing.T) {
+	payload := cancelQueuedPayload(t)
+	snapshot := cancelPersistedSnapshot(t, domain.StateRunning, true)
+	snapshot.ProcessStartedAt = nil
+	tasks, _, _, terminator, disarmer, uc := cancelFixture(t, payload, false)
+	tasks.reserved = true
+	tasks.snapshot = snapshot
+
+	response := uc.Handle(transport.Request{RequestID: "incomplete-process-identity", TaskID: payload.Task.ID().String(), Params: json.RawMessage(`{}`)})
+	if response.OK || response.Error == nil || response.Error.Code != "CONTRACT_WRITE_FAILED" || response.Error.MessageKey != "error.contract.writeFailed" || tasks.saves != 0 || tasks.snapshot.PID == nil || tasks.snapshot.ProcessStartedAt != nil || tasks.snapshot.State != domain.StateRunning || terminator.calls != 0 || disarmer.calls != 0 {
+		t.Fatalf("response=%#v snapshot=%#v saves=%d terminator=%#v disarmer=%#v", response, tasks.snapshot, tasks.saves, terminator, disarmer)
 	}
 }
 

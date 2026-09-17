@@ -112,14 +112,18 @@ func (uc *CancelTaskUseCase) Execute(ctx context.Context, in CancelTaskInput) (C
 			uc.queueMu.Unlock()
 		}
 	}()
-	payload, index, removed, _ := uc.queue.Remove(in.TaskID, in.OccurredAt)
+	payload, index, removed, removeEvents := uc.queue.Remove(in.TaskID, in.OccurredAt)
 	if removed {
-		out, err := uc.cancelQueued(in, payload, index)
+		out, reindexEvents, reindexSource, err := uc.cancelQueued(in, payload, index, removeEvents)
 		if err != nil {
+			uc.queueMu.Unlock()
+			queueLocked = false
+			uc.logQueueReindexEvents(reindexEvents, reindexSource)
 			return CancelTaskOutput{}, err
 		}
 		uc.queueMu.Unlock()
 		queueLocked = false
+		uc.logQueueReindexEvents(reindexEvents, reindexSource)
 		_, err = uc.confirmer.Execute(ctx, execution.ConfirmTaskKilledInput{TaskID: in.TaskID, RawExitCode: 130, Estimated: true, OccurredAt: in.OccurredAt})
 		return out, err
 	}
@@ -135,11 +139,12 @@ func (uc *CancelTaskUseCase) Execute(ctx context.Context, in CancelTaskInput) (C
 	return uc.cancelPersisted(ctx, in)
 }
 
-func (uc *CancelTaskUseCase) cancelQueued(in CancelTaskInput, payload execution.TaskLaunchPayload, index int) (out CancelTaskOutput, err error) {
+func (uc *CancelTaskUseCase) cancelQueued(in CancelTaskInput, payload execution.TaskLaunchPayload, index int, removeEvents []domain.Event) (out CancelTaskOutput, reindexEvents []domain.Event, reindexSource string, err error) {
 	committed := false
 	defer func() {
 		if !committed {
-			uc.queue.Restore(payload, index, in.OccurredAt)
+			reindexEvents = uc.queue.Restore(payload, index, in.OccurredAt)
+			reindexSource = "restore"
 		}
 	}()
 	if payload.Task == nil || payload.Task.State() != domain.StateQueued {
@@ -148,21 +153,43 @@ func (uc *CancelTaskUseCase) cancelQueued(in CancelTaskInput, payload execution.
 	candidate := *payload.Task
 	events, err := candidate.RequestCancel(in.Force, in.OccurredAt)
 	if err != nil {
-		return CancelTaskOutput{}, err
+		return CancelTaskOutput{}, nil, "", err
 	}
 	snapshot, err := domain.NewTaskSnapshotFromAdmission(&candidate, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, payload.SandboxMode, domain.ExecutionRouteDaemon, in.OccurredAt)
 	if err != nil {
-		return CancelTaskOutput{}, err
+		return CancelTaskOutput{}, nil, "", err
 	}
 	if err := uc.tasks.Save(in.TaskID, snapshot); err != nil {
-		return CancelTaskOutput{}, contractWriteError(err)
+		return CancelTaskOutput{}, nil, "", contractWriteError(err)
 	}
 	committed = true
+	reindexEvents = removeEvents
+	reindexSource = "remove"
 	if err := uc.events.AppendEvent(in.TaskID, events[0]); err != nil {
 		uc.logger.Warn("append cancel event failed (retained cancelling state)", "task_id", in.TaskID.String(), "error", err)
 	}
 	out = CancelTaskOutput{State: domain.StateCancelling, Events: events}
-	return out, nil
+	return out, reindexEvents, reindexSource, nil
+}
+
+func (uc *CancelTaskUseCase) logQueueReindexEvents(events []domain.Event, source string) {
+	for _, event := range events {
+		uc.logQueueReindexEvent(event, source)
+	}
+}
+
+func (uc *CancelTaskUseCase) logQueueReindexEvent(event domain.Event, source string) {
+	// Queue reindex records are observational. A faulty slog handler must not
+	// affect the already committed cancel or rollback outcome.
+	defer func() {
+		_ = recover()
+	}()
+	queued, ok := event.(domain.TaskQueued)
+	if !ok {
+		uc.logger.Warn("queue reindex returned unexpected event", "event_type", event.Type(), "queue_reindex_source", source)
+		return
+	}
+	uc.logger.Info("queue task reindexed", "event_type", queued.Type(), "task_id", queued.TaskID.String(), "queue_position", queued.QueuePosition, "occurred_at", queued.OccurredAt, "queue_reindex_source", source)
 }
 
 func (uc *CancelTaskUseCase) cancelPersisted(ctx context.Context, in CancelTaskInput) (out CancelTaskOutput, err error) {
