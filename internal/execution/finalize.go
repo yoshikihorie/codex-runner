@@ -224,7 +224,7 @@ func (uc *FinalizeTaskUseCase) writeTerminalState(taskID domain.TaskID, exitCode
 			uc.logExitCodeMismatch(taskID, existing, attempted)
 			return nil, fatalErr, false
 		}
-		uc.logger.Error("contract write failed: exit-code validation", "task_id", taskID.String(), "code", machineCodeContractWriteFailed, "stage", "exit-code", "error", fatalErr)
+		uc.logger.Error("contract write failed: exit-code validation", "task_id", taskID.String(), "stage", "exit-code", "error", fatalErr)
 		return nil, fatalErr, false
 	}
 	if writeErr != nil {
@@ -268,7 +268,7 @@ func (uc *FinalizeTaskUseCase) logStructuredContractFailure(taskID domain.TaskID
 }
 
 func (uc *FinalizeTaskUseCase) logExitCodeMismatch(taskID domain.TaskID, existing, attempted int) {
-	uc.logger.Error("contract write failed: exit-code mismatch (fail-closed, not retried)", "task_id", taskID.String(), "code", machineCodeContractWriteFailed, "stage", "exit-code-mismatch", "existing_exit_code", existing, "attempted_exit_code", attempted)
+	uc.logger.Error("contract write failed: exit-code mismatch (fail-closed, not retried)", "task_id", taskID.String(), "stage", "exit-code-mismatch", "existing_exit_code", existing, "attempted_exit_code", attempted)
 }
 
 // Finalize adapts Execute to the recovery orphan-finalizer boundary.

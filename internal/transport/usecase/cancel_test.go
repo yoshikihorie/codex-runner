@@ -481,7 +481,12 @@ func (f *cancelWriterFake) AppendEvent(_ domain.TaskID, e domain.Event) error {
 	return nil
 }
 
-type cancelReaderFake struct{}
+type cancelReaderFake struct {
+	exitCode   int
+	exitExists bool
+	exitErr    error
+	exitReads  int
+}
 
 func (*cancelReaderFake) ReadStderrLog(domain.TaskID) ([]byte, error)          { return nil, nil }
 func (*cancelReaderFake) ReadLastMessage(domain.TaskID) (bool, error)          { return false, nil }
@@ -490,7 +495,10 @@ func (*cancelReaderFake) ReadLastMessageContent(domain.TaskID) ([]byte, error) {
 func (*cancelReaderFake) ReadPartialOutputContent(domain.TaskID) ([]byte, error) {
 	return nil, nil
 }
-func (*cancelReaderFake) ReadExitCode(domain.TaskID) (int, bool, error) { return 0, false, nil }
+func (f *cancelReaderFake) ReadExitCode(domain.TaskID) (int, bool, error) {
+	f.exitReads++
+	return f.exitCode, f.exitExists, f.exitErr
+}
 
 type cancelSlotFake struct{ calls int }
 
@@ -1576,6 +1584,56 @@ func TestCancelTaskHandle_ContractWriteFailureRemainsContractWriteFailed_SCNProt
 	response := uc.Handle(transport.Request{RequestID: "write-failure", TaskID: payload.Task.ID().String(), Params: json.RawMessage(`{}`)})
 	if response.OK || response.Error == nil || response.Error.Code != "CONTRACT_WRITE_FAILED" || response.Error.MessageKey != "error.contract.writeFailed" {
 		t.Fatalf("response=%#v", response)
+	}
+}
+
+func TestCancelTaskHandle_ExitCodeValidationAndWriteFailureClassification_SCNProto0334(t *testing.T) {
+	readErr := errors.New("exit-code read failure")
+	writeErr := errors.New("exit-code write failure")
+	for _, tc := range []struct {
+		name           string
+		reader         cancelReaderFake
+		writeErr       error
+		wantCode       string
+		wantExitWrites int
+		wantLogCause   string
+	}{
+		{"read failure is cancel failed", cancelReaderFake{exitErr: readErr}, nil, "CANCEL_FAILED", 0, "exit-code read failure"},
+		{"mismatch is cancel failed", cancelReaderFake{exitCode: 1, exitExists: true}, nil, "CANCEL_FAILED", 0, "exit-code mismatch: existing=1 attempted=130"},
+		{"write failure is contract write failed", cancelReaderFake{}, writeErr, "CONTRACT_WRITE_FAILED", 1, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := cancelQueuedPayload(t)
+			tasks := &cancelStoreFake{reserved: true, snapshot: cancelPersistedSnapshot(t, domain.StateOrphaned, false)}
+			queueMu := &sync.Mutex{}
+			queue := &cancelQueueFake{payload: payload, index: 1, queueMu: queueMu}
+			acceptEvents := &cancelEventsFake{}
+			writer := &cancelWriterFake{writeExitErr: tc.writeErr}
+			reader := tc.reader
+			disarmer := &cancelDisarmerFake{}
+			confirmer := execution.NewConfirmTaskKilledUseCase(tasks, writer, &reader, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, &cancelPendingRegistrarFake{})
+			uc := NewCancelTaskUseCase(tasks, queue, queueMu, store.NewTaskMutex(), acceptEvents, &cancelTerminatorFake{}, &cancelTerminationEnsurerFake{}, &cancelPendingRegistrarFake{}, disarmer, confirmer, &cancelStalledTrackerFake{}, &cancelOwnershipFake{}, domain.ClockFunc(time.Now))
+			var logs bytes.Buffer
+			uc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+
+			response := uc.Handle(transport.Request{RequestID: tc.name, TaskID: payload.Task.ID().String(), Params: json.RawMessage(`{}`)})
+			if response.OK || response.Error == nil || response.Error.Code != tc.wantCode {
+				t.Fatalf("response=%#v", response)
+			}
+			detail, err := json.Marshal(response.Error.Detail)
+			if err != nil || string(detail) != `{"task_id":"`+payload.Task.ID().String()+`"}` {
+				t.Fatalf("detail=%s err=%v", detail, err)
+			}
+			if tc.wantLogCause != "" && !strings.Contains(logs.String(), tc.wantLogCause) {
+				t.Fatalf("logs=%q, want cause %q", logs.String(), tc.wantLogCause)
+			}
+			if reader.exitReads != 1 || len(writer.exits) != tc.wantExitWrites {
+				t.Fatalf("exit reads=%d writes=%d, want reads=1 writes=%d", reader.exitReads, len(writer.exits), tc.wantExitWrites)
+			}
+			if tasks.saves != 1 || tasks.snapshot.State != domain.StateCancelling || len(acceptEvents.events) != 1 || len(writer.events) != 0 {
+				t.Fatalf("saves=%d state=%s accept events=%d terminal events=%d", tasks.saves, tasks.snapshot.State, len(acceptEvents.events), len(writer.events))
+			}
+		})
 	}
 }
 

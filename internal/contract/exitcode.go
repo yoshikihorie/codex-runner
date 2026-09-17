@@ -28,10 +28,10 @@ func (e *exitCodeMismatchError) Error() string {
 func CheckExitCode(reader ExitCodeReader, taskID domain.TaskID, exitCode domain.ExitCode) (shouldWrite bool, fatalErr error) {
 	existing, exists, err := reader.ReadExitCode(taskID)
 	if err != nil {
-		return false, fmt.Errorf("%w: read exit-code: %w", domain.ErrContractWriteFailed, err)
+		return false, fmt.Errorf("read exit-code: %w", err)
 	}
 	if exists && existing != exitCode.Raw() {
-		return false, fmt.Errorf("%w: %w", domain.ErrContractWriteFailed, &exitCodeMismatchError{existing: existing, attempted: exitCode.Raw()})
+		return false, &exitCodeMismatchError{existing: existing, attempted: exitCode.Raw()}
 	}
 	return !exists, nil
 }

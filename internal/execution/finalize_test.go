@@ -962,6 +962,68 @@ func TestFinalizeTaskUseCaseStructuredContractWriteLogs(t *testing.T) {
 	}
 }
 
+func TestFinalizeTaskUseCaseFatalExitCodeLogsOmitPublicMachineCode(t *testing.T) {
+	now := time.Date(2026, 8, 9, 12, 1, 0, 0, time.UTC)
+	t.Run("read failure log", func(t *testing.T) {
+		s, r, w, _, _, uc := finalizeFixtures(t, domain.StateRunning, now)
+		readErr := errors.New("exit-code read failure")
+		r.exits = []struct {
+			code   int
+			exists bool
+			err    error
+		}{{err: readErr}}
+		capture := &logCapture{}
+		uc.logger = slog.New(capture)
+
+		out, err := uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, now))
+		writes, events := w.snapshot()
+		saves, _ := s.counts()
+		if err == nil || !errors.Is(err, readErr) || len(writes) != 0 || len(events) != 0 || saves != 0 || out.ResultState != domain.StateCompleted {
+			t.Fatalf("out=%+v err=%v writes=%d events=%d saves=%d", out, err, len(writes), len(events), saves)
+		}
+		logs := capture.snapshot()
+		if len(logs) != 1 {
+			t.Fatalf("logs=%#v", logs)
+		}
+		got := logs[0]
+		if got.level != slog.LevelError || got.msg != "contract write failed: exit-code validation" || got.attrs["task_id"] != s.latest.TaskID.String() || got.attrs["stage"] != "exit-code" || !strings.Contains(fmt.Sprint(got.attrs["error"]), readErr.Error()) {
+			t.Fatalf("log=%#v", got)
+		}
+		if _, found := got.attrs["code"]; found {
+			t.Fatalf("unexpected code attribute in log=%#v", got)
+		}
+	})
+
+	t.Run("mismatch log", func(t *testing.T) {
+		s, r, w, _, _, uc := finalizeFixtures(t, domain.StateRunning, now)
+		r.exits = []struct {
+			code   int
+			exists bool
+			err    error
+		}{{code: 1, exists: true}}
+		capture := &logCapture{}
+		uc.logger = slog.New(capture)
+
+		out, err := uc.Execute(context.Background(), finalizeInput(s.latest.TaskID, now))
+		writes, events := w.snapshot()
+		saves, _ := s.counts()
+		if err == nil || len(writes) != 0 || len(events) != 0 || saves != 0 || out.ResultState != domain.StateCompleted {
+			t.Fatalf("out=%+v err=%v writes=%d events=%d saves=%d", out, err, len(writes), len(events), saves)
+		}
+		logs := capture.snapshot()
+		if len(logs) != 1 {
+			t.Fatalf("logs=%#v", logs)
+		}
+		got := logs[0]
+		if got.level != slog.LevelError || got.msg != "contract write failed: exit-code mismatch (fail-closed, not retried)" || got.attrs["task_id"] != s.latest.TaskID.String() || got.attrs["stage"] != "exit-code-mismatch" || got.attrs["existing_exit_code"] != int64(1) || got.attrs["attempted_exit_code"] != int64(0) {
+			t.Fatalf("log=%#v", got)
+		}
+		if _, found := got.attrs["code"]; found {
+			t.Fatalf("unexpected code attribute in log=%#v", got)
+		}
+	})
+}
+
 func TestFinalizeTaskUseCaseTerminalPersistenceFinalizesStalledMetrics(t *testing.T) {
 	now := time.Date(2026, 8, 17, 12, 1, 0, 0, time.UTC)
 	for _, tc := range []struct {

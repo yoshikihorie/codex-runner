@@ -59,6 +59,7 @@ func TestWriteExitCodeIdempotently(t *testing.T) {
 		t.Fatal(err)
 	}
 	writeFailure := errors.New("write")
+	readFailure := errors.New("read")
 	for _, tc := range []struct {
 		name                    string
 		reader                  exitCodeReaderFake
@@ -72,8 +73,8 @@ func TestWriteExitCodeIdempotently(t *testing.T) {
 	}{
 		{"missing writes once", exitCodeReaderFake{}, nil, 0, 1, false, false, false, nil},
 		{"same value skips write", exitCodeReaderFake{existing: 0, exists: true}, nil, 0, 0, false, false, false, nil},
-		{"mismatch fails closed", exitCodeReaderFake{existing: 1, exists: true}, nil, 0, 0, false, true, true, &exitCodeMismatchExpectation{existing: 1, attempted: 0}},
-		{"read failure fails closed", exitCodeReaderFake{err: errors.New("read")}, nil, 0, 0, false, true, true, nil},
+		{"mismatch fails closed", exitCodeReaderFake{existing: 1, exists: true}, nil, 0, 0, false, true, false, &exitCodeMismatchExpectation{existing: 1, attempted: 0}},
+		{"read failure fails closed", exitCodeReaderFake{err: readFailure}, nil, 0, 0, false, true, false, nil},
 		{"write failure is returned separately", exitCodeReaderFake{}, writeFailure, 0, 1, true, false, false, nil},
 		{"requested nonzero value is written", exitCodeReaderFake{}, nil, 137, 1, false, false, false, nil},
 		{"same nonzero value skips write", exitCodeReaderFake{existing: 137, exists: true}, nil, 137, 0, false, false, false, nil},
@@ -87,6 +88,9 @@ func TestWriteExitCodeIdempotently(t *testing.T) {
 			}
 			if tc.writerErr != nil && !errors.Is(writeErr, tc.writerErr) {
 				t.Fatalf("writeErr=%v, want=%v", writeErr, tc.writerErr)
+			}
+			if tc.reader.err != nil && !errors.Is(fatalErr, tc.reader.err) {
+				t.Fatalf("fatalErr=%v, want cause=%v", fatalErr, tc.reader.err)
 			}
 			if reader.calls != 1 {
 				t.Fatalf("reader calls=%d, want=1", reader.calls)

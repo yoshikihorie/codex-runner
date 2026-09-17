@@ -1112,10 +1112,13 @@ func TestResolveRecoveringLockedRejectsExitCodeMismatchWithoutOverwrite(t *testi
 	snapshot := adoptionSnapshot(t, id, domain.StateRecovering)
 	tasks := &adoptionStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}
 	writer := &adoptionWriterFake{}
-	err := resolveRecoveringLocked(tasks, &adoptionReaderFake{exitCode: 1, exitExists: true}, writer, slog.Default(), id, snapshot, true, time.Now())
-	if !errors.Is(err, domain.ErrContractWriteFailed) || writer.exitCodes != 0 || tasks.saves != 0 || len(writer.events) != 0 {
+	var logs bytes.Buffer
+	err := resolveRecoveringLocked(tasks, &adoptionReaderFake{exitCode: 1, exitExists: true}, writer, slog.New(slog.NewJSONHandler(&logs, nil)), id, snapshot, true, time.Now())
+	existing, attempted, mismatch := contract.ExitCodeMismatch(err)
+	if err == nil || errors.Is(err, domain.ErrContractWriteFailed) || !mismatch || existing != 1 || attempted != 0 || writer.exitCodes != 0 || tasks.saves != 0 || len(writer.events) != 0 {
 		t.Fatalf("err=%v writes=%d saves=%d events=%d", err, writer.exitCodes, tasks.saves, len(writer.events))
 	}
+	assertRecoveryLogCodeAbsent(t, logs.String(), "CONTRACT_WRITE_FAILED")
 }
 
 func TestResolveRecoveringLockedReadExitCodeFailureFailsClosed(t *testing.T) {
@@ -1123,10 +1126,13 @@ func TestResolveRecoveringLockedReadExitCodeFailureFailsClosed(t *testing.T) {
 	snapshot := adoptionSnapshot(t, id, domain.StateRecovering)
 	tasks := &adoptionStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}
 	writer := &adoptionWriterFake{}
-	err := resolveRecoveringLocked(tasks, &adoptionReaderFake{exitErr: errors.New("read exit")}, writer, slog.Default(), id, snapshot, true, time.Now())
-	if err == nil || writer.exitCodes != 0 || tasks.saves != 0 || len(writer.events) != 0 {
+	readErr := errors.New("read exit")
+	var logs bytes.Buffer
+	err := resolveRecoveringLocked(tasks, &adoptionReaderFake{exitErr: readErr}, writer, slog.New(slog.NewJSONHandler(&logs, nil)), id, snapshot, true, time.Now())
+	if err == nil || errors.Is(err, domain.ErrContractWriteFailed) || !errors.Is(err, readErr) || writer.exitCodes != 0 || tasks.saves != 0 || len(writer.events) != 0 {
 		t.Fatalf("err=%v writes=%d saves=%d events=%d", err, writer.exitCodes, tasks.saves, len(writer.events))
 	}
+	assertRecoveryLogCodeAbsent(t, logs.String(), "CONTRACT_WRITE_FAILED")
 }
 
 func TestAdoptRunningTasksRecoveringSaveFailureRetryDoesNotRewriteExitCode(t *testing.T) {
