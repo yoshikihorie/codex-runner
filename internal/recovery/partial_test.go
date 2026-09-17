@@ -3,6 +3,7 @@ package recovery
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"strings"
@@ -42,6 +43,19 @@ type partialTestWriter struct {
 	contents []string
 }
 
+type contextObservingHandler struct {
+	key  any
+	seen any
+}
+
+func (*contextObservingHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *contextObservingHandler) Handle(ctx context.Context, _ slog.Record) error {
+	h.seen = ctx.Value(h.key)
+	return nil
+}
+func (h *contextObservingHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *contextObservingHandler) WithGroup(string) slog.Handler      { return h }
+
 func (w *partialTestWriter) WritePartialOutput(_ domain.TaskID, content string) error {
 	w.contents = append(w.contents, content)
 	return w.err
@@ -65,6 +79,24 @@ func TestNewSavePartialOutputUseCaseRejectsNilDependencies(t *testing.T) {
 			}()
 			tc.build()
 		})
+	}
+}
+
+func TestSavePartialOutputUseCasePreservesLogContext(t *testing.T) {
+	key := struct{}{}
+	handler := &contextObservingHandler{key: key}
+	reader := &partialTestReader{stderr: []byte("progress")}
+	writer := &partialTestWriter{err: errors.New("write failed")}
+	uc := NewSavePartialOutputUseCase(reader, writer, slog.New(handler))
+	taskID, err := domain.NewTaskID("impl-20260808-120000-abcd-context-log")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := uc.Execute(context.WithValue(context.Background(), key, "request-context"), SavePartialOutputInput{TaskID: taskID}); err != nil {
+		t.Fatal(err)
+	}
+	if handler.seen != "request-context" {
+		t.Fatalf("handler context value = %#v", handler.seen)
 	}
 }
 
@@ -139,6 +171,7 @@ func TestSavePartialOutputUseCaseExecute(t *testing.T) {
 				assertNotSaved(t, out, err, w)
 				assertLogHas(t, logs, "task_id", "io error")
 				assertLogLacks(t, logs, "secret stderr")
+				assertPartialLogCodeAbsent(t, logs, "CONTRACT_WRITE_FAILED")
 			},
 		},
 		{
@@ -152,6 +185,7 @@ func TestSavePartialOutputUseCaseExecute(t *testing.T) {
 					t.Fatalf("result = (%+v, %v)", out, err)
 				}
 				assertLogHas(t, logs, "write failed")
+				assertPartialLogRecord(t, logs, "CONTRACT_WRITE_FAILED", "error.contract.writeFailed", "write_partial_output", "partial-output.md")
 			},
 		},
 		{
@@ -193,6 +227,7 @@ func TestSavePartialOutputUseCaseExecute(t *testing.T) {
 					t.Fatalf("stderr calls = %d", r.stderrCalls)
 				}
 				assertLogHas(t, logs, "last message io error")
+				assertPartialLogCodeAbsent(t, logs, "CONTRACT_WRITE_FAILED")
 			},
 		},
 		{
@@ -275,10 +310,46 @@ func TestSavePartialOutputUseCaseExecute(t *testing.T) {
 			w := &partialTestWriter{}
 			tt.configure(r, w)
 			var logBuffer bytes.Buffer
-			uc := NewSavePartialOutputUseCase(r, w, slog.New(slog.NewTextHandler(&logBuffer, nil)))
+			uc := NewSavePartialOutputUseCase(r, w, slog.New(slog.NewJSONHandler(&logBuffer, nil)))
 			out, err := uc.Execute(tt.ctx, tt.input)
 			tt.check(t, out, err, r, w, logBuffer.String())
 		})
+	}
+}
+
+func assertPartialLogRecord(t *testing.T, logs, code, messageKey, operation, stage string) {
+	t.Helper()
+	for _, line := range bytes.Split([]byte(logs), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatalf("decode log record %q: %v", line, err)
+		}
+		if record["code"] == code && record["message_key"] == messageKey && record["operation"] == operation && record["stage"] == stage {
+			if err := validateRequiredRecoveryLogFields(record); err != nil {
+				t.Fatalf("incomplete partial log record: %#v", record)
+			}
+			return
+		}
+	}
+	t.Fatalf("log record code=%q message_key=%q operation=%q not found in %s", code, messageKey, operation, logs)
+}
+
+func assertPartialLogCodeAbsent(t *testing.T, logs, code string) {
+	t.Helper()
+	for _, line := range bytes.Split([]byte(logs), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatalf("decode log record %q: %v", line, err)
+		}
+		if record["code"] == code {
+			t.Fatalf("unexpected code=%q in %#v", code, record)
+		}
 	}
 }
 

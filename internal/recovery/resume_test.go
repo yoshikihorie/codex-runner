@@ -1,8 +1,11 @@
 package recovery
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -186,8 +189,49 @@ func TestResumeRecovererAllowsNilSessionRef(t *testing.T) {
 		t.Fatal(err)
 	}
 	result, err := recoverer.Resume(context.Background(), recoveryTestTaskID(t), nil, domain.RecoveryOriginTimeout, ResumeSettings{})
-	if err != nil || result != (RecoveryResult{}) || launcher.calls != 0 {
+	if !errors.Is(err, errRecoverySessionUnavailable) || result.Succeeded || result.ExitCode.Raw() == domain.NewExitCode(0).Raw() || launcher.calls != 0 {
 		t.Fatalf("result=(%+v, %v), launches=%d", result, err, launcher.calls)
+	}
+}
+
+func TestRecoverViaResumeUseCaseLogsTimeoutImplResumeSkip(t *testing.T) {
+	session := recoveryTestSession(t)
+	uc, store, _, recoverer, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	store.snapshot.Subcommand = domain.SubcommandImpl
+	var logs bytes.Buffer
+	uc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
+	if err != nil || out.Succeeded || recoverer.calls != 0 {
+		t.Fatalf("out=(%+v,%v), resumes=%d", out, err, recoverer.calls)
+	}
+	assertRecoveryLogRecordWithoutCode(t, logs.String(), "resume skipped to avoid duplicate impl application", "skip_resume", "resume")
+	assertRecoveryLogCodeAbsent(t, logs.String(), "RECOVERY_SESSION_UNAVAILABLE")
+}
+
+func TestRecoverViaResumeUseCasePreservesLogContextThroughFinish(t *testing.T) {
+	key := struct{}{}
+	handler := &contextObservingHandler{key: key}
+	session := recoveryTestSession(t)
+	uc, _, writer, _, _, _, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	writer.exitCodeErr = errors.New("exit write failed")
+	uc.logger = slog.New(handler)
+	if _, err := uc.Execute(context.WithValue(context.Background(), key, "request-context"), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()}); err != nil {
+		t.Fatal(err)
+	}
+	if handler.seen != "request-context" {
+		t.Fatalf("handler context value = %#v", handler.seen)
+	}
+}
+
+func TestResumeRecovererClassifiesMissingLastMessageAsSessionUnavailable(t *testing.T) {
+	recoverer, err := NewResumeRecoverer(&resumeLauncherFake{}, &resumeReaderFake{}, "/usr/local/bin/codex", t.TempDir(), domain.ClockFunc(time.Now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := recoveryTestSession(t)
+	result, err := recoverer.Resume(context.Background(), recoveryTestTaskID(t), &session, domain.RecoveryOriginTimeout, ResumeSettings{Subcommand: domain.SubcommandImpl})
+	if result.Succeeded || !errors.Is(err, errRecoverySessionUnavailable) {
+		t.Fatalf("result=(%+v, %v)", result, err)
 	}
 }
 
@@ -293,10 +337,14 @@ type recoveryStoreFake struct {
 	saveErr   error
 	saveErrOn int
 	saveHook  func(int)
+	loadHook  func(int)
 }
 
 func (f *recoveryStoreFake) Load(domain.TaskID) (domain.TaskSnapshot, error) {
 	f.loads++
+	if f.loadHook != nil {
+		f.loadHook(f.loads)
+	}
 	return f.snapshot, nil
 }
 
@@ -715,6 +763,8 @@ func TestRecoverViaResumeUseCaseSaveFailureIsNotTerminal(t *testing.T) {
 	session := recoveryTestSession(t)
 	uc, store, writer, recoverer, recorded, slots, mutex := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
 	store.saveErr, store.saveErrOn = errors.New("save failed"), 2
+	var logs bytes.Buffer
+	uc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 
 	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
 	if err == nil || err.Error() != "recovery: terminal transition was not persisted" {
@@ -729,6 +779,7 @@ func TestRecoverViaResumeUseCaseSaveFailureIsNotTerminal(t *testing.T) {
 	if slots.calls != 0 {
 		t.Fatalf("slot released despite unpersisted terminal state: calls=%d", slots.calls)
 	}
+	assertRecoveryLogRecordWithStage(t, logs.String(), "CONTRACT_WRITE_FAILED", "error.contract.writeFailed", "save_task", "task.json")
 	if writer.exitCodeCalls != 0 {
 		t.Fatalf("exit code written despite unpersisted terminal state: calls=%d", writer.exitCodeCalls)
 	}
@@ -910,6 +961,8 @@ func TestRecoverViaResumeUseCaseSchemaInspectionFailureUsesOriginOutcome(t *test
 
 func TestRecoverViaResumeUseCaseNilSessionTransitionsToTimeoutLostWithoutResume(t *testing.T) {
 	uc, store, writer, recoverer, recorded, slots, mutex := newRecoveryUseCaseFixture(t, domain.StateTimeout, nil, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
+	var logs bytes.Buffer
+	uc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
 	if err != nil || out.Succeeded || out.ExitCode.Raw() != 6 || out.FinalState != domain.StateTimeoutLost || recoverer.calls != 0 || slots.calls != 1 || mutex.locks != 2 || mutex.unlocks != 2 {
 		t.Fatalf("result=(%+v, %v), resume=%d slots=%d locks=%d unlocks=%d", out, err, recoverer.calls, slots.calls, mutex.locks, mutex.unlocks)
@@ -922,6 +975,7 @@ func TestRecoverViaResumeUseCaseNilSessionTransitionsToTimeoutLostWithoutResume(
 	if attempted.SessionRef != nil || failed.Origin != domain.RecoveryOriginTimeout {
 		t.Fatalf("attempted=%#v failed=%#v", attempted, failed)
 	}
+	assertRecoveryLogRecord(t, logs.String(), "RECOVERY_SESSION_UNAVAILABLE", "error.recovery.sessionUnavailable", "resume")
 }
 
 func TestRecoverViaResumeUseCaseOrphanFailureKeepsFailureExitCode(t *testing.T) {
@@ -953,6 +1007,8 @@ func TestRecoverViaResumeUseCaseOrphanFailureKeepsFailureExitCode(t *testing.T) 
 func TestRecoverViaResumeUseCaseRejectsInvalidStateWithoutSideEffects(t *testing.T) {
 	session := recoveryTestSession(t)
 	uc, store, writer, recoverer, recorded, slots, mutex := newRecoveryUseCaseFixture(t, domain.StateRunning, &session, RecoveryResult{})
+	var logs bytes.Buffer
+	uc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 	_, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
 	if !errors.Is(err, domain.ErrInvalidStateTransition) {
 		t.Fatalf("error = %v", err)
@@ -960,6 +1016,7 @@ func TestRecoverViaResumeUseCaseRejectsInvalidStateWithoutSideEffects(t *testing
 	if store.saves != 0 || len(writer.events) != 0 || recoverer.calls != 0 || len(recorded.inputs) != 0 || slots.calls != 0 || mutex.locks != 1 || mutex.unlocks != 1 {
 		t.Fatalf("unexpected side effects: saves=%d events=%d resume=%d metrics=%d slots=%d locks=%d unlocks=%d", store.saves, len(writer.events), recoverer.calls, len(recorded.inputs), slots.calls, mutex.locks, mutex.unlocks)
 	}
+	assertRecoveryLogRecord(t, logs.String(), "TASK_INVALID_TRANSITION", "error.task.invalidTransition", "begin")
 }
 
 func TestRecoverViaResumeUseCaseCompletionTimeIsTakenAfterResume(t *testing.T) {
@@ -979,6 +1036,8 @@ func TestRecoverViaResumeUseCaseTimeoutDuringResumeFailsTerminally(t *testing.T)
 	session := recoveryTestSession(t)
 	uc, _, writer, recoverer, recorded, slots, _ := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
 	recoverer.err = context.DeadlineExceeded
+	var logs bytes.Buffer
+	uc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 	writer.stderr = []byte("incomplete output")
 	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
 	if err != nil || out.Succeeded || out.FinalState != domain.StateTimeoutLost || writer.partialCalls != 1 || slots.calls != 1 || len(recorded.inputs) != 1 {
@@ -990,6 +1049,7 @@ func TestRecoverViaResumeUseCaseTimeoutDuringResumeFailsTerminally(t *testing.T)
 	if writer.exitCodeCalls != 1 || writer.exitCode.Raw() != 6 {
 		t.Fatalf("exit code writes=%d code=%d", writer.exitCodeCalls, writer.exitCode.Raw())
 	}
+	assertRecoveryLogRecord(t, logs.String(), "RECOVERY_SESSION_UNAVAILABLE", "error.recovery.sessionUnavailable", "resume")
 }
 
 func TestRecoverViaResumeUseCaseWriterFailuresDoNotSkipMetricsOrSlotRelease(t *testing.T) {
@@ -997,10 +1057,108 @@ func TestRecoverViaResumeUseCaseWriterFailuresDoNotSkipMetricsOrSlotRelease(t *t
 	uc, _, writer, _, recorded, slots, mutex := newRecoveryUseCaseFixture(t, domain.StateTimeout, &session, RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)})
 	writer.markerErr = errors.New("marker write failed")
 	writer.appendErr = errors.New("event append failed")
+	writer.exitCodeErr = errors.New("exit code write failed")
+	var logs bytes.Buffer
+	uc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
 	out, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()})
 	if err != nil || !out.Succeeded || out.FinalState != domain.StateRecovered || len(recorded.inputs) != 1 || slots.calls != 1 || mutex.locks != 2 || mutex.unlocks != 2 {
 		t.Fatalf("result=(%+v, %v), metrics=%+v slots=%d locks=%d unlocks=%d", out, err, recorded.inputs, slots.calls, mutex.locks, mutex.unlocks)
 	}
+	assertRecoveryLogRecord(t, logs.String(), "CONTRACT_WRITE_FAILED", "error.contract.writeFailed", "write_recovered_marker")
+	assertRecoveryLogRecord(t, logs.String(), "CONTRACT_WRITE_FAILED", "error.contract.writeFailed", "write_exit_code")
+	assertRecoveryLogRecord(t, logs.String(), "CONTRACT_WRITE_FAILED", "error.contract.writeFailed", "append_event")
+}
+
+func TestRecoverViaResumeUseCaseLogsTerminalTransitionRejections(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		state  domain.TaskState
+		result RecoveryResult
+		op     string
+	}{
+		{name: "complete", state: domain.StateTimeout, result: RecoveryResult{Succeeded: true, ExitCode: domain.NewExitCode(0)}, op: "complete"},
+		{name: "fail", state: domain.StateOrphaned, result: RecoveryResult{ExitCode: domain.NewExitCode(1)}, op: "fail"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session := recoveryTestSession(t)
+			uc, store, _, _, _, _, _ := newRecoveryUseCaseFixture(t, tc.state, &session, tc.result)
+			store.loadHook = func(load int) {
+				if load == 2 {
+					store.snapshot = recoverySnapshot(t, domain.StateRunning, &session)
+				}
+			}
+			var logs bytes.Buffer
+			uc.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+			if _, err := uc.Execute(context.Background(), RecoverViaResumeInput{TaskID: recoveryTestTaskID(t), SessionRef: &session, Origin: domain.RecoveryOriginTimeout, OccurredAt: time.Now()}); err == nil {
+				t.Fatal("expected terminal transition failure")
+			}
+			assertRecoveryLogRecord(t, logs.String(), "TASK_INVALID_TRANSITION", "error.task.invalidTransition", tc.op)
+		})
+	}
+}
+
+func assertRecoveryLogRecord(t *testing.T, logs, code, messageKey, operation string) {
+	assertRecoveryLogRecordWithStage(t, logs, code, messageKey, operation, "")
+}
+
+func assertRecoveryLogRecordWithStage(t *testing.T, logs, code, messageKey, operation, stage string) {
+	t.Helper()
+	for _, line := range bytes.Split([]byte(logs), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatalf("decode log record %q: %v", line, err)
+		}
+		if record["code"] == code && record["message_key"] == messageKey && record["operation"] == operation && (stage == "" || record["stage"] == stage) {
+			if err := validateRequiredRecoveryLogFields(record); err != nil {
+				t.Fatalf("incomplete recovery log record: %#v", record)
+			}
+			return
+		}
+	}
+	t.Fatalf("log record code=%q message_key=%q operation=%q not found in %s", code, messageKey, operation, logs)
+}
+
+func assertRecoveryLogCodeAbsent(t *testing.T, logs, code string) {
+	t.Helper()
+	for _, line := range bytes.Split([]byte(logs), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatalf("decode log record %q: %v", line, err)
+		}
+		if record["code"] == code {
+			t.Fatalf("unexpected code=%q in %#v", code, record)
+		}
+	}
+}
+
+func assertRecoveryLogRecordWithoutCode(t *testing.T, logs, message, operation, stage string) {
+	t.Helper()
+	for _, line := range bytes.Split([]byte(logs), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var record map[string]any
+		if err := json.Unmarshal(line, &record); err != nil {
+			t.Fatalf("decode log record %q: %v", line, err)
+		}
+		if record["msg"] == message && record["operation"] == operation && record["stage"] == stage {
+			taskID, ok := record["task_id"].(string)
+			if !ok || taskID == "" {
+				t.Fatalf("incomplete recovery skip record: %#v", record)
+			}
+			if _, found := record["code"]; found {
+				t.Fatalf("unexpected code in recovery skip record: %#v", record)
+			}
+			return
+		}
+	}
+	t.Fatalf("skip record not found in %s", logs)
 }
 
 func TestRecoverViaResumeUseCaseRejectsInvalidOriginBeforeLocking(t *testing.T) {

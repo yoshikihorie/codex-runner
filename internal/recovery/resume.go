@@ -2,6 +2,7 @@ package recovery
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -145,9 +146,13 @@ func NewResumeRecoverer(launcher ResumeLauncher, reader ContractReader, codexBin
 }
 func (r *resumeRecoverer) Resume(ctx context.Context, taskID domain.TaskID, sessionRef *domain.SessionRef, origin domain.RecoveryOrigin, settings ResumeSettings) (RecoveryResult, error) {
 	if sessionRef == nil {
-		return RecoveryResult{}, nil
+		return RecoveryResult{ExitCode: failureExitCodeFor(origin)}, errRecoverySessionUnavailable
 	}
-	return (&RecoveryAttempt{TaskID: taskID, Origin: origin, SessionRef: *sessionRef, StartedAt: r.clock.Now(), CodexBinaryPath: r.codexBinaryPath, TaskPlacementRoot: r.taskPlacementRoot, Subcommand: settings.Subcommand, SandboxMode: settings.SandboxMode, Model: settings.Model, ReasoningEffort: settings.ReasoningEffort}).Attempt(ctx, r.launcher, r.reader)
+	result, err := (&RecoveryAttempt{TaskID: taskID, Origin: origin, SessionRef: *sessionRef, StartedAt: r.clock.Now(), CodexBinaryPath: r.codexBinaryPath, TaskPlacementRoot: r.taskPlacementRoot, Subcommand: settings.Subcommand, SandboxMode: settings.SandboxMode, Model: settings.Model, ReasoningEffort: settings.ReasoningEffort}).Attempt(ctx, r.launcher, r.reader)
+	if err != nil || result.Succeeded {
+		return result, err
+	}
+	return result, errRecoverySessionUnavailable
 }
 
 type recoveryContractWriter interface {
@@ -211,7 +216,7 @@ func (uc *RecoverViaResumeUseCase) Execute(ctx context.Context, in RecoverViaRes
 		return RecoverViaResumeOutput{}, ErrRecoveryAlreadyInFlight
 	}
 	defer release()
-	origin, settings, err := uc.begin(in)
+	origin, settings, err := uc.begin(ctx, in)
 	if err != nil {
 		return RecoverViaResumeOutput{}, err
 	}
@@ -219,10 +224,18 @@ func (uc *RecoverViaResumeUseCase) Execute(ctx context.Context, in RecoverViaRes
 	if in.SessionRef != nil && !(settings.Subcommand == domain.SubcommandImpl && origin == domain.RecoveryOriginTimeout) {
 		resumeResult, resumeErr := uc.recoverer.Resume(ctx, in.TaskID, in.SessionRef, origin, settings)
 		if resumeErr != nil {
-			uc.logger.Warn("resume recovery failed", "task_id", in.TaskID.String(), "error", resumeErr)
+			if isRecoverySessionUnavailable(resumeErr) {
+				logRecoveryError(ctx, uc.logger, slog.LevelWarn, "resume recovery session unavailable", machineCodeRecoverySessionUnavailable, messageKeyRecoverySessionUnavailable, in.TaskID, "resume", "attempt", resumeErr)
+			} else {
+				uc.logger.Log(ctx, slog.LevelWarn, "resume recovery failed", "task_id", in.TaskID.String(), "error", resumeErr)
+			}
 		} else {
 			result = resumeResult
 		}
+	} else if in.SessionRef == nil {
+		logRecoveryError(ctx, uc.logger, slog.LevelWarn, "resume recovery session unavailable", machineCodeRecoverySessionUnavailable, messageKeyRecoverySessionUnavailable, in.TaskID, "resume", "attempt", errRecoverySessionUnavailable)
+	} else {
+		logRecoveryInfo(ctx, uc.logger, "resume skipped to avoid duplicate impl application", in.TaskID, "skip_resume", "resume")
 	}
 	completedAt := uc.clock.Now()
 	cleanupCtx := context.WithoutCancel(ctx)
@@ -237,7 +250,7 @@ func (uc *RecoverViaResumeUseCase) Execute(ctx context.Context, in RecoverViaRes
 	return output, nil
 }
 
-func (uc *RecoverViaResumeUseCase) begin(in RecoverViaResumeInput) (domain.RecoveryOrigin, ResumeSettings, error) {
+func (uc *RecoverViaResumeUseCase) begin(ctx context.Context, in RecoverViaResumeInput) (domain.RecoveryOrigin, ResumeSettings, error) {
 	uc.taskMu.Lock(in.TaskID)
 	defer uc.taskMu.Unlock(in.TaskID)
 	snapshot, err := uc.tasks.Load(in.TaskID)
@@ -250,6 +263,9 @@ func (uc *RecoverViaResumeUseCase) begin(in RecoverViaResumeInput) (domain.Recov
 	}
 	events, err := task.BeginRecovery(in.SessionRef, in.OccurredAt)
 	if err != nil {
+		if errors.Is(err, domain.ErrInvalidStateTransition) {
+			logRecoveryError(ctx, uc.logger, slog.LevelWarn, "begin recovery state transition rejected", machineCodeTaskInvalidTransition, messageKeyTaskInvalidTransition, in.TaskID, "begin", "transition", err)
+		}
 		return "", ResumeSettings{}, err
 	}
 	attempted := events[0].(domain.RecoveryAttempted)
@@ -258,11 +274,12 @@ func (uc *RecoverViaResumeUseCase) begin(in RecoverViaResumeInput) (domain.Recov
 		return "", ResumeSettings{}, err
 	}
 	if err := uc.tasks.Save(in.TaskID, updated); err != nil {
+		logRecoveryError(ctx, uc.logger, slog.LevelError, "save recovery state failed", machineCodeContractWriteFailed, messageKeyContractWriteFailed, in.TaskID, "save_task", "task.json", err)
 		return "", ResumeSettings{}, err
 	}
 	writer := uc.contract
 	if err := writer.AppendEvent(in.TaskID, attempted); err != nil {
-		uc.logger.Warn("append recovery attempted event failed", "task_id", in.TaskID.String(), "error", err)
+		logRecoveryError(ctx, uc.logger, slog.LevelWarn, "append recovery attempted event failed", machineCodeContractWriteFailed, messageKeyContractWriteFailed, in.TaskID, "append_event", "events.jsonl", err)
 	}
 	return attempted.Origin, newResumeSettings(snapshot), nil
 }
@@ -284,42 +301,48 @@ func (uc *RecoverViaResumeUseCase) finish(ctx context.Context, in RecoverViaResu
 	if result.Succeeded {
 		events, err = task.CompleteRecovery(result.ExitCode, at)
 		if err != nil {
+			if errors.Is(err, domain.ErrInvalidStateTransition) {
+				logRecoveryError(ctx, uc.logger, slog.LevelWarn, "complete recovery state transition rejected", machineCodeTaskInvalidTransition, messageKeyTaskInvalidTransition, in.TaskID, "complete", "transition", err)
+			}
 			return RecoverViaResumeOutput{}, false
 		}
 	} else {
 		if origin == domain.RecoveryOriginTimeout {
 			partialResult, partialErr := uc.partial.Execute(ctx, SavePartialOutputInput{TaskID: in.TaskID, OccurredAt: at})
 			if partialErr != nil {
-				uc.logger.Warn("save partial output failed", "task_id", in.TaskID.String(), "error", partialErr)
+				uc.logger.Log(ctx, slog.LevelWarn, "save partial output failed", "task_id", in.TaskID.String(), "error", partialErr)
 			}
 			partialSaved = partialResult.Saved
 		}
 		events, err = task.FailRecovery(partialSaved, at)
 		if err != nil {
+			if errors.Is(err, domain.ErrInvalidStateTransition) {
+				logRecoveryError(ctx, uc.logger, slog.LevelWarn, "fail recovery state transition rejected", machineCodeTaskInvalidTransition, messageKeyTaskInvalidTransition, in.TaskID, "fail", "transition", err)
+			}
 			return RecoverViaResumeOutput{}, false
 		}
 	}
 	updated, snapshotErr := snapshot.WithTask(task, at)
 	if snapshotErr != nil {
-		uc.logger.Error("build recovery terminal snapshot failed", "task_id", in.TaskID.String(), "error", snapshotErr)
+		uc.logger.Log(ctx, slog.LevelError, "build recovery terminal snapshot failed", "task_id", in.TaskID.String(), "error", snapshotErr)
 		return RecoverViaResumeOutput{}, false
 	}
 	output := RecoverViaResumeOutput{Succeeded: result.Succeeded, ExitCode: result.ExitCode, PartialOutputSaved: partialSaved, FinalState: task.State()}
 	if err := uc.tasks.Save(in.TaskID, updated); err != nil {
-		uc.logger.Error("save recovery terminal state failed", "task_id", in.TaskID.String(), "error", err)
+		logRecoveryError(ctx, uc.logger, slog.LevelError, "save recovery terminal state failed", machineCodeContractWriteFailed, messageKeyContractWriteFailed, in.TaskID, "save_task", "task.json", err)
 		return RecoverViaResumeOutput{}, false
 	}
 	if result.Succeeded {
 		if err := writer.WriteRecoveredMarker(in.TaskID, at); err != nil {
-			uc.logger.Warn("write recovered marker failed", "task_id", in.TaskID.String(), "error", err)
+			logRecoveryError(ctx, uc.logger, slog.LevelWarn, "write recovered marker failed", machineCodeContractWriteFailed, messageKeyContractWriteFailed, in.TaskID, "write_recovered_marker", "recovered-after-timeout", err)
 		}
 	}
 	if err := writer.WriteExitCode(in.TaskID, result.ExitCode); err != nil {
-		uc.logger.Warn("write recovery exit code failed", "task_id", in.TaskID.String(), "error", err)
+		logRecoveryError(ctx, uc.logger, slog.LevelWarn, "write recovery exit code failed", machineCodeContractWriteFailed, messageKeyContractWriteFailed, in.TaskID, "write_exit_code", "exit-code", err)
 	}
 	for _, event := range events {
 		if err := writer.AppendEvent(in.TaskID, event); err != nil {
-			uc.logger.Warn("append recovery event failed", "task_id", in.TaskID.String(), "event_type", event.Type(), "error", err)
+			logRecoveryError(ctx, uc.logger, slog.LevelWarn, "append recovery event failed", machineCodeContractWriteFailed, messageKeyContractWriteFailed, in.TaskID, "append_event", "events.jsonl", err)
 		}
 	}
 	return output, true

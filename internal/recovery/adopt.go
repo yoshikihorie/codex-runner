@@ -478,7 +478,7 @@ func resolveRecoveringLockedWithContext(ctx context.Context, tasks AdoptionTaskS
 			if ctx.Err() != nil {
 				return nil, false
 			}
-			logger.Error("write recovered marker failed", "task_id", taskID.String(), "error", err)
+			logRecoveryError(ctx, logger, slog.LevelError, "write recovered marker failed", machineCodeContractWriteFailed, messageKeyContractWriteFailed, taskID, "write_recovered_marker", "recovered-after-timeout", err)
 		}
 	}
 	if ctx.Err() != nil {
@@ -489,14 +489,14 @@ func resolveRecoveringLockedWithContext(ctx context.Context, tasks AdoptionTaskS
 			if ctx.Err() != nil {
 				return nil, false
 			}
-			logger.Error("write recovery exit code failed", "task_id", taskID.String(), "error", err)
+			logRecoveryError(ctx, logger, slog.LevelError, "write recovery exit code failed", machineCodeContractWriteFailed, messageKeyContractWriteFailed, taskID, "write_exit_code", "exit-code", err)
 		}
 	}
 	if ctx.Err() != nil {
 		return nil, false
 	}
 	if err := tasks.Save(taskID, updated); err != nil {
-		logger.Error("save recovered task failed", "task_id", taskID.String(), "error", err)
+		logRecoveryError(ctx, logger, slog.LevelError, "save recovered task failed", machineCodeContractWriteFailed, messageKeyContractWriteFailed, taskID, "save_task", "task.json", err)
 		return err, true
 	}
 	if ctx.Err() != nil {
@@ -510,7 +510,7 @@ func resolveRecoveringLockedWithContext(ctx context.Context, tasks AdoptionTaskS
 			if ctx.Err() != nil {
 				return nil, false
 			}
-			logger.Error("append adoption event failed", "task_id", taskID.String(), "error", err)
+			logRecoveryError(ctx, logger, slog.LevelError, "append adoption event failed", machineCodeContractWriteFailed, messageKeyContractWriteFailed, taskID, "append_event", "events.jsonl", err)
 		}
 		if ctx.Err() != nil {
 			return nil, false
@@ -556,21 +556,21 @@ func resolveRecoveringLocked(tasks AdoptionTaskStore, reader contract.ExitCodeRe
 	}
 	if present {
 		if err := writer.WriteRecoveredMarker(taskID, occurredAt); err != nil {
-			logger.Error("write recovered marker failed", "task_id", taskID.String(), "error", err)
+			logRecoveryError(context.Background(), logger, slog.LevelError, "write recovered marker failed", machineCodeContractWriteFailed, messageKeyContractWriteFailed, taskID, "write_recovered_marker", "recovered-after-timeout", err)
 		}
 	}
 	if shouldWriteExitCode {
 		if err := writer.WriteExitCode(taskID, exitCode); err != nil {
-			logger.Error("write recovery exit code failed", "task_id", taskID.String(), "error", err)
+			logRecoveryError(context.Background(), logger, slog.LevelError, "write recovery exit code failed", machineCodeContractWriteFailed, messageKeyContractWriteFailed, taskID, "write_exit_code", "exit-code", err)
 		}
 	}
 	if err := tasks.Save(taskID, updated); err != nil {
-		logger.Error("save recovered task failed", "task_id", taskID.String(), "error", err)
+		logRecoveryError(context.Background(), logger, slog.LevelError, "save recovered task failed", machineCodeContractWriteFailed, messageKeyContractWriteFailed, taskID, "save_task", "task.json", err)
 		return err
 	}
 	for _, event := range events {
 		if err := writer.AppendEvent(taskID, event); err != nil {
-			logger.Error("append adoption event failed", "task_id", taskID.String(), "error", err)
+			logRecoveryError(context.Background(), logger, slog.LevelError, "append adoption event failed", machineCodeContractWriteFailed, messageKeyContractWriteFailed, taskID, "append_event", "events.jsonl", err)
 		}
 	}
 	return nil

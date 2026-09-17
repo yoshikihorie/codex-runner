@@ -7,6 +7,7 @@ import (
 	"errors"
 	"log/slog"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -1020,6 +1021,48 @@ func TestAdoptRunningTasksRecoveringNonSaveWriteFailuresAreFailSoft(t *testing.T
 				t.Fatalf("out=(%+v,%v) held=%v slots=%d logs=%q events=%d", out, err, mutex.held, slots.releases, logs.String(), len(writer.events))
 			}
 		})
+	}
+}
+
+func TestResolveRecoveringLockedLogsContractWriteFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		configure   func(*adoptionStoreFake, *adoptionWriterFake)
+		operation   string
+		stage       string
+		wantCode    bool
+		withContext bool
+	}{
+		{name: "adopted marker is not a contract file", configure: func(_ *adoptionStoreFake, writer *adoptionWriterFake) { writer.adoptedErr = errors.New("adopted") }, wantCode: false},
+		{name: "recovered marker", configure: func(_ *adoptionStoreFake, writer *adoptionWriterFake) { writer.recoveredErr = errors.New("recovered") }, operation: "write_recovered_marker", stage: "recovered-after-timeout", wantCode: true},
+		{name: "exit code", configure: func(_ *adoptionStoreFake, writer *adoptionWriterFake) { writer.exitErr = errors.New("exit") }, operation: "write_exit_code", stage: "exit-code", wantCode: true},
+		{name: "task json", configure: func(store *adoptionStoreFake, _ *adoptionWriterFake) { store.saveErr = errors.New("save") }, operation: "save_task", stage: "task.json", wantCode: true},
+		{name: "event", configure: func(_ *adoptionStoreFake, writer *adoptionWriterFake) { writer.appendErr = errors.New("event") }, operation: "append_event", stage: "events.jsonl", wantCode: true},
+	} {
+		for _, withContext := range []bool{false, true} {
+			t.Run(tc.name+"/with-context="+strconv.FormatBool(withContext), func(t *testing.T) {
+				id := adoptionID(t, "recovering-log-"+tc.name[:1])
+				snapshot := adoptionSnapshot(t, id, domain.StateRecovering)
+				store := &adoptionStoreFake{entries: map[domain.TaskID]domain.TaskSnapshot{id: snapshot}}
+				writer := &adoptionWriterFake{}
+				tc.configure(store, writer)
+				var logs bytes.Buffer
+				logger := slog.New(slog.NewJSONHandler(&logs, nil))
+				if withContext {
+					_, completed := resolveRecoveringLockedWithContext(context.Background(), store, &adoptionReaderFake{}, writer, logger, id, snapshot, true, time.Now())
+					if !completed && tc.operation != "save_task" {
+						t.Fatal("recovery did not complete")
+					}
+				} else {
+					_ = resolveRecoveringLocked(store, &adoptionReaderFake{}, writer, logger, id, snapshot, true, time.Now())
+				}
+				if tc.wantCode {
+					assertRecoveryLogRecordWithStage(t, logs.String(), "CONTRACT_WRITE_FAILED", "error.contract.writeFailed", tc.operation, tc.stage)
+				} else {
+					assertRecoveryLogCodeAbsent(t, logs.String(), "CONTRACT_WRITE_FAILED")
+				}
+			})
+		}
 	}
 }
 

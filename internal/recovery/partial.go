@@ -77,7 +77,7 @@ func (uc *SavePartialOutputUseCase) Execute(ctx context.Context, in SavePartialO
 
 	present, err := uc.reader.ReadLastMessage(in.TaskID)
 	if err != nil {
-		uc.logError("failed to read last-message.md", in, err)
+		uc.logReadError(ctx, "failed to read last-message.md", in, "read_last_message", "last-message.md", err)
 		return SavePartialOutputOutput{}, nil
 	}
 	if present {
@@ -91,7 +91,7 @@ func (uc *SavePartialOutputUseCase) Execute(ctx context.Context, in SavePartialO
 	// 正典・T1-05 との調整事項として 2026-08-08 に受容済み。
 	raw, err := uc.reader.ReadStderrLog(in.TaskID)
 	if err != nil {
-		uc.logError("failed to read stderr.log", in, err)
+		uc.logReadError(ctx, "failed to read stderr.log", in, "read_stderr_log", "stderr.log", err)
 		return SavePartialOutputOutput{}, nil
 	}
 	if len(raw) == 0 {
@@ -107,16 +107,17 @@ func (uc *SavePartialOutputUseCase) Execute(ctx context.Context, in SavePartialO
 	content := partialOutputHeader + tailLogicalLines(text, partialOutputTailLines)
 
 	if err := uc.contract.WritePartialOutput(in.TaskID, content); err != nil {
-		uc.logError("failed to write partial-output.md", in, err)
+		logRecoveryError(ctx, uc.logger, slog.LevelError, "failed to write partial-output.md", machineCodeContractWriteFailed, messageKeyContractWriteFailed, in.TaskID, "write_partial_output", "partial-output.md", err)
 		return SavePartialOutputOutput{}, nil
 	}
 	return SavePartialOutputOutput{Saved: true, BytesWritten: len(content)}, nil
 }
 
-func (uc *SavePartialOutputUseCase) logError(message string, in SavePartialOutputInput, err error) {
-	uc.logger.Error(message,
+func (uc *SavePartialOutputUseCase) logReadError(ctx context.Context, message string, in SavePartialOutputInput, operation, stage string, err error) {
+	uc.logger.Log(ctx, slog.LevelError, message,
 		"task_id", in.TaskID.String(),
-		"op", "save_partial_output",
+		"operation", operation,
+		"stage", stage,
 		"occurred_at", in.OccurredAt,
 		"error", err,
 	)
