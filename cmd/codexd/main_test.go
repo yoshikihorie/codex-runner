@@ -337,6 +337,94 @@ func TestRunStatsReadFailedFilesOutputAndExitCode(t *testing.T) { // SCN-metrics
 	})
 }
 
+func TestRunStatsOpenFailedFilesOutputAndExitCode(t *testing.T) { // SCN-metrics-02-21
+	t.Run("json always includes zero", func(t *testing.T) {
+		withStatsDependencies(t, t.TempDir(), statsReaderFake{
+			list: func(string, *string, *string) ([]string, error) { return nil, nil },
+			open: func(string) (io.ReadCloser, error) { t.Fatal("open called"); return nil, nil },
+		})
+		var out bytes.Buffer
+		if code := runStats(context.Background(), []string{"--json"}, &out, io.Discard); code != 0 {
+			t.Fatalf("exit code = %d", code)
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(out.Bytes(), &raw); err != nil {
+			t.Fatal(err)
+		}
+		if got, ok := raw["open_failed_files"]; !ok || string(got) != "0" {
+			t.Fatalf("open_failed_files = %q, present = %t", got, ok)
+		}
+	})
+
+	t.Run("text reports nonzero and remains successful", func(t *testing.T) {
+		withStatsDependencies(t, t.TempDir(), statsReaderFake{
+			list: func(string, *string, *string) ([]string, error) { return []string{"failed"}, nil },
+			open: func(string) (io.ReadCloser, error) { return nil, errors.New("open failed") },
+		})
+		var text, stderr, logs bytes.Buffer
+		withStatsLogger(t, func(io.Writer) *slog.Logger {
+			return slog.New(slog.NewJSONHandler(&logs, nil))
+		})
+		if code := runStats(context.Background(), nil, &text, &stderr); code != 0 {
+			t.Fatalf("exit code = %d, stderr = %q", code, stderr.String())
+		}
+		if !strings.Contains(text.String(), metrics.MessageKeyStatsOpenFailedFiles+": 1") {
+			t.Fatalf("text = %q", text.String())
+		}
+		if stderr.Len() != 0 {
+			t.Fatalf("unexpected stderr = %q", stderr.String())
+		}
+		assertRunStatsOpenFailureLog(t, logs.Bytes(), "failed")
+	})
+
+	t.Run("text omits zero", func(t *testing.T) {
+		withStatsDependencies(t, t.TempDir(), statsReaderFake{
+			list: func(string, *string, *string) ([]string, error) { return nil, nil },
+			open: func(string) (io.ReadCloser, error) { t.Fatal("open called"); return nil, nil },
+		})
+		var text bytes.Buffer
+		if code := runStats(context.Background(), nil, &text, io.Discard); code != 0 {
+			t.Fatalf("exit code = %d", code)
+		}
+		if strings.Contains(text.String(), metrics.MessageKeyStatsOpenFailedFiles) {
+			t.Fatalf("text = %q", text.String())
+		}
+	})
+}
+
+func assertRunStatsOpenFailureLog(t *testing.T, logs []byte, path string) {
+	t.Helper()
+	decoder := json.NewDecoder(bytes.NewReader(logs))
+	found := false
+	for {
+		var record map[string]any
+		err := decoder.Decode(&record)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("open failure log = %q: %v", logs, err)
+		}
+		if record["code"] == "METRICS_FILE_READ_FAILED" {
+			t.Fatalf("open failure was also logged as a read failure: %#v", record)
+		}
+		if record["code"] != "METRICS_FILE_OPEN_FAILED" {
+			continue
+		}
+		found = true
+		if record["message_key"] != "error.metrics.fileOpenFailed" || record["path"] != path || record["stage"] != "open" {
+			t.Fatalf("open failure log = %#v", record)
+		}
+		errText, ok := record["error"].(string)
+		if !ok || errText == "" {
+			t.Fatalf("open failure error attribute = %#v, present = %t", record["error"], ok)
+		}
+	}
+	if !found {
+		t.Fatalf("missing METRICS_FILE_OPEN_FAILED log: %q", logs)
+	}
+}
+
 func TestRunStatsTC6TC7TC10TC11TC18(t *testing.T) {
 	home := t.TempDir()
 	logs := filepath.Join(home, ".claude", "logs")

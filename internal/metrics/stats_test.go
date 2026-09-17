@@ -111,6 +111,16 @@ type readFailureReadCloser struct {
 func (r readFailureReadCloser) Read(p []byte) (int, error) { return copy(p, r.data), r.cause }
 func (r readFailureReadCloser) Close() error               { return nil }
 
+type openFailureMetricsReader struct{ cause error }
+
+func (r openFailureMetricsReader) ListMonthlyFiles(string, *string, *string) ([]string, error) {
+	return []string{"open-failure"}, nil
+}
+
+func (r openFailureMetricsReader) OpenMonthlyFile(string) (io.ReadCloser, error) {
+	return nil, r.cause
+}
+
 type capturedLogHandler struct{ records []slog.Record }
 
 func (h *capturedLogHandler) Enabled(context.Context, slog.Level) bool { return true }
@@ -297,7 +307,7 @@ func TestComputeTaskStats_CorruptionLog(t *testing.T) { // T-A17, SCN-06
 }
 
 func TestStatsMessageKeys(t *testing.T) { // T-A18
-	if MessageKeyStatsInvalidDateRange != "error.stats.invalidDateRange" || MessageKeyStatsInvalidSubcommand != "error.stats.invalidSubcommand" || MessageKeyStatsSkippedLines != "info.stats.skippedLines" || MessageKeyStatsReadFailedFiles != "info.stats.readFailedFiles" || MessageKeyMetricsFileReadFailed != "error.metrics.fileReadFailed" {
+	if MessageKeyStatsInvalidDateRange != "error.stats.invalidDateRange" || MessageKeyStatsInvalidSubcommand != "error.stats.invalidSubcommand" || MessageKeyStatsSkippedLines != "info.stats.skippedLines" || MessageKeyStatsReadFailedFiles != "info.stats.readFailedFiles" || MessageKeyStatsOpenFailedFiles != "info.stats.openFailedFiles" || MessageKeyMetricsFileReadFailed != "error.metrics.fileReadFailed" || MessageKeyMetricsFileOpenFailed != "error.metrics.fileOpenFailed" {
 		t.Fatal("unexpected message key")
 	}
 }
@@ -342,7 +352,7 @@ func TestComputeTaskStats_ReadFailureContinuesAfterTruncatedGzip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if report.ReadFailedFiles != 1 || report.MatchedFiles != 3 || report.SkippedLines != 0 || report.TotalRecords != 5 {
+	if report.OpenFailedFiles != 0 || report.ReadFailedFiles != 1 || report.MatchedFiles != 3 || report.SkippedLines != 0 || report.TotalRecords != 5 {
 		t.Fatalf("report = %#v", report)
 	}
 	for _, model := range []string{"preceding", "model-a", "second-member-one", "second-member-two", "following"} {
@@ -361,8 +371,8 @@ func TestComputeTaskStats_ReadFailureContinuesAfterTruncatedGzip(t *testing.T) {
 			}
 			return true
 		})
-		if code == machineCodeMetricsFileCorrupted {
-			t.Fatal("read failure was logged as corrupted")
+		if code == machineCodeMetricsFileCorrupted || code == machineCodeMetricsFileOpenFailed {
+			t.Fatalf("read failure was logged with incorrect code %q", code)
 		}
 	}
 }
@@ -383,12 +393,110 @@ func TestComputeTaskStats_ReadFailureDropsDataAndJoinsSentinelAndCause(t *testin
 	handler := &capturedLogHandler{}
 	partialRecord := strings.TrimSuffix(statsLine(t, func(r *taskMetricsRecord) { r.Model = "must-not-count" }), "\n")
 	report, err := newStatsUseCase(readFailureMetricsReader{cause: cause, data: []byte(partialRecord)}, slog.New(handler)).Execute(StatsQuery{})
-	if err != nil || report.ReadFailedFiles != 1 || report.SkippedLines != 0 || report.TotalRecords != 0 {
+	if err != nil || report.OpenFailedFiles != 0 || report.ReadFailedFiles != 1 || report.SkippedLines != 0 || report.TotalRecords != 0 {
 		t.Fatalf("report = %#v, err = %v", report, err)
 	}
 	if !capturedReadFailure(t, handler.records, cause) {
 		t.Fatal("missing joined read failure log")
 	}
+}
+
+func TestComputeTaskStats_OpenFailureContinuesAfterCorruptGzip(t *testing.T) { // SCN-metrics-02-21
+	dir := t.TempDir()
+	precedingPath := filepath.Join(dir, "task-metrics-2025-12.jsonl")
+	failedPath := filepath.Join(dir, "task-metrics-2026-01.jsonl.gz")
+	followingPath := filepath.Join(dir, "task-metrics-2026-02.jsonl")
+	if err := os.WriteFile(precedingPath, []byte(statsLine(t, func(r *taskMetricsRecord) { r.Model = "preceding" })), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(failedPath, []byte("not a gzip file"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(followingPath, []byte(statsLine(t, func(r *taskMetricsRecord) { r.Model = "following" })), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := os.Open(failedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, gzipErr := gzip.NewReader(file)
+	closeErr := file.Close()
+	if gzipErr == nil || closeErr != nil {
+		t.Fatalf("gzip.NewReader error = %v, close error = %v", gzipErr, closeErr)
+	}
+
+	var logs bytes.Buffer
+	reader := listedMetricsReader{files: []string{precedingPath, failedPath, followingPath}, reader: store.NewFileMetricsReader()}
+	report, err := newStatsUseCase(reader, slog.New(slog.NewJSONHandler(&logs, nil))).Execute(StatsQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.TotalRecords != 2 || report.OpenFailedFiles != 1 || report.MatchedFiles != 3 || report.ReadFailedFiles != 0 || report.SkippedLines != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	for _, model := range []string{"preceding", "following"} {
+		if report.SuccessRateByModel[model].Total != 1 {
+			t.Fatalf("record for %q was not retained: %#v", model, report.SuccessRateByModel)
+		}
+	}
+	assertOpenFailureJSONLog(t, logs.Bytes(), failedPath)
+}
+
+func TestComputeTaskStats_OpenFailureJoinsSentinelAndCause(t *testing.T) { // SCN-metrics-02-21
+	cause := errors.New("injected open failure")
+	handler := &capturedLogHandler{}
+	report, err := newStatsUseCase(openFailureMetricsReader{cause: cause}, slog.New(handler)).Execute(StatsQuery{})
+	if err != nil || report.OpenFailedFiles != 1 || report.ReadFailedFiles != 0 || report.SkippedLines != 0 {
+		t.Fatalf("report = %#v, err = %v", report, err)
+	}
+	if len(handler.records) != 1 {
+		t.Fatalf("open failure warnings = %d, want 1", len(handler.records))
+	}
+	assertOpenFailureRecord(t, handler.records[0], "open-failure", cause)
+	assertNoReadFailureRecord(t, handler.records)
+}
+
+func TestComputeTaskStats_OpenFailureContinuesAfterEmptyGzip(t *testing.T) { // SCN-metrics-02-21
+	dir := t.TempDir()
+	precedingPath := filepath.Join(dir, "task-metrics-2025-12.jsonl")
+	failedPath := filepath.Join(dir, "task-metrics-2026-01.jsonl.gz")
+	followingPath := filepath.Join(dir, "task-metrics-2026-02.jsonl")
+	if err := os.WriteFile(precedingPath, []byte(statsLine(t, func(r *taskMetricsRecord) { r.Model = "preceding" })), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(failedPath, nil, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(followingPath, []byte(statsLine(t, func(r *taskMetricsRecord) { r.Model = "following" })), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	file, err := os.Open(failedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, gzipErr := gzip.NewReader(file)
+	closeErr := file.Close()
+	if !errors.Is(gzipErr, io.EOF) || closeErr != nil {
+		t.Fatalf("gzip.NewReader error = %v, close error = %v", gzipErr, closeErr)
+	}
+
+	var logs bytes.Buffer
+	reader := listedMetricsReader{files: []string{precedingPath, failedPath, followingPath}, reader: store.NewFileMetricsReader()}
+	report, err := newStatsUseCase(reader, slog.New(slog.NewJSONHandler(&logs, nil))).Execute(StatsQuery{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if report.TotalRecords != 2 || report.OpenFailedFiles != 1 || report.MatchedFiles != 3 || report.ReadFailedFiles != 0 || report.SkippedLines != 0 {
+		t.Fatalf("report = %#v", report)
+	}
+	for _, model := range []string{"preceding", "following"} {
+		if report.SuccessRateByModel[model].Total != 1 {
+			t.Fatalf("record for %q was not retained: %#v", model, report.SuccessRateByModel)
+		}
+	}
+	assertOpenFailureJSONLog(t, logs.Bytes(), failedPath)
 }
 
 func writeTruncatedGzipMembers(t *testing.T, path, first, second string) {
@@ -469,6 +577,84 @@ func capturedReadFailure(t *testing.T, records []slog.Record, causes ...error) b
 		}
 	}
 	return false
+}
+
+func assertOpenFailureJSONLog(t *testing.T, logs []byte, path string) {
+	t.Helper()
+	decoder := json.NewDecoder(bytes.NewReader(logs))
+	found := false
+	for {
+		var record map[string]any
+		err := decoder.Decode(&record)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("open failure log = %q: %v", logs, err)
+		}
+		if record["code"] == machineCodeMetricsFileReadFailed {
+			t.Fatalf("open failure was also logged as a read failure: %#v", record)
+		}
+		if record["code"] != machineCodeMetricsFileOpenFailed {
+			continue
+		}
+		found = true
+		if record["message_key"] != MessageKeyMetricsFileOpenFailed || record["path"] != path || record["stage"] != "open" {
+			t.Fatalf("open failure log = %#v", record)
+		}
+		errText, ok := record["error"].(string)
+		if !ok || errText == "" {
+			t.Fatalf("open failure error attribute = %#v, present = %t", record["error"], ok)
+		}
+	}
+	if !found {
+		t.Fatalf("missing METRICS_FILE_OPEN_FAILED log: %q", logs)
+	}
+}
+
+func assertOpenFailureRecord(t *testing.T, record slog.Record, path string, cause error) {
+	t.Helper()
+	var code, messageKey, loggedPath, stage string
+	var loggedErr error
+	hasError := false
+	record.Attrs(func(attr slog.Attr) bool {
+		switch attr.Key {
+		case "code":
+			code = attr.Value.String()
+		case "message_key":
+			messageKey = attr.Value.String()
+		case "path":
+			loggedPath = attr.Value.String()
+		case "stage":
+			stage = attr.Value.String()
+		case "error":
+			hasError = true
+			loggedErr, _ = attr.Value.Any().(error)
+		}
+		return true
+	})
+	if code != machineCodeMetricsFileOpenFailed || messageKey != MessageKeyMetricsFileOpenFailed || loggedPath != path || stage != "open" {
+		t.Fatalf("open failure record = %#v", record)
+	}
+	if !hasError || loggedErr == nil || !errors.Is(loggedErr, ErrMetricsFileOpenFailed) || !errors.Is(loggedErr, cause) {
+		t.Fatalf("open failure error = %v, present = %t", loggedErr, hasError)
+	}
+}
+
+func assertNoReadFailureRecord(t *testing.T, records []slog.Record) {
+	t.Helper()
+	for _, record := range records {
+		var code string
+		record.Attrs(func(attr slog.Attr) bool {
+			if attr.Key == "code" {
+				code = attr.Value.String()
+			}
+			return true
+		})
+		if code == machineCodeMetricsFileReadFailed {
+			t.Fatalf("open failure was also logged as a read failure: %#v", record)
+		}
+	}
 }
 
 func TestComputeTaskStats_MultipleSuccessGroups(t *testing.T) { // T-A21, SCN-01/02

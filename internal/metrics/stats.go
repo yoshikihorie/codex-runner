@@ -19,12 +19,18 @@ const (
 	MessageKeyStatsInvalidSubcommand = "error.stats.invalidSubcommand"
 	MessageKeyStatsSkippedLines      = "info.stats.skippedLines"
 	MessageKeyStatsReadFailedFiles   = "info.stats.readFailedFiles"
+	MessageKeyStatsOpenFailedFiles   = "info.stats.openFailedFiles"
 	MessageKeyMetricsFileReadFailed  = "error.metrics.fileReadFailed"
+	MessageKeyMetricsFileOpenFailed  = "error.metrics.fileOpenFailed"
 	machineCodeMetricsFileCorrupted  = "METRICS_FILE_CORRUPTED"
 	machineCodeMetricsFileReadFailed = "METRICS_FILE_READ_FAILED"
+	machineCodeMetricsFileOpenFailed = "METRICS_FILE_OPEN_FAILED"
 )
 
-var ErrMetricsFileReadFailed = errors.New("metrics file read failed")
+var (
+	ErrMetricsFileReadFailed = errors.New("metrics file read failed")
+	ErrMetricsFileOpenFailed = errors.New("metrics file open failed")
+)
 
 type StatsQuery struct {
 	Since            *string
@@ -38,6 +44,7 @@ type StatsReport struct {
 	TotalRecords                          int                               `json:"total_records"`
 	SkippedLines                          int                               `json:"skipped_lines"`
 	ReadFailedFiles                       int                               `json:"read_failed_files"`
+	OpenFailedFiles                       int                               `json:"open_failed_files"`
 	SuccessRateBySubcommand               map[domain.Subcommand]SuccessStat `json:"success_rate_by_subcommand"`
 	SuccessRateByModel                    map[string]SuccessStat            `json:"success_rate_by_model"`
 	QueueWaitMedian                       *int                              `json:"queue_wait_median"`
@@ -98,11 +105,13 @@ func (u *ComputeTaskStatsUseCase) Execute(q StatsQuery) (StatsReport, error) {
 	records := make([]taskMetricsRecord, 0)
 	skippedLines := 0
 	readFailedFiles := 0
+	openFailedFiles := 0
 	for _, path := range files {
 		func() {
 			stream, openErr := u.reader.OpenMonthlyFile(path)
 			if openErr != nil {
-				u.logger.Warn("metrics file could not be opened", "path", path, "error", openErr)
+				openFailedFiles++
+				u.warnOpenFailed(path, "open", errors.Join(ErrMetricsFileOpenFailed, openErr))
 				return
 			}
 			defer func() {
@@ -142,6 +151,7 @@ func (u *ComputeTaskStatsUseCase) Execute(q StatsQuery) (StatsReport, error) {
 	report.MatchedFiles = len(files)
 	report.SkippedLines = skippedLines
 	report.ReadFailedFiles = readFailedFiles
+	report.OpenFailedFiles = openFailedFiles
 	return report, nil
 }
 
@@ -151,6 +161,10 @@ func (u *ComputeTaskStatsUseCase) warnCorrupted(path, stage string, err error) {
 
 func (u *ComputeTaskStatsUseCase) warnReadFailed(path, stage string, err error) {
 	u.logger.Warn("metrics file could not be fully read", "code", machineCodeMetricsFileReadFailed, "message_key", MessageKeyMetricsFileReadFailed, "path", path, "stage", stage, "error", err)
+}
+
+func (u *ComputeTaskStatsUseCase) warnOpenFailed(path, stage string, err error) {
+	u.logger.Warn("metrics file could not be opened", "code", machineCodeMetricsFileOpenFailed, "message_key", MessageKeyMetricsFileOpenFailed, "path", path, "stage", stage, "error", err)
 }
 
 func buildStatsReport(records []taskMetricsRecord) StatsReport {
