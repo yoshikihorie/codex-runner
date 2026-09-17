@@ -163,7 +163,7 @@ func (uc *CancelTaskUseCase) cancelQueued(in CancelTaskInput, payload execution.
 		return CancelTaskOutput{}, nil, "", err
 	}
 	if err := uc.tasks.Save(in.TaskID, snapshot); err != nil {
-		return CancelTaskOutput{}, nil, "", contractWriteError(err)
+		return CancelTaskOutput{}, nil, "", err
 	}
 	committed = true
 	reindexEvents = removeEvents
@@ -260,7 +260,7 @@ func (uc *CancelTaskUseCase) cancelPersisted(ctx context.Context, in CancelTaskI
 		return out, err
 	}
 	if err := uc.tasks.Save(in.TaskID, updated); err != nil {
-		return out, contractWriteError(err)
+		return out, err
 	}
 	if previous == domain.StateStalled {
 		uc.stalledTracker.LeaveStalled(in.TaskID, in.OccurredAt)
@@ -400,7 +400,7 @@ func (uc *CancelTaskUseCase) finishStartingClaim(ctx context.Context, in CancelT
 			if saveErr := uc.tasks.Save(in.TaskID, updated); saveErr != nil {
 				uc.taskMu.Unlock(in.TaskID)
 				uc.pendingRegistrar.RemoveClaim(claim)
-				return CancelTaskOutput{}, contractWriteError(saveErr)
+				return CancelTaskOutput{}, saveErr
 			}
 			out.Events = events
 			if err := uc.events.AppendEvent(in.TaskID, events[0]); err != nil {
@@ -441,10 +441,6 @@ func (uc *CancelTaskUseCase) sendClaimedStarting(ctx context.Context, in CancelT
 		uc.logger.Warn("terminate cancelled task", "task_id", in.TaskID.String(), "error", err)
 	}
 	return out, nil
-}
-
-func contractWriteError(cause error) error {
-	return errors.Join(domain.ErrContractWriteFailed, cause)
 }
 
 func cancelPendingRegistration(taskID domain.TaskID, pid *int, processStartedAt *time.Time, generation *domain.LifecycleGeneration) (recovery.PendingSendDisposition, *recovery.ProcessSignalAuthority) {

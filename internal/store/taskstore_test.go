@@ -181,6 +181,42 @@ func TestTaskStoreSaveRejectsInvalidSnapshot(t *testing.T) {
 	v.Model = ""
 	if err := s.Save(id, v); err == nil {
 		t.Fatal("invalid snapshot accepted")
+	} else if errors.Is(err, domain.ErrContractWriteFailed) {
+		t.Fatalf("validation error classified as contract write failure: %v", err)
+	}
+}
+func TestTaskStoreSaveMarshalFailureIsNotContractWriteFailure(t *testing.T) {
+	s, id := newReservedStore(t)
+	v := storeSnapshot(t, id, domain.StateQueued)
+	v.RequestedAt = time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC)
+	if err := v.Validate(); err != nil {
+		t.Fatalf("test snapshot must pass validation: %v", err)
+	}
+	err := s.Save(id, v)
+	var marshalErr *json.MarshalerError
+	if err == nil || !errors.As(err, &marshalErr) {
+		t.Fatalf("Save error = %v, want JSON marshal error", err)
+	}
+	if errors.Is(err, domain.ErrContractWriteFailed) {
+		t.Fatalf("marshal error classified as contract write failure: %v", err)
+	}
+}
+func TestTaskStoreSaveWriteAtomicFailureRetainsSentinelAndCause(t *testing.T) {
+	s, id := newReservedStore(t)
+	p, err := newTaskPaths(s.root, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(p.taskJSON(), taskDirPerm); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Save(id, storeSnapshot(t, id, domain.StateQueued))
+	if !errors.Is(err, domain.ErrContractWriteFailed) {
+		t.Fatalf("Save error = %v, want ErrContractWriteFailed", err)
+	}
+	var linkErr *os.LinkError
+	if !errors.As(err, &linkErr) || linkErr.Op != "rename" {
+		t.Fatalf("Save error = %v, want underlying rename error", err)
 	}
 }
 func TestTaskStoreSaveAcceptsFailedWithoutPID(t *testing.T) {

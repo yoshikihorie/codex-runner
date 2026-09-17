@@ -2,6 +2,7 @@ package store
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"io"
@@ -165,7 +166,7 @@ func (s *FileTaskStore) Save(id domain.TaskID, v domain.TaskSnapshot) error {
 		return e
 	}
 	if e = WriteAtomic(p.taskJSON(), b, taskFilePerm); e != nil {
-		return e
+		return errors.Join(domain.ErrContractWriteFailed, e)
 	}
 	s.index[id.String()] = v
 	return nil

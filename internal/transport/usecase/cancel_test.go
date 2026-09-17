@@ -8,6 +8,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -1368,7 +1369,7 @@ func TestCancelTaskHandle_ContractWriteFailuresAreSanitized(t *testing.T) {
 	}{
 		{"save", func(tasks *cancelStoreFake) {
 			tasks.snapshot = cancelPersistedSnapshot(t, domain.StateStarting, false)
-			tasks.saveErr = errors.New("/private/contract/task.json secret=cancel-token")
+			tasks.saveErr = errors.Join(domain.ErrContractWriteFailed, errors.New("/private/contract/task.json secret=cancel-token"))
 		}},
 		{"reservation", func(tasks *cancelStoreFake) {
 			tasks.reservedErr = errors.New("/private/contract/reservation secret=cancel-token")
@@ -1394,7 +1395,125 @@ func TestCancelTaskHandle_ContractWriteFailuresAreSanitized(t *testing.T) {
 	}
 }
 
-func TestCancelTaskExecute_ContractWriteFailuresRetainUnderlyingCause(t *testing.T) {
+func TestCancelTaskHandle_FileTaskStoreWriteAtomicFailureReturnsContractWriteFailed(t *testing.T) {
+	root := t.TempDir()
+	tasks, err := store.NewFileTaskStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := cancelQueuedPayload(t)
+	id := payload.Task.ID()
+	if err := tasks.Reserve(id); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(root, id.String(), "task.json"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	queueMu := &sync.Mutex{}
+	queue := &cancelQueueFake{payload: payload, index: 1, removed: true, queueMu: queueMu}
+	uc := NewCancelTaskUseCase(tasks, queue, queueMu, store.NewTaskMutex(), &cancelEventsFake{}, &cancelTerminatorFake{}, &cancelTerminationEnsurerFake{}, &cancelPendingRegistrarFake{}, &cancelDisarmerFake{}, &cancelConfirmerFake{}, &cancelStalledTrackerFake{}, &cancelOwnershipFake{}, domain.ClockFunc(time.Now))
+
+	response := uc.Handle(transport.Request{RequestID: "write-atomic", TaskID: id.String(), Params: json.RawMessage(`{}`)})
+	if response.OK || response.Error == nil || response.Error.Code != "CONTRACT_WRITE_FAILED" || response.Error.MessageKey != "error.contract.writeFailed" {
+		t.Fatalf("response=%#v", response)
+	}
+	detail, marshalErr := json.Marshal(response.Error.Detail)
+	if marshalErr != nil || string(detail) != `{"task_id":"`+id.String()+`"}` || strings.Contains(string(detail), root) || strings.Contains(string(detail), "task.json") || strings.Contains(string(detail), "rename") {
+		t.Fatalf("detail=%s err=%v", detail, marshalErr)
+	}
+}
+
+func TestCancelTaskHandle_SaveFailuresReturnCancelFailed(t *testing.T) {
+	type fixture struct {
+		tasks   *cancelStoreFake
+		queue   *cancelQueueFake
+		pending *cancelPendingRegistrarFake
+		uc      *CancelTaskUseCase
+	}
+	for _, tc := range []struct {
+		name       string
+		cause      error
+		newFixture func(*testing.T, error) fixture
+		checkRoute func(*testing.T, fixture)
+	}{
+		{
+			name:  "queued-save",
+			cause: errors.New("snapshot validation failure /private/internal secret=cancel-token"),
+			newFixture: func(t *testing.T, cause error) fixture {
+				payload := cancelQueuedPayload(t)
+				tasks, queue, _, _, _, uc := cancelFixture(t, payload, true)
+				tasks.saveErr = cause
+				return fixture{tasks: tasks, queue: queue, pending: uc.pendingRegistrar.(*cancelPendingRegistrarFake), uc: uc}
+			},
+			checkRoute: func(t *testing.T, f fixture) {
+				t.Helper()
+				if f.queue.restores != 1 || f.pending.claimInitialCalls != 0 {
+					t.Fatalf("restores=%d claimInitialCalls=%d", f.queue.restores, f.pending.claimInitialCalls)
+				}
+			},
+		},
+		{
+			name:  "persisted-save",
+			cause: errors.New("snapshot marshal failure /private/internal secret=cancel-token"),
+			newFixture: func(t *testing.T, cause error) fixture {
+				payload := cancelQueuedPayload(t)
+				tasks, queue, _, _, _, uc := cancelFixture(t, payload, false)
+				tasks.snapshot = cancelPersistedSnapshot(t, domain.StateStarting, false)
+				tasks.saveErr = cause
+				return fixture{tasks: tasks, queue: queue, pending: uc.pendingRegistrar.(*cancelPendingRegistrarFake), uc: uc}
+			},
+			checkRoute: func(t *testing.T, f fixture) {
+				t.Helper()
+				if f.queue.restores != 0 || f.pending.claimInitialCalls != 0 {
+					t.Fatalf("restores=%d claimInitialCalls=%d", f.queue.restores, f.pending.claimInitialCalls)
+				}
+			},
+		},
+		{
+			name:  "starting-claimed-save",
+			cause: errors.New("task directory validation failure /private/internal secret=cancel-token"),
+			newFixture: func(t *testing.T, cause error) fixture {
+				payload := cancelQueuedPayload(t)
+				tasks, queue, _, _, _, uc := cancelFixture(t, payload, false)
+				tasks.snapshot = cancelPersistedSnapshot(t, domain.StateStarting, true)
+				tasks.saveErr = cause
+				pending := uc.pendingRegistrar.(*cancelPendingRegistrarFake)
+				outcome := recovery.ClaimAcquired
+				pending.initialOutcome = &outcome
+				return fixture{tasks: tasks, queue: queue, pending: pending, uc: uc}
+			},
+			checkRoute: func(t *testing.T, f fixture) {
+				t.Helper()
+				if f.pending.claimInitialCalls != 1 || f.pending.removeCalls != 1 {
+					t.Fatalf("claimInitialCalls=%d removeCalls=%d", f.pending.claimInitialCalls, f.pending.removeCalls)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			executeFixture := tc.newFixture(t, tc.cause)
+			id := cancelTaskID(t)
+			_, err := executeFixture.uc.Execute(context.Background(), CancelTaskInput{TaskID: id, OccurredAt: time.Now()})
+			if !errors.Is(err, tc.cause) || errors.Is(err, domain.ErrContractWriteFailed) || executeFixture.tasks.saves != 1 {
+				t.Fatalf("err=%v saves=%d", err, executeFixture.tasks.saves)
+			}
+			tc.checkRoute(t, executeFixture)
+
+			handleFixture := tc.newFixture(t, tc.cause)
+			response := handleFixture.uc.Handle(transport.Request{RequestID: tc.name, TaskID: id.String(), Params: json.RawMessage(`{}`)})
+			if response.OK || response.Error == nil || response.Error.Code != "CANCEL_FAILED" || response.Error.MessageKey != "error.cancel.failed" || handleFixture.tasks.saves != 1 {
+				t.Fatalf("response=%#v saves=%d", response, handleFixture.tasks.saves)
+			}
+			detail, marshalErr := json.Marshal(response.Error.Detail)
+			if marshalErr != nil || string(detail) != `{"task_id":"`+id.String()+`"}` || strings.Contains(string(detail), tc.cause.Error()) || strings.Contains(string(detail), "/private/internal") || strings.Contains(string(detail), "cancel-token") {
+				t.Fatalf("detail=%s err=%v", detail, marshalErr)
+			}
+			tc.checkRoute(t, handleFixture)
+		})
+	}
+}
+
+func TestCancelTaskExecute_FailuresRetainUnderlyingCause(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		setup func(*cancelStoreFake, error)
@@ -1420,8 +1539,7 @@ func TestCancelTaskExecute_ContractWriteFailuresRetainUnderlyingCause(t *testing
 
 			_, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
 			var pathErr *os.PathError
-			wantContractWrite := tc.name == "queued-save" || tc.name == "persisted-save"
-			if errors.Is(err, domain.ErrContractWriteFailed) != wantContractWrite || !errors.Is(err, cause) || !errors.As(err, &pathErr) || pathErr != cause {
+			if errors.Is(err, domain.ErrContractWriteFailed) || !errors.Is(err, cause) || !errors.As(err, &pathErr) || pathErr != cause {
 				t.Fatalf("err=%v pathErr=%#v cause=%#v", err, pathErr, cause)
 			}
 			if tc.name == "rechecked-reservation" && tasks.reservations != 2 {
@@ -1733,7 +1851,7 @@ func TestCancelTaskHandleResponsesRemainStableWithStalledTracker(t *testing.T) {
 		{"TASK_NOT_FOUND_after_load", func(tasks *cancelStoreFake) { tasks.loadErr, tasks.reserved = domain.ErrTaskNotFound, false }, false, "TASK_NOT_FOUND", "error.task.notFound"},
 		{"CONTRACT_WRITE_FAILED", func(tasks *cancelStoreFake) {
 			tasks.snapshot = cancelPersistedSnapshot(t, domain.StateStalled, true)
-			tasks.saveErr = errors.New("save")
+			tasks.saveErr = errors.Join(domain.ErrContractWriteFailed, errors.New("save"))
 		}, false, "CONTRACT_WRITE_FAILED", "error.contract.writeFailed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
