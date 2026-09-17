@@ -27,6 +27,8 @@ const (
 	// Canonical identifiers registered in the published error-code and message catalogs.
 	admissionUnavailableCode       = "ADMISSION_UNAVAILABLE"
 	admissionUnavailableMessageKey = "error.admission.unavailable"
+	admissionFailedCode            = "ADMISSION_FAILED"
+	admissionFailedMessageKey      = "error.admission.failed"
 )
 
 type SubmitTaskStore interface {
@@ -92,8 +94,8 @@ func NewSubmitTaskUseCase(tasks SubmitTaskStore, pathLocks SubmitPathLockAcquire
 	if tasks == nil || admitter == nil || starter == nil || options == nil || clock == nil {
 		panic("submit use case requires non-nil dependencies")
 	}
-	if (pathLocks == nil) != (pathLockReleaser == nil) {
-		panic("submit use case requires paired path lock dependencies")
+	if pathLocks == nil || pathLockReleaser == nil {
+		panic("submit use case requires path lock dependencies")
 	}
 	if logger == nil {
 		logger = slog.Default()
@@ -251,13 +253,17 @@ func (uc *SubmitTaskUseCase) Execute(ctx context.Context, in SubmitTaskInput) (S
 	}
 	result, err := uc.admitter.Admit(execution.TaskAdmissionInput{TaskID: id, Subcommand: subcommand, Slug: slug, RequestedTimeout: in.RequestedTimeoutSeconds, RequestedAt: in.RequestedAt, PromptText: in.Prompt, NormalizedPaths: normalizedPaths, ResolvedTimeout: timeout, Model: model, ReasoningEffort: effort, SandboxMode: sandbox, SourceWorkingDir: workingDir, WorktreeMode: worktreeMode, OutputSchemaPath: outputSchemaPath})
 	if err != nil {
+		mappedErr := uc.mapError(err)
+		if _, classified := mappedErr.(*submitError); !classified {
+			uc.logger.Error("unclassified task admission failure", "task_id", id.String(), "error", execution.ErrorTypeName(err))
+		}
 		if acquired {
 			if cleanupErr := uc.pathLockReleaser.Release(context.WithoutCancel(ctx), id); cleanupErr != nil {
 				uc.logger.Error("release path lock after admission failure", "task_id", id.String(), "error", execution.ErrorTypeName(cleanupErr))
 			}
 		}
 		uc.releaseReservation(id, outputSchemaPath)
-		return SubmitTaskOutput{}, err
+		return SubmitTaskOutput{}, uc.mapAdmissionError(mappedErr, id)
 	}
 	if result.LaunchPayload != nil {
 		if !uc.starter.Start(*result.LaunchPayload) {
@@ -377,6 +383,8 @@ func (e *taskReservationError) Unwrap() error { return e.Err }
 func (uc *SubmitTaskUseCase) reserveTaskID(subcommand domain.Subcommand, slug domain.Slug, at time.Time) (domain.TaskID, error) {
 	var last domain.TaskID
 	for attempt := 0; attempt < taskIDGenerationMaxAttempts; attempt++ {
+		// Subcommand and slug have already been validated, so NewTaskID can only
+		// fail here when the random suffix cannot be read and is classified above.
 		id, err := newTaskID(subcommand, slug, at, uc.random)
 		if err != nil {
 			return domain.TaskID{}, err
@@ -403,10 +411,6 @@ func (uc *SubmitTaskUseCase) releaseReservation(id domain.TaskID, outputSchemaPa
 	}
 }
 func (uc *SubmitTaskUseCase) acquirePathLocksAfterSnapshot(id domain.TaskID, paths []string, outputSchemaPath *string) ([]domain.NormalizedPath, bool, error) {
-	if uc.pathLocks == nil {
-		uc.releaseReservation(id, outputSchemaPath)
-		return nil, false, fmt.Errorf("submit path lock acquirer is required for impl")
-	}
 	normalized, err := uc.pathLocks.Acquire(id, paths)
 	if err != nil {
 		uc.releaseReservation(id, outputSchemaPath)
@@ -428,6 +432,8 @@ func (uc *SubmitTaskUseCase) mapPathLockError(err error, taskID domain.TaskID) e
 	if errors.As(err, &liveness) {
 		return submitFailure("LIVENESS_LOCK_IO_ERROR", "error.liveness.lockIoError", map[string]any{"task_id": liveness.TaskID.String()})
 	}
+	// domain.Acquire currently returns only ErrPathLockConflict or nil, so this
+	// branch is unreachable through the production acquirer until that changes.
 	return err
 }
 func (uc *SubmitTaskUseCase) mapError(err error) error {
@@ -446,6 +452,14 @@ func (uc *SubmitTaskUseCase) mapError(err error) error {
 	}
 	return err
 }
+
+func (uc *SubmitTaskUseCase) mapAdmissionError(err error, taskID domain.TaskID) error {
+	if _, ok := err.(*submitError); ok {
+		return err
+	}
+	return submitFailure(admissionFailedCode, admissionFailedMessageKey, map[string]any{"task_id": taskID.String()})
+}
+
 func submitErrorResponse(requestID string, err error) transport.Response {
 	value, ok := err.(*submitError)
 	if !ok {

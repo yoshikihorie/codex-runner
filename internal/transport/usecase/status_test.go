@@ -91,6 +91,54 @@ func TestGetTaskStatusHandleMapsErrorsAndExcludesInternalFields(t *testing.T) {
 	}
 }
 
+func TestGetTaskStatusHandleValidatesParams(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		params json.RawMessage
+		valid  bool
+	}{
+		{name: "unknown_field", params: json.RawMessage(`{"unknown":true}`)},
+		{name: "null", params: json.RawMessage(`null`)},
+		{name: "array", params: json.RawMessage(`[]`)},
+		{name: "malformed_json", params: json.RawMessage(`{`)},
+		{name: "trailing_token", params: json.RawMessage(`{} true`)},
+		{name: "empty_object", params: json.RawMessage(`{}`), valid: true},
+		{name: "omitted", valid: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := statusSnapshot(t, domain.StateQueued)
+			provider := &statusProviderStub{snapshot: snapshot, position: 2, found: true}
+			uc := NewGetTaskStatusUseCase(provider, domain.ClockFunc(func() time.Time { return snapshot.RequestedAt }))
+			response := uc.Handle(transport.Request{RequestID: "request", TaskID: snapshot.TaskID.String(), Params: tc.params})
+			if tc.valid {
+				if !response.OK || response.Error != nil || provider.snapshotCalls != 1 || provider.positionCalls != 1 {
+					t.Fatalf("response=%#v snapshot=%d position=%d", response, provider.snapshotCalls, provider.positionCalls)
+				}
+				return
+			}
+			if response.OK || response.Error == nil || response.Error.Code != "STATUS_PARAMS_MALFORMED" || response.Error.MessageKey != "error.status.paramsMalformed" || response.Error.Detail != nil {
+				t.Fatalf("response=%#v", response)
+			}
+			if provider.snapshotCalls != 0 || provider.positionCalls != 0 {
+				t.Fatalf("provider calls: snapshot=%d position=%d", provider.snapshotCalls, provider.positionCalls)
+			}
+		})
+	}
+}
+
+func TestGetTaskStatusHandlePrioritizesInvalidTaskIDOverMalformedParams(t *testing.T) {
+	snapshot := statusSnapshot(t, domain.StateQueued)
+	provider := &statusProviderStub{snapshot: snapshot}
+	uc := NewGetTaskStatusUseCase(provider, domain.ClockFunc(func() time.Time { return snapshot.RequestedAt }))
+	response := uc.Handle(transport.Request{RequestID: "request", TaskID: "invalid", Params: json.RawMessage(`{"unknown":true}`)})
+	if response.OK || response.Error == nil || response.Error.Code != "TASK_ID_INVALID_FORMAT" || response.Error.MessageKey != "error.task.idInvalidFormat" || response.Error.Detail["task_id"] != "invalid" {
+		t.Fatalf("response=%#v", response)
+	}
+	if provider.snapshotCalls != 0 || provider.positionCalls != 0 {
+		t.Fatalf("provider calls: snapshot=%d position=%d", provider.snapshotCalls, provider.positionCalls)
+	}
+}
+
 func TestGetTaskStatusExecuteStalledGapUsesLastEventOrProcessStart(t *testing.T) {
 	snapshot := statusSnapshot(t, domain.StateStalled)
 	lastEventAt := snapshot.RequestedAt.Add(time.Minute)

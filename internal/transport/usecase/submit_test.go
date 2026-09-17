@@ -111,6 +111,12 @@ type submitAdmitterFake struct {
 	events        *[]string
 }
 
+type submitCanaryAdmissionError struct {
+	message string
+}
+
+func (e *submitCanaryAdmissionError) Error() string { return e.message }
+
 func (f *submitAdmitterFake) Admit(in execution.TaskAdmissionInput) (execution.TaskAdmissionResult, error) {
 	f.calls++
 	f.input = in
@@ -508,18 +514,104 @@ func TestSubmitExecuteClassifiesSnapshotFailuresWithTaskID(t *testing.T) {
 	}
 }
 
-func TestSubmitErrorClassificationDoesNotUseCatchAll(t *testing.T) {
+func TestSubmitMapErrorDoesNotUseCatchAll(t *testing.T) {
 	fixture := newSubmitFixture()
 	sentinel := errors.New("sentinel")
 	if got := fixture.uc.mapError(sentinel); !errors.Is(got, sentinel) {
 		t.Fatalf("mapError=%v, want original error", got)
 	}
+}
+
+func TestSubmitMapAdmissionErrorConvertsUnclassifiedAdmissionFailure(t *testing.T) {
+	fixture := newSubmitFixture()
+	sentinel := errors.New("sentinel")
+	id, err := domain.NewTaskID("review-20260809-010203-0102-0304")
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertSubmitError(t, fixture.uc.mapAdmissionError(sentinel, id), "ADMISSION_FAILED", "error.admission.failed", map[string]any{"task_id": id.String()})
+}
+
+func TestSubmitErrorResponseRejectsUnclassifiedError(t *testing.T) {
 	defer func() {
 		if recover() == nil {
 			t.Fatal("submitErrorResponse accepted an unclassified error")
 		}
 	}()
-	_ = submitErrorResponse("request", sentinel)
+	submitErrorResponse("request", errors.New("unclassified"))
+}
+
+func TestSubmitHandleImplAdmissionFailureCompensatesAndReturnsSingleErrorEnvelope(t *testing.T) {
+	fixture := newSubmitFixture()
+	fixture.admitter.err = errors.New("admission failed")
+	response := fixture.uc.Handle(transport.Request{RequestID: "request", Params: json.RawMessage(fmt.Sprintf(`{"subcommand":"impl","slug":"valid-slug","prompt":"safe","working_dir":%q,"paths":[]}`, t.TempDir()))})
+	if response.OK || response.Error == nil || response.Error.Code != "ADMISSION_FAILED" || response.Error.MessageKey != "error.admission.failed" {
+		t.Fatalf("response=%#v", response)
+	}
+	if fixture.locks.calls != 1 || fixture.releaser.calls != 1 || len(fixture.store.reserved) != 1 || len(fixture.store.released) != 1 || fixture.admitter.calls != 1 || len(fixture.starter.payloads) != 0 {
+		t.Fatalf("lock/reservation/admission/start mismatch: acquire=%d release=%d reserve=%d reservation release=%d admissions=%d starts=%d", fixture.locks.calls, fixture.releaser.calls, len(fixture.store.reserved), len(fixture.store.released), fixture.admitter.calls, len(fixture.starter.payloads))
+	}
+	if taskID, ok := response.Error.Detail["task_id"].(string); !ok || taskID != fixture.locks.ids[0].String() {
+		t.Fatalf("detail=%#v, acquired task IDs=%v", response.Error.Detail, fixture.locks.ids)
+	}
+	if fixture.locks.ids[0] != fixture.releaser.ids[0] || fixture.locks.ids[0] != fixture.store.released[0] {
+		t.Fatalf("compensation task IDs: acquired=%v lock-released=%v reservation-released=%v", fixture.locks.ids, fixture.releaser.ids, fixture.store.released)
+	}
+	var line bytes.Buffer
+	if err := json.NewEncoder(&line).Encode(response); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Count(line.Bytes(), []byte("\n")) != 1 || !bytes.HasSuffix(line.Bytes(), []byte("\n")) {
+		t.Fatalf("response is not exactly one JSON Lines frame: %q", line.String())
+	}
+}
+
+func TestSubmitHandleAdmissionFailureReturnsSingleErrorEnvelope(t *testing.T) {
+	fixture := newSubmitFixture()
+	fixture.admitter.err = errors.New("admission failed")
+	response := fixture.uc.Handle(transport.Request{RequestID: "request", Params: json.RawMessage(fmt.Sprintf(`{"subcommand":"review","slug":"valid-slug","prompt":"safe","working_dir":%q}`, t.TempDir()))})
+	if response.OK || response.Error == nil || response.Error.Code != "ADMISSION_FAILED" || response.Error.MessageKey != "error.admission.failed" {
+		t.Fatalf("response=%#v", response)
+	}
+	if taskID, ok := response.Error.Detail["task_id"].(string); !ok || taskID == "" {
+		t.Fatalf("detail=%#v", response.Error.Detail)
+	}
+	if len(fixture.store.released) != 1 || fixture.admitter.calls != 1 || len(fixture.starter.payloads) != 0 {
+		t.Fatalf("cleanup/admission/start mismatch: releases=%d admissions=%d starts=%d", len(fixture.store.released), fixture.admitter.calls, len(fixture.starter.payloads))
+	}
+
+	var line bytes.Buffer
+	if err := json.NewEncoder(&line).Encode(response); err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Count(line.Bytes(), []byte("\n")) != 1 || !bytes.HasSuffix(line.Bytes(), []byte("\n")) {
+		t.Fatalf("response is not exactly one JSON Lines frame: %q", line.String())
+	}
+	var encoded transport.Response
+	if err := json.Unmarshal(bytes.TrimSuffix(line.Bytes(), []byte("\n")), &encoded); err != nil {
+		t.Fatalf("invalid JSON Lines response: %v", err)
+	}
+}
+
+func TestSubmitHandleSuccessRegression(t *testing.T) {
+	fixture := newSubmitFixture()
+	queuePosition := 2
+	fixture.admitter.result.QueuePosition = &queuePosition
+	response := fixture.uc.Handle(transport.Request{RequestID: "request", Params: json.RawMessage(fmt.Sprintf(`{"subcommand":"review","slug":"valid-slug","prompt":"safe","working_dir":%q}`, t.TempDir()))})
+	if !response.OK || response.Error != nil {
+		t.Fatalf("response=%#v", response)
+	}
+	var result struct {
+		TaskID        string `json:"task_id"`
+		State         string `json:"state"`
+		QueuePosition *int   `json:"queue_position"`
+	}
+	if err := json.Unmarshal(response.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if result.TaskID == "" || result.State != string(domain.StateQueued) || result.QueuePosition == nil || *result.QueuePosition != queuePosition {
+		t.Fatalf("result=%#v", result)
+	}
 }
 
 func TestAcquirePathLocksAfterSnapshotRollsBackSnapshotAndReservation(t *testing.T) {
@@ -634,7 +726,7 @@ func newSubmitLifecycleFixture(t *testing.T, model string, effort *string) (*Sub
 		}
 	}}
 	options := submitOptionsFake{model: model, modelOK: true, effortOK: true, effortValue: effort}
-	uc := NewSubmitTaskUseCase(tasks, nil, nil, admitter, 10, starter, options, clock, nil)
+	uc := NewSubmitTaskUseCase(tasks, &submitPathLockFake{}, &submitPathLockReleaserFake{}, admitter, 10, starter, options, clock, nil)
 	uc.random = &submitByteReader{bytes: []byte{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24}}
 	return uc, admitter, tasks, root
 }
@@ -945,6 +1037,8 @@ func TestSubmitTaskUseCaseCompensatesRejectedLifecycleStart(t *testing.T) {
 func TestSubmitHandleMapsQueueFullWithDetailContract(t *testing.T) {
 	fixture := newSubmitFixture()
 	fixture.admitter.err = domain.ErrQueueFull
+	var logs bytes.Buffer
+	fixture.uc.logger = slog.New(slog.NewTextHandler(&logs, nil))
 	resp := fixture.uc.Handle(transport.Request{RequestID: "request", Params: json.RawMessage(fmt.Sprintf(`{"subcommand":"review","slug":"valid-slug","prompt":"safe","working_dir":%q}`, t.TempDir()))})
 	if resp.OK || resp.Error == nil || resp.Error.Code != "QUEUE_FULL" || resp.Error.MessageKey != "error.queue.full" {
 		t.Fatalf("response=%#v", resp)
@@ -954,6 +1048,9 @@ func TestSubmitHandleMapsQueueFullWithDetailContract(t *testing.T) {
 	}
 	if len(fixture.store.released) != 1 || len(fixture.starter.payloads) != 0 {
 		t.Fatalf("cleanup/start mismatch")
+	}
+	if strings.Contains(logs.String(), "unclassified task admission failure") {
+		t.Fatalf("classified queue-full error logged as unclassified: %s", logs.String())
 	}
 }
 
@@ -1007,7 +1104,7 @@ func TestNewSubmitTaskUseCaseRequiresPairedPathLockDependencies(t *testing.T) {
 		releaser SubmitPathLockReleaser
 		panics   bool
 	}{
-		{name: "both nil"},
+		{name: "both nil", panics: true},
 		{name: "both set", locks: &submitPathLockFake{}, releaser: &submitPathLockReleaserFake{}},
 		{name: "acquirer only", locks: &submitPathLockFake{}, panics: true},
 		{name: "releaser only", releaser: &submitPathLockReleaserFake{}, panics: true},
@@ -1025,8 +1122,8 @@ func TestNewSubmitTaskUseCaseRequiresPairedPathLockDependencies(t *testing.T) {
 
 func TestSubmitExecuteAdmissionFailureCompensatesWithoutCancelledContext(t *testing.T) {
 	fixture := newSubmitFixture()
-	fixture.admitter.err = errors.New("admission failed")
 	const canary = "CANARY-SECRET-VALUE-DO-NOT-LOG"
+	fixture.admitter.err = &submitCanaryAdmissionError{message: "admission failed " + canary}
 	fixture.releaser.err = errors.New("release path lock " + canary)
 	fixture.store.releaseErr = errors.New("release reservation " + canary)
 	var logs bytes.Buffer
@@ -1042,6 +1139,9 @@ func TestSubmitExecuteAdmissionFailureCompensatesWithoutCancelledContext(t *test
 	}
 	if strings.Contains(logs.String(), canary) || !strings.Contains(logs.String(), "error=") {
 		t.Fatalf("unsafe compensation logs: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), execution.ErrorTypeName(fixture.admitter.err)) {
+		t.Fatalf("admission failure type not logged: %s", logs.String())
 	}
 }
 

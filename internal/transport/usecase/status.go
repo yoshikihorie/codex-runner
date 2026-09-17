@@ -1,10 +1,12 @@
 package usecase
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"reflect"
 	"time"
@@ -125,6 +127,9 @@ func (uc *GetTaskStatusUseCase) Handle(req transport.Request) transport.Response
 	if err != nil {
 		return statusErrorResponse(req.RequestID, "TASK_ID_INVALID_FORMAT", "error.task.idInvalidFormat", map[string]any{"task_id": req.TaskID})
 	}
+	if !isEmptyStatusParams(req.Params) {
+		return statusErrorResponse(req.RequestID, "STATUS_PARAMS_MALFORMED", "error.status.paramsMalformed", nil)
+	}
 	out, err := uc.Execute(context.Background(), GetTaskStatusInput{TaskID: id})
 	if err != nil {
 		return uc.statusMappedError(req.RequestID, id, err)
@@ -137,6 +142,19 @@ func (uc *GetTaskStatusUseCase) Handle(req transport.Request) transport.Response
 		panic(fmt.Errorf("marshal status response: %w", err))
 	}
 	return transport.Response{ProtocolVersion: transport.ProtocolVersion, RequestID: req.RequestID, OK: true, Result: body}
+}
+
+func isEmptyStatusParams(params json.RawMessage) bool {
+	if len(params) == 0 {
+		return true
+	}
+	decoder := json.NewDecoder(bytes.NewReader(params))
+	var object map[string]json.RawMessage
+	if err := decoder.Decode(&object); err != nil || object == nil || len(object) != 0 {
+		return false
+	}
+	var trailing any
+	return errors.Is(decoder.Decode(&trailing), io.EOF)
 }
 
 func (uc *GetTaskStatusUseCase) statusMappedError(requestID string, id domain.TaskID, err error) transport.Response {

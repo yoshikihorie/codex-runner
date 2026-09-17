@@ -84,9 +84,24 @@ func newQueueIntegrationFixture(t *testing.T, maxConcurrent int, maxConcurrentIm
 	admit := executionusecase.NewAdmitTaskUseCase(queue, registry, launching, promotions, &sync.Mutex{}, maxConcurrent, maxConcurrentImpl, queueMaxDepth)
 	recording := &recordingAdmitter{inner: admit}
 	starter := &queueIntegrationStarter{}
+	pathStore := store.NewPathLockFileStore(t.TempDir())
+	resolveLockPath, err := execution.NewLockPathResolver(tasksRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquire, err := execution.NewAcquirePathLockUseCase(
+		store.NewFileMutex(filepath.Join(t.TempDir(), "path-locks.lock")), pathStore,
+		domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }),
+		store.NormalizePath, tasks, resolveLockPath, slog.New(slog.NewTextHandler(os.Stderr, nil)),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	recordingAcquire := &recordingPathLockAcquirer{inner: acquire}
+	releaser := execution.NewReleasePathLockUseCase(pathStore, slog.New(slog.NewTextHandler(os.Stderr, nil)))
 	now := time.Date(2026, 8, 9, 12, 0, 0, 0, time.UTC)
 	submit := transportusecase.NewSubmitTaskUseCase(
-		tasks, nil, nil, recording, queueMaxDepth, starter, options,
+		tasks, recordingAcquire, releaser, recording, queueMaxDepth, starter, options,
 		domain.ClockFunc(func() time.Time { return now }), slog.New(slog.NewTextHandler(os.Stderr, nil)),
 	)
 	return queueIntegrationFixture{tasksRoot: tasksRoot, queue: queue, registry: registry, launching: launching, admitter: recording, starter: starter, submit: submit}
