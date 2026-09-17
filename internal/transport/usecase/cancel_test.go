@@ -447,6 +447,7 @@ func (f *cancelDisarmerFake) Disarm(domain.TaskID) {
 type cancelWriterFake struct {
 	contract.ContractWriter
 	events       []domain.Event
+	exits        []domain.ExitCode
 	writeExitErr error
 }
 
@@ -460,7 +461,20 @@ func (f *cancelConfirmerFake) Execute(context.Context, execution.ConfirmTaskKill
 	return execution.ConfirmTaskKilledOutput{}, f.err
 }
 
-func (f *cancelWriterFake) WriteExitCode(domain.TaskID, domain.ExitCode) error { return f.writeExitErr }
+type cancelConfirmerSpy struct {
+	delegate cancelTaskKilledConfirmer
+	inputs   []execution.ConfirmTaskKilledInput
+}
+
+func (s *cancelConfirmerSpy) Execute(ctx context.Context, in execution.ConfirmTaskKilledInput) (execution.ConfirmTaskKilledOutput, error) {
+	s.inputs = append(s.inputs, in)
+	return s.delegate.Execute(ctx, in)
+}
+
+func (f *cancelWriterFake) WriteExitCode(_ domain.TaskID, code domain.ExitCode) error {
+	f.exits = append(f.exits, code)
+	return f.writeExitErr
+}
 func (f *cancelWriterFake) AppendEvent(_ domain.TaskID, e domain.Event) error {
 	f.events = append(f.events, e)
 	return nil
@@ -917,10 +931,42 @@ func TestCancelTaskExecute_DoesNotWriteSynthetic130BeforeWaiter_SCNProto0333(t *
 	writer := &cancelWriterFake{}
 	pending := &cancelPendingRegistrarFake{}
 	confirmer := execution.NewConfirmTaskKilledUseCase(tasks, writer, &cancelReaderFake{}, store.NewTaskMutex(), disarmer, execution.NewReleasePathLockUseCase(&cancelPathsFake{}), &cancelSlotFake{}, domain.ClockFunc(time.Now), &cancelMetricsRecorderFake{}, &metrics.StalledTimeTracker{}, pending)
-	uc := NewCancelTaskUseCase(tasks, &cancelQueueFake{payload: payload, queueMu: queueMu}, queueMu, store.NewTaskMutex(), events, &cancelTerminatorFake{}, termination, pending, disarmer, confirmer, &cancelStalledTrackerFake{}, &cancelOwnershipFake{}, domain.ClockFunc(time.Now))
+	spy := &cancelConfirmerSpy{delegate: confirmer}
+	uc := NewCancelTaskUseCase(tasks, &cancelQueueFake{payload: payload, queueMu: queueMu}, queueMu, store.NewTaskMutex(), events, &cancelTerminatorFake{}, termination, pending, disarmer, spy, &cancelStalledTrackerFake{}, &cancelOwnershipFake{}, domain.ClockFunc(time.Now))
 	out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
-	if err != nil || out.State != domain.StateCancelling || tasks.snapshot.State != domain.StateCancelling || termination.calls != 1 || disarmer.calls != 1 || len(events.events) != 1 || len(writer.events) != 0 {
-		t.Fatalf("out=%#v err=%v snapshot=%#v termination=%#v disarmer=%#v events=%#v killed=%#v", out, err, tasks.snapshot, termination, disarmer, events.events, writer.events)
+	if err != nil || out.State != domain.StateCancelling || tasks.snapshot.State != domain.StateCancelling || termination.calls != 1 || disarmer.calls != 1 || len(events.events) != 1 || len(spy.inputs) != 0 || len(writer.exits) != 0 || len(writer.events) != 0 {
+		t.Fatalf("out=%#v err=%v snapshot=%#v termination=%#v disarmer=%#v events=%#v confirmationInputs=%#v exits=%#v killed=%#v", out, err, tasks.snapshot, termination, disarmer, events.events, spy.inputs, writer.exits, writer.events)
+	}
+
+	_, err = spy.Execute(context.Background(), execution.ConfirmTaskKilledInput{TaskID: payload.Task.ID(), RawExitCode: 143, Estimated: false, OccurredAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(spy.inputs) != 1 || spy.inputs[0].RawExitCode != 143 || spy.inputs[0].Estimated {
+		t.Fatalf("confirmation inputs=%#v", spy.inputs)
+	}
+	if tasks.snapshot.State != domain.StateKilled || tasks.snapshot.ExitCode == nil || tasks.snapshot.ExitCode.Raw() != 143 {
+		t.Fatalf("snapshot=%#v", tasks.snapshot)
+	}
+	if len(writer.exits) != 1 || writer.exits[0].Raw() != 143 {
+		t.Fatalf("exit-code writes=%#v", writer.exits)
+	}
+	if len(writer.events) != 1 {
+		t.Fatalf("killed events=%#v", writer.events)
+	}
+	killed, ok := writer.events[0].(domain.TaskKilled)
+	if !ok || killed.ExitCode.Raw() != 143 || killed.Estimated {
+		t.Fatalf("killed event=%#v", writer.events[0])
+	}
+	for _, exit := range writer.exits {
+		if exit.Raw() == 130 {
+			t.Fatalf("synthetic exit-code written: %#v", writer.exits)
+		}
+	}
+	for _, event := range writer.events {
+		if killed, ok := event.(domain.TaskKilled); ok && killed.ExitCode.Raw() == 130 {
+			t.Fatalf("synthetic TaskKilled appended: %#v", writer.events)
+		}
 	}
 }
 
@@ -1507,10 +1553,15 @@ func TestCancelTaskExecute_AdoptedAfterRestartWithPIDUsesEstimated130_SCNProto03
 	tasks.snapshot = cancelPersistedSnapshot(t, domain.StateRunning, true)
 	tasks.snapshot.AdoptedAfterRestart = true
 	termination.result.Dead = true
+	spy := &cancelConfirmerSpy{delegate: uc.confirmer}
+	uc.confirmer = spy
 
 	out, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), OccurredAt: time.Now()})
 	if err != nil || !out.TerminationTriggered || tasks.snapshot.State != domain.StateKilled || disarmer.calls != 1 {
 		t.Fatalf("out=%#v err=%v snapshot=%#v disarmer=%#v", out, err, tasks.snapshot, disarmer)
+	}
+	if len(spy.inputs) != 1 || spy.inputs[0].RawExitCode != 130 || !spy.inputs[0].Estimated {
+		t.Fatalf("confirmation inputs=%#v", spy.inputs)
 	}
 }
 
