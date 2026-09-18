@@ -6,9 +6,74 @@ import (
 	"testing"
 	"time"
 
+	"github.com/yoshikihorie/codex-runner/internal/contract"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/store"
 )
+
+type launchFailureContractReader struct {
+	store.ContractReader
+	existing int
+	exists   bool
+	err      error
+	calls    int
+	trace    *[]string
+}
+
+func (f *launchFailureContractReader) ReadExitCode(domain.TaskID) (int, bool, error) {
+	f.calls++
+	appendLifecycleTrace(f.trace, "read-exit-code")
+	return f.existing, f.exists, f.err
+}
+
+type launchFailureContractWriter struct {
+	contract.ContractWriter
+	writeErr    error
+	writeCalls  int
+	written     []domain.ExitCode
+	appendCalls int
+	trace       *[]string
+}
+
+func (f *launchFailureContractWriter) WriteExitCode(_ domain.TaskID, exitCode domain.ExitCode) error {
+	f.writeCalls++
+	f.written = append(f.written, exitCode)
+	appendLifecycleTrace(f.trace, "write-exit-code")
+	return f.writeErr
+}
+
+func (f *launchFailureContractWriter) AppendEvent(_ domain.TaskID, _ domain.Event) error {
+	f.appendCalls++
+	appendLifecycleTrace(f.trace, "append-event")
+	return nil
+}
+
+type launchFailureFixture struct {
+	input   FailTaskLaunchInput
+	store   *lifecycleRecordingTaskStore
+	locker  *lifecycleRecordingTaskLocker
+	reader  *launchFailureContractReader
+	writer  *launchFailureContractWriter
+	slots   *lifecycleRecordingSlotReleaser
+	paths   *lifecycleRecordingPathLockReleaser
+	trace   []string
+	useCase *FailTaskLaunchUseCase
+}
+
+func newLaunchFailureFixture(t *testing.T, existing int, exists bool, readErr, writeErr error) *launchFailureFixture {
+	t.Helper()
+	f := &launchFailureFixture{}
+	task := lifecycleTask(t, domain.SubcommandImpl)
+	f.store = &lifecycleRecordingTaskStore{loads: []lifecycleLoadResult{{err: domain.ErrTaskNotFound}}, trace: &f.trace, loadName: "load", saveName: "save"}
+	f.locker = &lifecycleRecordingTaskLocker{trace: &f.trace}
+	f.reader = &launchFailureContractReader{existing: existing, exists: exists, err: readErr, trace: &f.trace}
+	f.writer = &launchFailureContractWriter{writeErr: writeErr, trace: &f.trace}
+	f.slots = &lifecycleRecordingSlotReleaser{trace: &f.trace}
+	f.paths = &lifecycleRecordingPathLockReleaser{trace: &f.trace}
+	f.useCase = NewFailTaskLaunchUseCase(f.store, f.locker, f.writer, f.reader, f.slots, f.paths, &lifecycleRecordingClock{now: testLifecycleTime, trace: &f.trace})
+	f.input = FailTaskLaunchInput{Task: task, ResolvedTimeout: lifecycleTimeout(t), Model: "gpt-5", SandboxMode: "workspace-write", OccurredAt: testLifecycleTime}
+	return f
+}
 
 func TestFailTaskLaunchUseCaseContract(t *testing.T) {
 	var input FailTaskLaunchInput
@@ -133,6 +198,97 @@ func TestFailTaskLaunchUseCaseExecuteLockedRetainsTerminalResultOnSaveFailure(t 
 	}
 	if slots.calls != 0 || paths.calls != 0 {
 		t.Fatal("ExecuteLocked released resources after a persistence failure")
+	}
+}
+
+func TestFailTaskLaunchUseCaseClassifiesExitCodeErrorsAndReleasesResources(t *testing.T) {
+	readErr := errors.New("read exit-code")
+	writeErr := errors.New("write exit-code")
+	const mismatchExisting = 2
+	expectedExitCode := domain.NewExitCode(1)
+	cases := []struct {
+		name                    string
+		existing                int
+		exists                  bool
+		readErr                 error
+		writeErr                error
+		wantContractWriteFailed bool
+		wantWriteCalls          int
+	}{
+		{name: "read-error", readErr: readErr},
+		{name: "mismatch", existing: mismatchExisting, exists: true},
+		{name: "write-error", writeErr: writeErr, wantContractWriteFailed: true, wantWriteCalls: 1},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertError := func(t *testing.T, err error) {
+				t.Helper()
+				if err == nil {
+					t.Fatal("expected exit-code error")
+				}
+				if got := errors.Is(err, domain.ErrContractWriteFailed); got != tc.wantContractWriteFailed {
+					t.Fatalf("errors.Is(ErrContractWriteFailed) = %t, want %t: %v", got, tc.wantContractWriteFailed, err)
+				}
+				switch tc.name {
+				case "read-error":
+					if !errors.Is(err, readErr) {
+						t.Fatalf("read error was not retained: %v", err)
+					}
+				case "mismatch":
+					existing, attempted, ok := contract.ExitCodeMismatch(err)
+					if !ok || existing != mismatchExisting || attempted != expectedExitCode.Raw() {
+						t.Fatalf("ExitCodeMismatch() = (%d, %d, %t)", existing, attempted, ok)
+					}
+				case "write-error":
+					if errors.Is(err, writeErr) {
+						t.Fatalf("write error unexpectedly remained in the error chain: %v", err)
+					}
+				}
+			}
+
+			assertContractCalls := func(t *testing.T, f *launchFailureFixture) {
+				t.Helper()
+				if f.reader.calls != 1 || f.writer.writeCalls != tc.wantWriteCalls {
+					t.Fatalf("contract calls: read=%d write=%d", f.reader.calls, f.writer.writeCalls)
+				}
+				if f.store.saveCalls != 0 || f.writer.appendCalls != 0 {
+					t.Fatalf("terminal persistence continued: save=%d append=%d trace=%v", f.store.saveCalls, f.writer.appendCalls, f.trace)
+				}
+				if tc.wantWriteCalls == 1 {
+					if len(f.writer.written) != 1 || f.writer.written[0].Raw() != expectedExitCode.Raw() {
+						t.Fatalf("written exit codes=%v", f.writer.written)
+					}
+				} else if len(f.writer.written) != 0 {
+					t.Fatalf("fatal error attempted exit-code write: %v", f.writer.written)
+				}
+			}
+
+			locked := newLaunchFailureFixture(t, tc.existing, tc.exists, tc.readErr, tc.writeErr)
+			result, err := locked.useCase.ExecuteLocked(context.Background(), locked.input)
+			assertError(t, err)
+			if !result.Terminal || !result.Impl {
+				t.Fatalf("ExecuteLocked() result = %+v", result)
+			}
+			assertContractCalls(t, locked)
+			if locked.locker.lockCalls != 0 || locked.locker.unlockCalls != 0 || locked.paths.calls != 0 || locked.slots.calls != 0 {
+				t.Fatalf("ExecuteLocked managed resources: trace=%v", locked.trace)
+			}
+
+			executed := newLaunchFailureFixture(t, tc.existing, tc.exists, tc.readErr, tc.writeErr)
+			err = executed.useCase.Execute(context.Background(), executed.input)
+			assertError(t, err)
+			assertContractCalls(t, executed)
+			if executed.locker.lockCalls != 1 || executed.locker.unlockCalls != 1 {
+				t.Fatalf("task mutex calls: lock=%d unlock=%d trace=%v", executed.locker.lockCalls, executed.locker.unlockCalls, executed.trace)
+			}
+			if executed.paths.calls != 1 || executed.slots.calls != 1 {
+				t.Fatalf("resource release calls: path=%d slot=%d trace=%v", executed.paths.calls, executed.slots.calls, executed.trace)
+			}
+			if !lifecycleTraceSubsequence(executed.trace, "task-unlock", "release-path-lock", "release-slot") {
+				t.Fatalf("release order=%v", executed.trace)
+			}
+		})
 	}
 }
 
