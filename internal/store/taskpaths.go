@@ -3,10 +3,12 @@ package store
 import (
 	"errors"
 	"fmt"
-	"github.com/yoshikihorie/codex-runner/internal/domain"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"syscall"
+
+	"github.com/yoshikihorie/codex-runner/internal/domain"
 )
 
 const (
@@ -44,7 +46,7 @@ func (p taskPaths) adoptedAfterRestart() string {
 }
 func openTaskDir(path string) (*os.File, error) {
 	f, e := os.OpenFile(path, os.O_RDONLY|syscall.O_NOFOLLOW, 0)
-	if os.IsNotExist(e) {
+	if errors.Is(e, fs.ErrNotExist) {
 		return nil, nil
 	}
 	if e != nil {

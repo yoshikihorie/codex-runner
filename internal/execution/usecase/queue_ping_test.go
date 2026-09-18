@@ -42,9 +42,13 @@ func TestPingRemainsResponsiveWhileQueueMutexIsHeld(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("locker goroutine did not acquire mutex")
 	}
+	ping, err := transportusecase.NewPingUseCase(0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	result := make(chan error, 1)
 	pingDone := make(chan struct{})
-	go func() { _, err := (&transportusecase.PingUseCase{}).Execute(context.Background()); result <- err }()
+	go func() { _, err := ping.Execute(context.Background()); result <- err }()
 	t.Cleanup(func() {
 		select {
 		case <-pingDone:

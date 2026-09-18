@@ -15,7 +15,7 @@ import (
 
 func TestDispatcherDispatchesPingUseCase(t *testing.T) {
 	ignored := func(transport.Request) transport.Response { return transport.Response{} }
-	dispatcher, err := transport.NewDispatcher(ignored, ignored, ignored, (&PingUseCase{}).Handle)
+	dispatcher, err := transport.NewDispatcher(ignored, ignored, ignored, newPingUseCaseForTest(t, 0).Handle)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -42,7 +42,7 @@ func TestServePingConcurrentConnections(t *testing.T) {
 	})
 	socketPath := filepath.Join(dir, "codexd.sock")
 	ignored := func(transport.Request) transport.Response { return transport.Response{} }
-	dispatcher, err := transport.NewDispatcher(ignored, ignored, ignored, (&PingUseCase{}).Handle)
+	dispatcher, err := transport.NewDispatcher(ignored, ignored, ignored, newPingUseCaseForTest(t, 0).Handle)
 	if err != nil {
 		t.Fatal(err)
 	}

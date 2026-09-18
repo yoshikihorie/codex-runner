@@ -9,6 +9,15 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/transport"
 )
 
+func newPingUseCaseForTest(t *testing.T, failedTaskSnapshots int) *PingUseCase {
+	t.Helper()
+	useCase, err := NewPingUseCase(failedTaskSnapshots)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return useCase
+}
+
 func TestPingUseCaseExecute(t *testing.T) {
 	useCase, err := NewPingUseCase(0)
 	if err != nil {
@@ -46,7 +55,7 @@ func TestNewPingUseCaseValidatesFailedTaskSnapshots(t *testing.T) {
 }
 
 func TestPingUseCaseDoesNotReferenceQueue(t *testing.T) {
-	got, err := (&PingUseCase{}).Execute(context.Background())
+	got, err := newPingUseCaseForTest(t, 0).Execute(context.Background())
 	if err != nil {
 		t.Fatalf("Execute() error = %v", err)
 	}
@@ -112,7 +121,7 @@ func TestPingHandleSuccess(t *testing.T) {
 }
 
 func TestPingHandleIgnoresTaskIDAndParams(t *testing.T) {
-	useCase := &PingUseCase{}
+	useCase := newPingUseCaseForTest(t, 0)
 	withExtras := useCase.Handle(transport.Request{
 		RequestID: "r-2",
 		Verb:      "ping",
@@ -127,7 +136,7 @@ func TestPingHandleIgnoresTaskIDAndParams(t *testing.T) {
 }
 
 func TestPingHandleAcceptsUnknownRequestProtocolVersion(t *testing.T) {
-	resp := (&PingUseCase{}).Handle(transport.Request{
+	resp := newPingUseCaseForTest(t, 0).Handle(transport.Request{
 		ProtocolVersion: "999",
 		RequestID:       "r-4",
 		Verb:            "ping",
@@ -138,7 +147,7 @@ func TestPingHandleAcceptsUnknownRequestProtocolVersion(t *testing.T) {
 }
 
 func TestPingHandleEchoesEmptyRequestID(t *testing.T) {
-	resp := (&PingUseCase{}).Handle(transport.Request{Verb: "ping"})
+	resp := newPingUseCaseForTest(t, 0).Handle(transport.Request{Verb: "ping"})
 	if resp.RequestID != "" || !resp.OK {
 		t.Fatalf("response = %#v", resp)
 	}

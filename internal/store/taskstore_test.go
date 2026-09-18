@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io/fs"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -334,6 +336,29 @@ func TestNewFileTaskStoreClassifiesStartupCorruption(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
+		{name: "task directory open EACCES", setup: func(t *testing.T, root string, id domain.TaskID) {
+			dir := filepath.Join(root, id.String())
+			if err := os.Mkdir(dir, taskDirPerm); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Chmod(dir, 0); err != nil {
+				t.Fatal(err)
+			}
+			// Cleanup runs in LIFO order, so restore permission before t.TempDir removes the tree.
+			t.Cleanup(func() {
+				if err := os.Chmod(dir, taskDirPerm); err != nil {
+					t.Errorf("restore task directory permission: %v", err)
+				}
+			})
+			probe, err := os.Open(dir)
+			if err == nil {
+				probe.Close()
+				t.Skip("permission 0000 does not prevent opening the task directory in this environment")
+			}
+			if !errors.Is(err, fs.ErrPermission) {
+				t.Fatalf("open permission probe = %v, want EACCES", err)
+			}
+		}},
 		{name: "task json IO non-ENOENT", setup: func(t *testing.T, root string, id domain.TaskID) {
 			dir := filepath.Join(root, id.String())
 			if err := os.Mkdir(dir, taskDirPerm); err != nil {
@@ -433,6 +458,12 @@ func TestNewFileTaskStoreSkipsStartupENOENT(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			root := t.TempDir()
 			id := storeID(t, tc.slug)
+			validID := storeID(t, tc.slug+"-valid")
+			validBody, err := json.Marshal(storeSnapshot(t, validID, domain.StateQueued))
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeStartupSnapshot(t, root, validID, validBody)
 			var output bytes.Buffer
 			previous := slog.Default()
 			slog.SetDefault(slog.New(slog.NewTextHandler(&output, nil)))
@@ -451,17 +482,45 @@ func TestNewFileTaskStoreSkipsStartupENOENT(t *testing.T) {
 			if len(corrupted) != 0 {
 				t.Fatalf("CorruptedTaskIDs() = %#v, want empty", corrupted)
 			}
-			if len(store.index) != 0 {
-				t.Fatalf("index = %#v, want empty", store.index)
+			if len(store.index) != 1 {
+				t.Fatalf("index = %#v, want only %s", store.index, validID.String())
 			}
 			listed, err := store.ListByStates([]domain.TaskState{domain.StateQueued})
-			if err != nil || len(listed) != 0 {
+			if err != nil || len(listed) != 1 || listed[0].TaskID != validID {
 				t.Fatalf("ListByStates() = %#v, %v", listed, err)
 			}
 			if output.Len() != 0 {
 				t.Fatalf("store logged during startup: %q", output.String())
 			}
 		})
+	}
+}
+
+func TestNewFileTaskStoreSkipsWrappedSnapshotENOENT(t *testing.T) {
+	root := t.TempDir()
+	id := storeID(t, "wrapped-enoent")
+	if err := os.Mkdir(filepath.Join(root, id.String()), taskDirPerm); err != nil {
+		t.Fatal(err)
+	}
+	var output bytes.Buffer
+	previous := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&output, nil)))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	store, err := newFileTaskStoreWithSnapshotReader(root, os.ReadDir, func(string) (domain.TaskSnapshot, error) {
+		return domain.TaskSnapshot{}, fmt.Errorf("wrapped: %w", fs.ErrNotExist)
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if corrupted := store.CorruptedTaskIDs(); len(corrupted) != 0 {
+		t.Fatalf("CorruptedTaskIDs() = %#v, want empty", corrupted)
+	}
+	if len(store.index) != 0 {
+		t.Fatalf("index = %#v, want empty", store.index)
+	}
+	if output.Len() != 0 {
+		t.Fatalf("store logged during startup: %q", output.String())
 	}
 }
 

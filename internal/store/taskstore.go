@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"sort"
 	"sync"
@@ -36,12 +37,19 @@ func NewFileTaskStore(root string) (*FileTaskStore, error) {
 }
 
 func newFileTaskStore(root string, readDir func(string) ([]os.DirEntry, error)) (*FileTaskStore, error) {
+	return newFileTaskStoreWithSnapshotReader(root, readDir, nil)
+}
+
+func newFileTaskStoreWithSnapshotReader(root string, readDir func(string) ([]os.DirEntry, error), readSnapshot func(string) (domain.TaskSnapshot, error)) (*FileTaskStore, error) {
 	path, err := domain.NewNormalizedPath(root)
 	if err != nil {
 		return nil, err
 	}
 	root = path.String()
 	s := &FileTaskStore{root: root, index: map[string]domain.TaskSnapshot{}}
+	if readSnapshot == nil {
+		readSnapshot = s.read
+	}
 	es, e := readDir(root)
 	if os.IsNotExist(e) {
 		return s, nil
@@ -54,7 +62,11 @@ func newFileTaskStore(root string, readDir func(string) ([]os.DirEntry, error)) 
 		if e != nil {
 			continue
 		}
-		p, _ := newTaskPaths(root, id)
+		p, e := newTaskPaths(root, id)
+		if e != nil {
+			s.corrupted = append(s.corrupted, id)
+			continue
+		}
 		d, e := openTaskDir(p.dir())
 		if e != nil {
 			s.corrupted = append(s.corrupted, id)
@@ -64,8 +76,8 @@ func newFileTaskStore(root string, readDir func(string) ([]os.DirEntry, error)) 
 			continue
 		}
 		d.Close()
-		v, e := s.read(p.taskJSON())
-		if os.IsNotExist(e) {
+		v, e := readSnapshot(p.taskJSON())
+		if errors.Is(e, fs.ErrNotExist) {
 			continue
 		}
 		if e != nil || v.Validate() != nil || v.TaskID != id {
