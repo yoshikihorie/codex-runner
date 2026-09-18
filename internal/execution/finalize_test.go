@@ -986,7 +986,7 @@ func TestFinalizeTaskUseCaseFatalExitCodeLogsOmitPublicMachineCode(t *testing.T)
 			t.Fatalf("logs=%#v", logs)
 		}
 		got := logs[0]
-		if got.level != slog.LevelError || got.msg != "contract write failed: exit-code validation" || got.attrs["task_id"] != s.latest.TaskID.String() || got.attrs["stage"] != "exit-code" || !strings.Contains(fmt.Sprint(got.attrs["error"]), readErr.Error()) {
+		if got.level != slog.LevelError || got.msg != "exit-code read failed before write" || got.attrs["task_id"] != s.latest.TaskID.String() || got.attrs["stage"] != "exit-code" || !strings.Contains(fmt.Sprint(got.attrs["error"]), readErr.Error()) {
 			t.Fatalf("log=%#v", got)
 		}
 		if _, found := got.attrs["code"]; found {
@@ -1015,7 +1015,7 @@ func TestFinalizeTaskUseCaseFatalExitCodeLogsOmitPublicMachineCode(t *testing.T)
 			t.Fatalf("logs=%#v", logs)
 		}
 		got := logs[0]
-		if got.level != slog.LevelError || got.msg != "contract write failed: exit-code mismatch (fail-closed, not retried)" || got.attrs["task_id"] != s.latest.TaskID.String() || got.attrs["stage"] != "exit-code-mismatch" || got.attrs["existing_exit_code"] != int64(1) || got.attrs["attempted_exit_code"] != int64(0) {
+		if got.level != slog.LevelError || got.msg != "exit-code mismatch detected before write (fail-closed, not retried)" || got.attrs["task_id"] != s.latest.TaskID.String() || got.attrs["stage"] != "exit-code-mismatch" || got.attrs["existing_exit_code"] != int64(1) || got.attrs["attempted_exit_code"] != int64(0) {
 			t.Fatalf("log=%#v", got)
 		}
 		if _, found := got.attrs["code"]; found {
