@@ -303,7 +303,7 @@ func TestTaskStoreListByStatesSkipsCorruptedSnapshot(t *testing.T) {
 	}
 }
 
-func TestNewFileTaskStoreWarnsAboutCorruptedSnapshots(t *testing.T) {
+func TestNewFileTaskStoreDoesNotLogCorruptedSnapshots(t *testing.T) {
 	root := t.TempDir()
 	id := storeID(t, "warn-corrupted")
 	if err := os.Mkdir(filepath.Join(root, id.String()), taskDirPerm); err != nil {
@@ -319,8 +319,212 @@ func TestNewFileTaskStoreWarnsAboutCorruptedSnapshots(t *testing.T) {
 	if _, err := NewFileTaskStore(root); err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(output.String(), "corrupted task snapshots ignored during startup") || !strings.Contains(output.String(), "count=1") || !strings.Contains(output.String(), id.String()) {
-		t.Fatalf("startup warning = %q", output.String())
+	if output.Len() != 0 {
+		t.Fatalf("store logged during startup: %q", output.String())
+	}
+}
+
+func TestNewFileTaskStoreClassifiesStartupCorruption(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*testing.T, string, domain.TaskID)
+	}{
+		{name: "task directory open non-ENOENT", setup: func(t *testing.T, root string, id domain.TaskID) {
+			if err := os.WriteFile(filepath.Join(root, id.String()), []byte("not a directory"), taskFilePerm); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "task json IO non-ENOENT", setup: func(t *testing.T, root string, id domain.TaskID) {
+			dir := filepath.Join(root, id.String())
+			if err := os.Mkdir(dir, taskDirPerm); err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(root, "task-json-symlink-target")
+			if err := os.WriteFile(target, []byte("not opened through symlink"), taskFilePerm); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, filepath.Join(dir, "task.json")); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "JSON decode", setup: func(t *testing.T, root string, id domain.TaskID) {
+			writeStartupSnapshot(t, root, id, []byte("{"))
+		}},
+		{name: "snapshot validation", setup: func(t *testing.T, root string, id domain.TaskID) {
+			snapshot := storeSnapshot(t, id, domain.StateQueued)
+			snapshot.Model = ""
+			body, err := json.Marshal(snapshot)
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeStartupSnapshot(t, root, id, body)
+		}},
+		{name: "task ID mismatch", setup: func(t *testing.T, root string, id domain.TaskID) {
+			body, err := json.Marshal(storeSnapshot(t, storeID(t, "table-other"), domain.StateQueued))
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeStartupSnapshot(t, root, id, body)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			corruptedID := storeID(t, "table-"+strings.ToLower(strings.ReplaceAll(tc.name, " ", "-")))
+			validID := storeID(t, "table-valid")
+			validBody, err := json.Marshal(storeSnapshot(t, validID, domain.StateQueued))
+			if err != nil {
+				t.Fatal(err)
+			}
+			writeStartupSnapshot(t, root, validID, validBody)
+			tc.setup(t, root, corruptedID)
+			var output bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&output, nil)))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+
+			store, err := NewFileTaskStore(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			corrupted := store.CorruptedTaskIDs()
+			if len(corrupted) != 1 || corrupted[0] != corruptedID {
+				t.Fatalf("CorruptedTaskIDs() = %#v, want [%s]", corrupted, corruptedID.String())
+			}
+			listed, err := store.ListByStates([]domain.TaskState{domain.StateQueued})
+			if err != nil || len(listed) != 1 || listed[0].TaskID != validID {
+				t.Fatalf("ListByStates() = %#v, %v", listed, err)
+			}
+			if output.Len() != 0 {
+				t.Fatalf("store logged during startup: %q", output.String())
+			}
+		})
+	}
+}
+
+func TestNewFileTaskStoreSkipsStartupENOENT(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		slug      string
+		construct func(*testing.T, string, domain.TaskID) (*FileTaskStore, error)
+	}{
+		{name: "queued reservation without task json", slug: "enoent-queued", construct: func(t *testing.T, root string, id domain.TaskID) (*FileTaskStore, error) {
+			if err := os.Mkdir(filepath.Join(root, id.String()), taskDirPerm); err != nil {
+				t.Fatal(err)
+			}
+			return NewFileTaskStore(root)
+		}},
+		{name: "task directory removed after ReadDir", slug: "enoent-removed", construct: func(t *testing.T, root string, id domain.TaskID) (*FileTaskStore, error) {
+			taskDir := filepath.Join(root, id.String())
+			if err := os.Mkdir(taskDir, taskDirPerm); err != nil {
+				t.Fatal(err)
+			}
+			return newFileTaskStore(root, func(path string) ([]os.DirEntry, error) {
+				entries, err := os.ReadDir(path)
+				if err != nil {
+					return nil, err
+				}
+				if err := os.Remove(taskDir); err != nil {
+					t.Fatal(err)
+				}
+				return entries, nil
+			})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			id := storeID(t, tc.slug)
+			var output bytes.Buffer
+			previous := slog.Default()
+			slog.SetDefault(slog.New(slog.NewTextHandler(&output, nil)))
+			t.Cleanup(func() { slog.SetDefault(previous) })
+
+			store, err := tc.construct(t, root, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			corrupted := store.CorruptedTaskIDs()
+			for _, corruptedID := range corrupted {
+				if corruptedID == id {
+					t.Fatalf("CorruptedTaskIDs() contains %s", id.String())
+				}
+			}
+			if len(corrupted) != 0 {
+				t.Fatalf("CorruptedTaskIDs() = %#v, want empty", corrupted)
+			}
+			if len(store.index) != 0 {
+				t.Fatalf("index = %#v, want empty", store.index)
+			}
+			listed, err := store.ListByStates([]domain.TaskState{domain.StateQueued})
+			if err != nil || len(listed) != 0 {
+				t.Fatalf("ListByStates() = %#v, %v", listed, err)
+			}
+			if output.Len() != 0 {
+				t.Fatalf("store logged during startup: %q", output.String())
+			}
+		})
+	}
+}
+
+func TestNewFileTaskStoreStartupDiagnosticsBoundaries(t *testing.T) {
+	root := t.TempDir()
+	id := storeID(t, "diagnostic-boundaries")
+	writeStartupSnapshot(t, root, id, []byte("{"))
+	if err := os.Mkdir(filepath.Join(root, "not-a-task-id"), taskDirPerm); err != nil {
+		t.Fatal(err)
+	}
+
+	store, err := NewFileTaskStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupted := store.CorruptedTaskIDs()
+	if len(corrupted) != 1 || corrupted[0] != id {
+		t.Fatalf("CorruptedTaskIDs() = %#v", corrupted)
+	}
+	corrupted[0] = storeID(t, "mutated-copy")
+	if got := store.CorruptedTaskIDs(); len(got) != 1 || got[0] != id {
+		t.Fatalf("CorruptedTaskIDs() exposed internal storage: %#v", got)
+	}
+
+	validBody, err := json.Marshal(storeSnapshot(t, id, domain.StateQueued))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeStartupSnapshot(t, root, id, validBody)
+	if got := store.CorruptedTaskIDs(); len(got) != 1 || got[0] != id {
+		t.Fatalf("same-generation corruption changed after repair: %#v", got)
+	}
+	if listed, err := store.ListByStates([]domain.TaskState{domain.StateQueued}); err != nil || len(listed) != 0 {
+		t.Fatalf("same-generation index changed after repair: %#v, %v", listed, err)
+	}
+	restarted, err := NewFileTaskStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := restarted.CorruptedTaskIDs(); len(got) != 0 {
+		t.Fatalf("restart retained repaired corruption: %#v", got)
+	}
+}
+
+func TestNewFileTaskStoreReturnsRootReadDirError(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "regular-file")
+	if err := os.WriteFile(root, []byte("not a directory"), taskFilePerm); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewFileTaskStore(root)
+	if err == nil || store != nil {
+		t.Fatalf("NewFileTaskStore() = %#v, %v", store, err)
+	}
+}
+
+func writeStartupSnapshot(t *testing.T, root string, id domain.TaskID, body []byte) {
+	t.Helper()
+	dir := filepath.Join(root, id.String())
+	if err := os.MkdirAll(dir, taskDirPerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "task.json"), body, taskFilePerm); err != nil {
+		t.Fatal(err)
 	}
 }
 func TestTaskStoreListByStatesFiltersDeduplicatesAndSorts(t *testing.T) {

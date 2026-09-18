@@ -159,6 +159,192 @@ func TestBuildDependenciesWiresTaskPlacementRootToStoreAndResumeRecoverer(t *tes
 	}
 }
 
+func TestBuildDependenciesPublishesStartupSnapshotDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name           string
+		corruptedCount int
+		wantWarnings   int
+	}{
+		{name: "no corruption", corruptedCount: 0, wantWarnings: 0},
+		{name: "multiple corruptions", corruptedCount: 3, wantWarnings: 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			t.Setenv("HOME", home)
+			taskRoot := filepath.Join(home, "tasks")
+			if err := os.Mkdir(taskRoot, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			ids := make([]string, tc.corruptedCount)
+			for i := range ids {
+				id := mustMainTaskID(t, fmt.Sprintf("corrupt-%d", i))
+				ids[i] = id.String()
+				writeMainSnapshot(t, taskRoot, id, []byte("{"))
+			}
+			cfg := loadBuildDependenciesConfig(t, home, taskRoot)
+			logsDir := filepath.Join(home, "logs")
+			if err := os.Mkdir(logsDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			var logs bytes.Buffer
+			deps, err := buildDependencies(context.Background(), cfg, home, logsDir, func(string) error { return nil }, slog.New(slog.NewJSONHandler(&logs, nil)))
+			if err != nil {
+				t.Fatal(err)
+			}
+			response := deps.ping.Handle(transport.Request{RequestID: "startup-diagnostics", Verb: "ping"})
+			var result struct {
+				FailedTaskSnapshots int `json:"failed_task_snapshots"`
+			}
+			if err := json.Unmarshal(response.Result, &result); err != nil {
+				t.Fatal(err)
+			}
+			if !response.OK || result.FailedTaskSnapshots != tc.corruptedCount {
+				t.Fatalf("ping response = %#v, result = %#v", response, result)
+			}
+
+			records := decodeJSONLogRecords(t, logs.String())
+			warnings := make([]map[string]any, 0, len(records))
+			for _, record := range records {
+				if record["code"] == taskSnapshotReadFailedCode {
+					warnings = append(warnings, record)
+				}
+			}
+			if len(warnings) != tc.wantWarnings {
+				t.Fatalf("snapshot warnings = %#v, want %d", warnings, tc.wantWarnings)
+			}
+			if tc.wantWarnings == 1 {
+				warning := warnings[0]
+				if warning["level"] != "WARN" || warning["message_key"] != taskSnapshotReadFailedMessageKey || warning["failed_task_snapshots"] != float64(tc.corruptedCount) {
+					t.Fatalf("snapshot warning = %#v", warning)
+				}
+				gotIDs, ok := warning["task_ids"].([]any)
+				if !ok || len(gotIDs) != len(ids) {
+					t.Fatalf("task_ids = %#v, want %#v", warning["task_ids"], ids)
+				}
+				for i, wantID := range ids {
+					if gotIDs[i] != wantID {
+						t.Fatalf("task_ids = %#v, want %#v", gotIDs, ids)
+					}
+				}
+			}
+		})
+	}
+}
+
+func TestBuildDependenciesKeepsValidSnapshotWhenAnotherIsCorrupt(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	taskRoot := filepath.Join(home, "tasks")
+	if err := os.Mkdir(taskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	validID := mustMainTaskID(t, "valid")
+	validBody, err := json.Marshal(mainStartupSnapshot(validID, domain.StateStarting))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeMainSnapshot(t, taskRoot, validID, validBody)
+	writeMainSnapshot(t, taskRoot, mustMainTaskID(t, "corrupt"), []byte("{"))
+	cfg := loadBuildDependenciesConfig(t, home, taskRoot)
+	logsDir := filepath.Join(home, "logs")
+	if err := os.Mkdir(logsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	deps, err := buildDependencies(context.Background(), cfg, home, logsDir, func(string) error { return nil }, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	listed, err := deps.taskStore.ListByStates([]domain.TaskState{domain.StateStarting})
+	if err != nil || len(listed) != 1 || listed[0].TaskID != validID {
+		t.Fatalf("ListByStates() = %#v, %v", listed, err)
+	}
+}
+
+func TestBuildDependenciesReturnsTaskRootReadDirErrorWithoutSnapshotWarning(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	taskRoot := filepath.Join(home, "tasks-file")
+	if err := os.WriteFile(taskRoot, []byte("not a directory"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg := loadBuildDependenciesConfig(t, home, taskRoot)
+	logsDir := filepath.Join(home, "logs")
+	if err := os.Mkdir(logsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	deps, err := buildDependencies(context.Background(), cfg, home, logsDir, func(string) error { return nil }, slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err == nil || deps.taskStore != nil {
+		t.Fatalf("buildDependencies() = %#v, %v", deps, err)
+	}
+	if strings.Contains(logs.String(), taskSnapshotReadFailedCode) {
+		t.Fatalf("root failure emitted snapshot warning: %s", logs.String())
+	}
+}
+
+func loadBuildDependenciesConfig(t *testing.T, home, taskRoot string) config.Config {
+	t.Helper()
+	path := writeTestConfig(t, home)
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	contents = append(contents, []byte(fmt.Sprintf("task_placement_root = %q\n", taskRoot))...)
+	if err := os.WriteFile(path, contents, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := config.LoadExplicit(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cfg
+}
+
+func mustMainTaskID(t *testing.T, slug string) domain.TaskID {
+	t.Helper()
+	id, err := domain.NewTaskID("impl-20260918-120000-a1b2-" + slug)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
+}
+
+func mainStartupSnapshot(id domain.TaskID, state domain.TaskState) domain.TaskSnapshot {
+	at := time.Date(2026, 9, 18, 12, 0, 0, 0, time.UTC)
+	return domain.TaskSnapshot{
+		TaskID: id, Subcommand: domain.SubcommandImpl, ResolvedTimeoutSeconds: 1920,
+		Model: "gpt-5", SandboxMode: "workspace-write", RequestedAt: at,
+		Route: domain.ExecutionRouteDaemon, State: state, StateUpdatedAt: at,
+		SchemaVersion: 2,
+	}
+}
+
+func writeMainSnapshot(t *testing.T, root string, id domain.TaskID, body []byte) {
+	t.Helper()
+	dir := filepath.Join(root, id.String())
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "task.json"), body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func decodeJSONLogRecords(t *testing.T, logs string) []map[string]any {
+	t.Helper()
+	var records []map[string]any
+	decoder := json.NewDecoder(strings.NewReader(logs))
+	for {
+		var record map[string]any
+		if err := decoder.Decode(&record); errors.Is(err, io.EOF) {
+			return records
+		} else if err != nil {
+			t.Fatal(err)
+		}
+		records = append(records, record)
+	}
+}
+
 func TestPrepareTaskPlacementRoot(t *testing.T) {
 	root := filepath.Join(t.TempDir(), "tasks")
 	if err := prepareTaskPlacementRoot(root); err != nil {

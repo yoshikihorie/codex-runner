@@ -59,6 +59,8 @@ const (
 const (
 	machineCodeStatsInvalidDateRange        = "STATS_INVALID_DATE_RANGE"
 	machineCodeStatsInvalidSubcommandFilter = "STATS_INVALID_SUBCOMMAND_FILTER"
+	taskSnapshotReadFailedCode              = "TASK_SNAPSHOT_READ_FAILED"
+	taskSnapshotReadFailedMessageKey        = "error.task.snapshotReadFailed"
 )
 
 const (
@@ -782,6 +784,7 @@ func logGitStubUnavailable(logger *slog.Logger, status proc.GitStubPathStatus) {
 
 type daemonDependencies struct {
 	taskStore          *store.FileTaskStore
+	ping               *transportusecase.PingUseCase
 	resumeRecoverer    recovery.Recoverer
 	adoption           *recovery.AdoptRunningTasksUseCase
 	stall              interface{ Run(context.Context) }
@@ -805,6 +808,23 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	rawTasks, err := store.NewFileTaskStore(taskPlacementRoot)
 	if err != nil {
 		return daemonDependencies{}, err
+	}
+	corruptedTaskIDs := rawTasks.CorruptedTaskIDs()
+	pingUseCase, err := transportusecase.NewPingUseCase(len(corruptedTaskIDs))
+	if err != nil {
+		return daemonDependencies{}, err
+	}
+	if len(corruptedTaskIDs) > 0 {
+		taskIDs := make([]string, len(corruptedTaskIDs))
+		for i, id := range corruptedTaskIDs {
+			taskIDs[i] = id.String()
+		}
+		logger.Warn("corrupted task snapshots ignored during startup",
+			"code", taskSnapshotReadFailedCode,
+			"message_key", taskSnapshotReadFailedMessageKey,
+			"failed_task_snapshots", len(taskIDs),
+			"task_ids", taskIDs,
+		)
 	}
 	tasks := execution.NewNotifyingTaskStore(rawTasks, notifier)
 	rawWriter, err := contract.NewFileContractWriter(taskPlacementRoot, clock)
@@ -912,7 +932,7 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 	submit := transportusecase.NewSubmitTaskUseCase(tasks, pathAcquire, pathRelease, admit, cfg.QueueMaxDepth(), starter, cfg, clock, logger)
 	status := transportusecase.NewGetTaskStatusUseCase(provider, clock, logger)
 	cancel := transportusecase.NewCancelTaskUseCase(tasks, queue, queueMu, taskMu, writer, processRunner, termination, pending, watcher, killed, stalled, ownership, clock, logger)
-	dispatch, err := transport.NewDispatcher(submit.Handle, status.Handle, cancel.Handle, (&transportusecase.PingUseCase{}).Handle)
+	dispatch, err := transport.NewDispatcher(submit.Handle, status.Handle, cancel.Handle, pingUseCase.Handle)
 	if err != nil {
 		return daemonDependencies{}, err
 	}
@@ -930,7 +950,7 @@ func buildDependencies(baseCtx context.Context, cfg config.Config, home, logsDir
 		result.socketRemoveErr = removeOwnedSocket(cfg.SocketPath(), expected)
 		return result
 	}
-	return daemonDependencies{taskStore: rawTasks, resumeRecoverer: resumeRecoverer, adoption: adoption, stall: stall, reconcile: reconcile, evictLogs: evictLogs, evictWorkDir: evictWorkDir, evictTaskPlacement: evictTaskPlacement, watcher: watcher, starter: starter, shutdownStarter: starterConcrete.Shutdown, finalizer: transport.NewShutdownFinalizer(connections, tailConns, acceptDone), serve: serve}, nil
+	return daemonDependencies{taskStore: rawTasks, ping: pingUseCase, resumeRecoverer: resumeRecoverer, adoption: adoption, stall: stall, reconcile: reconcile, evictLogs: evictLogs, evictWorkDir: evictWorkDir, evictTaskPlacement: evictTaskPlacement, watcher: watcher, starter: starter, shutdownStarter: starterConcrete.Shutdown, finalizer: transport.NewShutdownFinalizer(connections, tailConns, acceptDone), serve: serve}, nil
 }
 
 func newEvictLogsUseCase(cfg config.Config, home, logsDir string, reopenLog func(string) error, liveness *execution.CheckLivenessUseCase, logger *slog.Logger) (*execution.EvictLogsUseCase, error) {

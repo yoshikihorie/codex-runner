@@ -4,13 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"io"
-	"log/slog"
 	"os"
 	"sort"
 	"sync"
 	"syscall"
+
+	"github.com/yoshikihorie/codex-runner/internal/domain"
 )
 
 type FileTaskStore struct {
@@ -32,13 +32,17 @@ type TaskStore interface {
 var _ TaskStore = (*FileTaskStore)(nil)
 
 func NewFileTaskStore(root string) (*FileTaskStore, error) {
+	return newFileTaskStore(root, os.ReadDir)
+}
+
+func newFileTaskStore(root string, readDir func(string) ([]os.DirEntry, error)) (*FileTaskStore, error) {
 	path, err := domain.NewNormalizedPath(root)
 	if err != nil {
 		return nil, err
 	}
 	root = path.String()
 	s := &FileTaskStore{root: root, index: map[string]domain.TaskSnapshot{}}
-	es, e := os.ReadDir(root)
+	es, e := readDir(root)
 	if os.IsNotExist(e) {
 		return s, nil
 	}
@@ -52,24 +56,23 @@ func NewFileTaskStore(root string) (*FileTaskStore, error) {
 		}
 		p, _ := newTaskPaths(root, id)
 		d, e := openTaskDir(p.dir())
-		if e != nil || d == nil {
+		if e != nil {
 			s.corrupted = append(s.corrupted, id)
+			continue
+		}
+		if d == nil {
 			continue
 		}
 		d.Close()
 		v, e := s.read(p.taskJSON())
+		if os.IsNotExist(e) {
+			continue
+		}
 		if e != nil || v.Validate() != nil || v.TaskID != id {
 			s.corrupted = append(s.corrupted, id)
 			continue
 		}
 		s.index[id.String()] = v
-	}
-	if len(s.corrupted) != 0 {
-		taskIDs := make([]string, len(s.corrupted))
-		for i, id := range s.corrupted {
-			taskIDs[i] = id.String()
-		}
-		slog.Warn("corrupted task snapshots ignored during startup", "count", len(taskIDs), "task_ids", taskIDs)
 	}
 	return s, nil
 }

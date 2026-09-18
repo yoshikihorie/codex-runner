@@ -8,17 +8,31 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/transport"
 )
 
-// PingUseCase returns the protocol version without depending on task state.
-type PingUseCase struct{}
+// PingUseCase returns startup diagnostics without depending on mutable task state.
+type PingUseCase struct {
+	failedTaskSnapshots int
+}
 
-// Execute returns the protocol version implemented by this build.
+// NewPingUseCase validates and retains the startup snapshot failure count.
+func NewPingUseCase(failedTaskSnapshots int) (*PingUseCase, error) {
+	if failedTaskSnapshots < 0 {
+		return nil, fmt.Errorf("failed task snapshots must be non-negative")
+	}
+	return &PingUseCase{failedTaskSnapshots: failedTaskSnapshots}, nil
+}
+
+// Execute returns the protocol version and the startup snapshot failure count.
 func (u *PingUseCase) Execute(ctx context.Context) (PingResult, error) {
-	return PingResult{ProtocolVersion: transport.ProtocolVersion}, nil
+	return PingResult{
+		ProtocolVersion:     transport.ProtocolVersion,
+		FailedTaskSnapshots: u.failedTaskSnapshots,
+	}, nil
 }
 
 // PingResult is the result body returned for a ping request.
 type PingResult struct {
-	ProtocolVersion string `json:"protocol_version"`
+	ProtocolVersion     string `json:"protocol_version"`
+	FailedTaskSnapshots int    `json:"failed_task_snapshots"`
 }
 
 // Handle adapts PingUseCase to a transport Dispatcher handler.

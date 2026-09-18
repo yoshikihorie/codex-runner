@@ -10,7 +10,10 @@ import (
 )
 
 func TestPingUseCaseExecute(t *testing.T) {
-	useCase := &PingUseCase{}
+	useCase, err := NewPingUseCase(0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -19,9 +22,25 @@ func TestPingUseCaseExecute(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Execute() error = %v", err)
 		}
-		want := PingResult{ProtocolVersion: transport.ProtocolVersion}
+		want := PingResult{ProtocolVersion: transport.ProtocolVersion, FailedTaskSnapshots: 0}
 		if got != want {
 			t.Fatalf("Execute() = %#v, want %#v", got, want)
+		}
+	}
+}
+
+func TestNewPingUseCaseValidatesFailedTaskSnapshots(t *testing.T) {
+	if useCase, err := NewPingUseCase(-1); err == nil || useCase != nil {
+		t.Fatalf("NewPingUseCase(-1) = %#v, %v", useCase, err)
+	}
+	for _, count := range []int{0, 2} {
+		useCase, err := NewPingUseCase(count)
+		if err != nil {
+			t.Fatalf("NewPingUseCase(%d): %v", count, err)
+		}
+		result, err := useCase.Execute(context.Background())
+		if err != nil || result.FailedTaskSnapshots != count {
+			t.Fatalf("Execute() = %#v, %v; want failed snapshots %d", result, err, count)
 		}
 	}
 }
@@ -37,7 +56,10 @@ func TestPingUseCaseDoesNotReferenceQueue(t *testing.T) {
 }
 
 func TestPingUseCaseHandleIsIdempotent(t *testing.T) {
-	useCase := &PingUseCase{}
+	useCase, err := NewPingUseCase(2)
+	if err != nil {
+		t.Fatal(err)
+	}
 	req := transport.Request{RequestID: "r-7", Verb: "ping"}
 	var first PingResult
 
@@ -58,17 +80,21 @@ func TestPingUseCaseHandleIsIdempotent(t *testing.T) {
 }
 
 func TestPingResultJSON(t *testing.T) {
-	body, err := json.Marshal(PingResult{ProtocolVersion: transport.ProtocolVersion})
+	body, err := json.Marshal(PingResult{ProtocolVersion: transport.ProtocolVersion, FailedTaskSnapshots: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if string(body) != `{"protocol_version":"1"}` {
+	if string(body) != `{"protocol_version":"1","failed_task_snapshots":0}` {
 		t.Fatalf("Marshal(PingResult) = %s", body)
 	}
 }
 
 func TestPingHandleSuccess(t *testing.T) {
-	resp := (&PingUseCase{}).Handle(transport.Request{RequestID: "r-1", Verb: "ping"})
+	useCase, err := NewPingUseCase(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp := useCase.Handle(transport.Request{RequestID: "r-1", Verb: "ping"})
 	var result PingResult
 	if err := json.Unmarshal(resp.Result, &result); err != nil {
 		t.Fatal(err)
@@ -79,6 +105,9 @@ func TestPingHandleSuccess(t *testing.T) {
 	}
 	if result.ProtocolVersion != transport.ProtocolVersion || result.ProtocolVersion != resp.ProtocolVersion {
 		t.Fatalf("result = %#v, response protocol version = %q", result, resp.ProtocolVersion)
+	}
+	if result.FailedTaskSnapshots != 2 {
+		t.Fatalf("result = %#v, want failed snapshots 2", result)
 	}
 }
 
