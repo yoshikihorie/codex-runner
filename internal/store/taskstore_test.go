@@ -237,6 +237,12 @@ func TestTaskStoreLoadReturnsNotFound(t *testing.T) {
 		t.Fatalf("Load = %v", err)
 	}
 }
+func TestTaskStoreLoadReturnsNotFoundWhenTaskJSONMissing(t *testing.T) {
+	s, id := newReservedStore(t)
+	if _, err := s.Load(id); !errors.Is(err, domain.ErrTaskNotFound) {
+		t.Fatalf("Load = %v", err)
+	}
+}
 func TestTaskStoreLoadRejectsInvalidSnapshot(t *testing.T) {
 	s, id := newReservedStore(t)
 	p, _ := newTaskPaths(s.root, id)

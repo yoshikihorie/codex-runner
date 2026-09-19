@@ -200,7 +200,7 @@ func (s *FileTaskStore) Load(id domain.TaskID) (domain.TaskSnapshot, error) {
 	}
 	d.Close()
 	v, e := s.read(p.taskJSON())
-	if os.IsNotExist(e) {
+	if errors.Is(e, fs.ErrNotExist) {
 		return domain.TaskSnapshot{}, domain.ErrTaskNotFound
 	}
 	if e != nil {
