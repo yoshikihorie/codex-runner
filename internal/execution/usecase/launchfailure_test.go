@@ -111,6 +111,35 @@ func TestFailTaskLaunchInputPreservesOptionalReasoningEffort(t *testing.T) {
 	}
 }
 
+func TestFailTaskLaunchUseCasePersistsResolvedWorkingDir(t *testing.T) {
+	f := newLaunchFailureFixture(t, 0, false, nil, nil)
+	workingDir := t.TempDir()
+	f.input.WorkingDir = &workingDir
+	if _, err := f.useCase.ExecuteLocked(context.Background(), f.input); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.store.saved) != 1 || f.store.saved[0].WorkingDir == nil || *f.store.saved[0].WorkingDir != workingDir || f.store.saved[0].WorkingDir == &workingDir {
+		t.Fatalf("saved working dir = %v", f.store.saved)
+	}
+}
+
+func TestFailTaskLaunchUseCaseDoesNotBackfillSchemaVersion2WorkingDir(t *testing.T) {
+	f := newLaunchFailureFixture(t, 0, false, nil, nil)
+	storedTask := lifecycleTask(t, domain.SubcommandImpl)
+	stored := lifecycleSnapshot(t, storedTask, domain.StateStarting)
+	stored.SchemaVersion = 2
+	stored.WorkingDir = nil
+	f.store.loads = []lifecycleLoadResult{{snapshot: stored}}
+	workingDir := t.TempDir()
+	f.input.WorkingDir = &workingDir
+	if _, err := f.useCase.ExecuteLocked(context.Background(), f.input); err != nil {
+		t.Fatal(err)
+	}
+	if len(f.store.saved) != 1 || f.store.saved[0].SchemaVersion != 2 || f.store.saved[0].WorkingDir != nil {
+		t.Fatalf("schema version 2 snapshot was backfilled: %#v", f.store.saved)
+	}
+}
+
 func TestFailTaskLaunchUseCaseTransitionsAndReleases(t *testing.T) {
 	cases := []struct {
 		name       string

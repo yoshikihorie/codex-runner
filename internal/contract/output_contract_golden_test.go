@@ -162,7 +162,7 @@ func runGoldenScenario(t *testing.T, scenario string, family domain.Subcommand, 
 		t.Fatal(err)
 	}
 	dir := filepath.Join(root, id.String())
-	if err := usecase.NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), task, timeout, "test-model", nil, "read-only", domain.ExecutionRouteDaemon, "golden prompt\n", now); err != nil {
+	if err := usecase.NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), task, timeout, "test-model", nil, "read-only", t.TempDir(), domain.ExecutionRouteDaemon, "golden prompt\n", now); err != nil {
 		t.Fatal(err)
 	}
 	if family == domain.SubcommandReview {

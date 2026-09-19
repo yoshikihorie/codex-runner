@@ -39,6 +39,7 @@ type FailTaskLaunchInput struct {
 	Model           string
 	ReasoningEffort *string
 	SandboxMode     string
+	WorkingDir      *string
 	OccurredAt      time.Time
 }
 
@@ -125,7 +126,10 @@ func (uc *FailTaskLaunchUseCase) ExecuteLocked(_ context.Context, in FailTaskLau
 		return result, fmt.Errorf("%w: exit-code: %v", domain.ErrContractWriteFailed, writeErr)
 	}
 	if snapshot.TaskID.String() == "" {
-		snapshot = domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, in.ReasoningEffort, in.SandboxMode)
+		snapshot = domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, in.ReasoningEffort, in.SandboxMode, in.WorkingDir)
+	} else if snapshot.SupportsWorkingDir() && snapshot.WorkingDir == nil && in.WorkingDir != nil {
+		workingDir := *in.WorkingDir
+		snapshot.WorkingDir = &workingDir
 	}
 	updated, err := snapshot.WithTask(task, in.OccurredAt)
 	if err != nil {

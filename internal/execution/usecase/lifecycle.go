@@ -28,7 +28,7 @@ type stdoutFileSystem struct{}
 func (stdoutFileSystem) Open(path string) (*os.File, error) { return os.Open(path) }
 
 type lifecycleRecordStarting interface {
-	Execute(context.Context, *domain.Task, domain.Timeout, string, *string, string, domain.ExecutionRoute, string, time.Time) error
+	Execute(context.Context, *domain.Task, domain.Timeout, string, *string, string, string, domain.ExecutionRoute, string, time.Time) error
 }
 type lifecycleWorktree interface {
 	ResolveWorkingDir(domain.TaskID) (string, error)
@@ -131,7 +131,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 	}
 	lock, err := o.deps.AcquireForChild(input.TaskDirPath)
 	if err != nil {
-		o.fail(ctx, input, 130, true)
+		o.fail(ctx, input, input.WorkingDir, 130, true)
 		return
 	}
 	if o.stopForCancellation(ctx) {
@@ -145,13 +145,13 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 	if useWorktree {
 		if isNilValue(o.deps.CreateWorktree) {
 			_ = lock.Close()
-			o.fail(ctx, input, 130, true)
+			o.fail(ctx, input, nil, 130, true)
 			return
 		}
 		plannedWorkingDir, err = o.deps.CreateWorktree.ResolveWorkingDir(taskID)
 		if err != nil {
 			_ = lock.Close()
-			o.fail(ctx, input, 130, true)
+			o.fail(ctx, input, nil, 130, true)
 			return
 		}
 		launchPrompt = replaceSourceWorkingDir(input.PromptText, input.SourceWorkingDir, plannedWorkingDir)
@@ -161,9 +161,14 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		_ = lock.Close()
 		return
 	}
-	if err = o.deps.RecordStarting.Execute(ctx, input.Task, input.ResolvedTimeout, input.Model, input.ReasoningEffort, input.SandboxMode, domain.ExecutionRouteDaemon, launchPrompt, input.Now); err != nil {
+	if workingDir == nil {
 		_ = lock.Close()
-		o.fail(ctx, input, 130, true)
+		o.fail(ctx, input, nil, 130, true)
+		return
+	}
+	if err = o.deps.RecordStarting.Execute(ctx, input.Task, input.ResolvedTimeout, input.Model, input.ReasoningEffort, input.SandboxMode, *workingDir, domain.ExecutionRouteDaemon, launchPrompt, input.Now); err != nil {
+		_ = lock.Close()
+		o.fail(ctx, input, workingDir, 130, true)
 		return
 	}
 	if useWorktree {
@@ -174,14 +179,9 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		out, createErr := o.deps.CreateWorktree.Execute(ctx, execution.CreateWorktreeInput{TaskID: taskID, SourceWorkingDir: input.SourceWorkingDir})
 		if createErr != nil || out.WorkingDir != plannedWorkingDir {
 			_ = lock.Close()
-			o.fail(ctx, input, 130, true)
+			o.fail(ctx, input, workingDir, 130, true)
 			return
 		}
-	}
-	if workingDir == nil {
-		_ = lock.Close()
-		o.fail(ctx, input, 130, true)
-		return
 	}
 	if o.confirmUnlaunchedCancellation(ctx, taskID) {
 		_ = lock.Close()
@@ -197,7 +197,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		return
 	}
 	if err != nil || launched == nil || launched.Handle == nil || launched.Waiter == nil {
-		o.fail(ctx, input, 130, true)
+		o.fail(ctx, input, workingDir, 130, true)
 		return
 	}
 	cancelling, recordErr := o.recordProcessAtLaunchBoundary(ctx, input, launched)
@@ -209,7 +209,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		return
 	}
 	if recordErr != nil {
-		o.handleRecordProcessFailure(ctx, input, launched)
+		o.handleRecordProcessFailure(ctx, input, workingDir, launched)
 		return
 	}
 	confirmed, err := o.deps.ConfirmRunning.Execute(ctx, taskID, input.Now)
@@ -410,7 +410,7 @@ func (o *TaskLifecycleOrchestrator) waitLaunched(taskID domain.TaskID, launched 
 	return raw, err
 }
 
-func (o *TaskLifecycleOrchestrator) fail(ctx context.Context, input TaskLifecycleInput, rawExitCode int, estimated bool) bool {
+func (o *TaskLifecycleOrchestrator) fail(ctx context.Context, input TaskLifecycleInput, workingDir *string, rawExitCode int, estimated bool) bool {
 	taskID := input.Task.ID()
 	o.deps.TaskMu.Lock(taskID)
 	if ctx.Err() != nil {
@@ -443,7 +443,7 @@ func (o *TaskLifecycleOrchestrator) fail(ctx context.Context, input TaskLifecycl
 		return true
 	}
 
-	result, failErr := o.deps.FailLaunch.ExecuteLocked(ctx, FailTaskLaunchInput{Task: input.Task, ResolvedTimeout: input.ResolvedTimeout, Model: input.Model, ReasoningEffort: input.ReasoningEffort, SandboxMode: input.SandboxMode, OccurredAt: input.Now})
+	result, failErr := o.deps.FailLaunch.ExecuteLocked(ctx, FailTaskLaunchInput{Task: input.Task, ResolvedTimeout: input.ResolvedTimeout, Model: input.Model, ReasoningEffort: input.ReasoningEffort, SandboxMode: input.SandboxMode, WorkingDir: workingDir, OccurredAt: input.Now})
 	o.deps.TaskMu.Unlock(taskID)
 	if failErr != nil {
 		o.logger.Warn("fail task launch", "task_id", taskID.String(), "error", failErr)
@@ -454,7 +454,7 @@ func (o *TaskLifecycleOrchestrator) fail(ctx context.Context, input TaskLifecycl
 	return true
 }
 
-func (o *TaskLifecycleOrchestrator) handleRecordProcessFailure(ctx context.Context, input TaskLifecycleInput, launched *execution.LaunchedProcess) {
+func (o *TaskLifecycleOrchestrator) handleRecordProcessFailure(ctx context.Context, input TaskLifecycleInput, workingDir *string, launched *execution.LaunchedProcess) {
 	taskID := input.Task.ID()
 	terminateErr := o.deps.Terminator.Terminate(launched.Handle.PID, execution.TimeoutKillGrace)
 	if terminateErr != nil {
@@ -472,14 +472,14 @@ func (o *TaskLifecycleOrchestrator) handleRecordProcessFailure(ctx context.Conte
 		if waitErr != nil {
 			rawExitCode = 1
 		}
-		o.fail(ctx, input, rawExitCode, waitErr != nil)
+		o.fail(ctx, input, workingDir, rawExitCode, waitErr != nil)
 		return
 	}
 	if ctx.Err() != nil {
 		return
 	}
 	if dead && livenessErr == nil {
-		o.fail(ctx, input, 1, false)
+		o.fail(ctx, input, workingDir, 1, false)
 		if ctx.Err() != nil {
 			return
 		}
@@ -494,7 +494,7 @@ func (o *TaskLifecycleOrchestrator) handleRecordProcessFailure(ctx context.Conte
 	if estimated {
 		rawExitCode = 1
 	}
-	o.fail(ctx, input, rawExitCode, estimated)
+	o.fail(ctx, input, workingDir, rawExitCode, estimated)
 }
 
 func (o *TaskLifecycleOrchestrator) recordFailureStateIsCancelling(ctx context.Context, taskID domain.TaskID) bool {

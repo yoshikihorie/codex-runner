@@ -44,7 +44,7 @@ func TestAdmitTaskUseCaseImmediateAndQueuedResults(t *testing.T) {
 	if err != nil || immediate.QueuePosition != nil || immediate.LaunchPayload == nil || immediate.LaunchPayload.WorkingDir == nil {
 		t.Fatalf("immediate=%#v err=%v", immediate, err)
 	}
-	if snapshot, found := launching.Lookup(immediate.LaunchPayload.Task.ID()); !found || snapshot.State != domain.StateQueued || !snapshot.RequestedAt.Equal(immediate.LaunchPayload.Task.RequestedAt()) || !snapshot.StateUpdatedAt.Equal(immediate.LaunchPayload.Task.RequestedAt()) {
+	if snapshot, found := launching.Lookup(immediate.LaunchPayload.Task.ID()); !found || snapshot.State != domain.StateQueued || snapshot.WorkingDir == nil || *snapshot.WorkingDir != *immediate.LaunchPayload.WorkingDir || !snapshot.RequestedAt.Equal(immediate.LaunchPayload.Task.RequestedAt()) || !snapshot.StateUpdatedAt.Equal(immediate.LaunchPayload.Task.RequestedAt()) {
 		t.Fatalf("snapshot=%#v found=%t", snapshot, found)
 	}
 	queued, err := useCase.Admit(testAdmissionInput(t, domain.SubcommandImpl, "queued"))

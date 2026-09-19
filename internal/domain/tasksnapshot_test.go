@@ -13,9 +13,12 @@ func snapshotTime(offset int) time.Time {
 
 func snapshotInt(value int) *int { return &value }
 
+func snapshotString(value string) *string { return &value }
+
 func TestNewInitialTaskSnapshot(t *testing.T) {
 	reasoning := "high"
-	snapshot := NewInitialTaskSnapshot(ExecutionRouteDaemon, &reasoning, "workspace-write")
+	workingDir := "/tmp/work"
+	snapshot := NewInitialTaskSnapshot(ExecutionRouteDaemon, &reasoning, "workspace-write", &workingDir)
 	if snapshot.Route != ExecutionRouteDaemon || snapshot.ReasoningEffort == nil || *snapshot.ReasoningEffort != reasoning || snapshot.ReasoningEffort == &reasoning || snapshot.SchemaVersion != taskSnapshotSchemaVersion {
 		t.Fatalf("initial snapshot = %#v", snapshot)
 	}
@@ -26,8 +29,12 @@ func TestNewInitialTaskSnapshot(t *testing.T) {
 	if snapshot.TaskID.String() != "" || snapshot.Subcommand != "" || snapshot.PID != nil || snapshot.ProcessStartedAt != nil || snapshot.Model != "" || !snapshot.RequestedAt.IsZero() || snapshot.State != "" || !snapshot.StateUpdatedAt.IsZero() {
 		t.Fatalf("initial snapshot has non-zero task fields: %#v", snapshot)
 	}
-	if NewInitialTaskSnapshot(ExecutionRouteDaemon, nil, "workspace-write").ReasoningEffort != nil {
+	if NewInitialTaskSnapshot(ExecutionRouteDaemon, nil, "workspace-write", nil).ReasoningEffort != nil {
 		t.Fatal("nil reasoning effort was not retained")
+	}
+	workingDir = "/tmp/changed"
+	if snapshot.WorkingDir == nil || *snapshot.WorkingDir != "/tmp/work" {
+		t.Fatalf("initial snapshot working dir was aliased: %v", snapshot.WorkingDir)
 	}
 }
 
@@ -63,7 +70,8 @@ func TestNewTaskSnapshotFromAdmission(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", &reasoning, "workspace-write", ExecutionRouteDaemon, snapshotTime(1))
+	workingDir := "/tmp/work"
+	snapshot, err := NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", &reasoning, "workspace-write", &workingDir, ExecutionRouteDaemon, snapshotTime(1))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -95,7 +103,7 @@ func TestNewTaskSnapshotFromAdmission_RejectsInvalidInput(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			before := *task
-			if _, err := NewTaskSnapshotFromAdmission(tc.task, tc.timeout, tc.model, nil, "workspace-write", tc.route, tc.at); err == nil {
+			if _, err := NewTaskSnapshotFromAdmission(tc.task, tc.timeout, tc.model, nil, "workspace-write", snapshotString("/tmp/work"), tc.route, tc.at); err == nil {
 				t.Fatal("invalid input accepted")
 			}
 			if tc.task != nil && !reflect.DeepEqual(*task, before) {
@@ -112,12 +120,13 @@ func TestNewTaskSnapshotFromAdmission_DefensivelyCopiesPointers(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", &reasoning, "workspace-write", ExecutionRouteDaemon, snapshotTime(1))
+	workingDir := "/tmp/work"
+	snapshot, err := NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", &reasoning, "workspace-write", &workingDir, ExecutionRouteDaemon, snapshotTime(1))
 	if err != nil {
 		t.Fatal(err)
 	}
-	requested, reasoning = timeoutMinSeconds+30, "low"
-	if *snapshot.RequestedTimeoutSeconds == requested || *snapshot.ReasoningEffort == reasoning {
+	requested, reasoning, workingDir = timeoutMinSeconds+30, "low", "/tmp/changed"
+	if *snapshot.RequestedTimeoutSeconds == requested || *snapshot.ReasoningEffort == reasoning || *snapshot.WorkingDir == workingDir {
 		t.Fatalf("snapshot aliases input: %#v", snapshot)
 	}
 }
@@ -131,11 +140,64 @@ func validRunningSnapshot(t *testing.T) TaskSnapshot {
 	pid := 42
 	started := snapshotTime(1)
 	requested := timeoutMinSeconds + 60
+	workingDir := "/tmp/work"
 	return TaskSnapshot{
 		TaskID: id, Subcommand: SubcommandImpl, PID: &pid, ProcessStartedAt: &started,
 		ResolvedTimeoutSeconds: timeoutMinSeconds + 120, RequestedTimeoutSeconds: &requested,
 		Model: "gpt-5", SandboxMode: "workspace-write", RequestedAt: snapshotTime(0), Route: ExecutionRouteDaemon,
-		State: StateRunning, StateUpdatedAt: snapshotTime(2), SchemaVersion: taskSnapshotSchemaVersion,
+		State: StateRunning, StateUpdatedAt: snapshotTime(2), WorkingDir: &workingDir, SchemaVersion: taskSnapshotSchemaVersion,
+	}
+}
+
+func TestTaskSnapshotValidateWorkingDirBySchema(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		version int
+		state   TaskState
+		pid     bool
+		dir     *string
+		wantErr bool
+	}{
+		{name: "version 2 omitted", version: 2, state: StateRunning, pid: true},
+		{name: "version 2 rejects value", version: 2, state: StateRunning, pid: true, dir: snapshotString("/tmp/work"), wantErr: true},
+		{name: "version 3 running valid", version: 3, state: StateRunning, pid: true, dir: snapshotString("/tmp/work")},
+		{name: "version 3 running missing", version: 3, state: StateRunning, pid: true, wantErr: true},
+		{name: "version 3 queued missing", version: 3, state: StateQueued},
+		{name: "version 3 failed missing", version: 3, state: StateFailed},
+		{name: "version 3 failed with pid missing", version: 3, state: StateFailed, pid: true, wantErr: true},
+		{name: "version 3 relative", version: 3, state: StateQueued, dir: snapshotString("relative"), wantErr: true},
+		{name: "version 3 unclean", version: 3, state: StateQueued, dir: snapshotString("/tmp/a/.."), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			snapshot := validRunningSnapshot(t)
+			snapshot.SchemaVersion = tc.version
+			snapshot.State = tc.state
+			snapshot.WorkingDir = tc.dir
+			if !tc.pid {
+				snapshot.PID, snapshot.ProcessStartedAt = nil, nil
+			}
+			err := snapshot.Validate()
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("Validate() error = %v, wantErr %t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+func TestTaskSnapshotVersion2MarshalOmitsWorkingDir(t *testing.T) {
+	snapshot := validRunningSnapshot(t)
+	snapshot.SchemaVersion = 2
+	snapshot.WorkingDir = nil
+	data, err := json.Marshal(snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(data, &fields); err != nil {
+		t.Fatal(err)
+	}
+	if _, exists := fields["working_dir"]; exists {
+		t.Fatalf("version 2 JSON contains working_dir: %s", data)
 	}
 }
 
@@ -300,7 +362,7 @@ func TestTaskSnapshotJSONFieldNames(t *testing.T) {
 	if err := json.Unmarshal(data, &fields); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"task_id", "subcommand", "pid", "process_started_at", "resolved_timeout_seconds", "requested_timeout_seconds", "model", "reasoning_effort", "sandbox_mode", "requested_at", "route", "state", "state_updated_at", "session_ref", "last_event_at", "exit_code", "recovered", "adopted_after_restart", "recovery_origin", "schema_version"}
+	want := []string{"task_id", "subcommand", "pid", "process_started_at", "resolved_timeout_seconds", "requested_timeout_seconds", "model", "reasoning_effort", "sandbox_mode", "working_dir", "requested_at", "route", "state", "state_updated_at", "session_ref", "last_event_at", "exit_code", "recovered", "adopted_after_restart", "recovery_origin", "schema_version"}
 	if len(fields) != len(want) {
 		t.Fatalf("field count = %d, want %d: %s", len(fields), len(want), data)
 	}

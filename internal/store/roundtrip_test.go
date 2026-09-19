@@ -1,6 +1,9 @@
 package store
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -135,5 +138,12 @@ func TestRoundTripLoadRestoreTransitionSave(t *testing.T) {
 	}
 	if final.State != domain.StateCompleted || final.ExitCode == nil || final.ExitCode.Raw() != 0 || final.PID == nil || *final.PID != 1234 || final.LastEventAt == nil {
 		t.Fatalf("final snapshot = %#v", final)
+	}
+	body, err := os.ReadFile(filepath.Join(root, id.String(), "task.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(body, []byte(`"working_dir"`)) {
+		t.Fatalf("schema version 2 round trip added working_dir: %s", body)
 	}
 }

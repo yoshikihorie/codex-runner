@@ -59,7 +59,9 @@ type ProcessRunner interface {
 	SendKill(pid int) error
 }
 
-var launchNewSession = proc.LaunchNewSession
+type launchNewSessionFunc func(context.Context, string, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error)
+
+var launchNewSession launchNewSessionFunc = proc.LaunchNewSession
 var sendTerminate = proc.SendTerminate
 var sendKill = proc.SendKill
 var now = time.Now
@@ -223,6 +225,10 @@ func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.Resu
 	if rootErr != nil {
 		return fmt.Errorf("resume launch task placement root: %w", rootErr)
 	}
+	workingDir, workingDirErr := domain.NewNormalizedPath(params.WorkingDir)
+	if workingDirErr != nil {
+		return fmt.Errorf("resume launch working directory: %w", workingDirErr)
+	}
 	taskDirPath := filepath.Join(root.String(), params.TaskID.String())
 	expectedOutputPath, expectedOutputPathErr := store.LastMessageMDPath(root.String(), params.TaskID)
 	if expectedOutputPathErr != nil {
@@ -265,7 +271,7 @@ func (l *resumeLauncher) LaunchAndWait(ctx context.Context, params recovery.Resu
 	defer lock.Close()
 	var stderr limitedWriter
 	stderr.limit = resumeStderrBufferMaxBytes
-	cmd, err := launchNewSession(context.Background(), params.CodexBinaryPath, proc.SafeChildEnv(), lock, nil, &stderr, buildResumeArgs(params)...)
+	cmd, err := launchNewSession(context.Background(), params.CodexBinaryPath, workingDir.String(), proc.SafeChildEnv(), lock, nil, &stderr, buildResumeArgs(params)...)
 	if err != nil {
 		l.logStderr(params, err, &stderr)
 		return err
@@ -431,7 +437,7 @@ func (r *processRunner) Launch(ctx context.Context, p LaunchParams) (*LaunchedPr
 	}
 	defer logs.Close()
 
-	cmd, err := launchNewSession(context.WithoutCancel(ctx), head, proc.SafeChildEnv(), p.LivenessLockFile, logs.Stdout, logs.Stderr, args...)
+	cmd, err := launchNewSession(context.WithoutCancel(ctx), head, p.WorkingDir, proc.SafeChildEnv(), p.LivenessLockFile, logs.Stdout, logs.Stderr, args...)
 	if err != nil {
 		if p.PTYEnabled {
 			return nil, fmt.Errorf("%w: %v", domain.ErrPTYAllocationFailed, err)

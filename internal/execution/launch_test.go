@@ -195,7 +195,7 @@ func TestProcessRunnerRejectsInvalidSandboxModeBeforeLaunching(t *testing.T) {
 	called := false
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })
-	launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+	launchNewSession = func(context.Context, string, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
 		called = true
 		return nil, errors.New("must not launch")
 	}
@@ -361,7 +361,7 @@ func TestProcessRunnerLogsOnlySafeGitCheckAttributes(t *testing.T) {
 	t.Cleanup(func() { decideSkipGitRepoCheck, launchNewSession = originalDecision, originalLaunch })
 	decideSkipGitRepoCheck = func(string) (bool, gitRepoCheckReason) { return true, gitRepoCheckReasonNotConfirmed }
 	var launchArgs []string
-	launchNewSession = func(_ context.Context, _ string, _ []string, lock *os.File, _ io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
+	launchNewSession = func(_ context.Context, _ string, _ string, _ []string, lock *os.File, _ io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
 		launchArgs = args
 		cmd := exec.Command("/bin/echo")
 		if err := cmd.Start(); err != nil {
@@ -415,7 +415,7 @@ func TestNewProcessRunnerLoggerSelection(t *testing.T) {
 func TestProcessRunnerLaunchMapsErrorsAndClosesLock(t *testing.T) {
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })
-	launchNewSession = func(_ context.Context, _ string, _ []string, lock *os.File, _ io.Writer, _ io.Writer, _ ...string) (*exec.Cmd, error) {
+	launchNewSession = func(_ context.Context, _ string, _ string, _ []string, lock *os.File, _ io.Writer, _ io.Writer, _ ...string) (*exec.Cmd, error) {
 		_ = lock.Close()
 		return nil, errors.New("start failed")
 	}
@@ -463,7 +463,7 @@ func TestProcessRunnerLaunchDetachesLaunchContext(t *testing.T) {
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })
 	var captured context.Context
-	launchNewSession = func(ctx context.Context, _ string, _ []string, lock *os.File, _ io.Writer, _ io.Writer, _ ...string) (*exec.Cmd, error) {
+	launchNewSession = func(ctx context.Context, _ string, _ string, _ []string, lock *os.File, _ io.Writer, _ io.Writer, _ ...string) (*exec.Cmd, error) {
 		captured = ctx
 		_ = lock.Close()
 		return &exec.Cmd{Process: &os.Process{Pid: 12345}}, nil
@@ -523,7 +523,7 @@ func TestProcessRunnerLaunchRejectsMissingTaskDirectoryBeforeDependencies(t *tes
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })
 	called := false
-	launchNewSession = func(ctx context.Context, name string, env []string, lock *os.File, stdout io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
+	launchNewSession = func(ctx context.Context, name string, _ string, env []string, lock *os.File, stdout io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
 		called = true
 		return nil, nil
 	}
@@ -542,7 +542,7 @@ func TestProcessRunnerLaunchRejectsNilLivenessLockBeforeClosing(t *testing.T) {
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })
 	called := false
-	launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+	launchNewSession = func(context.Context, string, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
 		called = true
 		return nil, nil
 	}
@@ -560,7 +560,7 @@ func TestProcessRunnerLaunchRejectsFileAsTaskDirectory(t *testing.T) {
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })
 	called := false
-	launchNewSession = func(ctx context.Context, name string, env []string, lock *os.File, stdout io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
+	launchNewSession = func(ctx context.Context, name string, _ string, env []string, lock *os.File, stdout io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
 		called = true
 		return nil, nil
 	}
@@ -583,7 +583,7 @@ func TestProcessRunnerLaunchReturnsContractErrorWithoutStarting(t *testing.T) {
 	original := launchNewSession
 	t.Cleanup(func() { launchNewSession = original })
 	called := false
-	launchNewSession = func(ctx context.Context, name string, env []string, lock *os.File, stdout io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
+	launchNewSession = func(ctx context.Context, name string, _ string, env []string, lock *os.File, stdout io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
 		called = true
 		return nil, nil
 	}
@@ -628,7 +628,7 @@ func TestProcessRunnerCapturesTimestampAndDomainHandle(t *testing.T) {
 	var gotName string
 	var gotEnv []string
 	var gotArgs []string
-	launchNewSession = func(ctx context.Context, name string, env []string, lock *os.File, stdout io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
+	launchNewSession = func(ctx context.Context, name string, _ string, env []string, lock *os.File, stdout io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
 		gotName, gotEnv, gotArgs = name, env, args
 		cmd := exec.Command("/bin/echo")
 		cmd.Stdout = stdout
@@ -674,7 +674,7 @@ func TestProcessRunnerLaunchPassesPTYArguments(t *testing.T) {
 	t.Cleanup(func() { launchNewSession = original })
 	var gotName string
 	var gotArgs []string
-	launchNewSession = func(ctx context.Context, name string, env []string, lock *os.File, stdout io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
+	launchNewSession = func(ctx context.Context, name string, _ string, env []string, lock *os.File, stdout io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
 		gotName, gotArgs = name, args
 		cmd := exec.Command("/bin/echo")
 		cmd.Stdout = stdout
@@ -840,15 +840,20 @@ func TestResumeLauncherValidatesOutputSchemaBeforeLaunch(t *testing.T) {
 			tc.setup(t, schemaPath)
 			launchCalls := 0
 			var gotArgs []string
-			launchNewSession = func(_ context.Context, _ string, _ []string, _ *os.File, _ io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
+			var gotWorkingDir string
+			launchNewSession = func(_ context.Context, _ string, workingDir string, _ []string, _ *os.File, _ io.Writer, _ io.Writer, args ...string) (*exec.Cmd, error) {
 				launchCalls++
+				gotWorkingDir = workingDir
 				gotArgs = args
 				return nil, errors.New("launch stopped")
 			}
-			params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), OutputSchemaPath: &schemaPath, PromptText: recovery.RecoveryResumePrompt, Subcommand: tc.subcommand, SandboxMode: "read-only", Model: "gpt-5"}
+			params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), OutputSchemaPath: &schemaPath, PromptText: recovery.RecoveryResumePrompt, Subcommand: tc.subcommand, SandboxMode: "read-only", Model: "gpt-5", WorkingDir: root}
 			err := NewResumeLauncher(&timeoutProcessFake{}).LaunchAndWait(context.Background(), params)
 			if (launchCalls == 1) != tc.wantLaunch {
 				t.Fatalf("launch calls = %d, want launch=%t, err=%v", launchCalls, tc.wantLaunch, err)
+			}
+			if tc.wantLaunch && gotWorkingDir != root {
+				t.Fatalf("working dir = %q, want %q", gotWorkingDir, root)
 			}
 			if tc.wantSchema && (!slices.Contains(gotArgs, "--output-schema") || !slices.Contains(gotArgs, schemaPath)) {
 				t.Fatalf("args = %q, want schema path", gotArgs)
@@ -887,11 +892,11 @@ func TestResumeLauncherRejectsOutputSchemaInspectionFailure(t *testing.T) {
 		return originalLstat(path)
 	}
 	launchCalls := 0
-	launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+	launchNewSession = func(context.Context, string, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
 		launchCalls++
 		return nil, nil
 	}
-	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), OutputSchemaPath: &schemaPath, Subcommand: domain.SubcommandReview, SandboxMode: "read-only", Model: "gpt-5"}
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), OutputSchemaPath: &schemaPath, Subcommand: domain.SubcommandReview, SandboxMode: "read-only", Model: "gpt-5", WorkingDir: root}
 	err := NewResumeLauncher(&timeoutProcessFake{}).LaunchAndWait(context.Background(), params)
 	if !errors.Is(err, syscall.EACCES) || launchCalls != 0 {
 		t.Fatalf("err=%v launch calls=%d, want EACCES and 0", err, launchCalls)
@@ -939,7 +944,7 @@ func TestResumeLauncherRejectsInvalidOutputLastMessagePathBeforeLaunch(t *testin
 			originalLaunch := launchNewSession
 			t.Cleanup(func() { launchNewSession = originalLaunch })
 			launchCalls := 0
-			launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+			launchNewSession = func(context.Context, string, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
 				launchCalls++
 				return nil, nil
 			}
@@ -952,6 +957,7 @@ func TestResumeLauncherRejectsInvalidOutputLastMessagePathBeforeLaunch(t *testin
 				OutputLastMessagePath: tt.outputLastMessagePath,
 				SandboxMode:           "read-only",
 				Model:                 "gpt-5",
+				WorkingDir:            root,
 			}
 			err := NewResumeLauncher(&timeoutProcessFake{}).LaunchAndWait(context.Background(), params)
 			if err == nil || err.Error() != "resume launch paths are invalid" {
@@ -979,11 +985,11 @@ func TestResumeLauncherRejectsInvalidSandboxModeOrModelBeforeLaunch(t *testing.T
 			originalLaunch := launchNewSession
 			t.Cleanup(func() { launchNewSession = originalLaunch })
 			launchCalls := 0
-			launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+			launchNewSession = func(context.Context, string, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
 				launchCalls++
 				return nil, nil
 			}
-			params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), SandboxMode: tc.sandboxMode, Model: tc.model}
+			params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), SandboxMode: tc.sandboxMode, Model: tc.model, WorkingDir: root}
 			if err := NewResumeLauncher(&timeoutProcessFake{}).LaunchAndWait(context.Background(), params); err == nil {
 				t.Fatal("invalid resume launch parameters were accepted")
 			}
@@ -1027,12 +1033,12 @@ func TestResumeLauncherDoesNotLaunchWhenContextCanceledAfterLockAcquisition(t *t
 		return nil
 	}
 	launchCalls := 0
-	launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+	launchNewSession = func(context.Context, string, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
 		launchCalls++
 		return nil, nil
 	}
 
-	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), SandboxMode: "read-only", Model: "gpt-5"}
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), SandboxMode: "read-only", Model: "gpt-5", WorkingDir: root}
 	err = NewResumeLauncher(&timeoutProcessFake{}).LaunchAndWait(ctx, params)
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want context.Canceled", err)
@@ -1069,14 +1075,14 @@ func TestResumeLauncherRejectsEvictedWorktreeBeforeContextCancellation(t *testin
 		t.Fatal(err)
 	}
 	launchCalls := 0
-	launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+	launchNewSession = func(context.Context, string, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
 		launchCalls++
 		return nil, nil
 	}
 	var logOutput bytes.Buffer
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), SandboxMode: "read-only", Model: "gpt-5"}
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), SandboxMode: "read-only", Model: "gpt-5", WorkingDir: root}
 	err = NewResumeLauncher(&timeoutProcessFake{}, slog.New(slog.NewTextHandler(&logOutput, nil))).LaunchAndWait(ctx, params)
 	if !errors.Is(err, ErrWorktreeEvicted) || errors.Is(err, context.Canceled) {
 		t.Fatalf("error = %v, want eviction error only", err)
@@ -1131,12 +1137,12 @@ func TestResumeLauncherRejectsMarkerInspectionPermissionFailure(t *testing.T) {
 		return os.Chmod(taskDir, 0o000)
 	}
 	launchCalls := 0
-	launchNewSession = func(context.Context, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
+	launchNewSession = func(context.Context, string, string, []string, *os.File, io.Writer, io.Writer, ...string) (*exec.Cmd, error) {
 		launchCalls++
 		return nil, nil
 	}
 	var logOutput bytes.Buffer
-	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), SandboxMode: "read-only", Model: "gpt-5"}
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), SandboxMode: "read-only", Model: "gpt-5", WorkingDir: root}
 	err = NewResumeLauncher(&timeoutProcessFake{}, slog.New(slog.NewTextHandler(&logOutput, nil))).LaunchAndWait(context.Background(), params)
 	if !errors.Is(err, syscall.EACCES) {
 		t.Fatalf("error = %v, want EACCES", err)
@@ -1201,7 +1207,7 @@ func TestResumeLauncherLogsCapturedStderrMetadataOnLaunchFailure(t *testing.T) {
 	var logOutput bytes.Buffer
 	logger := slog.New(slog.NewTextHandler(&logOutput, nil))
 	const sensitiveStderr = "resume-secret-value-7a930b"
-	launchNewSession = func(_ context.Context, _ string, _ []string, _ *os.File, _ io.Writer, stderr io.Writer, _ ...string) (*exec.Cmd, error) {
+	launchNewSession = func(_ context.Context, _ string, _ string, _ []string, _ *os.File, _ io.Writer, stderr io.Writer, _ ...string) (*exec.Cmd, error) {
 		_, _ = stderr.Write([]byte("\x1b[31m" + sensitiveStderr + "\x1b[0m"))
 		return nil, errors.New("launch failed")
 	}
@@ -1218,7 +1224,7 @@ func TestResumeLauncherLogsCapturedStderrMetadataOnLaunchFailure(t *testing.T) {
 	if err := lock.Close(); err != nil {
 		t.Fatal(err)
 	}
-	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), SandboxMode: "read-only", Model: "gpt-5"}
+	params := recovery.ResumeLaunchParams{TaskID: id, CodexBinaryPath: "/usr/local/bin/codex", SessionID: "session-id", TaskPlacementRoot: root, OutputLastMessagePath: filepath.Join(taskDir, "last-message.md"), SandboxMode: "read-only", Model: "gpt-5", WorkingDir: root}
 	if err := NewResumeLauncher(&timeoutProcessFake{}, logger).LaunchAndWait(context.Background(), params); err == nil {
 		t.Fatal("launch failure was accepted")
 	}

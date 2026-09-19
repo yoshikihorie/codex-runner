@@ -58,7 +58,7 @@ func (u *AdvanceQueueUseCase) Execute(ctx context.Context, taskID domain.TaskID,
 		u.queue.Prepend(payload)
 		return execution.TaskLaunchPayload{}, false, err
 	}
-	snapshot, err := domain.NewTaskSnapshotFromAdmission(payload.Task, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, payload.SandboxMode, domain.ExecutionRouteDaemon, payload.Task.RequestedAt())
+	snapshot, err := domain.NewTaskSnapshotFromAdmission(payload.Task, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, payload.SandboxMode, payload.WorkingDir, domain.ExecutionRouteDaemon, payload.Task.RequestedAt())
 	if err != nil {
 		u.queue.Prepend(payload)
 		return execution.TaskLaunchPayload{}, false, err

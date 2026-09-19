@@ -32,8 +32,8 @@ func NewRecordTaskStartingUseCase(tasks store.TaskStore, contractWriter contract
 	return &RecordTaskStartingUseCase{tasks: tasks, contractW: contractWriter, logger: logger}
 }
 
-func (u *RecordTaskStartingUseCase) Execute(_ context.Context, task *domain.Task, resolvedTimeout domain.Timeout, model string, reasoningEffort *string, sandboxMode string, route domain.ExecutionRoute, promptText string, now time.Time) error {
-	if err := validateRecordTaskStartingInput(task, resolvedTimeout, model, sandboxMode, route, promptText, now); err != nil {
+func (u *RecordTaskStartingUseCase) Execute(_ context.Context, task *domain.Task, resolvedTimeout domain.Timeout, model string, reasoningEffort *string, sandboxMode string, workingDir string, route domain.ExecutionRoute, promptText string, now time.Time) error {
+	if err := validateRecordTaskStartingInput(task, resolvedTimeout, model, sandboxMode, workingDir, route, promptText, now); err != nil {
 		return err
 	}
 	if _, err := task.Start(resolvedTimeout, model, now); err != nil {
@@ -43,7 +43,7 @@ func (u *RecordTaskStartingUseCase) Execute(_ context.Context, task *domain.Task
 		u.logger.Error("contract write failed", "task_id", task.ID().String(), "code", "CONTRACT_WRITE_FAILED", "stage", "prompt", "error", err)
 		return err
 	}
-	snapshot, err := domain.NewInitialTaskSnapshot(route, reasoningEffort, sandboxMode).WithTask(task, now)
+	snapshot, err := domain.NewInitialTaskSnapshot(route, reasoningEffort, sandboxMode, &workingDir).WithTask(task, now)
 	if err != nil {
 		return err
 	}
@@ -54,7 +54,7 @@ func (u *RecordTaskStartingUseCase) Execute(_ context.Context, task *domain.Task
 	return nil
 }
 
-func validateRecordTaskStartingInput(task *domain.Task, resolvedTimeout domain.Timeout, model, sandboxMode string, route domain.ExecutionRoute, promptText string, now time.Time) error {
+func validateRecordTaskStartingInput(task *domain.Task, resolvedTimeout domain.Timeout, model, sandboxMode, workingDir string, route domain.ExecutionRoute, promptText string, now time.Time) error {
 	switch {
 	case task == nil:
 		return fmt.Errorf("record task starting task is required")
@@ -64,6 +64,8 @@ func validateRecordTaskStartingInput(task *domain.Task, resolvedTimeout domain.T
 		return fmt.Errorf("record task starting model is required")
 	case !domain.IsValidSandboxMode(sandboxMode):
 		return fmt.Errorf("record task starting sandbox mode is invalid")
+	case workingDir == "":
+		return fmt.Errorf("record task starting working directory is required")
 	case promptText == "":
 		return fmt.Errorf("record task starting prompt text is required")
 	case route != domain.ExecutionRouteDaemon:
@@ -71,7 +73,8 @@ func validateRecordTaskStartingInput(task *domain.Task, resolvedTimeout domain.T
 	case now.IsZero():
 		return fmt.Errorf("record task starting now is required")
 	default:
-		return nil
+		_, err := domain.NewNormalizedPath(workingDir)
+		return err
 	}
 }
 

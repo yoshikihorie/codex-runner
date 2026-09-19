@@ -45,6 +45,7 @@ type ResumeLaunchParams struct {
 	SandboxMode           string
 	Model                 string
 	ReasoningEffort       *string
+	WorkingDir            string
 }
 type ResumeLauncher interface {
 	LaunchAndWait(context.Context, ResumeLaunchParams) error
@@ -65,6 +66,7 @@ type RecoveryAttempt struct {
 	SandboxMode       string
 	Model             string
 	ReasoningEffort   *string
+	WorkingDir        *string
 }
 
 type ResumeSettings struct {
@@ -72,6 +74,7 @@ type ResumeSettings struct {
 	SandboxMode     string
 	Model           string
 	ReasoningEffort *string
+	WorkingDir      *string
 }
 
 func newResumeSettings(snapshot domain.TaskSnapshot) ResumeSettings {
@@ -79,6 +82,10 @@ func newResumeSettings(snapshot domain.TaskSnapshot) ResumeSettings {
 	if snapshot.ReasoningEffort != nil {
 		value := *snapshot.ReasoningEffort
 		settings.ReasoningEffort = &value
+	}
+	if snapshot.WorkingDir != nil {
+		value := *snapshot.WorkingDir
+		settings.WorkingDir = &value
 	}
 	return settings
 }
@@ -98,11 +105,18 @@ func (r *RecoveryAttempt) Attempt(ctx context.Context, launcher ResumeLauncher, 
 		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, fmt.Errorf("resume task placement root: %w", err)
 	}
 	taskPlacementRoot := path.String()
+	if r.WorkingDir == nil {
+		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, errors.Join(errRecoveryResumeLaunchFailed, fmt.Errorf("resume working directory is required"))
+	}
+	workingDir, err := domain.NewNormalizedPath(*r.WorkingDir)
+	if err != nil {
+		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, errors.Join(errRecoveryResumeLaunchFailed, fmt.Errorf("resume working directory: %w", err))
+	}
 	outputLastMessagePath, err := store.LastMessageMDPath(taskPlacementRoot, r.TaskID)
 	if err != nil {
 		return RecoveryResult{ExitCode: failureExitCodeFor(r.Origin)}, fmt.Errorf("resume output last message path: %w", err)
 	}
-	params := ResumeLaunchParams{TaskID: r.TaskID, CodexBinaryPath: r.CodexBinaryPath, SessionID: r.SessionRef.SessionID(), TaskPlacementRoot: taskPlacementRoot, OutputLastMessagePath: outputLastMessagePath, Subcommand: r.Subcommand, SandboxMode: r.SandboxMode, Model: r.Model, ReasoningEffort: r.ReasoningEffort}
+	params := ResumeLaunchParams{TaskID: r.TaskID, CodexBinaryPath: r.CodexBinaryPath, SessionID: r.SessionRef.SessionID(), TaskPlacementRoot: taskPlacementRoot, OutputLastMessagePath: outputLastMessagePath, Subcommand: r.Subcommand, SandboxMode: r.SandboxMode, Model: r.Model, ReasoningEffort: r.ReasoningEffort, WorkingDir: workingDir.String()}
 	if domain.SupportsOutputSchema(r.Subcommand) {
 		outputSchemaPath, err := store.OutputSchemaPath(taskPlacementRoot, r.TaskID)
 		if err != nil {
@@ -151,7 +165,7 @@ func (r *resumeRecoverer) Resume(ctx context.Context, taskID domain.TaskID, sess
 	if sessionRef == nil {
 		return RecoveryResult{ExitCode: failureExitCodeFor(origin)}, errRecoverySessionUnavailable
 	}
-	result, err := (&RecoveryAttempt{TaskID: taskID, Origin: origin, SessionRef: *sessionRef, StartedAt: r.clock.Now(), CodexBinaryPath: r.codexBinaryPath, TaskPlacementRoot: r.taskPlacementRoot, Subcommand: settings.Subcommand, SandboxMode: settings.SandboxMode, Model: settings.Model, ReasoningEffort: settings.ReasoningEffort}).Attempt(ctx, r.launcher, r.reader)
+	result, err := (&RecoveryAttempt{TaskID: taskID, Origin: origin, SessionRef: *sessionRef, StartedAt: r.clock.Now(), CodexBinaryPath: r.codexBinaryPath, TaskPlacementRoot: r.taskPlacementRoot, Subcommand: settings.Subcommand, SandboxMode: settings.SandboxMode, Model: settings.Model, ReasoningEffort: settings.ReasoningEffort, WorkingDir: settings.WorkingDir}).Attempt(ctx, r.launcher, r.reader)
 	if err != nil || result.Succeeded {
 		return result, err
 	}

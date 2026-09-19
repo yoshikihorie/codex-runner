@@ -721,7 +721,10 @@ func newSubmitLifecycleFixture(t *testing.T, model string, effort *string) (*Sub
 		if _, err := os.Stat(taskJSON); !os.IsNotExist(err) {
 			t.Fatalf("task.json before Task.Start: err=%v", err)
 		}
-		if err := recordStarting.Execute(context.Background(), payload.Task, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, payload.SandboxMode, domain.ExecutionRouteDaemon, payload.PromptText, clock.Now()); err != nil {
+		if payload.WorkingDir == nil {
+			t.Fatal("working dir was not resolved")
+		}
+		if err := recordStarting.Execute(context.Background(), payload.Task, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, payload.SandboxMode, *payload.WorkingDir, domain.ExecutionRouteDaemon, payload.PromptText, clock.Now()); err != nil {
 			t.Fatal(err)
 		}
 	}}

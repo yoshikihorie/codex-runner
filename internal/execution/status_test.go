@@ -64,7 +64,7 @@ func TestTaskSnapshotProviderSearchesLaunchingBeforeQueue(t *testing.T) {
 	registry := NewLaunchingTaskRegistry()
 	launchingPayload := payload
 	launchingPayload.Model = "launching-model"
-	launching, err := domain.NewTaskSnapshotFromAdmission(launchingPayload.Task, launchingPayload.ResolvedTimeout, launchingPayload.Model, nil, launchingPayload.SandboxMode, domain.ExecutionRouteDaemon, launchingPayload.Task.RequestedAt())
+	launching, err := domain.NewTaskSnapshotFromAdmission(launchingPayload.Task, launchingPayload.ResolvedTimeout, launchingPayload.Model, nil, launchingPayload.SandboxMode, launchingPayload.WorkingDir, domain.ExecutionRouteDaemon, launchingPayload.Task.RequestedAt())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +107,7 @@ func TestTaskSnapshotProviderQueuePositionExcludesLaunching(t *testing.T) {
 	queue.Enqueue(payload)
 	registry := NewLaunchingTaskRegistry()
 	launchingPayload := statusPayload(t, "position-launching")
-	launching, err := domain.NewTaskSnapshotFromAdmission(launchingPayload.Task, launchingPayload.ResolvedTimeout, launchingPayload.Model, nil, launchingPayload.SandboxMode, domain.ExecutionRouteDaemon, launchingPayload.Task.RequestedAt())
+	launching, err := domain.NewTaskSnapshotFromAdmission(launchingPayload.Task, launchingPayload.ResolvedTimeout, launchingPayload.Model, nil, launchingPayload.SandboxMode, launchingPayload.WorkingDir, domain.ExecutionRouteDaemon, launchingPayload.Task.RequestedAt())
 	if err != nil {
 		t.Fatal(err)
 	}

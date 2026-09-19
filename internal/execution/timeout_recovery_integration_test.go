@@ -335,7 +335,8 @@ func (f metricsAcceptanceFixture) prepareWithSubcommand(t *testing.T, suffix str
 	if _, err = task.Start(timeout, "test-model", requested); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := domain.NewTaskSnapshotFromAdmission(task, timeout, "test-model", nil, "workspace-write", domain.ExecutionRouteDaemon, requested)
+	workingDir := t.TempDir()
+	snapshot, err := domain.NewTaskSnapshotFromAdmission(task, timeout, "test-model", nil, "workspace-write", &workingDir, domain.ExecutionRouteDaemon, requested)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -45,15 +45,17 @@ func (f *lifecycleRecordingAcquireForChild) Acquire(path string) (*os.File, erro
 }
 
 type lifecycleRecordingRecordStarting struct {
-	calls   int
-	prompts []string
-	err     error
-	trace   *[]string
+	calls       int
+	prompts     []string
+	workingDirs []string
+	err         error
+	trace       *[]string
 }
 
-func (f *lifecycleRecordingRecordStarting) Execute(_ context.Context, _ *domain.Task, _ domain.Timeout, _ string, _ *string, _ string, _ domain.ExecutionRoute, prompt string, _ time.Time) error {
+func (f *lifecycleRecordingRecordStarting) Execute(_ context.Context, _ *domain.Task, _ domain.Timeout, _ string, _ *string, _ string, workingDir string, _ domain.ExecutionRoute, prompt string, _ time.Time) error {
 	f.calls++
 	f.prompts = append(f.prompts, prompt)
+	f.workingDirs = append(f.workingDirs, workingDir)
 	appendLifecycleTrace(f.trace, "record-starting")
 	return f.err
 }
@@ -786,7 +788,8 @@ func lifecycleSnapshotWithProcessStartedAt(t *testing.T, task *domain.Task, stat
 	if _, err := task.RecordProcessInfo(42, processStartedAt, testLifecycleTime); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil, "workspace-write").WithTask(task, testLifecycleTime)
+	workingDir := t.TempDir()
+	snapshot, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil, "workspace-write", &workingDir).WithTask(task, testLifecycleTime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -815,7 +818,8 @@ func lifecycleStartingSnapshotWithoutProcess(t *testing.T, task *domain.Task) do
 	if _, err := task.Start(lifecycleTimeout(t), "gpt-5", testLifecycleTime); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil, "workspace-write").WithTask(task, testLifecycleTime)
+	workingDir := t.TempDir()
+	snapshot, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil, "workspace-write", &workingDir).WithTask(task, testLifecycleTime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1029,6 +1033,19 @@ func TestLifecycleCurrentModeDoesNotCreateWorktree(t *testing.T) {
 	}
 }
 
+func TestLifecycleRejectsMissingWorkingDirBeforeRecordStarting(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.input.WorktreeMode = domain.WorktreeModeCurrent
+	f.input.WorkingDir = nil
+	f.failStore.loads = []lifecycleLoadResult{{snapshot: domain.TaskSnapshot{}}}
+
+	f.run()
+
+	if f.starting.calls != 0 || f.launch.calls != 0 {
+		t.Fatalf("missing working dir reached record/launch: starting=%d launch=%d trace=%v", f.starting.calls, f.launch.calls, f.trace)
+	}
+}
+
 func TestLifecycleCurrentModeKeepsPromptUnchanged(t *testing.T) {
 	f := newLifecycleFixture(t)
 	f.input.WorktreeMode = domain.WorktreeModeCurrent
@@ -1054,8 +1071,8 @@ func TestLifecycleCurrentModeLaunchesInSourceWorkingDir(t *testing.T) {
 
 	f.run()
 
-	if len(f.launch.params) != 1 || f.launch.params[0].WorkingDir != f.input.SourceWorkingDir {
-		t.Fatalf("launch working dir=%q, want %q", f.launch.params[0].WorkingDir, f.input.SourceWorkingDir)
+	if len(f.starting.workingDirs) != 1 || f.starting.workingDirs[0] != f.input.SourceWorkingDir || len(f.launch.params) != 1 || f.launch.params[0].WorkingDir != f.input.SourceWorkingDir {
+		t.Fatalf("working dirs: starting=%v launch=%v, want %q", f.starting.workingDirs, f.launch.params, f.input.SourceWorkingDir)
 	}
 }
 
@@ -1081,8 +1098,8 @@ func TestLifecycleAutoModeStillCreatesWorktree(t *testing.T) {
 	if f.worktree.resolveCalls != 1 || f.worktree.calls != 1 {
 		t.Fatalf("worktree resolveCalls=%d calls=%d, want 1/1", f.worktree.resolveCalls, f.worktree.calls)
 	}
-	if len(f.launch.params) != 1 || f.launch.params[0].WorkingDir != "/private/tmp/worktree" {
-		t.Fatalf("launch working dir=%q, want /private/tmp/worktree", f.launch.params[0].WorkingDir)
+	if len(f.starting.workingDirs) != 1 || f.starting.workingDirs[0] != "/private/tmp/worktree" || len(f.launch.params) != 1 || f.launch.params[0].WorkingDir != "/private/tmp/worktree" {
+		t.Fatalf("working dirs: starting=%v launch=%v, want /private/tmp/worktree", f.starting.workingDirs, f.launch.params)
 	}
 }
 
@@ -1578,7 +1595,7 @@ func TestTaskLifecycleCancellationConfirmationRegistersUnconfirmed(t *testing.T)
 				disposition: recovery.PendingSendConfirmOnly,
 				invoke: func(f *lifecycleFixture) {
 					f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
-					f.orchestrator.fail(context.Background(), f.input, 130, true)
+					f.orchestrator.fail(context.Background(), f.input, f.input.WorkingDir, 130, true)
 				},
 			},
 			{
@@ -1641,7 +1658,7 @@ func TestTaskLifecycleCancellationConfirmationReleasesConfirmedDespiteError(t *t
 			name: "launch-failure",
 			invoke: func(f *lifecycleFixture) {
 				f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
-				f.orchestrator.fail(context.Background(), f.input, 130, true)
+				f.orchestrator.fail(context.Background(), f.input, f.input.WorkingDir, 130, true)
 			},
 		},
 		{
@@ -1705,7 +1722,7 @@ func TestTaskLifecycleFailReleasesConfirmedCancellationDespiteError(t *testing.T
 	f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
 	f.killed.lockedResult = execution.LockedKillResult{Confirmed: true}
 	f.killed.lockedErr = errors.New("contract")
-	f.orchestrator.fail(context.Background(), f.input, 130, true)
+	f.orchestrator.fail(context.Background(), f.input, f.input.WorkingDir, 130, true)
 	if f.killed.releaseCalls != 1 || !lifecycleTraceSubsequence(f.trace, "confirm-killed-locked", "task-unlock", "release-after-confirmation") {
 		t.Fatalf("confirmed cancellation was not released after unlock: trace=%v", f.trace)
 	}
@@ -1717,7 +1734,7 @@ func TestTaskLifecycleFailDoesNotReleaseUnconfirmedCancellation(t *testing.T) {
 		f.tasks.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateCancelling)}}
 		f.killed.lockedResult = execution.LockedKillResult{}
 		f.killed.lockedErr = err
-		f.orchestrator.fail(context.Background(), f.input, 130, true)
+		f.orchestrator.fail(context.Background(), f.input, f.input.WorkingDir, 130, true)
 		if f.killed.releaseCalls != 0 || f.pending.calls != 1 || f.pending.dispositions[0] != recovery.PendingSendConfirmOnly || f.pending.authorities[0] != nil {
 			t.Fatalf("unconfirmed cancellation release=%d pending=%+v error=%v", f.killed.releaseCalls, f.pending, err)
 		}
@@ -1730,7 +1747,7 @@ func TestTaskLifecycleFailKeepsTaskMutexUntilFailureTransitionAndThenReleases(t 
 	f.failStore.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateStarting)}}
 	f.failStore.loadName = "load"
 	f.failStore.saveName = "save"
-	f.orchestrator.fail(context.Background(), f.input, 130, true)
+	f.orchestrator.fail(context.Background(), f.input, f.input.WorkingDir, 130, true)
 	if f.taskMu.lockCalls != 1 || f.taskMu.unlockCalls != 1 || f.failStore.saveCalls != 1 || f.failSlots.calls != 1 {
 		t.Fatalf("failure transition was not completed in one task mutex section: trace=%v", f.trace)
 	}
@@ -2317,7 +2334,8 @@ func TestTaskLifecycleConfirmTerminalCancellingPreReadTerminalAuthoritativeLoadR
 	if _, err := task.ConfirmKilled(domain.NewExitCode(130), true, testLifecycleTime); err != nil {
 		t.Fatal(err)
 	}
-	terminal, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil, "workspace-write").WithTask(task, testLifecycleTime)
+	workingDir := t.TempDir()
+	terminal, err := domain.NewInitialTaskSnapshot(domain.ExecutionRouteDaemon, nil, "workspace-write", &workingDir).WithTask(task, testLifecycleTime)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -2521,7 +2539,7 @@ func TestTaskLifecycleFailBranchesUseRealTaskMutexAndReleaseAfterUnlock(t *testi
 				f.orchestrator.deps.FailLaunch = NewFailTaskLaunchUseCase(f.failStore, shared, f.failWriter, &lifecycleRecordingContractReader{}, slots, paths, f.clock)
 			}
 			done := make(chan struct{})
-			go func() { f.orchestrator.fail(context.Background(), f.input, 130, true); close(done) }()
+			go func() { f.orchestrator.fail(context.Background(), f.input, f.input.WorkingDir, 130, true); close(done) }()
 			select {
 			case <-done:
 			case <-time.After(3 * time.Second):

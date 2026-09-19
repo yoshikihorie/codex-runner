@@ -76,12 +76,25 @@ func TestRecordTaskStartingUseCase_WritesPromptThenTaskJSONWithNilPID(t *testing
 	trace := []string{}
 	tasks := &recordStartingTaskStoreFake{trace: &trace}
 	writer := &recordStartingContractWriterFake{trace: &trace}
-	err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), recordStartingTask(t), recordStartingTimeout(t, nil), "gpt-5", nil, "workspace-write", domain.ExecutionRouteDaemon, "prompt", time.Date(2026, time.August, 10, 12, 1, 0, 0, time.UTC))
+	workingDir := t.TempDir()
+	err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), recordStartingTask(t), recordStartingTimeout(t, nil), "gpt-5", nil, "workspace-write", workingDir, domain.ExecutionRouteDaemon, "prompt", time.Date(2026, time.August, 10, 12, 1, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if fmt.Sprint(trace) != "[prompt save]" || tasks.snapshot.PID != nil || tasks.snapshot.ProcessStartedAt != nil || tasks.snapshot.State != domain.StateStarting || tasks.snapshot.Route != domain.ExecutionRouteDaemon || writer.appendEvents != 0 {
+	if fmt.Sprint(trace) != "[prompt save]" || tasks.snapshot.PID != nil || tasks.snapshot.ProcessStartedAt != nil || tasks.snapshot.State != domain.StateStarting || tasks.snapshot.Route != domain.ExecutionRouteDaemon || tasks.snapshot.WorkingDir == nil || *tasks.snapshot.WorkingDir != workingDir || writer.appendEvents != 0 {
 		t.Fatalf("trace=%v snapshot=%#v", trace, tasks.snapshot)
+	}
+}
+
+func TestRecordTaskStartingUseCaseRejectsInvalidWorkingDirBeforeSideEffects(t *testing.T) {
+	for _, workingDir := range []string{"", "relative", "/tmp/a/.."} {
+		trace := []string{}
+		tasks := &recordStartingTaskStoreFake{trace: &trace}
+		writer := &recordStartingContractWriterFake{trace: &trace}
+		err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), recordStartingTask(t), recordStartingTimeout(t, nil), "gpt-5", nil, "workspace-write", workingDir, domain.ExecutionRouteDaemon, "prompt", time.Now())
+		if err == nil || writer.prompts != 0 || tasks.saves != 0 {
+			t.Fatalf("workingDir=%q err=%v prompts=%d saves=%d", workingDir, err, writer.prompts, tasks.saves)
+		}
 	}
 }
 
@@ -90,7 +103,7 @@ func TestRecordTaskStartingUseCase_TaskJSONWriteFailureReturnsContractWriteFaile
 	tasks := &recordStartingTaskStoreFake{trace: &trace, saveErr: errors.New("save")}
 	writer := &recordStartingContractWriterFake{trace: &trace}
 	task := recordStartingTask(t)
-	err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), task, recordStartingTimeout(t, nil), "gpt-5", nil, "workspace-write", domain.ExecutionRouteDaemon, "prompt", time.Now())
+	err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), task, recordStartingTimeout(t, nil), "gpt-5", nil, "workspace-write", t.TempDir(), domain.ExecutionRouteDaemon, "prompt", time.Now())
 	if !errors.Is(err, domain.ErrContractWriteFailed) || task.State() != domain.StateStarting {
 		t.Fatalf("err=%v state=%s", err, task.State())
 	}
@@ -102,7 +115,7 @@ func TestRecordTaskStartingUseCase_NonQueuedTaskRejected(t *testing.T) {
 	writer := &recordStartingContractWriterFake{trace: &trace}
 	task := recordStartingTask(t)
 	_, _ = task.Start(recordStartingTimeout(t, nil), "gpt-5", time.Now())
-	err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), task, recordStartingTimeout(t, nil), "gpt-5", nil, "workspace-write", domain.ExecutionRouteDaemon, "prompt", time.Now())
+	err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), task, recordStartingTimeout(t, nil), "gpt-5", nil, "workspace-write", t.TempDir(), domain.ExecutionRouteDaemon, "prompt", time.Now())
 	if !errors.Is(err, domain.ErrInvalidStateTransition) || writer.prompts != 0 || tasks.saves != 0 {
 		t.Fatalf("err=%v", err)
 	}
@@ -112,7 +125,7 @@ func TestRecordTaskStartingUseCase_OmitsRequestedTimeoutWhenNil(t *testing.T) {
 	trace := []string{}
 	tasks := &recordStartingTaskStoreFake{trace: &trace}
 	writer := &recordStartingContractWriterFake{trace: &trace}
-	if err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), recordStartingTask(t), recordStartingTimeout(t, nil), "gpt-5", nil, "workspace-write", domain.ExecutionRouteDaemon, "prompt", time.Now()); err != nil || tasks.snapshot.RequestedTimeoutSeconds != nil {
+	if err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), recordStartingTask(t), recordStartingTimeout(t, nil), "gpt-5", nil, "workspace-write", t.TempDir(), domain.ExecutionRouteDaemon, "prompt", time.Now()); err != nil || tasks.snapshot.RequestedTimeoutSeconds != nil {
 		t.Fatalf("err=%v snapshot=%#v", err, tasks.snapshot)
 	}
 }
@@ -123,10 +136,11 @@ func TestRecordTaskStartingUseCase_SecondCallRejectedWithoutOverwrite(t *testing
 	writer := &recordStartingContractWriterFake{trace: &trace}
 	task := recordStartingTask(t)
 	uc := NewRecordTaskStartingUseCase(tasks, writer)
-	if err := uc.Execute(context.Background(), task, recordStartingTimeout(t, nil), "gpt-5", nil, "workspace-write", domain.ExecutionRouteDaemon, "prompt", time.Now()); err != nil {
+	workingDir := t.TempDir()
+	if err := uc.Execute(context.Background(), task, recordStartingTimeout(t, nil), "gpt-5", nil, "workspace-write", workingDir, domain.ExecutionRouteDaemon, "prompt", time.Now()); err != nil {
 		t.Fatal(err)
 	}
-	if err := uc.Execute(context.Background(), task, recordStartingTimeout(t, nil), "gpt-5", nil, "workspace-write", domain.ExecutionRouteDaemon, "prompt", time.Now()); !errors.Is(err, domain.ErrInvalidStateTransition) || tasks.saves != 1 {
+	if err := uc.Execute(context.Background(), task, recordStartingTimeout(t, nil), "gpt-5", nil, "workspace-write", workingDir, domain.ExecutionRouteDaemon, "prompt", time.Now()); !errors.Is(err, domain.ErrInvalidStateTransition) || tasks.saves != 1 {
 		t.Fatalf("err=%v saves=%d", err, tasks.saves)
 	}
 }
@@ -135,7 +149,7 @@ func TestRecordTaskStartingUseCase_PromptWriteFailureSkipsTaskJSON(t *testing.T)
 	trace := []string{}
 	tasks := &recordStartingTaskStoreFake{trace: &trace}
 	writer := &recordStartingContractWriterFake{trace: &trace, writePromptErr: fmt.Errorf("%w: prompt", domain.ErrContractWriteFailed)}
-	err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), recordStartingTask(t), recordStartingTimeout(t, nil), "gpt-5", nil, "workspace-write", domain.ExecutionRouteDaemon, "prompt", time.Now())
+	err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), recordStartingTask(t), recordStartingTimeout(t, nil), "gpt-5", nil, "workspace-write", t.TempDir(), domain.ExecutionRouteDaemon, "prompt", time.Now())
 	if !errors.Is(err, domain.ErrContractWriteFailed) || tasks.saves != 0 {
 		t.Fatalf("err=%v saves=%d", err, tasks.saves)
 	}
@@ -146,7 +160,7 @@ func TestRecordTaskStartingUseCase_ReasoningEffortPersistedAsGiven(t *testing.T)
 		trace := []string{}
 		tasks := &recordStartingTaskStoreFake{trace: &trace}
 		writer := &recordStartingContractWriterFake{trace: &trace}
-		if err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), recordStartingTask(t), recordStartingTimeout(t, nil), "gpt-5", reasoning, "workspace-write", domain.ExecutionRouteDaemon, "prompt", time.Now()); err != nil || !sameStringPtr(tasks.snapshot.ReasoningEffort, reasoning) {
+		if err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), recordStartingTask(t), recordStartingTimeout(t, nil), "gpt-5", reasoning, "workspace-write", t.TempDir(), domain.ExecutionRouteDaemon, "prompt", time.Now()); err != nil || !sameStringPtr(tasks.snapshot.ReasoningEffort, reasoning) {
 			t.Fatalf("err=%v got=%v want=%v", err, tasks.snapshot.ReasoningEffort, reasoning)
 		}
 	}
@@ -164,7 +178,7 @@ func TestRecordTaskStartingUseCase_RejectsInvalidInput(t *testing.T) {
 			trace := []string{}
 			tasks := &recordStartingTaskStoreFake{trace: &trace}
 			writer := &recordStartingContractWriterFake{trace: &trace}
-			if NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), tc.task, recordStartingTimeout(t, nil), tc.model, nil, "workspace-write", tc.route, tc.prompt, tc.now) == nil || writer.prompts != 0 || tasks.saves != 0 {
+			if NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), tc.task, recordStartingTimeout(t, nil), tc.model, nil, "workspace-write", t.TempDir(), tc.route, tc.prompt, tc.now) == nil || writer.prompts != 0 || tasks.saves != 0 {
 				t.Fatal("invalid input was accepted")
 			}
 		})
@@ -185,7 +199,7 @@ func TestRecordTaskStartingUseCase_RejectsInvalidSandboxModeBeforeSideEffects(t 
 			trace := []string{}
 			tasks := &recordStartingTaskStoreFake{trace: &trace}
 			writer := &recordStartingContractWriterFake{trace: &trace}
-			err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), recordStartingTask(t), recordStartingTimeout(t, nil), "gpt-5", nil, sandboxMode, domain.ExecutionRouteDaemon, "prompt", time.Now())
+			err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), recordStartingTask(t), recordStartingTimeout(t, nil), "gpt-5", nil, sandboxMode, t.TempDir(), domain.ExecutionRouteDaemon, "prompt", time.Now())
 			if err == nil || writer.prompts != 0 || tasks.saves != 0 {
 				t.Fatalf("err=%v prompts=%d saves=%d", err, writer.prompts, tasks.saves)
 			}
@@ -209,7 +223,7 @@ func TestRecordTaskStartingUseCase_RejectsZeroTimeout(t *testing.T) {
 	trace := []string{}
 	tasks := &recordStartingTaskStoreFake{trace: &trace}
 	writer := &recordStartingContractWriterFake{trace: &trace}
-	err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), recordStartingTask(t), domain.Timeout{}, "gpt-5", nil, "workspace-write", domain.ExecutionRouteDaemon, "prompt", time.Now())
+	err := NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), recordStartingTask(t), domain.Timeout{}, "gpt-5", nil, "workspace-write", t.TempDir(), domain.ExecutionRouteDaemon, "prompt", time.Now())
 	if err == nil || writer.prompts != 0 || tasks.saves != 0 {
 		t.Fatalf("err=%v prompts=%d saves=%d", err, writer.prompts, tasks.saves)
 	}
@@ -220,7 +234,7 @@ func assertRecordStartingInvalidInput(t *testing.T, task *domain.Task, model, pr
 	trace := []string{}
 	tasks := &recordStartingTaskStoreFake{trace: &trace}
 	writer := &recordStartingContractWriterFake{trace: &trace}
-	if NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), task, recordStartingTimeout(t, nil), model, nil, "workspace-write", route, prompt, now) == nil || writer.prompts != 0 || tasks.saves != 0 {
+	if NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), task, recordStartingTimeout(t, nil), model, nil, "workspace-write", t.TempDir(), route, prompt, now) == nil || writer.prompts != 0 || tasks.saves != 0 {
 		t.Fatal("invalid input was accepted")
 	}
 }

@@ -12,7 +12,8 @@ import (
 
 func TestLaunchNewSessionStartsNewSession(t *testing.T) {
 	lockFile := newLockFile(t)
-	cmd, err := LaunchNewSession(context.Background(), "/bin/sleep", SafeChildEnv(), lockFile, nil, nil, "10")
+	workingDir := t.TempDir()
+	cmd, err := LaunchNewSession(context.Background(), "/bin/sleep", workingDir, SafeChildEnv(), lockFile, nil, nil, "10")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -31,11 +32,31 @@ func TestLaunchNewSessionStartsNewSession(t *testing.T) {
 	if childSessionID == parentSessionID {
 		t.Fatalf("child session ID = parent session ID = %d", childSessionID)
 	}
+	if cmd.Dir != workingDir {
+		t.Fatalf("cmd.Dir = %q, want %q", cmd.Dir, workingDir)
+	}
+}
+
+func TestLaunchNewSessionRejectsInvalidWorkingDir(t *testing.T) {
+	for _, workingDir := range []string{"", "relative", "/tmp/a/.."} {
+		if _, err := LaunchNewSession(context.Background(), "/bin/echo", workingDir, SafeChildEnv(), newLockFile(t), nil, nil); err == nil {
+			t.Errorf("LaunchNewSession accepted working dir %q", workingDir)
+		}
+	}
+}
+
+func TestLaunchNewSessionFailsWhenWorkingDirIsMissing(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing")
+	if _, err := LaunchNewSession(context.Background(), "/bin/echo", missing, SafeChildEnv(), newLockFile(t), nil, nil); err == nil {
+		t.Fatal("LaunchNewSession started with a missing working directory")
+	} else if strings.Contains(err.Error(), missing) {
+		t.Fatalf("launch error leaked working directory: %v", err)
+	}
 }
 
 func TestLaunchNewSessionPassesLivenessLockFile(t *testing.T) {
 	lockFile := newLockFile(t)
-	cmd, err := LaunchNewSession(context.Background(), "/bin/sh", SafeChildEnv(), lockFile, nil, nil, "-c", "test -e /dev/fd/3")
+	cmd, err := LaunchNewSession(context.Background(), "/bin/sh", t.TempDir(), SafeChildEnv(), lockFile, nil, nil, "-c", "test -e /dev/fd/3")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -47,19 +68,19 @@ func TestLaunchNewSessionPassesLivenessLockFile(t *testing.T) {
 func TestLaunchNewSessionReturnsErrorForCanceledContext(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := LaunchNewSession(ctx, "/bin/sleep", SafeChildEnv(), newLockFile(t), nil, nil, "10"); err == nil {
+	if _, err := LaunchNewSession(ctx, "/bin/sleep", t.TempDir(), SafeChildEnv(), newLockFile(t), nil, nil, "10"); err == nil {
 		t.Fatal("LaunchNewSession succeeded with a canceled context")
 	}
 }
 
 func TestLaunchNewSessionReturnsErrorForMissingCommand(t *testing.T) {
-	if _, err := LaunchNewSession(context.Background(), "/missing-command", SafeChildEnv(), newLockFile(t), nil, nil); err == nil {
+	if _, err := LaunchNewSession(context.Background(), "/missing-command", t.TempDir(), SafeChildEnv(), newLockFile(t), nil, nil); err == nil {
 		t.Fatal("LaunchNewSession succeeded with a missing command")
 	}
 }
 
 func TestLaunchNewSessionReturnsErrorForNilLivenessLockFile(t *testing.T) {
-	cmd, err := LaunchNewSession(context.Background(), "/bin/sleep", SafeChildEnv(), nil, nil, nil, "10")
+	cmd, err := LaunchNewSession(context.Background(), "/bin/sleep", t.TempDir(), SafeChildEnv(), nil, nil, nil, "10")
 	if err == nil {
 		t.Fatal("LaunchNewSession succeeded with a nil liveness lock file")
 	}
@@ -77,7 +98,7 @@ func TestLaunchNewSessionRedirectsStdout(t *testing.T) {
 		_ = stdout.Close()
 	})
 
-	cmd, err := LaunchNewSession(context.Background(), "/bin/echo", SafeChildEnv(), newLockFile(t), stdout, nil, "hello")
+	cmd, err := LaunchNewSession(context.Background(), "/bin/echo", t.TempDir(), SafeChildEnv(), newLockFile(t), stdout, nil, "hello")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -98,7 +119,7 @@ func TestLaunchNewSessionRedirectsStdout(t *testing.T) {
 
 func TestLaunchNewSessionClosesLivenessLockFileAfterSuccessfulStart(t *testing.T) {
 	lockFile := newLockFile(t)
-	cmd, err := LaunchNewSession(context.Background(), "/bin/echo", SafeChildEnv(), lockFile, nil, nil)
+	cmd, err := LaunchNewSession(context.Background(), "/bin/echo", t.TempDir(), SafeChildEnv(), lockFile, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +133,7 @@ func TestLaunchNewSessionClosesLivenessLockFileAfterSuccessfulStart(t *testing.T
 
 func TestLaunchNewSessionClosesLivenessLockFileAfterFailedStart(t *testing.T) {
 	lockFile := newLockFile(t)
-	if _, err := LaunchNewSession(context.Background(), "/missing-command", SafeChildEnv(), lockFile, nil, nil); err == nil {
+	if _, err := LaunchNewSession(context.Background(), "/missing-command", t.TempDir(), SafeChildEnv(), lockFile, nil, nil); err == nil {
 		t.Fatal("LaunchNewSession succeeded with a missing command")
 	}
 	if _, err := lockFile.Stat(); err == nil {
@@ -123,7 +144,7 @@ func TestLaunchNewSessionClosesLivenessLockFileAfterFailedStart(t *testing.T) {
 func TestLaunchNewSessionUsesOnlySafeEnvironment(t *testing.T) {
 	t.Setenv("FAKE_API_KEY", "secret")
 	var stdout bytes.Buffer
-	cmd, err := LaunchNewSession(context.Background(), "/usr/bin/env", SafeChildEnv(), newLockFile(t), &stdout, nil)
+	cmd, err := LaunchNewSession(context.Background(), "/usr/bin/env", t.TempDir(), SafeChildEnv(), newLockFile(t), &stdout, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -143,7 +164,7 @@ func TestLaunchNewSessionUsesOnlySafeEnvironment(t *testing.T) {
 
 func TestLaunchNewSessionRejectsUnsafeEnvironmentAndClosesLockFile(t *testing.T) {
 	lockFile := newLockFile(t)
-	if _, err := LaunchNewSession(context.Background(), "/bin/echo", nil, lockFile, nil, nil); err == nil {
+	if _, err := LaunchNewSession(context.Background(), "/bin/echo", t.TempDir(), nil, lockFile, nil, nil); err == nil {
 		t.Fatal("LaunchNewSession succeeded with nil environment")
 	}
 	if _, err := lockFile.Stat(); err == nil {
@@ -153,7 +174,7 @@ func TestLaunchNewSessionRejectsUnsafeEnvironmentAndClosesLockFile(t *testing.T)
 
 func TestLaunchNewSessionRejectsRelativeCommand(t *testing.T) {
 	for _, name := range []string{"git", "./local-bin"} {
-		if _, err := LaunchNewSession(context.Background(), name, SafeChildEnv(), newLockFile(t), nil, nil); err == nil {
+		if _, err := LaunchNewSession(context.Background(), name, t.TempDir(), SafeChildEnv(), newLockFile(t), nil, nil); err == nil {
 			t.Errorf("LaunchNewSession(%q) succeeded", name)
 		}
 	}
@@ -161,7 +182,7 @@ func TestLaunchNewSessionRejectsRelativeCommand(t *testing.T) {
 
 func TestLaunchNewSessionRedirectsStderr(t *testing.T) {
 	var stderr bytes.Buffer
-	cmd, err := LaunchNewSession(context.Background(), "/bin/sh", SafeChildEnv(), newLockFile(t), nil, &stderr, "-c", "printf stderr >&2")
+	cmd, err := LaunchNewSession(context.Background(), "/bin/sh", t.TempDir(), SafeChildEnv(), newLockFile(t), nil, &stderr, "-c", "printf stderr >&2")
 	if err != nil {
 		t.Fatal(err)
 	}

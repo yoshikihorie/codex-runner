@@ -47,7 +47,7 @@ func (p *taskSnapshotProvider) Snapshot(taskID domain.TaskID) (domain.TaskSnapsh
 		p.queueMu.Unlock()
 		return domain.TaskSnapshot{}, domain.ErrTaskNotFound
 	}
-	snapshot, err = domain.NewTaskSnapshotFromAdmission(payload.Task, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, payload.SandboxMode, domain.ExecutionRouteDaemon, payload.Task.RequestedAt())
+	snapshot, err = domain.NewTaskSnapshotFromAdmission(payload.Task, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, payload.SandboxMode, payload.WorkingDir, domain.ExecutionRouteDaemon, payload.Task.RequestedAt())
 	p.queueMu.Unlock()
 	return snapshot, err
 }

@@ -177,7 +177,7 @@ func TestSendTerminateAndSendKillIgnoreMissingProcess(t *testing.T) {
 
 func startProcessGroup(t *testing.T, name string, args ...string) *exec.Cmd {
 	t.Helper()
-	cmd, err := LaunchNewSession(context.Background(), name, SafeChildEnv(), newLockFile(t), nil, nil, args...)
+	cmd, err := LaunchNewSession(context.Background(), name, t.TempDir(), SafeChildEnv(), newLockFile(t), nil, nil, args...)
 	if err != nil {
 		t.Fatal(err)
 	}

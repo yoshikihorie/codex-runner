@@ -595,7 +595,9 @@ func cancelQueuedUseCase(t *testing.T, queue execution.TaskQueueReader, tasks *c
 func cancelPersistedSnapshot(t *testing.T, state domain.TaskState, withPID bool) domain.TaskSnapshot {
 	t.Helper()
 	payload := cancelQueuedPayload(t)
-	snapshot, err := domain.NewTaskSnapshotFromAdmission(payload.Task, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, payload.SandboxMode, domain.ExecutionRouteDaemon, time.Date(2026, 8, 11, 12, 1, 0, 0, time.UTC))
+	workingDir := t.TempDir()
+	payload.WorkingDir = &workingDir
+	snapshot, err := domain.NewTaskSnapshotFromAdmission(payload.Task, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, payload.SandboxMode, payload.WorkingDir, domain.ExecutionRouteDaemon, time.Date(2026, 8, 11, 12, 1, 0, 0, time.UTC))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -614,7 +616,11 @@ func cancelPersistedSnapshot(t *testing.T, state domain.TaskState, withPID bool)
 func cancelLiveAdoptedWithoutPIDSnapshot(t *testing.T, payload execution.TaskLaunchPayload, stalled bool) domain.TaskSnapshot {
 	t.Helper()
 	at := time.Date(2026, 8, 11, 12, 1, 0, 0, time.UTC)
-	snapshot, err := domain.NewTaskSnapshotFromAdmission(payload.Task, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, payload.SandboxMode, domain.ExecutionRouteDaemon, at)
+	if payload.WorkingDir == nil {
+		workingDir := t.TempDir()
+		payload.WorkingDir = &workingDir
+	}
+	snapshot, err := domain.NewTaskSnapshotFromAdmission(payload.Task, payload.ResolvedTimeout, payload.Model, payload.ReasoningEffort, payload.SandboxMode, payload.WorkingDir, domain.ExecutionRouteDaemon, at)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -656,6 +662,28 @@ func TestCancelTaskExecute_QueuedReturnsOneTaskCancelRequestedEvent(t *testing.T
 	event, ok := out.Events[0].(domain.TaskCancelRequested)
 	if !ok || !event.Force || event.RequestedVia != domain.ProtocolVerbCancel || !event.OccurredAt.Equal(at) {
 		t.Fatalf("event=%#v", out.Events[0])
+	}
+}
+
+func TestCancelTaskExecuteAutoQueuedOmitsUnresolvedWorkingDir(t *testing.T) {
+	payload := cancelQueuedPayload(t)
+	payload.SourceWorkingDir = t.TempDir()
+	payload.WorktreeMode = domain.WorktreeModeAuto
+	payload.WorkingDir = nil
+	tasks, _, _, _, _, uc := cancelFixture(t, payload, true)
+	at := time.Date(2026, 8, 11, 12, 1, 0, 0, time.UTC)
+	if _, err := uc.Execute(context.Background(), CancelTaskInput{TaskID: payload.Task.ID(), Force: true, OccurredAt: at}); err != nil {
+		t.Fatal(err)
+	}
+	if tasks.snapshot.WorkingDir != nil {
+		t.Fatalf("auto queued cancel inferred working dir: %q", *tasks.snapshot.WorkingDir)
+	}
+	body, err := json.Marshal(tasks.snapshot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(body, []byte(`"working_dir"`)) || bytes.Contains(body, []byte(payload.SourceWorkingDir)) {
+		t.Fatalf("auto queued cancel persisted an unresolved working dir: %s", body)
 	}
 }
 

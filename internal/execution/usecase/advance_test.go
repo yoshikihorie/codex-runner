@@ -139,7 +139,7 @@ func TestAdvanceQueueUseCaseDequeuesFIFOAndReleasesSlot(t *testing.T) {
 	if err != nil || !found || payload.Task.ID() != waiting.TaskID || registry.Size() != 1 {
 		t.Fatalf("payload=%#v found=%t err=%v size=%d", payload, found, err, registry.Size())
 	}
-	if snapshot, registered := launching.Lookup(waiting.TaskID); !registered || snapshot.TaskID != waiting.TaskID || snapshot.State != domain.StateQueued || snapshot.Model != waiting.Model || snapshot.ResolvedTimeoutSeconds != waiting.ResolvedTimeout.ResolvedSeconds() || snapshot.Route != domain.ExecutionRouteDaemon || !snapshot.RequestedAt.Equal(waiting.RequestedAt) || !snapshot.StateUpdatedAt.Equal(waiting.RequestedAt) {
+	if snapshot, registered := launching.Lookup(waiting.TaskID); !registered || snapshot.TaskID != waiting.TaskID || snapshot.State != domain.StateQueued || snapshot.Model != waiting.Model || snapshot.WorkingDir == nil || *snapshot.WorkingDir != waiting.SourceWorkingDir || snapshot.ResolvedTimeoutSeconds != waiting.ResolvedTimeout.ResolvedSeconds() || snapshot.Route != domain.ExecutionRouteDaemon || !snapshot.RequestedAt.Equal(waiting.RequestedAt) || !snapshot.StateUpdatedAt.Equal(waiting.RequestedAt) {
 		t.Fatalf("snapshot=%#v registered=%t", snapshot, registered)
 	}
 }
@@ -200,7 +200,7 @@ func TestAdvanceQueueRemoveUnknownIDStillAdvances(t *testing.T) {
 	if err != nil || !found || got.Task.ID() != payload.Task.ID() || got.Model != payload.Model || got.PromptText != payload.PromptText || got.ReasoningEffort == nil || *got.ReasoningEffort != *payload.ReasoningEffort || len(got.NormalizedPaths) != 1 || got.NormalizedPaths[0] != payload.NormalizedPaths[0] || got.SandboxMode != payload.SandboxMode || got.SourceWorkingDir != payload.SourceWorkingDir || got.WorkingDir == nil || *got.WorkingDir != *payload.WorkingDir || registry.addCalls != 1 || queue.reindexCalls != 1 || len(queue.payloads) != 1 || queue.payloads[0].Task.ID() != remaining.Task.ID() {
 		t.Fatalf("payload=%#v found=%t err=%v add=%d reindex=%d", got, found, err, registry.addCalls, queue.reindexCalls)
 	}
-	if snapshot, registered := launching.Lookup(payload.Task.ID()); !registered || snapshot.Model != payload.Model || snapshot.ReasoningEffort == nil || *snapshot.ReasoningEffort != *payload.ReasoningEffort || snapshot.ResolvedTimeoutSeconds != payload.ResolvedTimeout.ResolvedSeconds() {
+	if snapshot, registered := launching.Lookup(payload.Task.ID()); !registered || snapshot.Model != payload.Model || snapshot.ReasoningEffort == nil || *snapshot.ReasoningEffort != *payload.ReasoningEffort || snapshot.WorkingDir == nil || *snapshot.WorkingDir != *payload.WorkingDir || snapshot.ResolvedTimeoutSeconds != payload.ResolvedTimeout.ResolvedSeconds() {
 		t.Fatalf("snapshot=%#v registered=%t", snapshot, registered)
 	}
 }

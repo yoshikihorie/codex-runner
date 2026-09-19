@@ -6,12 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/metrics"
+	"github.com/yoshikihorie/codex-runner/internal/proc"
 )
 
 type resumeLauncherFake struct {
@@ -32,6 +35,12 @@ type resumeReaderFake struct {
 	calls   int
 }
 
+func recoveryWorkingDir(t *testing.T) *string {
+	t.Helper()
+	value := t.TempDir()
+	return &value
+}
+
 func (f *resumeReaderFake) ReadLastMessage(domain.TaskID) (bool, error) {
 	f.calls++
 	return f.present, f.err
@@ -49,7 +58,7 @@ func TestRecoveryAttemptAttemptsResumeAndChecksLastMessage(t *testing.T) {
 	}
 	launcher := &resumeLauncherFake{}
 	reader := &resumeReaderFake{present: true}
-	attempt := RecoveryAttempt{TaskID: id, SessionRef: session, CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: t.TempDir()}
+	attempt := RecoveryAttempt{TaskID: id, SessionRef: session, CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: t.TempDir(), WorkingDir: recoveryWorkingDir(t)}
 	out, err := attempt.Attempt(context.Background(), launcher, reader)
 	if err != nil || !out.Succeeded || out.ExitCode.Raw() != 0 || out.PartialOutputSaved {
 		t.Fatalf("result = (%+v, %v)", out, err)
@@ -75,7 +84,7 @@ func TestRecoveryAttemptSetsPromptExceptForImpl(t *testing.T) {
 		for _, origin := range []domain.RecoveryOrigin{domain.RecoveryOriginTimeout, domain.RecoveryOriginOrphan} {
 			t.Run(tc.name+"/"+string(origin), func(t *testing.T) {
 				launcher := &resumeLauncherFake{}
-				attempt := RecoveryAttempt{TaskID: recoveryTestTaskID(t), Origin: origin, SessionRef: recoveryTestSession(t), CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: t.TempDir(), Subcommand: tc.subcommand}
+				attempt := RecoveryAttempt{TaskID: recoveryTestTaskID(t), Origin: origin, SessionRef: recoveryTestSession(t), CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: t.TempDir(), Subcommand: tc.subcommand, WorkingDir: recoveryWorkingDir(t)}
 				if _, err := attempt.Attempt(context.Background(), launcher, &resumeReaderFake{present: true}); err != nil {
 					t.Fatal(err)
 				}
@@ -112,7 +121,7 @@ func TestRecoveryAttemptDerivesOutputSchemaCandidateOnlyForSupportedSubcommands(
 			t.Run(tc.name+"/"+string(origin), func(t *testing.T) {
 				launcher := &resumeLauncherFake{}
 				id := recoveryTestTaskID(t)
-				attempt := RecoveryAttempt{TaskID: id, Origin: origin, SessionRef: recoveryTestSession(t), CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: root, Subcommand: tc.subcommand}
+				attempt := RecoveryAttempt{TaskID: id, Origin: origin, SessionRef: recoveryTestSession(t), CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: root, Subcommand: tc.subcommand, WorkingDir: recoveryWorkingDir(t)}
 				if _, err := attempt.Attempt(context.Background(), launcher, &resumeReaderFake{present: true}); err != nil {
 					t.Fatal(err)
 				}
@@ -129,9 +138,46 @@ func TestRecoveryAttemptDoesNotReadOutputAfterLaunchFailure(t *testing.T) {
 	session, _ := domain.NewSessionRef("123e4567-e89b-12d3-a456-426614174000", time.Date(2026, 8, 13, 12, 0, 0, 0, time.UTC), false)
 	launcher := &resumeLauncherFake{err: context.DeadlineExceeded}
 	reader := &resumeReaderFake{present: true}
-	_, err := (&RecoveryAttempt{TaskID: id, SessionRef: session, CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: t.TempDir()}).Attempt(context.Background(), launcher, reader)
+	_, err := (&RecoveryAttempt{TaskID: id, SessionRef: session, CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: t.TempDir(), WorkingDir: recoveryWorkingDir(t)}).Attempt(context.Background(), launcher, reader)
 	if err == nil || reader.calls != 0 {
 		t.Fatalf("err=%v reader calls=%d", err, reader.calls)
+	}
+}
+
+func TestRecoveryAttemptClassifiesMissingWorkingDirLaunchFailure(t *testing.T) {
+	root := t.TempDir()
+	workingDir := filepath.Join(root, "working")
+	if err := os.Mkdir(workingDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.RemoveAll(workingDir); err != nil {
+		t.Fatal(err)
+	}
+
+	lock, err := os.Create(filepath.Join(root, "task.lock"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	launcher := resumeLauncherFunc(func(ctx context.Context, params ResumeLaunchParams) error {
+		_, err := proc.LaunchNewSession(ctx, params.CodexBinaryPath, params.WorkingDir, proc.SafeChildEnv(), lock, nil, nil, "exec", "resume", params.SessionID)
+		return err
+	})
+	reader := &resumeReaderFake{present: true}
+	attempt := RecoveryAttempt{
+		TaskID:            recoveryTestTaskID(t),
+		Origin:            domain.RecoveryOriginOrphan,
+		SessionRef:        recoveryTestSession(t),
+		CodexBinaryPath:   "/usr/bin/true",
+		TaskPlacementRoot: root,
+		WorkingDir:        &workingDir,
+	}
+
+	result, err := attempt.Attempt(context.Background(), launcher, reader)
+	if !errors.Is(err, errRecoveryResumeLaunchFailed) {
+		t.Fatalf("error = %v, want errRecoveryResumeLaunchFailed", err)
+	}
+	if result.Succeeded || reader.calls != 0 {
+		t.Fatalf("result = %+v, reader calls = %d", result, reader.calls)
 	}
 }
 
@@ -153,7 +199,7 @@ func TestRecoveryAttemptFailureExitCodeDependsOnOrigin(t *testing.T) {
 		{name: "orphan missing last message", origin: domain.RecoveryOriginOrphan, launcher: &resumeLauncherFake{}, reader: &resumeReaderFake{}, wantCode: 1, wantClass: domain.ExitCodeClassFailure},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			result, err := (&RecoveryAttempt{TaskID: recoveryTestTaskID(t), Origin: tc.origin, SessionRef: recoveryTestSession(t), CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: t.TempDir()}).Attempt(context.Background(), tc.launcher, tc.reader)
+			result, err := (&RecoveryAttempt{TaskID: recoveryTestTaskID(t), Origin: tc.origin, SessionRef: recoveryTestSession(t), CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: t.TempDir(), WorkingDir: recoveryWorkingDir(t)}).Attempt(context.Background(), tc.launcher, tc.reader)
 			if (err != nil) != tc.wantErr || result.ExitCode.Raw() != tc.wantCode || result.ExitCode.Class() != tc.wantClass {
 				t.Fatalf("result=(%+v, %v), want code=%d class=%q err=%t", result, err, tc.wantCode, tc.wantClass, tc.wantErr)
 			}
@@ -177,7 +223,7 @@ func TestRecoveryAttemptAppliesResumeRecoveryTimeout(t *testing.T) {
 		launcher.calls++
 		return nil
 	})
-	result, err := (&RecoveryAttempt{TaskID: id, SessionRef: session, CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: t.TempDir()}).Attempt(context.Background(), launcherWithDeadline, &resumeReaderFake{present: true})
+	result, err := (&RecoveryAttempt{TaskID: id, SessionRef: session, CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: t.TempDir(), WorkingDir: recoveryWorkingDir(t)}).Attempt(context.Background(), launcherWithDeadline, &resumeReaderFake{present: true})
 	if err != nil || !result.Succeeded || launcher.calls != 1 {
 		t.Fatalf("result = (%+v, %v), calls = %d", result, err, launcher.calls)
 	}
@@ -352,8 +398,8 @@ func TestRecoverViaResumeUseCaseLeavesInvariantErrorsUnclassified(t *testing.T) 
 	}
 
 	for _, attempt := range []*RecoveryAttempt{
-		{TaskID: recoveryTestTaskID(t), Origin: domain.RecoveryOriginOrphan, SessionRef: recoveryTestSession(t), TaskPlacementRoot: ""},
-		{Origin: domain.RecoveryOriginOrphan, SessionRef: recoveryTestSession(t), TaskPlacementRoot: t.TempDir()},
+		{TaskID: recoveryTestTaskID(t), Origin: domain.RecoveryOriginOrphan, SessionRef: recoveryTestSession(t), TaskPlacementRoot: "", WorkingDir: recoveryWorkingDir(t)},
+		{Origin: domain.RecoveryOriginOrphan, SessionRef: recoveryTestSession(t), TaskPlacementRoot: t.TempDir(), WorkingDir: recoveryWorkingDir(t)},
 	} {
 		_, err := attempt.Attempt(context.Background(), &resumeLauncherFake{}, &resumeReaderFake{})
 		if err == nil || strings.Contains(err.Error(), "recovery resume launch failed") || strings.Contains(err.Error(), "recovery output read failed") {
@@ -383,9 +429,64 @@ func TestResumeRecovererClassifiesMissingLastMessageAsSessionUnavailable(t *test
 		t.Fatal(err)
 	}
 	session := recoveryTestSession(t)
-	result, err := recoverer.Resume(context.Background(), recoveryTestTaskID(t), &session, domain.RecoveryOriginTimeout, ResumeSettings{Subcommand: domain.SubcommandImpl})
+	result, err := recoverer.Resume(context.Background(), recoveryTestTaskID(t), &session, domain.RecoveryOriginTimeout, ResumeSettings{Subcommand: domain.SubcommandImpl, WorkingDir: recoveryWorkingDir(t)})
 	if result.Succeeded || !errors.Is(err, errRecoverySessionUnavailable) {
 		t.Fatalf("result=(%+v, %v)", result, err)
+	}
+}
+
+func TestRecoveryAttemptRejectsMissingOrInvalidWorkingDirBeforeLaunch(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		dir  *string
+	}{
+		{name: "missing"},
+		{name: "relative", dir: func() *string { value := "relative"; return &value }()},
+		{name: "unclean", dir: func() *string { value := "/tmp/a/.."; return &value }()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			launcher := &resumeLauncherFake{}
+			attempt := RecoveryAttempt{TaskID: recoveryTestTaskID(t), Origin: domain.RecoveryOriginTimeout, SessionRef: recoveryTestSession(t), TaskPlacementRoot: t.TempDir(), WorkingDir: tc.dir}
+			_, err := attempt.Attempt(context.Background(), launcher, &resumeReaderFake{})
+			if !errors.Is(err, errRecoveryResumeLaunchFailed) || launcher.calls != 0 {
+				t.Fatalf("err=%v launch calls=%d", err, launcher.calls)
+			}
+		})
+	}
+}
+
+func TestResumeRecovererRejectsSchemaVersionTwoWithoutWorkingDirBeforeLaunch(t *testing.T) {
+	session := recoveryTestSession(t)
+	snapshot := recoverySnapshot(t, domain.StateTimeout, &session)
+	snapshot.SchemaVersion = 2
+	snapshot.WorkingDir = nil
+	if err := snapshot.Validate(); err != nil {
+		t.Fatalf("schema version 2 fixture is invalid: %v", err)
+	}
+
+	settings := newResumeSettings(snapshot)
+	if settings.WorkingDir != nil {
+		t.Fatalf("working dir = %q, want nil", *settings.WorkingDir)
+	}
+
+	launcher := &resumeLauncherFake{}
+	recoverer, err := NewResumeRecoverer(launcher, &resumeReaderFake{}, "/usr/local/bin/codex", t.TempDir(), domain.ClockFunc(time.Now))
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = recoverer.Resume(context.Background(), snapshot.TaskID, &session, domain.RecoveryOriginTimeout, settings)
+	if !errors.Is(err, errRecoveryResumeLaunchFailed) || launcher.calls != 0 {
+		t.Fatalf("err=%v launch calls=%d", err, launcher.calls)
+	}
+}
+
+func TestNewResumeSettingsDefensivelyCopiesWorkingDir(t *testing.T) {
+	workingDir := t.TempDir()
+	snapshot := domain.TaskSnapshot{WorkingDir: &workingDir}
+	settings := newResumeSettings(snapshot)
+	workingDir = "/tmp/changed"
+	if settings.WorkingDir == nil || *settings.WorkingDir == workingDir || settings.WorkingDir == snapshot.WorkingDir {
+		t.Fatalf("working dir was not defensively copied: snapshot=%v settings=%v", snapshot.WorkingDir, settings.WorkingDir)
 	}
 }
 
@@ -677,7 +778,8 @@ func recoverySnapshot(t *testing.T, state domain.TaskState, session *domain.Sess
 	if _, err := task.Start(timeout, "gpt-5", requestedAt); err != nil {
 		t.Fatal(err)
 	}
-	snapshot, err := domain.NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", nil, "workspace-write", domain.ExecutionRouteDaemon, requestedAt)
+	workingDir := t.TempDir()
+	snapshot, err := domain.NewTaskSnapshotFromAdmission(task, timeout, "gpt-5", nil, "workspace-write", &workingDir, domain.ExecutionRouteDaemon, requestedAt)
 	if err != nil {
 		t.Fatal(err)
 	}

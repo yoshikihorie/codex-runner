@@ -5,25 +5,31 @@ import (
 	"time"
 )
 
-const taskSnapshotSchemaVersion = 2
+const taskSnapshotSchemaVersion = 3
+
+const previousTaskSnapshotSchemaVersion = 2
+
+func copyOptionalString(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
 
 // NewInitialTaskSnapshot creates the base metadata for a task before its first persistence.
-func NewInitialTaskSnapshot(route ExecutionRoute, reasoningEffort *string, sandboxMode string) TaskSnapshot {
-	var reasoningEffortCopy *string
-	if reasoningEffort != nil {
-		value := *reasoningEffort
-		reasoningEffortCopy = &value
-	}
+func NewInitialTaskSnapshot(route ExecutionRoute, reasoningEffort *string, sandboxMode string, workingDir *string) TaskSnapshot {
 	return TaskSnapshot{
 		Route:           route,
-		ReasoningEffort: reasoningEffortCopy,
+		ReasoningEffort: copyOptionalString(reasoningEffort),
 		SandboxMode:     sandboxMode,
+		WorkingDir:      copyOptionalString(workingDir),
 		SchemaVersion:   taskSnapshotSchemaVersion,
 	}
 }
 
 // NewTaskSnapshotFromAdmission creates the first persisted snapshot for an admitted task.
-func NewTaskSnapshotFromAdmission(task *Task, resolvedTimeout Timeout, model string, reasoningEffort *string, sandboxMode string, route ExecutionRoute, stateUpdatedAt time.Time) (TaskSnapshot, error) {
+func NewTaskSnapshotFromAdmission(task *Task, resolvedTimeout Timeout, model string, reasoningEffort *string, sandboxMode string, workingDir *string, route ExecutionRoute, stateUpdatedAt time.Time) (TaskSnapshot, error) {
 	if task == nil {
 		return TaskSnapshot{}, fmt.Errorf("task is nil")
 	}
@@ -32,19 +38,15 @@ func NewTaskSnapshotFromAdmission(task *Task, resolvedTimeout Timeout, model str
 		value := *requested
 		requestedTimeoutCopy = &value
 	}
-	var reasoningEffortCopy *string
-	if reasoningEffort != nil {
-		value := *reasoningEffort
-		reasoningEffortCopy = &value
-	}
 	snapshot := TaskSnapshot{
 		TaskID:                  task.ID(),
 		Subcommand:              task.Subcommand(),
 		ResolvedTimeoutSeconds:  resolvedTimeout.ResolvedSeconds(),
 		RequestedTimeoutSeconds: requestedTimeoutCopy,
 		Model:                   model,
-		ReasoningEffort:         reasoningEffortCopy,
+		ReasoningEffort:         copyOptionalString(reasoningEffort),
 		SandboxMode:             sandboxMode,
+		WorkingDir:              copyOptionalString(workingDir),
 		RequestedAt:             task.requestedAt,
 		Route:                   route,
 		State:                   task.State(),
@@ -69,6 +71,7 @@ type TaskSnapshot struct {
 	Model                   string          `json:"model"`
 	ReasoningEffort         *string         `json:"reasoning_effort"`
 	SandboxMode             string          `json:"sandbox_mode"`
+	WorkingDir              *string         `json:"working_dir,omitempty"`
 	RequestedAt             time.Time       `json:"requested_at"`
 	Route                   ExecutionRoute  `json:"route"`
 	State                   TaskState       `json:"state"`
@@ -80,6 +83,11 @@ type TaskSnapshot struct {
 	AdoptedAfterRestart     bool            `json:"adopted_after_restart"`
 	RecoveryOrigin          *RecoveryOrigin `json:"recovery_origin"`
 	SchemaVersion           int             `json:"schema_version"`
+}
+
+// SupportsWorkingDir reports whether the snapshot schema owns the working_dir field.
+func (s TaskSnapshot) SupportsWorkingDir() bool {
+	return s.SchemaVersion == taskSnapshotSchemaVersion
 }
 
 func isKnownTaskState(s TaskState) bool {
@@ -145,10 +153,37 @@ func (s TaskSnapshot) Validate() error {
 	if s.RequestedAt.IsZero() || s.StateUpdatedAt.IsZero() {
 		return bad("timestamp is zero")
 	}
-	if s.SchemaVersion != taskSnapshotSchemaVersion {
+	if s.SchemaVersion != previousTaskSnapshotSchemaVersion && s.SchemaVersion != taskSnapshotSchemaVersion {
 		return bad("unsupported schema version")
 	}
+	if s.SchemaVersion == previousTaskSnapshotSchemaVersion {
+		if s.WorkingDir != nil {
+			return bad("schema version 2 must not contain working_dir")
+		}
+		return nil
+	}
+	if s.WorkingDir == nil {
+		if !s.allowsUnresolvedWorkingDir() {
+			return bad("working_dir is required")
+		}
+		return nil
+	}
+	if _, err := NewNormalizedPath(*s.WorkingDir); err != nil {
+		return bad("working_dir: %v", err)
+	}
 	return nil
+}
+
+func (s TaskSnapshot) allowsUnresolvedWorkingDir() bool {
+	if s.PID != nil || s.ProcessStartedAt != nil {
+		return false
+	}
+	switch s.State {
+	case StateQueued, StateCancelling, StateKilled, StateFailed:
+		return true
+	default:
+		return false
+	}
 }
 func (s TaskSnapshot) Restore() (*Task, error) {
 	if e := s.Validate(); e != nil {
