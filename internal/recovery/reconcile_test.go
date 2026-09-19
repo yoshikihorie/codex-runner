@@ -9,6 +9,7 @@ import (
 	"go/parser"
 	"go/token"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"reflect"
 	"runtime"
@@ -19,6 +20,7 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/contract"
 	"github.com/yoshikihorie/codex-runner/internal/domain"
 	"github.com/yoshikihorie/codex-runner/internal/metrics"
+	"github.com/yoshikihorie/codex-runner/internal/store"
 )
 
 type reconcileStoreFake struct {
@@ -2002,6 +2004,110 @@ func TestReconcileTickDiscoversPersistentOrphanAndConverges(t *testing.T) {
 	}
 	if got := tasks.listStates[0]; !reflect.DeepEqual(got, []domain.TaskState{domain.StateOrphaned, domain.StateRecovering, domain.StateTimeout, domain.StateCancelling}) {
 		t.Fatalf("states=%v", got)
+	}
+}
+
+func TestReconcileTickDoesNotReindexRepairedSnapshotUntilStoreRecreated_SCNDaemon0142(t *testing.T) {
+	root := t.TempDir()
+	id := adoptionID(t, "scn42-repaired")
+	taskDir := filepath.Join(root, id.String())
+	if err := os.Mkdir(taskDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	snapshotPath := filepath.Join(taskDir, "task.json")
+	if err := os.WriteFile(snapshotPath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	existingStore, err := store.NewFileTaskStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupted := existingStore.CorruptedTaskIDs()
+	if len(corrupted) != 1 || corrupted[0] != id {
+		t.Fatalf("CorruptedTaskIDs() = %v, want [%s]", corrupted, id)
+	}
+	states := []domain.TaskState{
+		domain.StateRunning,
+		domain.StateStalled,
+		domain.StateOrphaned,
+		domain.StateRecovering,
+		domain.StateTimeout,
+		domain.StateCancelling,
+	}
+	listed, err := existingStore.ListByStates(states)
+	if err != nil || len(listed) != 0 {
+		t.Fatalf("ListByStates() before repair = %#v, %v", listed, err)
+	}
+
+	repaired := adoptionSnapshot(t, id, domain.StateOrphaned)
+	if err := repaired.Validate(); err != nil {
+		t.Fatalf("repaired snapshot is invalid: %v", err)
+	}
+	repairedBody, err := json.Marshal(repaired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapshotPath, repairedBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := existingStore.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.State != domain.StateOrphaned {
+		t.Fatalf("Load() state = %q, want orphaned", loaded.State)
+	}
+
+	pending := &PendingReconciliationSet{}
+	order := []string{}
+	uc := NewReconcilePendingUseCase(
+		pending,
+		existingStore,
+		&reconcileLivenessFake{called: make(chan struct{}), release: make(chan struct{})},
+		&reconcileReaderFake{},
+		&reconcileWriterFake{order: &order},
+		&adoptionFinalizerFake{},
+		&reconcileTerminationFake{called: make(chan struct{}), release: make(chan struct{}), finished: make(chan struct{})},
+		&reconcileKilledFake{},
+		&reconcilePathLocksFake{order: &order},
+		newAdoptionResumeUseCase(t),
+		&reconcileSlotsFake{order: &order},
+		&reconcileMutexFake{order: &order},
+		domain.ClockFunc(time.Now),
+		&adoptionStalledTrackerFake{},
+		&adoptionMetricsFake{},
+		time.Second,
+		time.Second,
+		slog.Default(),
+	)
+	uc.reconcileTick(context.Background())
+
+	if entries := pending.List(); len(entries) != 0 {
+		t.Fatalf("pending after periodic scan = %+v, want empty", entries)
+	}
+	listed, err = existingStore.ListByStates(states)
+	if err != nil || len(listed) != 0 {
+		t.Fatalf("ListByStates() after periodic scan = %#v, %v", listed, err)
+	}
+	corrupted = existingStore.CorruptedTaskIDs()
+	if len(corrupted) != 1 || corrupted[0] != id {
+		t.Fatalf("CorruptedTaskIDs() after periodic scan = %v, want [%s]", corrupted, id)
+	}
+
+	recreatedStore, err := store.NewFileTaskStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if corrupted := recreatedStore.CorruptedTaskIDs(); len(corrupted) != 0 {
+		t.Fatalf("recreated CorruptedTaskIDs() = %v, want empty", corrupted)
+	}
+	listed, err = recreatedStore.ListByStates([]domain.TaskState{domain.StateOrphaned})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(listed) != 1 || listed[0].TaskID != id || listed[0].State != domain.StateOrphaned {
+		t.Fatalf("recreated ListByStates(orphaned) = %#v, want only %s", listed, id)
 	}
 }
 

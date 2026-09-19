@@ -305,6 +305,46 @@ func TestTaskStoreListByStatesSkipsCorruptedSnapshot(t *testing.T) {
 	}
 }
 
+func TestTaskStoreKeepsAdoptionStateIndexedWhenAnotherSnapshotIsCorrupt_SCNDaemon0139(t *testing.T) {
+	root := t.TempDir()
+	validID := storeID(t, "scn39-valid")
+	corruptID := storeID(t, "scn39-corrupt")
+	for _, id := range []domain.TaskID{validID, corruptID} {
+		if err := os.Mkdir(filepath.Join(root, id.String()), taskDirPerm); err != nil {
+			t.Fatal(err)
+		}
+	}
+	validBody, err := json.Marshal(storeSnapshot(t, validID, domain.StateStarting))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, validID.String(), "task.json"), validBody, taskFilePerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, corruptID.String(), "task.json"), []byte("{"), taskFilePerm); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := NewFileTaskStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	corrupted := s.CorruptedTaskIDs()
+	if len(corrupted) != 1 || corrupted[0] != corruptID {
+		t.Fatalf("CorruptedTaskIDs() = %v, want [%s]", corrupted, corruptID)
+	}
+	got, err := s.ListByStates([]domain.TaskState{domain.StateStarting})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].TaskID != validID || got[0].State != domain.StateStarting {
+		t.Fatalf("ListByStates(starting) = %#v, want only %s", got, validID)
+	}
+	if got[0].TaskID == corruptID {
+		t.Fatalf("corrupt task %s remained indexed", corruptID)
+	}
+}
+
 func TestNewFileTaskStoreDoesNotLogCorruptedSnapshots(t *testing.T) {
 	root := t.TempDir()
 	id := storeID(t, "warn-corrupted")

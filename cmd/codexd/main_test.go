@@ -260,6 +260,91 @@ func TestBuildDependenciesKeepsValidSnapshotWhenAnotherIsCorrupt(t *testing.T) {
 	}
 }
 
+func TestBuildDependenciesAdoptsValidSnapshotWhenAnotherIsCorrupt_SCNDaemon0139(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	taskRoot := filepath.Join(home, "tasks")
+	if err := os.Mkdir(taskRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	validID := mustMainTaskID(t, "scn39-valid")
+	corruptID := mustMainTaskID(t, "scn39-corrupt")
+	validBody, err := json.Marshal(mainStartupSnapshot(validID, domain.StateStarting))
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeMainSnapshot(t, taskRoot, validID, validBody)
+	writeMainSnapshot(t, taskRoot, corruptID, []byte("{"))
+	livenessLock, err := execution.AcquireForChild(filepath.Join(taskRoot, validID.String()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := livenessLock.Close(); err != nil {
+			t.Errorf("close liveness lock: %v", err)
+		}
+	})
+
+	cfg := loadBuildDependenciesConfig(t, home, taskRoot)
+	logsDir := filepath.Join(home, "logs")
+	if err := os.Mkdir(logsDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	deps, err := buildDependencies(context.Background(), cfg, home, logsDir, func(string) error { return nil }, slog.New(slog.NewJSONHandler(io.Discard, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	out, err := deps.adoption.Execute(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Outcomes) != 1 || out.Outcomes[0].TaskID != validID || out.Outcomes[0].Outcome != "resumed-monitoring" {
+		t.Fatalf("adoption outcomes = %#v, want resumed monitoring for %s", out.Outcomes, validID)
+	}
+	for _, outcome := range out.Outcomes {
+		if outcome.TaskID == corruptID {
+			t.Fatalf("corrupt task %s was included in adoption outcomes", corruptID)
+		}
+	}
+
+	snapshot, err := deps.taskStore.Load(validID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if snapshot.State != domain.StateRunning || !snapshot.AdoptedAfterRestart {
+		t.Fatalf("adopted snapshot = %#v, want running and adopted_after_restart", snapshot)
+	}
+	eventReader, err := store.NewFileEventReader(taskRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	events, err := eventReader.ReadFrom(validID, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	foundAdopted := false
+	for _, event := range events {
+		if event.EventType == "TaskAdopted" {
+			foundAdopted = true
+			break
+		}
+	}
+	if !foundAdopted {
+		t.Fatalf("events = %#v, want TaskAdopted", events)
+	}
+
+	response := deps.ping.Handle(transport.Request{RequestID: "scn39", Verb: "ping"})
+	var result struct {
+		FailedTaskSnapshots int `json:"failed_task_snapshots"`
+	}
+	if err := json.Unmarshal(response.Result, &result); err != nil {
+		t.Fatal(err)
+	}
+	if !response.OK || result.FailedTaskSnapshots != 1 {
+		t.Fatalf("ping response = %#v, result = %#v", response, result)
+	}
+}
+
 func TestBuildDependenciesReturnsTaskRootReadDirErrorWithoutSnapshotWarning(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)

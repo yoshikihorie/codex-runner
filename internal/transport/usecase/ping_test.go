@@ -3,9 +3,14 @@ package usecase
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"reflect"
 	"testing"
+	"time"
 
+	"github.com/yoshikihorie/codex-runner/internal/domain"
+	"github.com/yoshikihorie/codex-runner/internal/store"
 	"github.com/yoshikihorie/codex-runner/internal/transport"
 )
 
@@ -85,6 +90,70 @@ func TestPingUseCaseHandleIsIdempotent(t *testing.T) {
 		if got != first {
 			t.Fatalf("response %d = %#v, want %#v", i, got, first)
 		}
+	}
+}
+
+func TestPingUseCaseKeepsStartupFailureCountAfterSnapshotRepair_SCNDaemon0142(t *testing.T) {
+	root := t.TempDir()
+	id, err := domain.NewTaskID("impl-20260919-120000-a1b2-scn42-ping")
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskDir := filepath.Join(root, id.String())
+	if err := os.Mkdir(taskDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	snapshotPath := filepath.Join(taskDir, "task.json")
+	if err := os.WriteFile(snapshotPath, []byte("{"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	taskStore, err := store.NewFileTaskStore(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if corrupted := taskStore.CorruptedTaskIDs(); len(corrupted) != 1 || corrupted[0] != id {
+		t.Fatalf("CorruptedTaskIDs() = %v, want [%s]", corrupted, id)
+	}
+	useCase := newPingUseCaseForTest(t, len(taskStore.CorruptedTaskIDs()))
+	before, err := useCase.Execute(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.FailedTaskSnapshots != 1 {
+		t.Fatalf("startup failed_task_snapshots = %d, want 1", before.FailedTaskSnapshots)
+	}
+
+	at := time.Date(2026, 9, 19, 12, 0, 0, 0, time.UTC)
+	repaired := domain.TaskSnapshot{
+		TaskID: id, Subcommand: domain.SubcommandImpl, ResolvedTimeoutSeconds: 1920,
+		Model: "gpt-5", SandboxMode: "workspace-write", RequestedAt: at,
+		Route: domain.ExecutionRouteDaemon, State: domain.StateStarting, StateUpdatedAt: at,
+		SchemaVersion: 2,
+	}
+	if err := repaired.Validate(); err != nil {
+		t.Fatalf("repaired snapshot is invalid: %v", err)
+	}
+	body, err := json.Marshal(repaired)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(snapshotPath, body, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := taskStore.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.State != domain.StateStarting {
+		t.Fatalf("Load() state = %q, want starting", loaded.State)
+	}
+
+	after, err := useCase.Execute(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.FailedTaskSnapshots != 1 {
+		t.Fatalf("repaired failed_task_snapshots = %d, want startup value 1", after.FailedTaskSnapshots)
 	}
 }
 
