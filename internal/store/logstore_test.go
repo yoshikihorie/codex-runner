@@ -2,6 +2,8 @@ package store
 
 import (
 	"errors"
+	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
@@ -179,6 +181,101 @@ func TestFileLogStoreListsOnlySupportedTaskLogs(t *testing.T) {
 		t.Fatalf("log file count = %d, want 3", got)
 	}
 }
+
+func TestFileLogStoreListPerTaskLogFilesSkipsTaskRemovedAfterReadDir(t *testing.T) {
+	root := t.TempDir()
+	precedingTaskID, err := domain.NewTaskID("impl-20260923-115959-a1b2-preceding")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disappearingTaskID, err := domain.NewTaskID("impl-20260923-120000-a1b2-disappearing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	followingTaskID, err := domain.NewTaskID("impl-20260923-120001-c3d4-following")
+	if err != nil {
+		t.Fatal(err)
+	}
+	precedingTaskDir := filepath.Join(root, precedingTaskID.String())
+	disappearingTaskDir := filepath.Join(root, disappearingTaskID.String())
+	followingTaskDir := filepath.Join(root, followingTaskID.String())
+	for _, taskDir := range []string{precedingTaskDir, disappearingTaskDir, followingTaskDir} {
+		if err := os.Mkdir(taskDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(taskDir, "stdout.log"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	precedingLog := filepath.Join(precedingTaskDir, "stdout.log")
+	followingLog := filepath.Join(followingTaskDir, "stdout.log")
+
+	store := NewFileLogStore(nil)
+	store.readDir = func(path string) ([]os.DirEntry, error) {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.RemoveAll(disappearingTaskDir); err != nil {
+			return nil, err
+		}
+		return entries, nil
+	}
+
+	files, err := store.ListPerTaskLogFiles(root)
+	if err != nil {
+		t.Fatalf("ListPerTaskLogFiles() error = %v", err)
+	}
+	if _, ok := files[disappearingTaskID]; ok {
+		t.Fatalf("ListPerTaskLogFiles() contains removed task %q", disappearingTaskID)
+	}
+	if got := files[precedingTaskID]; len(got) != 1 || got[0] != precedingLog {
+		t.Fatalf("ListPerTaskLogFiles()[%q] = %v, want [%q]", precedingTaskID, got, precedingLog)
+	}
+	if got := files[followingTaskID]; len(got) != 1 || got[0] != followingLog {
+		t.Fatalf("ListPerTaskLogFiles()[%q] = %v, want [%q]", followingTaskID, got, followingLog)
+	}
+}
+
+func TestFileLogStoreListPerTaskLogFilesReturnsNonNotExistInfoError(t *testing.T) {
+	permissionErr := fmt.Errorf("task directory info: %w", fs.ErrPermission)
+	store := NewFileLogStore(nil)
+	store.readDir = func(string) ([]os.DirEntry, error) {
+		return []os.DirEntry{infoErrorDirEntry{err: permissionErr}}, nil
+	}
+
+	files, err := store.ListPerTaskLogFiles(t.TempDir())
+	if files != nil {
+		t.Fatalf("ListPerTaskLogFiles() files = %v, want nil", files)
+	}
+	if !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("ListPerTaskLogFiles() error = %v, want wrapped ErrPermission", err)
+	}
+}
+
+func TestFileLogStoreListPerTaskLogFilesReturnsEmptyMapWhenRootDoesNotExist(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "missing")
+
+	files, err := NewFileLogStore(nil).ListPerTaskLogFiles(root)
+	if err != nil {
+		t.Fatalf("ListPerTaskLogFiles() error = %v", err)
+	}
+	if files == nil {
+		t.Fatal("ListPerTaskLogFiles() files = nil, want empty non-nil map")
+	}
+	if len(files) != 0 {
+		t.Fatalf("ListPerTaskLogFiles() files = %v, want empty map", files)
+	}
+}
+
+type infoErrorDirEntry struct {
+	err error
+}
+
+func (e infoErrorDirEntry) Name() string               { return "impl-20260923-120002-e5f6-error" }
+func (e infoErrorDirEntry) IsDir() bool                { return true }
+func (e infoErrorDirEntry) Type() fs.FileMode          { return fs.ModeDir }
+func (e infoErrorDirEntry) Info() (fs.FileInfo, error) { return nil, e.err }
 
 func TestRollbackRotationDoesNotReplaceNewActiveLog(t *testing.T) {
 	dir := t.TempDir()

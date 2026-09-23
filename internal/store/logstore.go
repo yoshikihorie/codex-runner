@@ -31,12 +31,13 @@ var (
 // FileLogStore implements the filesystem operations used by log eviction.
 // ReopenActiveHandle is injected because only the daemon owns its log handle.
 type FileLogStore struct {
-	reopen func(string) error
-	now    func() time.Time
+	reopen  func(string) error
+	now     func() time.Time
+	readDir func(string) ([]os.DirEntry, error)
 }
 
 func NewFileLogStore(reopen func(string) error) *FileLogStore {
-	return &FileLogStore{reopen: reopen, now: time.Now}
+	return &FileLogStore{reopen: reopen, now: time.Now, readDir: os.ReadDir}
 }
 
 func validateLogPath(path string) error {
@@ -251,7 +252,7 @@ func (s *FileLogStore) ListPerTaskLogFiles(root string) (map[domain.TaskID][]str
 	if root == "" || !filepath.IsAbs(root) || filepath.Clean(root) != root {
 		return nil, fmt.Errorf("task logs root must be a normalized absolute path: %q", root)
 	}
-	entries, err := os.ReadDir(root)
+	entries, err := s.readDir(root)
 	if errors.Is(err, fs.ErrNotExist) {
 		return map[domain.TaskID][]string{}, nil
 	}
@@ -261,6 +262,9 @@ func (s *FileLogStore) ListPerTaskLogFiles(root string) (map[domain.TaskID][]str
 	result := make(map[domain.TaskID][]string)
 	for _, entry := range entries {
 		info, err := entry.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
