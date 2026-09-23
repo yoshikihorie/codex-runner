@@ -393,12 +393,13 @@ func (m *cancelTrackedTaskMutex) IsLocked() bool {
 }
 
 type cancelBarrierPendingRegistrar struct {
-	set                    recovery.PendingReconciliationSet
-	arrived                chan struct{}
-	release                <-chan struct{}
-	taskMu                 *cancelTrackedTaskMutex
-	mu                     sync.Mutex
-	taskMutexHeldAtInitial bool
+	set                recovery.PendingReconciliationSet
+	arrived            chan struct{}
+	release            <-chan struct{}
+	taskMu             *cancelTrackedTaskMutex
+	mu                 sync.Mutex
+	rpcInitialObserved bool
+	rpcTaskMutexHeld   bool
 }
 
 func (*cancelBarrierPendingRegistrar) Register(domain.TaskID, recovery.PendingSendDisposition, *recovery.ProcessSignalAuthority) error {
@@ -408,20 +409,21 @@ func (p *cancelBarrierPendingRegistrar) ClaimForSend(id domain.TaskID, authority
 	return p.set.ClaimForSend(id, authority)
 }
 func (p *cancelBarrierPendingRegistrar) ClaimInitialSend(id domain.TaskID, authority recovery.ProcessSignalAuthority) (recovery.SendClaim, recovery.ClaimOutcome) {
-	if p.taskMu.IsLocked() {
-		p.mu.Lock()
-		p.taskMutexHeldAtInitial = true
-		p.mu.Unlock()
+	p.mu.Lock()
+	if !p.rpcInitialObserved {
+		p.rpcInitialObserved = true
+		p.rpcTaskMutexHeld = p.taskMu.IsLocked()
 	}
+	p.mu.Unlock()
 	p.arrived <- struct{}{}
 	<-p.release
 	return p.set.ClaimInitialSend(id, authority)
 }
 
-func (p *cancelBarrierPendingRegistrar) SawTaskMutexDuringInitialClaim() bool {
+func (p *cancelBarrierPendingRegistrar) RPCInitialClaimObservation() (bool, bool) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.taskMutexHeldAtInitial
+	return p.rpcInitialObserved, p.rpcTaskMutexHeld
 }
 func (p *cancelBarrierPendingRegistrar) CompleteSend(claim recovery.SendClaim) bool {
 	return p.set.CompleteSend(claim)
@@ -898,6 +900,11 @@ func TestCancelTaskExecute_StartingConcurrentInitialSendClaimsConvergeToOneSende
 	taskMu := &cancelTrackedTaskMutex{}
 	queueMu := &sync.Mutex{}
 	release := make(chan struct{})
+	var releaseOnce sync.Once
+	releaseBarrier := func() {
+		releaseOnce.Do(func() { close(release) })
+	}
+	t.Cleanup(releaseBarrier)
 	pending := &cancelBarrierPendingRegistrar{arrived: make(chan struct{}, 3), release: release, taskMu: taskMu}
 	terminator := &cancelTerminatorFake{}
 	disarmer := &cancelDisarmerFake{}
@@ -919,6 +926,11 @@ func TestCancelTaskExecute_StartingConcurrentInitialSendClaimsConvergeToOneSende
 		}
 		completed <- result{err: err}
 	}()
+	select {
+	case <-pending.arrived:
+	case <-time.After(time.Second):
+		t.Fatal("RPC cancel did not reach the ClaimInitialSend barrier")
+	}
 	for range 2 {
 		go func() {
 			claim, outcome := pending.ClaimInitialSend(payload.Task.ID(), authority)
@@ -931,14 +943,14 @@ func TestCancelTaskExecute_StartingConcurrentInitialSendClaimsConvergeToOneSende
 			completed <- result{outcome: outcome}
 		}()
 	}
-	for range 3 {
+	for range 2 {
 		select {
 		case <-pending.arrived:
 		case <-time.After(time.Second):
 			t.Fatal("ClaimInitialSend callers did not reach the barrier")
 		}
 	}
-	close(release)
+	releaseBarrier()
 	acquired := 0
 	for range 3 {
 		select {
@@ -953,8 +965,9 @@ func TestCancelTaskExecute_StartingConcurrentInitialSendClaimsConvergeToOneSende
 			t.Fatal("concurrent cancel callers did not complete")
 		}
 	}
-	if acquired != 1 || terminator.calls != 1 || pending.SawTaskMutexDuringInitialClaim() || tasks.snapshot.State != domain.StateCancelling {
-		t.Fatalf("acquired=%d terminator=%#v taskMuAtClaim=%t snapshot=%#v", acquired, terminator, pending.SawTaskMutexDuringInitialClaim(), tasks.snapshot)
+	rpcObserved, rpcTaskMutexHeld := pending.RPCInitialClaimObservation()
+	if acquired != 1 || terminator.calls != 1 || !rpcObserved || rpcTaskMutexHeld || tasks.snapshot.State != domain.StateCancelling {
+		t.Fatalf("acquired=%d terminator=%#v rpcObserved=%t rpcTaskMuAtClaim=%t snapshot=%#v", acquired, terminator, rpcObserved, rpcTaskMutexHeld, tasks.snapshot)
 	}
 }
 

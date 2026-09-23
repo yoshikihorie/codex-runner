@@ -63,6 +63,8 @@ type Response struct {
 // TailHandler writes tail responses for a validated tail request.
 type TailHandler func(context.Context, Request, io.Writer) error
 
+type acceptRetryTimerFactory func(time.Duration) (<-chan time.Time, func())
+
 type envelopeResult int
 
 const (
@@ -169,6 +171,22 @@ func Serve(ctx context.Context, socketPath string, dispatch func(Request) Respon
 }
 
 func serveAcceptLoop(ctx context.Context, listener net.Listener, dispatch func(Request) Response, tailHandler TailHandler, wg *sync.WaitGroup, tailConns *tailConnRegistry) error {
+	return serveAcceptLoopWithTimer(ctx, listener, dispatch, tailHandler, wg, tailConns, newAcceptRetryTimer)
+}
+
+func newAcceptRetryTimer(delay time.Duration) (<-chan time.Time, func()) {
+	timer := time.NewTimer(delay)
+	return timer.C, func() {
+		if !timer.Stop() {
+			select {
+			case <-timer.C:
+			default:
+			}
+		}
+	}
+}
+
+func serveAcceptLoopWithTimer(ctx context.Context, listener net.Listener, dispatch func(Request) Response, tailHandler TailHandler, wg *sync.WaitGroup, tailConns *tailConnRegistry, newTimer acceptRetryTimerFactory) error {
 	retryDelay := initialAcceptRetryDelay
 	for {
 		conn, err := listener.Accept()
@@ -180,17 +198,12 @@ func serveAcceptLoop(ctx context.Context, listener net.Listener, dispatch func(R
 				return fmt.Errorf("accept closed listener: %w", err)
 			}
 			slog.Error("accept failed", "error", err)
-			timer := time.NewTimer(retryDelay)
+			timerC, stopTimer := newTimer(retryDelay)
 			select {
 			case <-ctx.Done():
-				if !timer.Stop() {
-					select {
-					case <-timer.C:
-					default:
-					}
-				}
+				stopTimer()
 				return nil
-			case <-timer.C:
+			case <-timerC:
 				retryDelay = nextAcceptRetryDelay(retryDelay)
 				continue
 			}

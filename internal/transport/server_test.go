@@ -11,6 +11,7 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -88,6 +89,68 @@ func (l *scriptedAcceptListener) callTimes() []time.Time {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return append([]time.Time(nil), l.calls...)
+}
+
+type manualAcceptRetryTimer struct {
+	delay time.Duration
+	ch    chan time.Time
+	mu    sync.Mutex
+	stops int
+}
+
+func (t *manualAcceptRetryTimer) fire() {
+	t.ch <- time.Time{}
+}
+
+func (t *manualAcceptRetryTimer) stop() {
+	t.mu.Lock()
+	t.stops++
+	t.mu.Unlock()
+}
+
+func (t *manualAcceptRetryTimer) stopCount() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.stops
+}
+
+type manualAcceptRetryTimers struct {
+	created chan *manualAcceptRetryTimer
+	mu      sync.Mutex
+	delays  []time.Duration
+}
+
+func newManualAcceptRetryTimers() *manualAcceptRetryTimers {
+	return &manualAcceptRetryTimers{created: make(chan *manualAcceptRetryTimer, 4)}
+}
+
+func (f *manualAcceptRetryTimers) newTimer(delay time.Duration) (<-chan time.Time, func()) {
+	timer := &manualAcceptRetryTimer{delay: delay, ch: make(chan time.Time, 1)}
+	f.mu.Lock()
+	f.delays = append(f.delays, delay)
+	f.mu.Unlock()
+	f.created <- timer
+	return timer.ch, timer.stop
+}
+
+func (f *manualAcceptRetryTimers) next(t *testing.T, want time.Duration) *manualAcceptRetryTimer {
+	t.Helper()
+	select {
+	case timer := <-f.created:
+		if timer.delay != want {
+			t.Fatalf("accept retry delay = %v, want %v", timer.delay, want)
+		}
+		return timer
+	case <-time.After(time.Second):
+		t.Fatalf("accept retry timer for %v was not created", want)
+		return nil
+	}
+}
+
+func (f *manualAcceptRetryTimers) requestedDelays() []time.Duration {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]time.Duration(nil), f.delays...)
 }
 
 func TestValidateEnvelope(t *testing.T) {
@@ -593,6 +656,47 @@ func TestServeContinuesAfterTransientAcceptError(t *testing.T) {
 	}
 }
 
+func TestNewAcceptRetryTimer(t *testing.T) {
+	const stopWatchdog = time.Second
+	waitForStop := func(t *testing.T, stop func(), calls int) {
+		t.Helper()
+		done := make(chan struct{})
+		go func() {
+			for range calls {
+				stop()
+			}
+			close(done)
+		}()
+		select {
+		case <-done:
+		case <-time.After(stopWatchdog):
+			t.Fatalf("accept retry timer stop did not complete after %d call(s)", calls)
+		}
+	}
+
+	t.Run("stop before expiry is idempotent and prevents delivery", func(t *testing.T) {
+		const delay = 100 * time.Millisecond
+		timerC, stop := newAcceptRetryTimer(delay)
+		waitForStop(t, stop, 2)
+
+		select {
+		case <-timerC:
+			t.Fatal("accept retry timer fired after it was stopped")
+		case <-time.After(2 * delay):
+		}
+	})
+
+	t.Run("stop after delivery completes", func(t *testing.T) {
+		timerC, stop := newAcceptRetryTimer(time.Millisecond)
+		select {
+		case <-timerC:
+		case <-time.After(stopWatchdog):
+			t.Fatal("accept retry timer did not fire")
+		}
+		waitForStop(t, stop, 1)
+	})
+}
+
 func TestServeAcceptLoopBacksOffAfterContinuousErrors(t *testing.T) {
 	listener := &scriptedAcceptListener{
 		errors:   []error{errors.New("temporary accept error"), errors.New("temporary accept error"), errors.New("temporary accept error")},
@@ -601,29 +705,34 @@ func TestServeAcceptLoopBacksOffAfterContinuousErrors(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	timers := newManualAcceptRetryTimers()
 	done := make(chan error, 1)
 	go func() {
-		done <- serveAcceptLoop(ctx, listener, func(Request) Response { return Response{} }, noOpTailHandler, &sync.WaitGroup{}, NewTailConnRegistry())
+		done <- serveAcceptLoopWithTimer(ctx, listener, func(Request) Response { return Response{} }, noOpTailHandler, &sync.WaitGroup{}, NewTailConnRegistry(), timers.newTimer)
 	}()
+	firstDelay := initialAcceptRetryDelay
+	secondDelay := nextAcceptRetryDelay(firstDelay)
+	thirdDelay := nextAcceptRetryDelay(secondDelay)
+	timers.next(t, firstDelay).fire()
+	timers.next(t, secondDelay).fire()
+	timers.next(t, thirdDelay).fire()
 	select {
 	case <-listener.accepted:
 	case <-time.After(time.Second):
 		t.Fatal("Accept retries did not reach the blocking call")
 	}
-	calls := listener.callTimes()
-	if len(calls) != 4 {
-		t.Fatalf("Accept calls = %d, want 4", len(calls))
-	}
-	if elapsed := calls[1].Sub(calls[0]); elapsed < initialAcceptRetryDelay {
-		t.Fatalf("first retry after %v, want at least %v", elapsed, initialAcceptRetryDelay)
-	}
-	if elapsed := calls[2].Sub(calls[1]); elapsed < nextAcceptRetryDelay(initialAcceptRetryDelay) {
-		t.Fatalf("second retry after %v, want at least %v", elapsed, nextAcceptRetryDelay(initialAcceptRetryDelay))
+	if got, want := timers.requestedDelays(), []time.Duration{firstDelay, secondDelay, thirdDelay}; !slices.Equal(got, want) {
+		t.Fatalf("accept retry delays = %v, want %v", got, want)
 	}
 	cancel()
 	_ = listener.Close()
-	if err := <-done; err != nil {
-		t.Fatalf("serveAcceptLoop() error = %v", err)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serveAcceptLoop() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("continuous-error accept loop did not stop")
 	}
 }
 
@@ -634,11 +743,13 @@ func TestServeAcceptLoopCancellationInterruptsBackoff(t *testing.T) {
 		closed:   make(chan struct{}),
 	}
 	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	timers := newManualAcceptRetryTimers()
 	done := make(chan error, 1)
 	go func() {
-		done <- serveAcceptLoop(ctx, listener, func(Request) Response { return Response{} }, noOpTailHandler, &sync.WaitGroup{}, NewTailConnRegistry())
+		done <- serveAcceptLoopWithTimer(ctx, listener, func(Request) Response { return Response{} }, noOpTailHandler, &sync.WaitGroup{}, NewTailConnRegistry(), timers.newTimer)
 	}()
-	time.Sleep(time.Millisecond)
+	timer := timers.next(t, initialAcceptRetryDelay)
 	cancel()
 	select {
 	case err := <-done:
@@ -647,6 +758,9 @@ func TestServeAcceptLoopCancellationInterruptsBackoff(t *testing.T) {
 		}
 	case <-time.After(time.Second):
 		t.Fatal("context cancellation did not interrupt retry backoff")
+	}
+	if got := timer.stopCount(); got != 1 {
+		t.Fatalf("retry timer stop calls = %d, want 1", got)
 	}
 }
 
@@ -674,30 +788,30 @@ func TestServeAcceptLoopResetsBackoffAfterSuccessfulAccept(t *testing.T) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	timers := newManualAcceptRetryTimers()
 	var wg sync.WaitGroup
 	done := make(chan error, 1)
 	go func() {
-		done <- serveAcceptLoop(ctx, listener, func(Request) Response { return Response{} }, noOpTailHandler, &wg, NewTailConnRegistry())
+		done <- serveAcceptLoopWithTimer(ctx, listener, func(Request) Response { return Response{} }, noOpTailHandler, &wg, NewTailConnRegistry(), timers.newTimer)
 	}()
-	select {
-	case <-listener.accepted:
-	case <-time.After(time.Second):
-		t.Fatal("Accept retries did not reach the blocking call")
-	}
-	calls := listener.callTimes()
-	if len(calls) != 5 {
-		t.Fatalf("Accept calls = %d, want 5", len(calls))
-	}
-	if elapsed := calls[4].Sub(calls[3]); elapsed < initialAcceptRetryDelay {
-		t.Fatalf("retry after successful Accept took %v, want at least %v", elapsed, initialAcceptRetryDelay)
-	}
-	if elapsed := calls[4].Sub(calls[3]); elapsed >= nextAcceptRetryDelay(initialAcceptRetryDelay) {
-		t.Fatalf("retry after successful Accept took %v, want less than %v", elapsed, nextAcceptRetryDelay(initialAcceptRetryDelay))
+	secondDelay := nextAcceptRetryDelay(initialAcceptRetryDelay)
+	timers.next(t, initialAcceptRetryDelay).fire()
+	timers.next(t, secondDelay).fire()
+	lastTimer := timers.next(t, initialAcceptRetryDelay)
+	if got, want := timers.requestedDelays(), []time.Duration{initialAcceptRetryDelay, secondDelay, initialAcceptRetryDelay}; !slices.Equal(got, want) {
+		t.Fatalf("accept retry delays = %v, want %v", got, want)
 	}
 	cancel()
-	_ = listener.Close()
-	if err := <-done; err != nil {
-		t.Fatalf("serveAcceptLoop() error = %v", err)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("serveAcceptLoop() error = %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("reset-backoff accept loop did not stop")
+	}
+	if got := lastTimer.stopCount(); got != 1 {
+		t.Fatalf("retry timer stop calls = %d, want 1", got)
 	}
 	wg.Wait()
 }
