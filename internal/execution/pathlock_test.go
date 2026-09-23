@@ -9,9 +9,11 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -475,15 +477,56 @@ func TestReleasePathLockUseCaseSecondReleaseSucceedsAndLogsInfo_SCNLock0111(t *t
 	}
 }
 
+func TestReleasePathLockUseCaseLogsDeleteFailure_SCNLock0112(t *testing.T) {
+	owner, _ := pathLockIDs(t)
+	failure := &os.PathError{Op: pathLockLogCanary, Path: "/tmp/" + pathLockLogCanary, Err: syscall.ENOSPC}
+	capture := &logCapture{}
+	uc := NewReleasePathLockUseCase(&pathLockTestStore{deleteErr: failure}, slog.New(capture))
+	if err := uc.Execute(context.Background(), ReleasePathLockInput{TaskID: owner}); !errors.Is(err, failure) {
+		t.Fatalf("Execute error=%v", err)
+	}
+	logs := capture.snapshot()
+	if len(logs) != 1 || logs[0].level != slog.LevelError || logs[0].msg != "release path lock" || logs[0].attrs["task_id"] != owner.String() || logs[0].attrs["stage"] != "Delete" {
+		t.Fatalf("logs=%#v", logs)
+	}
+	if logs[0].attrs["error"] != ErrorTypeName(failure) || logs[0].attrs["reason"] != "ENOSPC" || logs[0].attrs["op"] != "unknown" || logs[0].attrs["errno"] != int64(syscall.ENOSPC) {
+		t.Fatalf("log=%#v", logs[0])
+	}
+	requireNoCanaryInLogs(t, logs)
+}
+
+func TestReleasePathLockUseCaseOmitsErrnoForTooManyLinks_SCNLock0112(t *testing.T) {
+	owner, _ := pathLockIDs(t)
+	failure := fmt.Errorf("wrapped: %w", errors.New("EvalSymlinks: too many links"))
+	capture := &logCapture{}
+	uc := NewReleasePathLockUseCase(&pathLockTestStore{deleteErr: failure}, slog.New(capture))
+	if err := uc.Execute(context.Background(), ReleasePathLockInput{TaskID: owner}); !errors.Is(err, failure) {
+		t.Fatalf("Execute error=%v", err)
+	}
+	logs := capture.snapshot()
+	if len(logs) != 1 || logs[0].attrs["reason"] != "TOO_MANY_LINKS" || logs[0].attrs["op"] != "unknown" || logs[0].attrs["error"] != ErrorTypeName(failure) {
+		t.Fatalf("logs=%#v", logs)
+	}
+	if _, found := logs[0].attrs["errno"]; found {
+		t.Fatalf("errno must be omitted: %#v", logs[0])
+	}
+}
+
 func TestAcquirePathLockUseCaseRejectsAndPreservesLockWhenTaskStateReadFails(t *testing.T) {
 	owner, _ := domain.NewTaskID("impl-20260809-120000-a1b2-owner")
 	requester, _ := domain.NewTaskID("impl-20260809-120001-a1b2-requester")
 	path, _ := domain.NewNormalizedPath(t.TempDir())
 	store := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{path.String()}}}}
-	uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, store, domain.LivenessLockFunc(func(string) (bool, error) { return false, fs.ErrNotExist }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{err: errors.New("task store unavailable")})
+	failure := &os.PathError{Op: "open", Path: "/tmp/" + pathLockLogCanary, Err: syscall.EIO}
+	capture := &logCapture{}
+	uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, store, domain.LivenessLockFunc(func(string) (bool, error) { return false, fs.ErrNotExist }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{err: failure}, slog.New(capture))
 	out, err := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{path.String()}})
 	if !errors.Is(err, domain.ErrPathLockInfraFailure) || out.Acquired || len(store.deleted) != 0 || store.saved {
 		t.Fatalf("Execute output=%+v error=%v deleted=%v saved=%v", out, err, store.deleted, store.saved)
+	}
+	log := requireSafeStageLog(t, capture.snapshot(), requester, "load-task-state", failure)
+	if log.attrs["confirmed_task_id"] != owner.String() {
+		t.Fatalf("log=%#v", log)
 	}
 }
 
@@ -772,7 +815,8 @@ func TestAcquirePathLockUseCaseKeepsEmptySuccessAfterUnlockFailure(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	mutex := &pathLockTestMutex{unlockErr: errors.New("unlock failure")}
+	failure := &os.PathError{Op: "readlink", Path: "/tmp/" + pathLockLogCanary, Err: syscall.EACCES}
+	mutex := &pathLockTestMutex{unlockErr: failure}
 	pathStore := &pathLockTestStore{}
 	capture := &logCapture{}
 	uc := mustNewAcquirePathLockUseCase(t, mutex, pathStore, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, pathLockTaskStateReaderFake{}, slog.New(capture))
@@ -784,9 +828,109 @@ func TestAcquirePathLockUseCaseKeepsEmptySuccessAfterUnlockFailure(t *testing.T)
 	if len(logs) != 1 || logs[0].level != slog.LevelError || logs[0].attrs["task_id"] != taskID.String() || logs[0].attrs["stage"] != "Unlock" {
 		t.Fatal("expected one structured unlock warning log")
 	}
+	if logs[0].attrs["error"] != ErrorTypeName(failure) || logs[0].attrs["reason"] != "EACCES" || logs[0].attrs["op"] != "readlink" || logs[0].attrs["errno"] != int64(syscall.EACCES) {
+		t.Fatalf("log=%#v", logs[0])
+	}
+	requireNoCanaryInLogs(t, logs)
 }
 
 const pathLockLogCanary = "CANARY-SECRET-VALUE-DO-NOT-LOG"
+
+var (
+	pathLockAllowedReasonPattern = regexp.MustCompile(`^(?:ENOENT|EACCES|EPERM|EIO|ENOTDIR|ENAMETOOLONG|ESTALE|ENOTCONN|ETIMEDOUT|ENODEV|ENXIO|EMFILE|ENFILE|EROFS|ENOSPC|EBUSY|EAGAIN|TOO_MANY_LINKS|unknown)$`)
+	pathLockErrnoReasonPattern   = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
+)
+
+func TestDiagnosePathLockError(t *testing.T) {
+	known := []struct {
+		errno  syscall.Errno
+		reason string
+	}{
+		{syscall.ENOENT, "ENOENT"},
+		{syscall.EACCES, "EACCES"},
+		{syscall.EPERM, "EPERM"},
+		{syscall.EIO, "EIO"},
+		{syscall.ENOTDIR, "ENOTDIR"},
+		{syscall.ENAMETOOLONG, "ENAMETOOLONG"},
+		{syscall.ESTALE, "ESTALE"},
+		{syscall.ENOTCONN, "ENOTCONN"},
+		{syscall.ETIMEDOUT, "ETIMEDOUT"},
+		{syscall.ENODEV, "ENODEV"},
+		{syscall.ENXIO, "ENXIO"},
+		{syscall.EMFILE, "EMFILE"},
+		{syscall.ENFILE, "ENFILE"},
+		{syscall.EROFS, "EROFS"},
+		{syscall.ENOSPC, "ENOSPC"},
+		{syscall.EBUSY, "EBUSY"},
+		{syscall.EAGAIN, "EAGAIN"},
+	}
+	for _, tc := range known {
+		t.Run(tc.reason, func(t *testing.T) {
+			diagnostic := diagnosePathLockError(fmt.Errorf("outer: %w", &os.PathError{Op: "open", Path: pathLockLogCanary, Err: fmt.Errorf("inner: %w", tc.errno)}))
+			requireAllowedPathLockReason(t, diagnostic.reason)
+			if !diagnostic.hasErrno || diagnostic.errno != int(tc.errno) || diagnostic.reason != tc.reason || diagnostic.op != "open" {
+				t.Fatalf("diagnostic=%+v", diagnostic)
+			}
+		})
+	}
+
+	for _, tc := range []struct {
+		name     string
+		err      error
+		hasErrno bool
+		errno    syscall.Errno
+		reason   string
+		op       string
+	}{
+		{name: "bare errno", err: syscall.ENOTDIR, hasErrno: true, errno: syscall.ENOTDIR, reason: "ENOTDIR", op: "unknown"},
+		{name: "unknown errno", err: syscall.Errno(9999), hasErrno: true, errno: syscall.Errno(9999), reason: "unknown", op: "unknown"},
+		{name: "ELOOP remains unknown", err: syscall.ELOOP, hasErrno: true, errno: syscall.ELOOP, reason: "unknown", op: "unknown"},
+		{name: "too many links", err: errors.New("EvalSymlinks: too many links"), reason: "TOO_MANY_LINKS", op: "unknown"},
+		{name: "wrapped too many links", err: fmt.Errorf("outer: %w", errors.New("EvalSymlinks: too many links")), reason: "TOO_MANY_LINKS", op: "unknown"},
+		{name: "partial too many links does not match", err: errors.New("prefix EvalSymlinks: too many links"), reason: "unknown", op: "unknown"},
+		{name: "unmapped op", err: &os.PathError{Op: pathLockLogCanary, Path: pathLockLogCanary, Err: syscall.EIO}, hasErrno: true, errno: syscall.EIO, reason: "EIO", op: "unknown"},
+		{name: "errno elsewhere in complete chain", err: errors.Join(&os.PathError{Op: "stat", Path: pathLockLogCanary, Err: errors.New("metadata failure")}, fmt.Errorf("other branch: %w", syscall.ENOSPC)), hasErrno: true, errno: syscall.ENOSPC, reason: "ENOSPC", op: "stat"},
+		{name: "nil", err: nil, reason: "unknown", op: "unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			diagnostic := diagnosePathLockError(tc.err)
+			requireAllowedPathLockReason(t, diagnostic.reason)
+			if diagnostic.hasErrno != tc.hasErrno || diagnostic.errno != int(tc.errno) || diagnostic.reason != tc.reason || diagnostic.op != tc.op {
+				t.Fatalf("diagnostic=%+v", diagnostic)
+			}
+		})
+	}
+
+	for _, op := range []string{"lstat", "readlink", "stat", "open"} {
+		t.Run("allowed op "+op, func(t *testing.T) {
+			diagnostic := diagnosePathLockError(&os.PathError{Op: op, Path: pathLockLogCanary, Err: syscall.EIO})
+			if diagnostic.op != op {
+				t.Fatalf("op=%q", diagnostic.op)
+			}
+		})
+	}
+}
+
+func TestDiagnosePathLockErrorClassifiesEvalSymlinksCycle(t *testing.T) {
+	root := t.TempDir()
+	pathA := filepath.Join(root, "a")
+	pathB := filepath.Join(root, "b")
+	if err := os.Symlink("b", pathA); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("a", pathB); err != nil {
+		t.Fatal(err)
+	}
+	_, err := filepath.EvalSymlinks(pathA)
+	if err == nil {
+		t.Fatal("EvalSymlinks succeeded for a symbolic-link cycle")
+	}
+	diagnostic := diagnosePathLockError(err)
+	requireAllowedPathLockReason(t, diagnostic.reason)
+	if diagnostic.reason != "TOO_MANY_LINKS" {
+		t.Fatalf("reason=%q error_type=%s", diagnostic.reason, ErrorTypeName(err))
+	}
+}
 
 func TestAcquirePathLockUseCaseLogsFailureStages(t *testing.T) {
 	requester, err := domain.NewTaskID("impl-20260809-120000-a1b2-log-requester")
@@ -799,7 +943,7 @@ func TestAcquirePathLockUseCaseLogsFailureStages(t *testing.T) {
 	}
 	requestedPath := "/tmp/" + pathLockLogCanary + "/requested"
 	storedPath := "/tmp/" + pathLockLogCanary + "/stored"
-	rawFailure := errors.New("injected failure " + pathLockLogCanary)
+	rawFailure := &os.PathError{Op: pathLockLogCanary, Path: "/tmp/" + pathLockLogCanary, Err: syscall.ENOTDIR}
 	for _, tc := range []struct {
 		name  string
 		stage string
@@ -815,10 +959,15 @@ func TestAcquirePathLockUseCaseLogsFailureStages(t *testing.T) {
 			return &pathLockTestMutex{}, &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{storedPath}}}, deleteErr: rawFailure}, domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }), func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }
 		}},
 		{"normalize-requested", "normalize-requested", func() (*pathLockTestMutex, *pathLockTestStore, domain.LivenessLock, normalizePathFunc) {
-			return &pathLockTestMutex{}, &pathLockTestStore{}, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), func(string, bool) (domain.NormalizedPath, error) { return domain.NormalizedPath{}, rawFailure }
+			return &pathLockTestMutex{}, &pathLockTestStore{}, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), func(raw string, _ bool) (domain.NormalizedPath, error) {
+				if raw == requestedPath {
+					return domain.NormalizedPath{}, rawFailure
+				}
+				return domain.NewNormalizedPath(raw)
+			}
 		}},
 		{"normalize-stored", "normalize-stored", func() (*pathLockTestMutex, *pathLockTestStore, domain.LivenessLock, normalizePathFunc) {
-			return &pathLockTestMutex{}, &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{storedPath}}}}, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), func(raw string, _ bool) (domain.NormalizedPath, error) {
+			return &pathLockTestMutex{}, &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{"/tmp/first", storedPath, "/tmp/third"}}}}, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), func(raw string, _ bool) (domain.NormalizedPath, error) {
 				if raw == storedPath {
 					return domain.NormalizedPath{}, rawFailure
 				}
@@ -833,11 +982,24 @@ func TestAcquirePathLockUseCaseLogsFailureStages(t *testing.T) {
 			mutex, pathStore, liveness, normalize := tc.build()
 			capture := &logCapture{}
 			uc := mustNewAcquirePathLockUseCase(t, mutex, pathStore, liveness, normalize, pathLockTaskStateReaderFake{}, slog.New(capture))
-			_, acquireErr := uc.Acquire(requester, []string{requestedPath})
+			requestedPaths := []string{requestedPath}
+			if tc.stage == "normalize-requested" {
+				requestedPaths = []string{"/tmp/first", requestedPath, "/tmp/third"}
+			}
+			_, acquireErr := uc.Acquire(requester, requestedPaths)
 			if !errors.Is(acquireErr, domain.ErrPathLockInfraFailure) {
 				t.Fatal("expected path-lock infrastructure failure")
 			}
-			requireSafeStageLog(t, capture.snapshot(), requester, tc.stage)
+			log := requireSafeStageLog(t, capture.snapshot(), requester, tc.stage, rawFailure)
+			if tc.stage == "normalize-requested" || tc.stage == "normalize-stored" {
+				if log.attrs["path_index"] != int64(1) || log.attrs["path_count"] != int64(3) {
+					t.Fatalf("normalization position=%#v", log.attrs)
+				}
+			} else if _, found := log.attrs["path_index"]; found {
+				t.Fatalf("path_index present outside normalization: %#v", log.attrs)
+			} else if _, found := log.attrs["path_count"]; found {
+				t.Fatalf("path_count present outside normalization: %#v", log.attrs)
+			}
 		})
 	}
 
@@ -871,28 +1033,57 @@ func TestAcquirePathLockUseCaseLogsFailureStages(t *testing.T) {
 		if !foundOwner || !foundOperation {
 			t.Fatal("liveness log did not identify request, owner, and operation")
 		}
+		requirePathLockDiagnosticAttrs(t, logs[0], rawFailure)
 		requireNoCanaryInLogs(t, logs)
 	})
 }
 
-func requireSafeStageLog(t *testing.T, logs []capturedLog, taskID domain.TaskID, stage string) {
+func requireSafeStageLog(t *testing.T, logs []capturedLog, taskID domain.TaskID, stage string, failure error) capturedLog {
 	t.Helper()
 	if len(logs) == 0 {
 		t.Fatal("expected structured error log")
 	}
-	found := false
+	var firstMatch *capturedLog
 	for _, record := range logs {
 		if record.level == slog.LevelError && record.attrs["stage"] == stage && record.attrs["task_id"] == taskID.String() {
-			if _, ok := record.attrs["error"]; !ok {
-				t.Fatal("expected error attribute")
+			requirePathLockDiagnosticAttrs(t, record, failure)
+			if firstMatch == nil {
+				matched := record
+				firstMatch = &matched
 			}
-			found = true
 		}
 	}
-	if !found {
+	if firstMatch == nil {
 		t.Fatal("expected stage log was not found")
 	}
 	requireNoCanaryInLogs(t, logs)
+	return *firstMatch
+}
+
+func requirePathLockDiagnosticAttrs(t *testing.T, record capturedLog, failure error) {
+	t.Helper()
+	want := diagnosePathLockError(failure)
+	requireAllowedPathLockReason(t, fmt.Sprint(record.attrs["reason"]))
+	if record.attrs["error"] != ErrorTypeName(failure) || record.attrs["reason"] != want.reason || record.attrs["op"] != want.op {
+		t.Fatalf("diagnostic attrs=%#v", record.attrs)
+	}
+	gotErrno, hasErrno := record.attrs["errno"]
+	if hasErrno != want.hasErrno || (want.hasErrno && gotErrno != int64(want.errno)) {
+		t.Fatalf("errno attrs=%#v", record.attrs)
+	}
+	if want.hasErrno && (record.attrs["reason"] == fmt.Sprint(want.errno) || record.attrs["reason"] == syscall.Errno(want.errno).Error()) {
+		t.Fatalf("reason used free-form errno text: %#v", record.attrs)
+	}
+}
+
+func requireAllowedPathLockReason(t *testing.T, reason string) {
+	t.Helper()
+	if !pathLockAllowedReasonPattern.MatchString(reason) {
+		t.Fatalf("reason=%q is outside the allowed set", reason)
+	}
+	if reason != "unknown" && !pathLockErrnoReasonPattern.MatchString(reason) {
+		t.Fatalf("reason=%q is not an uppercase symbolic name", reason)
+	}
 }
 
 func requireNoCanaryInLogs(t *testing.T, logs []capturedLog) {
