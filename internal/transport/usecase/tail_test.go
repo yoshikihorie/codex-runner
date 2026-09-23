@@ -428,7 +428,7 @@ func TestTailTaskHandleAcceptsPositiveIntegerBeyondIntRange(t *testing.T) {
 		return fmt.Sprintf("timers=%d, want 2", timers.count())
 	})
 	timers.fire(t, 1)
-	if err := <-errCh; err != nil {
+	if err := receiveTailError(t, errCh, "waiting for tail handler after terminal drain timer"); err != nil {
 		t.Fatal(err)
 	}
 	lines := decodeTailSuccessLines(t, &output)
@@ -454,7 +454,7 @@ func TestTailTaskHandleDefaultsAndPassesFromSeq(t *testing.T) {
 				return fmt.Sprintf("timers=%d, want 2", timers.count())
 			})
 			timers.fire(t, 1)
-			if err := <-errCh; err != nil {
+			if err := receiveTailError(t, errCh, "waiting for default tail handler after terminal drain timer"); err != nil {
 				t.Fatal(err)
 			}
 			want := 1
@@ -605,7 +605,7 @@ func TestTailTaskHandleDoesNotMapCancellationOrWriterFailuresToReadFailure(t *te
 		}()
 		waitTailCondition(t, errCh, "waiting for subscription", func() bool { return notifier.activeCount() == 1 }, func() string { return "not subscribed" })
 		cancel()
-		if err := <-errCh; !errors.Is(err, context.Canceled) || strings.Contains(output.String(), "TAIL_READ_FAILED") || notifier.unsubscribeCount() != 1 {
+		if err := receiveTailError(t, errCh, "waiting for cancelled tail handler"); !errors.Is(err, context.Canceled) || strings.Contains(output.String(), "TAIL_READ_FAILED") || notifier.unsubscribeCount() != 1 {
 			t.Fatalf("err=%v output=%q unsubscribes=%d", err, output.String(), notifier.unsubscribeCount())
 		}
 	})
@@ -665,7 +665,7 @@ func TestTailTaskExecuteSnapshotsThenSubscribesThenReplaysNonTerminal(t *testing
 				time.Sleep(time.Millisecond)
 			}
 			cancel()
-			if err := <-errCh; !errors.Is(err, context.Canceled) {
+			if err := receiveTailError(t, errCh, "waiting for cancelled tail execution"); !errors.Is(err, context.Canceled) {
 				t.Fatalf("err=%v", err)
 			}
 			if got := tailOrderCopy(&order); !reflect.DeepEqual(got, []string{"snapshot", "subscribe", "read"}) || notifier.unsubscribeCount() != 1 {
@@ -732,7 +732,7 @@ func TestTailTaskExecuteDelayedTerminalEventWaitsForDrainRetry(t *testing.T) {
 		t.Fatalf("progress=%#v", progress)
 	}
 	timers.fire(t, 3)
-	if err := <-errCh; err != nil {
+	if err := receiveTailError(t, errCh, "waiting for tail execution after terminal drain retry"); err != nil {
 		t.Fatal(err)
 	}
 	complete := writer.completeLines()
@@ -796,7 +796,7 @@ func TestTailTaskExecuteLiveEventsUsePreviousSnapshotBeforeRefreshing(t *testing
 		t.Fatalf("second iteration order=%v", got)
 	}
 	cancel()
-	if err := <-errCh; !errors.Is(err, context.Canceled) {
+	if err := receiveTailError(t, errCh, "waiting for cancelled live tail execution"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err=%v", err)
 	}
 	if notifier.unsubscribeCount() != 1 || timers.timer(1).stops == 0 {
@@ -845,7 +845,7 @@ func TestTailTaskExecuteIdleTimerRechecksTerminalBeforeCompleting(t *testing.T) 
 		t.Fatalf("complete=%#v idle=%#v", complete, timers.timer(0))
 	}
 	timers.fire(t, 2)
-	if err := <-errCh; err != nil {
+	if err := receiveTailError(t, errCh, "waiting for tail execution after terminal idle recheck"); err != nil {
 		t.Fatal(err)
 	}
 	if complete := writer.completeLines(); len(complete) != 1 || complete[0].Reason != schema.CompleteReasonTaskTerminal {
@@ -886,7 +886,7 @@ func TestTailTaskExecuteIdleTimerDeliversPersistedEventBeforeTimingOut(t *testin
 	// The running session is deliberately cancelled instead of waiting for the
 	// replacement idle timer; cancellation must not emit a completion line.
 	cancel()
-	if err := <-errCh; !errors.Is(err, context.Canceled) {
+	if err := receiveTailError(t, errCh, "waiting for cancelled tail execution after persisted event"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("err=%v", err)
 	}
 }
@@ -937,7 +937,7 @@ func TestTailTaskExecuteTerminalReplaysThenCompletesWithoutSubscription(t *testi
 				t.Fatalf("complete=%#v timers=%#v", complete, timers.timers)
 			}
 			timers.fire(t, 1)
-			if err := <-errCh; err != nil {
+			if err := receiveTailError(t, errCh, "waiting for terminal tail execution without subscription"); err != nil {
 				t.Fatal(err)
 			}
 			progress := writer.progressLines()
@@ -991,7 +991,7 @@ func TestTailTaskExecutePreservesUnknownEventFields(t *testing.T) {
 		return fmt.Sprintf("timers=%d, want 2", timers.count())
 	})
 	timers.fire(t, 1)
-	if err := <-errCh; err != nil {
+	if err := receiveTailError(t, errCh, "waiting for tail execution preserving unknown fields"); err != nil {
 		t.Fatal(err)
 	}
 	progress := writer.progressLines()
@@ -1085,6 +1085,17 @@ func waitTailCondition(t *testing.T, errCh <-chan error, message string, conditi
 		default:
 			time.Sleep(time.Millisecond)
 		}
+	}
+}
+
+func receiveTailError(t *testing.T, errCh <-chan error, message string) error {
+	t.Helper()
+	select {
+	case err := <-errCh:
+		return err
+	case <-time.After(time.Second):
+		t.Fatalf("%s: tail did not exit within deadline", message)
+		return nil
 	}
 }
 
