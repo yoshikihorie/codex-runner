@@ -131,7 +131,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 	}
 	lock, err := o.deps.AcquireForChild(input.TaskDirPath)
 	if err != nil {
-		o.fail(ctx, input, input.WorkingDir, 130, true)
+		o.fail(ctx, input, input.WorkingDir, 130, true, launchFailureDetail{"LIVENESS_LOCK_IO_ERROR", "acquire_for_child", err})
 		return
 	}
 	if o.stopForCancellation(ctx) {
@@ -168,7 +168,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 	}
 	if err = o.deps.RecordStarting.Execute(ctx, input.Task, input.ResolvedTimeout, input.Model, input.ReasoningEffort, input.SandboxMode, *workingDir, domain.ExecutionRouteDaemon, launchPrompt, input.Now); err != nil {
 		_ = lock.Close()
-		o.fail(ctx, input, workingDir, 130, true)
+		o.fail(ctx, input, workingDir, 130, true, launchFailureDetail{"CONTRACT_WRITE_FAILED", "record_task_starting", err})
 		return
 	}
 	if useWorktree {
@@ -179,7 +179,11 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		out, createErr := o.deps.CreateWorktree.Execute(ctx, execution.CreateWorktreeInput{TaskID: taskID, SourceWorkingDir: input.SourceWorkingDir})
 		if createErr != nil || out.WorkingDir != plannedWorkingDir {
 			_ = lock.Close()
-			o.fail(ctx, input, workingDir, 130, true)
+			if createErr != nil {
+				o.fail(ctx, input, workingDir, 130, true, launchFailureDetail{"WORKTREE_CREATE_FAILED", "create_worktree", createErr})
+			} else {
+				o.fail(ctx, input, workingDir, 130, true)
+			}
 			return
 		}
 	}
@@ -197,7 +201,17 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		return
 	}
 	if err != nil || launched == nil || launched.Handle == nil || launched.Waiter == nil {
-		o.fail(ctx, input, workingDir, 130, true)
+		_ = lock.Close()
+		detail := launchFailureDetail{cause: err}
+		switch {
+		case errors.Is(err, domain.ErrPTYAllocationFailed):
+			detail.code, detail.stage = "PTY_ALLOCATION_FAILED", "launch_pty_allocation"
+		case errors.Is(err, domain.ErrChildProcessLaunchFailed):
+			detail.code, detail.stage = "CHILD_PROCESS_LAUNCH_FAILED", "launch_child_process"
+		case errors.Is(err, domain.ErrContractWriteFailed):
+			detail.code, detail.stage = "CONTRACT_WRITE_FAILED", "launch_execution_logs_open"
+		}
+		o.fail(ctx, input, workingDir, 130, true, detail)
 		return
 	}
 	cancelling, recordErr := o.recordProcessAtLaunchBoundary(ctx, input, launched)
@@ -410,40 +424,55 @@ func (o *TaskLifecycleOrchestrator) waitLaunched(taskID domain.TaskID, launched 
 	return raw, err
 }
 
-func (o *TaskLifecycleOrchestrator) fail(ctx context.Context, input TaskLifecycleInput, workingDir *string, rawExitCode int, estimated bool) bool {
+type launchFailureDetail struct {
+	code  string
+	stage string
+	cause error
+}
+
+func (o *TaskLifecycleOrchestrator) fail(ctx context.Context, input TaskLifecycleInput, workingDir *string, rawExitCode int, estimated bool, details ...launchFailureDetail) bool {
 	taskID := input.Task.ID()
+	var detail launchFailureDetail
+	if len(details) != 0 {
+		detail = details[0]
+	}
 	o.deps.TaskMu.Lock(taskID)
 	if ctx.Err() != nil {
 		o.deps.TaskMu.Unlock(taskID)
 		return false
 	}
 	snapshot, loadErr := o.deps.Tasks.Load(taskID)
-	if loadErr != nil {
+	initialFailure := detail.stage == "acquire_for_child" || detail.stage == "record_task_starting"
+	if loadErr != nil && !(initialFailure && errors.Is(loadErr, domain.ErrTaskNotFound)) {
 		o.deps.TaskMu.Unlock(taskID)
 		o.logger.Warn("reload task before launch failure", "task_id", taskID.String(), "error", loadErr)
 		return false
 	}
-	task, restoreErr := snapshot.Restore()
-	if restoreErr != nil {
-		o.deps.TaskMu.Unlock(taskID)
-		o.logger.Warn("restore task before launch failure", "task_id", taskID.String(), "error", restoreErr)
-		return false
-	}
-	if task.State() == domain.StateCancelling {
-		result, confirmErr := o.deps.ConfirmKilled.ExecuteLocked(ctx, execution.ConfirmTaskKilledInput{TaskID: taskID, RawExitCode: rawExitCode, Estimated: estimated, OccurredAt: o.deps.Clock.Now()})
-		o.deps.TaskMu.Unlock(taskID)
-		if confirmErr != nil {
-			o.logger.Warn("confirm killed launch failure", "task_id", taskID.String(), "error", confirmErr)
+	if loadErr == nil {
+		task, restoreErr := snapshot.Restore()
+		if restoreErr != nil {
+			o.deps.TaskMu.Unlock(taskID)
+			o.logger.Warn("restore task before launch failure", "task_id", taskID.String(), "error", restoreErr)
+			return false
 		}
-		if result.Confirmed {
-			o.deps.ConfirmKilled.ReleaseAfterConfirmation(ctx, result, taskID)
-		} else if registerErr := o.deps.Pending.Register(taskID, recovery.PendingSendConfirmOnly, nil); registerErr != nil {
-			o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
+		if task.State() == domain.StateCancelling {
+			result, confirmErr := o.deps.ConfirmKilled.ExecuteLocked(ctx, execution.ConfirmTaskKilledInput{TaskID: taskID, RawExitCode: rawExitCode, Estimated: estimated, OccurredAt: o.deps.Clock.Now()})
+			o.deps.TaskMu.Unlock(taskID)
+			if confirmErr != nil {
+				o.logger.Warn("confirm killed launch failure", "task_id", taskID.String(), "error", confirmErr)
+			}
+			if result.Confirmed {
+				o.deps.ConfirmKilled.ReleaseAfterConfirmation(ctx, result, taskID)
+			} else if registerErr := o.deps.Pending.Register(taskID, recovery.PendingSendConfirmOnly, nil); registerErr != nil {
+				o.logger.Warn("register pending lifecycle reconciliation", "task_id", taskID.String(), "error", registerErr)
+			}
+			return true
 		}
-		return true
 	}
-
-	result, failErr := o.deps.FailLaunch.ExecuteLocked(ctx, FailTaskLaunchInput{Task: input.Task, ResolvedTimeout: input.ResolvedTimeout, Model: input.Model, ReasoningEffort: input.ReasoningEffort, SandboxMode: input.SandboxMode, WorkingDir: workingDir, OccurredAt: input.Now})
+	if detail.code != "" {
+		o.logger.Error("task launch failed", "task_id", taskID.String(), "stage", detail.stage, "failure_code", detail.code, "error", detail.cause)
+	}
+	result, failErr := o.deps.FailLaunch.ExecuteLocked(ctx, FailTaskLaunchInput{Task: input.Task, ResolvedTimeout: input.ResolvedTimeout, Model: input.Model, ReasoningEffort: input.ReasoningEffort, SandboxMode: input.SandboxMode, WorkingDir: workingDir, FailureCode: detail.code, OccurredAt: input.Now})
 	o.deps.TaskMu.Unlock(taskID)
 	if failErr != nil {
 		o.logger.Warn("fail task launch", "task_id", taskID.String(), "error", failErr)

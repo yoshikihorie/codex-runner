@@ -40,6 +40,7 @@ type FailTaskLaunchInput struct {
 	ReasoningEffort *string
 	SandboxMode     string
 	WorkingDir      *string
+	FailureCode     string
 	OccurredAt      time.Time
 }
 
@@ -134,6 +135,13 @@ func (uc *FailTaskLaunchUseCase) ExecuteLocked(_ context.Context, in FailTaskLau
 	updated, err := snapshot.WithTask(task, in.OccurredAt)
 	if err != nil {
 		return result, err
+	}
+	if in.FailureCode != "" && updated.SupportsFailureCode() {
+		code := in.FailureCode
+		updated.FailureCode = &code
+		if err := updated.Validate(); err != nil {
+			return result, err
+		}
 	}
 	if err := uc.tasks.Save(taskID, updated); err != nil {
 		return result, err

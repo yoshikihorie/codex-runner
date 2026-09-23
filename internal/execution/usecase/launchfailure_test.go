@@ -123,6 +123,34 @@ func TestFailTaskLaunchUseCasePersistsResolvedWorkingDir(t *testing.T) {
 	}
 }
 
+func TestFailTaskLaunchUseCasePersistsFailureCodeOnNewSnapshot(t *testing.T) {
+	f := newLaunchFailureFixture(t, 0, false, nil, nil)
+	f.input.FailureCode = "LIVENESS_LOCK_IO_ERROR"
+	result, err := f.useCase.ExecuteLocked(context.Background(), f.input)
+	if err != nil || !result.Terminal || len(f.store.saved) != 1 || f.store.saved[0].SchemaVersion != 4 || f.store.saved[0].FailureCode == nil || *f.store.saved[0].FailureCode != f.input.FailureCode {
+		t.Fatalf("result=%+v err=%v saved=%+v", result, err, f.store.saved)
+	}
+}
+
+func TestFailTaskLaunchUseCaseDoesNotBackfillOldFailureCode(t *testing.T) {
+	for _, version := range []int{2, 3} {
+		f := newLaunchFailureFixture(t, 0, false, nil, nil)
+		stored := lifecycleStartingSnapshotWithoutProcess(t, lifecycleTask(t, domain.SubcommandImpl))
+		stored.SchemaVersion = version
+		if version == 2 {
+			stored.WorkingDir = nil
+		}
+		f.store.loads = []lifecycleLoadResult{{snapshot: stored}}
+		f.input.FailureCode = "CONTRACT_WRITE_FAILED"
+		if _, err := f.useCase.ExecuteLocked(context.Background(), f.input); err != nil {
+			t.Fatal(err)
+		}
+		if len(f.store.saved) != 1 || f.store.saved[0].SchemaVersion != version || f.store.saved[0].FailureCode != nil {
+			t.Fatalf("version %d backfilled failure_code: %+v", version, f.store.saved)
+		}
+	}
+}
+
 func TestFailTaskLaunchUseCaseDoesNotBackfillSchemaVersion2WorkingDir(t *testing.T) {
 	f := newLaunchFailureFixture(t, 0, false, nil, nil)
 	storedTask := lifecycleTask(t, domain.SubcommandImpl)

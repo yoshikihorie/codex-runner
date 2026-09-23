@@ -84,6 +84,22 @@ func TestGetTaskStatusHandleMapsErrorsAndExcludesInternalFields(t *testing.T) {
 	if err := json.Unmarshal(response.Result, &object); err != nil {
 		t.Fatal(err)
 	}
+	if string(object["failure_code"]) != "null" {
+		t.Fatalf("failure_code=%s, want null", object["failure_code"])
+	}
+	code := "WORKTREE_CREATE_FAILED"
+	snapshot.SchemaVersion = 4
+	snapshot.State = domain.StateFailed
+	snapshot.PID, snapshot.ProcessStartedAt = nil, nil
+	snapshot.FailureCode = &code
+	provider.snapshot = snapshot
+	response = uc.Handle(transportRequest(snapshot.TaskID.String()))
+	if err := json.Unmarshal(response.Result, &object); err != nil {
+		t.Fatal(err)
+	}
+	if string(object["failure_code"]) != `"WORKTREE_CREATE_FAILED"` {
+		t.Fatalf("failure_code=%s", object["failure_code"])
+	}
 	for _, name := range []string{"pid", "session_ref", "requested_timeout_seconds", "recovery_origin", "schema_version"} {
 		if _, found := object[name]; found {
 			t.Fatalf("internal field %q leaked", name)

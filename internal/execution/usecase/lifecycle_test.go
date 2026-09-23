@@ -3,6 +3,7 @@ package usecase
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -346,6 +347,7 @@ type lifecycleRecordingContractWriter struct {
 	contract.ContractWriter
 	appendCalls int
 	exitCalls   int
+	exitErr     error
 	events      []domain.Event
 	trace       *[]string
 }
@@ -379,7 +381,7 @@ func (f *lifecycleRecordingContractWriter) AppendEvent(_ domain.TaskID, e domain
 func (f *lifecycleRecordingContractWriter) WriteExitCode(_ domain.TaskID, _ domain.ExitCode) error {
 	f.exitCalls++
 	appendLifecycleTrace(f.trace, "write-exit-code")
-	return nil
+	return f.exitErr
 }
 
 type lifecycleRecordingSlotReleaser struct {
@@ -1152,6 +1154,9 @@ func TestTaskLifecycleRunRejectsUnexpectedCreatedWorktreeDestination(t *testing.
 	if f.failStore.saveCalls != 1 || f.failStore.saved[0].State != domain.StateFailed || f.failLocks.calls != 1 || f.failSlots.calls != 1 {
 		t.Fatalf("unexpected failure handling: trace=%v", f.trace)
 	}
+	if f.failStore.saved[0].FailureCode != nil {
+		t.Fatalf("path mismatch was classified: %+v", f.failStore.saved[0])
+	}
 	if _, err := f.acquire.file.Stat(); err == nil {
 		t.Fatal("liveness lock remained open after worktree destination mismatch")
 	}
@@ -1320,7 +1325,7 @@ func TestTaskLifecycleRunLaunchPreparationFailuresFailAndStop(t *testing.T) {
 		wantLaunch int
 	}{{name: "missing worktree", configure: func(f *lifecycleFixture) { f.orchestrator.deps.CreateWorktree = nil }}, {name: "resolve worktree", configure: func(f *lifecycleFixture) { f.worktree.resolveErr = errors.New("resolve worktree") }}, {name: "starting", configure: func(f *lifecycleFixture) { f.starting.err = errors.New("starting") }}, {name: "worktree", configure: func(f *lifecycleFixture) {
 		f.worktree.err = errors.New("worktree")
-		f.failStore.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateStarting)}}
+		f.failStore.loads = []lifecycleLoadResult{{snapshot: lifecycleStartingSnapshotWithoutProcess(t, lifecycleTask(t, domain.SubcommandImpl))}}
 	}}, {name: "launch", configure: func(f *lifecycleFixture) {
 		f.launch.err = errors.New("launch")
 		f.failStore.loads = []lifecycleLoadResult{{snapshot: lifecycleSnapshot(t, lifecycleTask(t, domain.SubcommandImpl), domain.StateStarting)}}
@@ -1334,6 +1339,135 @@ func TestTaskLifecycleRunLaunchPreparationFailuresFailAndStop(t *testing.T) {
 				t.Fatalf("failure handling mismatch: %+v", f.trace)
 			}
 		})
+	}
+}
+
+func TestTaskLifecycleRunRecordsLaunchFailureCodes(t *testing.T) {
+	cases := []struct {
+		name, code, stage string
+		configure         func(*lifecycleFixture)
+	}{
+		{"acquire", "LIVENESS_LOCK_IO_ERROR", "acquire_for_child", func(f *lifecycleFixture) { f.acquire.err = errors.New("acquire failure") }},
+		{"starting", "CONTRACT_WRITE_FAILED", "record_task_starting", func(f *lifecycleFixture) { f.starting.err = errors.New("starting failure") }},
+		{"worktree", "WORKTREE_CREATE_FAILED", "create_worktree", func(f *lifecycleFixture) { f.worktree.err = errors.New("worktree failure") }},
+		{"pty", "PTY_ALLOCATION_FAILED", "launch_pty_allocation", func(f *lifecycleFixture) {
+			f.launch.err = errors.Join(domain.ErrPTYAllocationFailed, errors.New("pty failure"))
+		}},
+		{"child", "CHILD_PROCESS_LAUNCH_FAILED", "launch_child_process", func(f *lifecycleFixture) {
+			f.launch.err = errors.Join(domain.ErrChildProcessLaunchFailed, errors.New("child failure"))
+		}},
+		{"logs", "CONTRACT_WRITE_FAILED", "launch_execution_logs_open", func(f *lifecycleFixture) {
+			f.launch.err = errors.Join(domain.ErrContractWriteFailed, errors.New("logs failure"))
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newLifecycleFixture(t)
+			var logs bytes.Buffer
+			f.orchestrator.logger = slog.New(slog.NewJSONHandler(&logs, nil))
+			if tc.stage == "acquire_for_child" || tc.stage == "record_task_starting" {
+				f.tasks.loads = []lifecycleLoadResult{{err: domain.ErrTaskNotFound}}
+			} else {
+				starting := lifecycleStartingSnapshotWithoutProcess(t, lifecycleTask(t, domain.SubcommandImpl))
+				f.tasks.loads = []lifecycleLoadResult{{snapshot: starting}, {snapshot: starting}}
+				f.failStore.loads = []lifecycleLoadResult{{snapshot: starting}}
+			}
+			tc.configure(f)
+			f.run()
+			if f.failStore.saveCalls != 1 || len(f.failStore.saved) != 1 || f.failStore.saved[0].State != domain.StateFailed || f.failStore.saved[0].FailureCode == nil || *f.failStore.saved[0].FailureCode != tc.code {
+				t.Fatalf("saved=%+v trace=%v", f.failStore.saved, f.trace)
+			}
+			if f.failSlots.calls != 1 || f.failLocks.calls != 1 || !lifecycleTraceSubsequence(f.trace, "task-unlock", "release-path-lock", "release-slot") {
+				t.Fatalf("resources not released after unlock: %v", f.trace)
+			}
+			if tc.stage != "acquire_for_child" {
+				if _, err := f.acquire.file.Stat(); !errors.Is(err, os.ErrClosed) {
+					t.Fatalf("liveness lock remains open: %v", err)
+				}
+			}
+			found := false
+			for _, line := range bytes.Split(bytes.TrimSpace(logs.Bytes()), []byte{'\n'}) {
+				var record map[string]any
+				if err := json.Unmarshal(line, &record); err != nil {
+					t.Fatal(err)
+				}
+				if record["failure_code"] == tc.code && record["stage"] == tc.stage && record["task_id"] == f.input.Task.ID().String() && record["error"] != nil {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("missing structured failure log: %s", logs.String())
+			}
+		})
+	}
+}
+
+func TestTaskLifecycleInitialFailureReleasesResourcesAfterPersistenceErrors(t *testing.T) {
+	for _, stage := range []string{"acquire", "starting"} {
+		for _, failure := range []string{"exit-code", "task-save"} {
+			t.Run(stage+"/"+failure, func(t *testing.T) {
+				f := newLifecycleFixture(t)
+				f.tasks.loads = []lifecycleLoadResult{{err: domain.ErrTaskNotFound}}
+				if stage == "acquire" {
+					f.acquire.err = errors.New("acquire")
+				} else {
+					f.starting.err = errors.New("starting")
+				}
+				if failure == "exit-code" {
+					f.failWriter.exitErr = errors.New("exit-code")
+				} else {
+					f.failStore.saveErr = errors.New("task-save")
+				}
+				f.run()
+				if f.failSlots.calls != 1 || f.failLocks.calls != 1 || !lifecycleTraceSubsequence(f.trace, "task-unlock", "release-path-lock", "release-slot") {
+					t.Fatalf("terminal resources not released: %v", f.trace)
+				}
+			})
+		}
+	}
+}
+
+func TestTaskLifecycleInitialFailureRejectsOtherLoadErrors(t *testing.T) {
+	for _, stage := range []string{"acquire", "starting"} {
+		f := newLifecycleFixture(t)
+		f.tasks.loads = []lifecycleLoadResult{{err: errors.New("read error")}}
+		if stage == "acquire" {
+			f.acquire.err = errors.New("acquire")
+		} else {
+			f.starting.err = errors.New("starting")
+		}
+		f.run()
+		if f.failStore.saveCalls != 0 || f.failSlots.calls != 0 || f.failLocks.calls != 0 || f.pending.calls != 0 || f.killed.lockedCalls != 0 {
+			t.Fatalf("%s continued after load error: %v", stage, f.trace)
+		}
+	}
+}
+
+func TestTaskLifecycleLaterFailureDoesNotCreateMissingSnapshot(t *testing.T) {
+	for _, stage := range []string{"worktree", "launch"} {
+		f := newLifecycleFixture(t)
+		if stage == "worktree" {
+			f.worktree.err = errors.New("worktree")
+			f.tasks.loads = []lifecycleLoadResult{{err: domain.ErrTaskNotFound}}
+		} else {
+			starting := lifecycleStartingSnapshotWithoutProcess(t, lifecycleTask(t, domain.SubcommandImpl))
+			f.tasks.loads = []lifecycleLoadResult{{snapshot: starting}, {err: domain.ErrTaskNotFound}}
+			f.launch.err = domain.ErrPTYAllocationFailed
+		}
+		f.run()
+		if f.failStore.saveCalls != 0 || f.failSlots.calls != 0 || f.failLocks.calls != 0 || f.killed.lockedCalls != 0 || f.pending.calls != 0 {
+			t.Fatalf("%s continued after missing snapshot: %v", stage, f.trace)
+		}
+	}
+}
+
+func TestTaskLifecycleInitialFailureRejectsRestoreError(t *testing.T) {
+	f := newLifecycleFixture(t)
+	f.acquire.err = errors.New("acquire")
+	f.tasks.loads = []lifecycleLoadResult{{snapshot: domain.TaskSnapshot{}}}
+	f.run()
+	if f.failStore.saveCalls != 0 || f.failSlots.calls != 0 || f.killed.lockedCalls != 0 || f.pending.calls != 0 {
+		t.Fatalf("continued after restore error: %v", f.trace)
 	}
 }
 func TestTaskLifecycleRunRecordProcessFailureHandlesLiveness(t *testing.T) {

@@ -5,7 +5,9 @@ import (
 	"time"
 )
 
-const taskSnapshotSchemaVersion = 3
+const taskSnapshotSchemaVersion = 4
+
+const workingDirTaskSnapshotSchemaVersion = 3
 
 const previousTaskSnapshotSchemaVersion = 2
 
@@ -82,11 +84,17 @@ type TaskSnapshot struct {
 	Recovered               bool            `json:"recovered"`
 	AdoptedAfterRestart     bool            `json:"adopted_after_restart"`
 	RecoveryOrigin          *RecoveryOrigin `json:"recovery_origin"`
+	FailureCode             *string         `json:"failure_code,omitempty"`
 	SchemaVersion           int             `json:"schema_version"`
 }
 
 // SupportsWorkingDir reports whether the snapshot schema owns the working_dir field.
 func (s TaskSnapshot) SupportsWorkingDir() bool {
+	return s.SchemaVersion >= workingDirTaskSnapshotSchemaVersion
+}
+
+// SupportsFailureCode reports whether the snapshot schema owns the failure_code field.
+func (s TaskSnapshot) SupportsFailureCode() bool {
 	return s.SchemaVersion == taskSnapshotSchemaVersion
 }
 
@@ -153,8 +161,18 @@ func (s TaskSnapshot) Validate() error {
 	if s.RequestedAt.IsZero() || s.StateUpdatedAt.IsZero() {
 		return bad("timestamp is zero")
 	}
-	if s.SchemaVersion != previousTaskSnapshotSchemaVersion && s.SchemaVersion != taskSnapshotSchemaVersion {
+	if s.SchemaVersion != previousTaskSnapshotSchemaVersion && s.SchemaVersion != workingDirTaskSnapshotSchemaVersion && s.SchemaVersion != taskSnapshotSchemaVersion {
 		return bad("unsupported schema version")
+	}
+	if s.FailureCode != nil {
+		if s.SchemaVersion != taskSnapshotSchemaVersion || s.State != StateFailed || s.PID != nil {
+			return bad("failure_code requires schema version 4, failed state, and no process")
+		}
+		switch *s.FailureCode {
+		case "LIVENESS_LOCK_IO_ERROR", "CONTRACT_WRITE_FAILED", "WORKTREE_CREATE_FAILED", "PTY_ALLOCATION_FAILED", "CHILD_PROCESS_LAUNCH_FAILED":
+		default:
+			return bad("unknown failure_code %q", *s.FailureCode)
+		}
 	}
 	if s.SchemaVersion == previousTaskSnapshotSchemaVersion {
 		if s.WorkingDir != nil {

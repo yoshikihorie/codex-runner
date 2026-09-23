@@ -19,7 +19,7 @@ func TestNewInitialTaskSnapshot(t *testing.T) {
 	reasoning := "high"
 	workingDir := "/tmp/work"
 	snapshot := NewInitialTaskSnapshot(ExecutionRouteDaemon, &reasoning, "workspace-write", &workingDir)
-	if snapshot.Route != ExecutionRouteDaemon || snapshot.ReasoningEffort == nil || *snapshot.ReasoningEffort != reasoning || snapshot.ReasoningEffort == &reasoning || snapshot.SchemaVersion != taskSnapshotSchemaVersion {
+	if snapshot.Route != ExecutionRouteDaemon || snapshot.ReasoningEffort == nil || *snapshot.ReasoningEffort != reasoning || snapshot.ReasoningEffort == &reasoning || snapshot.SchemaVersion != 4 {
 		t.Fatalf("initial snapshot = %#v", snapshot)
 	}
 	reasoning = "low"
@@ -43,6 +43,39 @@ func TestTaskSnapshotSchemaVersionOneFailsClosed(t *testing.T) {
 	snapshot.SchemaVersion = 1
 	if err := snapshot.Validate(); err == nil {
 		t.Fatal("schema version 1 snapshot was accepted")
+	}
+}
+
+func TestTaskSnapshotFailureCodeValidation(t *testing.T) {
+	base := validRunningSnapshot(t)
+	base.State = StateFailed
+	base.PID, base.ProcessStartedAt = nil, nil
+	base.SchemaVersion = 4
+	for _, code := range []string{"LIVENESS_LOCK_IO_ERROR", "CONTRACT_WRITE_FAILED", "WORKTREE_CREATE_FAILED", "PTY_ALLOCATION_FAILED", "CHILD_PROCESS_LAUNCH_FAILED"} {
+		snapshot := base
+		snapshot.FailureCode = &code
+		if err := snapshot.Validate(); err != nil {
+			t.Fatalf("%s: %v", code, err)
+		}
+	}
+	for _, change := range []func(*TaskSnapshot){
+		func(s *TaskSnapshot) { s.SchemaVersion = 2; s.WorkingDir = nil },
+		func(s *TaskSnapshot) { s.SchemaVersion = 3 },
+		func(s *TaskSnapshot) { s.State = StateStarting },
+		func(s *TaskSnapshot) { pid := 42; at := snapshotTime(2); s.PID, s.ProcessStartedAt = &pid, &at },
+		func(s *TaskSnapshot) { unknown := "UNKNOWN"; s.FailureCode = &unknown },
+	} {
+		snapshot := base
+		code := "CONTRACT_WRITE_FAILED"
+		snapshot.FailureCode = &code
+		change(&snapshot)
+		if err := snapshot.Validate(); err == nil {
+			t.Fatalf("accepted invalid snapshot: %#v", snapshot)
+		}
+	}
+	base.SchemaVersion = 3
+	if err := base.Validate(); err != nil || !base.SupportsWorkingDir() || base.SupportsFailureCode() {
+		t.Fatalf("version 3: %v", err)
 	}
 }
 
@@ -365,6 +398,9 @@ func TestTaskSnapshotJSONFieldNames(t *testing.T) {
 	want := []string{"task_id", "subcommand", "pid", "process_started_at", "resolved_timeout_seconds", "requested_timeout_seconds", "model", "reasoning_effort", "sandbox_mode", "working_dir", "requested_at", "route", "state", "state_updated_at", "session_ref", "last_event_at", "exit_code", "recovered", "adopted_after_restart", "recovery_origin", "schema_version"}
 	if len(fields) != len(want) {
 		t.Fatalf("field count = %d, want %d: %s", len(fields), len(want), data)
+	}
+	if _, exists := fields["failure_code"]; exists {
+		t.Fatal("nil failure_code was not omitted")
 	}
 	for _, name := range want {
 		if _, ok := fields[name]; !ok {

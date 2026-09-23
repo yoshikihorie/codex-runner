@@ -40,6 +40,7 @@ type TaskStatusView struct {
 	LastEventAt            *time.Time            `json:"last_event_at"`
 	GapSeconds             *int                  `json:"gap_seconds"`
 	ExitCode               *domain.ExitCode      `json:"exit_code"`
+	FailureCode            *string               `json:"failure_code"`
 	Recovered              bool                  `json:"recovered"`
 	AdoptedAfterRestart    bool                  `json:"adopted_after_restart"`
 	Route                  domain.ExecutionRoute `json:"route"`
@@ -102,6 +103,7 @@ func taskStatusView(snapshot domain.TaskSnapshot, now time.Time) TaskStatusView 
 		RequestedAt:            snapshot.RequestedAt,
 		LastEventAt:            snapshot.LastEventAt,
 		ExitCode:               snapshot.ExitCode,
+		FailureCode:            snapshot.FailureCode,
 		Recovered:              snapshot.Recovered,
 		AdoptedAfterRestart:    snapshot.AdoptedAfterRestart,
 		Route:                  snapshot.Route,
