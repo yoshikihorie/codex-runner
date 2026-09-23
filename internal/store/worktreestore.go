@@ -25,13 +25,61 @@ import (
 var (
 	findGitBinary                 = proc.FindGitBinary
 	openWorktreeFile              = os.Open
+	readWorktreeLink              = os.Readlink
+	walkWorktreeTree              = filepath.WalkDir
+	createWorktreeTemporaryFn     = createWorktreeTemporary
+	openWorktreeOutputFile        = openAt
+	copyWorktreeFileData          = io.Copy
+	worktreeSetPermissions        = syscall.Fchmod
 	beforeWorktreeTemporaryCreate = func() error { return nil }
 	beforeWorktreePublish         = func() error { return nil }
 	afterWorktreeFileCopy         = func(string) error { return nil }
 	removeWorktreeTreeAtFn        = removeWorktreeTreeAt
 	removeTreeFchmod              = syscall.Fchmod
 	gitCommandTimeout             = 30 * time.Second
+	worktreeRetryWait             = waitForWorktreeRetry
 )
+
+// FD-exec-07 §17: one initial copy and three retries, with at most 100 ms of waiting.
+const (
+	worktreeCopyMaxAttempts = 4
+	worktreeRetryFirst      = 10 * time.Millisecond
+	worktreeRetrySecond     = 30 * time.Millisecond
+	worktreeRetryThird      = 60 * time.Millisecond
+)
+
+var (
+	worktreeRetryDelays      = [...]time.Duration{worktreeRetryFirst, worktreeRetrySecond, worktreeRetryThird}
+	errWorktreeSourceChanged = errors.New("worktree source changed during copy")
+)
+
+type worktreeSourceRetryError struct{ cause error }
+
+func (e worktreeSourceRetryError) Error() string { return e.cause.Error() }
+func (e worktreeSourceRetryError) Unwrap() error { return e.cause }
+
+type worktreeCleanupError struct{ cause error }
+
+func (e worktreeCleanupError) Error() string { return e.cause.Error() }
+func (e worktreeCleanupError) Unwrap() error { return e.cause }
+
+func retryMissingWorktreeSource(err error) error {
+	if errors.Is(err, fs.ErrNotExist) {
+		return worktreeSourceRetryError{cause: err}
+	}
+	return err
+}
+
+func waitForWorktreeRetry(ctx context.Context, delay time.Duration) error {
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return ctx.Err()
+	}
+}
 
 // WorktreeFileStore provides filesystem-backed worktree operations.
 type WorktreeFileStore struct{}
@@ -55,7 +103,7 @@ const (
 func NewWorktreeFileStore() *WorktreeFileStore { return &WorktreeFileStore{} }
 
 // Create copies sourceDir into a temporary sibling and publishes it only when complete.
-func (s *WorktreeFileStore) Create(ctx context.Context, sourceDir string, destinationDir string) (err error) {
+func (s *WorktreeFileStore) Create(ctx context.Context, sourceDir string, destinationDir string) error {
 	if sourceDir == "" || destinationDir == "" || !filepath.IsAbs(sourceDir) || !filepath.IsAbs(destinationDir) {
 		return fmt.Errorf("worktree source and destination must be absolute paths")
 	}
@@ -80,34 +128,65 @@ func (s *WorktreeFileStore) Create(ctx context.Context, sourceDir string, destin
 	if err := rejectWorktreeDestinationWithinSource(sourceDir, parentPath); err != nil {
 		return err
 	}
+	for attempt := 0; attempt < worktreeCopyMaxAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if attempt > 0 {
+			if err := worktreeRetryWait(ctx, worktreeRetryDelays[attempt-1]); err != nil {
+				return err
+			}
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		err := createWorktreeCopyAttempt(ctx, sourceDir, destinationDir, parentPath, parent)
+		if err == nil {
+			return nil
+		}
+		var cleanupErr worktreeCleanupError
+		if errors.As(err, &cleanupErr) {
+			return err
+		}
+		var sourceErr worktreeSourceRetryError
+		if !errors.As(err, &sourceErr) {
+			return err
+		}
+		if attempt == worktreeCopyMaxAttempts-1 {
+			return fmt.Errorf("worktree copy failed after %d attempts: %w", worktreeCopyMaxAttempts, err)
+		}
+	}
+	return fmt.Errorf("worktree copy attempts exhausted")
+}
+
+func createWorktreeCopyAttempt(ctx context.Context, sourceDir, destinationDir, parentPath string, parent *os.File) (err error) {
 	if err := beforeWorktreeTemporaryCreate(); err != nil {
 		return err
 	}
-	temporaryName, temporary, err := createWorktreeTemporary(parent.Fd())
+	temporaryName, temporary, err := createWorktreeTemporaryFn(parent.Fd())
 	if err != nil {
 		return fmt.Errorf("create worktree temporary directory: %w", err)
 	}
-	defer temporary.Close()
+	var directories []worktreeDirectoryMode
 	defer func() {
-		if err == nil {
-			return
-		}
-		cleanupErr := removeWorktreeTreeAtFn(parent.Fd(), temporaryName, temporary.Fd())
-		if cleanupErr != nil {
-			err = errors.Join(err, cleanupErr)
-		}
-	}()
-	directories, err := copyWorktreeTree(ctx, sourceDir, int(temporary.Fd()))
-	if err != nil {
 		closeWorktreeDirectories(directories)
+		if err != nil {
+			cleanupErr := removeWorktreeTreeAtFn(parent.Fd(), temporaryName, temporary.Fd())
+			if cleanupErr != nil {
+				err = errors.Join(err, worktreeCleanupError{cause: cleanupErr})
+			}
+		}
+		_ = temporary.Close()
+	}()
+	directories, err = copyWorktreeTree(ctx, sourceDir, int(temporary.Fd()))
+	if err != nil {
 		return err
 	}
-	defer closeWorktreeDirectories(directories)
 	for index := len(directories) - 1; index >= 0; index-- {
 		if err = ctx.Err(); err != nil {
 			return err
 		}
-		if err = syscall.Fchmod(directories[index].fd, uint32(directories[index].mode)); err != nil {
+		if err = worktreeSetPermissions(directories[index].fd, uint32(directories[index].mode)); err != nil {
 			return fmt.Errorf("restore worktree directory permissions: %w", err)
 		}
 	}
@@ -174,9 +253,9 @@ func copyWorktreeTree(ctx context.Context, source string, temporaryFD int) ([]wo
 		return nil, err
 	}
 	directories = append(directories, worktreeDirectoryMode{fd: rootFD})
-	err = filepath.WalkDir(source, func(path string, entry os.DirEntry, walkErr error) error {
+	err = walkWorktreeTree(source, func(path string, entry os.DirEntry, walkErr error) error {
 		if walkErr != nil {
-			return walkErr
+			return retryMissingWorktreeSource(walkErr)
 		}
 		if err := ctx.Err(); err != nil {
 			return err
@@ -188,7 +267,7 @@ func copyWorktreeTree(ctx context.Context, source string, temporaryFD int) ([]wo
 		if rel == "." {
 			info, err := entry.Info()
 			if err != nil {
-				return err
+				return retryMissingWorktreeSource(err)
 			}
 			directories[0].mode = info.Mode().Perm()
 			return nil
@@ -201,14 +280,14 @@ func copyWorktreeTree(ctx context.Context, source string, temporaryFD int) ([]wo
 		name := filepath.Base(rel)
 		info, err := entry.Info()
 		if err != nil {
-			return err
+			return retryMissingWorktreeSource(err)
 		}
 		mode := info.Mode()
 		switch {
 		case mode&os.ModeSymlink != 0:
-			link, err := os.Readlink(path)
+			link, err := readWorktreeLink(path)
 			if err != nil {
-				return err
+				return retryMissingWorktreeSource(err)
 			}
 			return symlinkAt(link, parentFD, name)
 		case mode.IsDir():
@@ -224,7 +303,7 @@ func copyWorktreeTree(ctx context.Context, source string, temporaryFD int) ([]wo
 		case mode.IsRegular():
 			from, err := openWorktreeFile(path)
 			if err != nil {
-				return err
+				return retryMissingWorktreeSource(err)
 			}
 			openedInfo, statErr := from.Stat()
 			if statErr != nil {
@@ -233,17 +312,17 @@ func copyWorktreeTree(ctx context.Context, source string, temporaryFD int) ([]wo
 			}
 			if !openedInfo.Mode().IsRegular() || !os.SameFile(info, openedInfo) {
 				_ = from.Close()
-				return fmt.Errorf("worktree source changed while opening: %s", path)
+				return worktreeSourceRetryError{cause: fmt.Errorf("%w while opening: %s", errWorktreeSourceChanged, path)}
 			}
 			defer from.Close()
-			toFD, err := openAt(parentFD, name, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW, uint32(mode.Perm()))
+			toFD, err := openWorktreeOutputFile(parentFD, name, syscall.O_WRONLY|syscall.O_CREAT|syscall.O_EXCL|syscall.O_NOFOLLOW, uint32(mode.Perm()))
 			if err != nil {
 				return err
 			}
 			to := os.NewFile(uintptr(toFD), name)
 			defer to.Close()
 			copyDigest := sha256.New()
-			_, copyErr := io.Copy(io.MultiWriter(to, copyDigest), contextReader{ctx: ctx, r: from})
+			_, copyErr := copyWorktreeFileData(io.MultiWriter(to, copyDigest), contextReader{ctx: ctx, r: from})
 			if copyErr != nil {
 				_ = to.Close()
 				return copyErr
@@ -267,9 +346,9 @@ func copyWorktreeTree(ctx context.Context, source string, temporaryFD int) ([]wo
 			}
 			if !finalInfo.Mode().IsRegular() || !os.SameFile(openedInfo, finalInfo) || openedInfo.Size() != finalInfo.Size() || !openedInfo.ModTime().Equal(finalInfo.ModTime()) || !bytes.Equal(copyDigest.Sum(nil), verifyDigest.Sum(nil)) {
 				_ = to.Close()
-				return fmt.Errorf("worktree source changed during copy: %s", path)
+				return worktreeSourceRetryError{cause: fmt.Errorf("%w: %s", errWorktreeSourceChanged, path)}
 			}
-			if err := syscall.Fchmod(toFD, uint32(mode.Perm())); err != nil {
+			if err := worktreeSetPermissions(toFD, uint32(mode.Perm())); err != nil {
 				_ = to.Close()
 				return err
 			}

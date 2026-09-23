@@ -4,9 +4,13 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -308,22 +312,283 @@ func TestWorktreeFileStoreCreateRejectsSourceChangedDuringCopy(t *testing.T) {
 		t.Fatal(err)
 	}
 	originalHook := afterWorktreeFileCopy
+	originalWait := worktreeRetryWait
+	var attempts int
+	var waits []time.Duration
+	worktreeRetryWait = func(_ context.Context, delay time.Duration) error {
+		waits = append(waits, delay)
+		return nil
+	}
 	afterWorktreeFileCopy = func(path string) error {
 		if path != sourceFile {
 			return nil
 		}
-		return os.WriteFile(sourceFile, []byte("changed"), 0o600)
+		attempts++
+		return os.WriteFile(sourceFile, []byte(strings.Repeat("changed", attempts)), 0o600)
 	}
-	t.Cleanup(func() { afterWorktreeFileCopy = originalHook })
+	t.Cleanup(func() {
+		afterWorktreeFileCopy = originalHook
+		worktreeRetryWait = originalWait
+	})
 	err := NewWorktreeFileStore().Create(context.Background(), source, destination)
-	if err == nil || !strings.Contains(err.Error(), "worktree source changed during copy") {
+	if !errors.Is(err, errWorktreeSourceChanged) || !strings.Contains(err.Error(), "worktree source changed during copy") {
 		t.Fatalf("Create() error=%v, want source change detection", err)
+	}
+	if attempts != 4 || !slices.Equal(waits, []time.Duration{10 * time.Millisecond, 30 * time.Millisecond, 60 * time.Millisecond}) {
+		t.Fatalf("attempts=%d waits=%v", attempts, waits)
 	}
 	if _, err := os.Stat(destination); !os.IsNotExist(err) {
 		t.Fatalf("destination was published: %v", err)
 	}
 	if temporary := temporaryWorktreeSibling(t, parent); temporary != "" {
 		t.Fatalf("temporary copy was not removed: %s", temporary)
+	}
+}
+
+func TestWorktreeFileStoreCreateRetriesMissingSourceReads(t *testing.T) {
+	for _, location := range []string{"entry info", "walk error", "read link", "open file"} {
+		t.Run(location, func(t *testing.T) {
+			source := t.TempDir()
+			parent := t.TempDir()
+			destination := filepath.Join(parent, "published")
+			for _, name := range []string{"a", "b"} {
+				if err := os.WriteFile(filepath.Join(source, name), []byte(name), 0o600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if location == "read link" {
+				if err := os.Symlink("a", filepath.Join(source, "link")); err != nil {
+					t.Fatal(err)
+				}
+			}
+			originalWalk, originalReadlink, originalOpen := walkWorktreeTree, readWorktreeLink, openWorktreeFile
+			originalCopy, originalWait := afterWorktreeFileCopy, worktreeRetryWait
+			t.Cleanup(func() {
+				walkWorktreeTree, readWorktreeLink, openWorktreeFile = originalWalk, originalReadlink, originalOpen
+				afterWorktreeFileCopy, worktreeRetryWait = originalCopy, originalWait
+			})
+			var names []string
+			var waits []time.Duration
+			worktreeRetryWait = func(_ context.Context, delay time.Duration) error {
+				waits = append(waits, delay)
+				if temporaryWorktreeSibling(t, parent) != "" {
+					t.Fatal("failed temporary directory still exists before retry")
+				}
+				return nil
+			}
+			missingOnce := true
+			afterWorktreeFileCopy = func(path string) error {
+				if path == filepath.Join(source, "a") {
+					names = append(names, temporaryWorktreeSibling(t, parent))
+					if location == "entry info" && missingOnce {
+						missingOnce = false
+						return os.Remove(filepath.Join(source, "b"))
+					}
+				}
+				return nil
+			}
+			switch location {
+			case "walk error":
+				walkWorktreeTree = func(root string, fn fs.WalkDirFunc) error {
+					return filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+						if path == filepath.Join(source, "b") && missingOnce {
+							missingOnce = false
+							return fn(path, entry, fs.ErrNotExist)
+						}
+						return fn(path, entry, err)
+					})
+				}
+			case "read link":
+				readWorktreeLink = func(path string) (string, error) {
+					if path == filepath.Join(source, "link") && missingOnce {
+						missingOnce = false
+						return "", fs.ErrNotExist
+					}
+					return originalReadlink(path)
+				}
+			case "open file":
+				openWorktreeFile = func(path string) (*os.File, error) {
+					if path == filepath.Join(source, "b") && missingOnce {
+						missingOnce = false
+						return nil, fs.ErrNotExist
+					}
+					return originalOpen(path)
+				}
+			}
+			if err := NewWorktreeFileStore().Create(context.Background(), source, destination); err != nil {
+				t.Fatal(err)
+			}
+			if len(names) != 2 || names[0] == names[1] || !slices.Equal(waits, []time.Duration{10 * time.Millisecond}) {
+				t.Fatalf("temporary names=%v waits=%v", names, waits)
+			}
+			if _, err := os.Stat(destination); err != nil {
+				t.Fatalf("worktree not published: %v", err)
+			}
+			if temporary := temporaryWorktreeSibling(t, parent); temporary != "" {
+				t.Fatalf("temporary directory remains: %s", temporary)
+			}
+		})
+	}
+}
+
+func TestWorktreeFileStoreCreateRetriesSourceChangedAfterCopy(t *testing.T) {
+	source := t.TempDir()
+	parent := t.TempDir()
+	file := filepath.Join(source, "file")
+	if err := os.WriteFile(file, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalHook, originalWait := afterWorktreeFileCopy, worktreeRetryWait
+	t.Cleanup(func() { afterWorktreeFileCopy, worktreeRetryWait = originalHook, originalWait })
+	var copies, waits int
+	worktreeRetryWait = func(context.Context, time.Duration) error { waits++; return nil }
+	afterWorktreeFileCopy = func(path string) error {
+		copies++
+		if copies == 1 {
+			return os.WriteFile(path, []byte("new"), 0o600)
+		}
+		return nil
+	}
+	destination := filepath.Join(parent, "published")
+	if err := NewWorktreeFileStore().Create(context.Background(), source, destination); err != nil {
+		t.Fatal(err)
+	}
+	if copies != 2 || waits != 1 {
+		t.Fatalf("copies=%d waits=%d", copies, waits)
+	}
+	if data, err := os.ReadFile(filepath.Join(destination, "file")); err != nil || string(data) != "new" {
+		t.Fatalf("published data=%q err=%v", data, err)
+	}
+}
+
+func TestWorktreeFileStoreCreateStopsRetryAfterCleanupFailure(t *testing.T) {
+	source := t.TempDir()
+	parent := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalOpen, originalRemove, originalWait := openWorktreeFile, removeWorktreeTreeAtFn, worktreeRetryWait
+	t.Cleanup(func() {
+		openWorktreeFile, removeWorktreeTreeAtFn, worktreeRetryWait = originalOpen, originalRemove, originalWait
+	})
+	sourceErr, cleanupErr := fs.ErrNotExist, errors.New("cleanup failed")
+	var opens, removes, waits int
+	openWorktreeFile = func(string) (*os.File, error) { opens++; return nil, sourceErr }
+	removeWorktreeTreeAtFn = func(parentFD uintptr, name string, temporaryFD uintptr) error {
+		removes++
+		var stat syscall.Stat_t
+		if err := syscall.Fstat(int(temporaryFD), &stat); err != nil {
+			t.Fatalf("temporary fd closed before cleanup: %v", err)
+		}
+		return cleanupErr
+	}
+	worktreeRetryWait = func(context.Context, time.Duration) error { waits++; return nil }
+	err := NewWorktreeFileStore().Create(context.Background(), source, filepath.Join(parent, "published"))
+	if !errors.Is(err, sourceErr) || !errors.Is(err, cleanupErr) || opens != 1 || removes != 1 || waits != 0 {
+		t.Fatalf("error=%v opens=%d removes=%d waits=%d", err, opens, removes, waits)
+	}
+}
+
+func TestWorktreeFileStoreCreatePreservesFinalSourceError(t *testing.T) {
+	source := t.TempDir()
+	parent := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalOpen, originalWait := openWorktreeFile, worktreeRetryWait
+	t.Cleanup(func() { openWorktreeFile, worktreeRetryWait = originalOpen, originalWait })
+	lastErr := errors.New("last source read")
+	var attempts, waits int
+	openWorktreeFile = func(string) (*os.File, error) {
+		attempts++
+		if attempts == worktreeCopyMaxAttempts {
+			return nil, fmt.Errorf("%w: %w", fs.ErrNotExist, lastErr)
+		}
+		return nil, fs.ErrNotExist
+	}
+	worktreeRetryWait = func(context.Context, time.Duration) error { waits++; return nil }
+	destination := filepath.Join(parent, "published")
+	err := NewWorktreeFileStore().Create(context.Background(), source, destination)
+	if !errors.Is(err, lastErr) || attempts != worktreeCopyMaxAttempts || waits != worktreeCopyMaxAttempts-1 {
+		t.Fatalf("error=%v attempts=%d waits=%d", err, attempts, waits)
+	}
+	if _, err := os.Stat(destination); !os.IsNotExist(err) {
+		t.Fatalf("destination published after retry exhaustion: %v", err)
+	}
+	if temporaryWorktreeSibling(t, parent) != "" {
+		t.Fatal("temporary directory remains")
+	}
+}
+
+func TestWorktreeFileStoreCreateStopsRetryOnCancellationDuringWait(t *testing.T) {
+	source := t.TempDir()
+	parent := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "file"), []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	originalOpen, originalWait := openWorktreeFile, worktreeRetryWait
+	t.Cleanup(func() { openWorktreeFile, worktreeRetryWait = originalOpen, originalWait })
+	var opens, waits int
+	openWorktreeFile = func(string) (*os.File, error) { opens++; return nil, fs.ErrNotExist }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	worktreeRetryWait = func(ctx context.Context, _ time.Duration) error {
+		waits++
+		cancel()
+		return ctx.Err()
+	}
+	err := NewWorktreeFileStore().Create(ctx, source, filepath.Join(parent, "published"))
+	if !errors.Is(err, context.Canceled) || opens != 1 || waits != 1 || temporaryWorktreeSibling(t, parent) != "" {
+		t.Fatalf("error=%v opens=%d waits=%d", err, opens, waits)
+	}
+}
+
+func TestWorktreeFileStoreCreateDoesNotRetryDestinationFailures(t *testing.T) {
+	for _, location := range []string{"temporary creation", "file creation", "write", "permissions", "publish"} {
+		t.Run(location, func(t *testing.T) {
+			source := t.TempDir()
+			parent := t.TempDir()
+			if err := os.WriteFile(filepath.Join(source, "file"), []byte("content"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			originalBefore, originalCreate := beforeWorktreeTemporaryCreate, createWorktreeTemporaryFn
+			originalOpen, originalCopy, originalChmod, originalPublish := openWorktreeOutputFile, copyWorktreeFileData, worktreeSetPermissions, beforeWorktreePublish
+			originalWait := worktreeRetryWait
+			t.Cleanup(func() {
+				beforeWorktreeTemporaryCreate, createWorktreeTemporaryFn = originalBefore, originalCreate
+				openWorktreeOutputFile, copyWorktreeFileData, worktreeSetPermissions, beforeWorktreePublish = originalOpen, originalCopy, originalChmod, originalPublish
+				worktreeRetryWait = originalWait
+			})
+			var attempts, waits int
+			beforeWorktreeTemporaryCreate = func() error { attempts++; return nil }
+			worktreeRetryWait = func(context.Context, time.Duration) error { waits++; return nil }
+			failure := errors.New("destination failure")
+			switch location {
+			case "temporary creation":
+				createWorktreeTemporaryFn = func(uintptr) (string, *os.File, error) { return "", nil, failure }
+			case "file creation":
+				failure = fs.ErrNotExist
+				openWorktreeOutputFile = func(int, string, int, uint32) (int, error) { return 0, failure }
+			case "write":
+				failure = fs.ErrNotExist
+				copyWorktreeFileData = func(io.Writer, io.Reader) (int64, error) { return 0, failure }
+			case "permissions":
+				worktreeSetPermissions = func(int, uint32) error { return failure }
+			case "publish":
+				beforeWorktreePublish = func() error { return failure }
+			}
+			destination := filepath.Join(parent, "published")
+			err := NewWorktreeFileStore().Create(context.Background(), source, destination)
+			if !errors.Is(err, failure) || attempts != 1 || waits != 0 {
+				t.Fatalf("error=%v attempts=%d waits=%d", err, attempts, waits)
+			}
+			if _, err := os.Stat(destination); !os.IsNotExist(err) {
+				t.Fatalf("destination published after failure: %v", err)
+			}
+			if temporaryWorktreeSibling(t, parent) != "" {
+				t.Fatal("temporary directory remains")
+			}
+		})
 	}
 }
 
@@ -417,7 +682,7 @@ func TestCreateWorktreeTemporaryUsesPrivatePermissions(t *testing.T) {
 	}
 }
 
-func TestWorktreeFileStoreCreateRejectsFileReplacedWithSymlinkBeforeOpen(t *testing.T) {
+func TestWorktreeFileStoreCreateCopiesLinkAfterFileReplacedBeforeOpen(t *testing.T) {
 	source := t.TempDir()
 	destinationParent := t.TempDir()
 	destination := filepath.Join(destinationParent, "published")
@@ -430,8 +695,13 @@ func TestWorktreeFileStoreCreateRejectsFileReplacedWithSymlinkBeforeOpen(t *test
 		t.Fatal(err)
 	}
 	originalOpen := openWorktreeFile
+	originalWait := worktreeRetryWait
+	var opens int
+	var waits int
+	worktreeRetryWait = func(context.Context, time.Duration) error { waits++; return nil }
 	openWorktreeFile = func(path string) (*os.File, error) {
 		if path == sourceFile {
+			opens++
 			if err := os.Rename(sourceFile, sourceFile+".original"); err != nil {
 				return nil, err
 			}
@@ -441,15 +711,22 @@ func TestWorktreeFileStoreCreateRejectsFileReplacedWithSymlinkBeforeOpen(t *test
 		}
 		return originalOpen(path)
 	}
-	t.Cleanup(func() { openWorktreeFile = originalOpen })
-	if err := NewWorktreeFileStore().Create(context.Background(), source, destination); err == nil {
-		t.Fatal("Create() succeeded after source file replacement")
+	t.Cleanup(func() {
+		openWorktreeFile = originalOpen
+		worktreeRetryWait = originalWait
+	})
+	if err := NewWorktreeFileStore().Create(context.Background(), source, destination); err != nil {
+		t.Fatal(err)
 	}
-	if _, err := os.Stat(destination); !os.IsNotExist(err) {
-		t.Fatalf("destination was published: %v", err)
+	if opens != 1 || waits != 1 {
+		t.Fatalf("opens=%d waits=%d, want one retry", opens, waits)
 	}
-	if temporary := temporaryWorktreeSibling(t, destinationParent); temporary != "" {
-		t.Fatalf("temporary copy was not removed: %s", temporary)
+	link, err := os.Readlink(filepath.Join(destination, "source-file"))
+	if err != nil || link != externalFile {
+		t.Fatalf("copied link=%q err=%v", link, err)
+	}
+	if info, err := os.Lstat(filepath.Join(destination, "source-file")); err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("copied file is not a link: info=%v err=%v", info, err)
 	}
 }
 
