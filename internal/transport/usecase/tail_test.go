@@ -422,9 +422,11 @@ func TestTailTaskHandleAcceptsPositiveIntegerBeyondIntRange(t *testing.T) {
 	go func() {
 		errCh <- uc.Handle(context.Background(), transport.Request{TaskID: tailTestID(t).String(), Params: []byte(`{"from_seq":9223372036854775808}`), RequestID: "request-beyond-int"}, &output)
 	}()
-	for timers.count() != 2 {
-		time.Sleep(time.Millisecond)
-	}
+	waitTailCondition(t, errCh, "waiting for terminal drain timer", func() bool {
+		return timers.count() == 2
+	}, func() string {
+		return fmt.Sprintf("timers=%d, want 2", timers.count())
+	})
 	timers.fire(t, 1)
 	if err := <-errCh; err != nil {
 		t.Fatal(err)
@@ -446,9 +448,11 @@ func TestTailTaskHandleDefaultsAndPassesFromSeq(t *testing.T) {
 			go func() {
 				errCh <- uc.Handle(context.Background(), transport.Request{TaskID: tailTestID(t).String(), Params: params, RequestID: "request-default"}, &output)
 			}()
-			for timers.count() != 2 {
-				time.Sleep(time.Millisecond)
-			}
+			waitTailCondition(t, errCh, "waiting for terminal drain timer", func() bool {
+				return timers.count() == 2
+			}, func() string {
+				return fmt.Sprintf("timers=%d, want 2", timers.count())
+			})
 			timers.fire(t, 1)
 			if err := <-errCh; err != nil {
 				t.Fatal(err)
@@ -825,14 +829,18 @@ func TestTailTaskExecuteIdleTimerRechecksTerminalBeforeCompleting(t *testing.T) 
 	defer cancel()
 	errCh := make(chan error, 1)
 	go func() { errCh <- uc.Execute(ctx, schema.TailTaskInput{TaskID: tailTestID(t), FromSeq: 1}, writer) }()
-	for timers.count() != 1 {
-		time.Sleep(time.Millisecond)
-	}
+	waitTailCondition(t, errCh, "waiting for initial idle timer", func() bool {
+		return timers.count() == 1
+	}, func() string {
+		return fmt.Sprintf("timers=%d, want 1", timers.count())
+	})
 	provider.setSnapshots(tailSnapshot(t, domain.StateCompleted))
 	timers.fire(t, 0)
-	for timers.count() != 3 {
-		time.Sleep(time.Millisecond)
-	}
+	waitTailCondition(t, errCh, "waiting for terminal drain timer", func() bool {
+		return timers.count() == 3
+	}, func() string {
+		return fmt.Sprintf("timers=%d, want 3", timers.count())
+	})
 	if complete := writer.completeLines(); len(complete) != 0 || timers.timer(0).stops == 0 {
 		t.Fatalf("complete=%#v idle=%#v", complete, timers.timer(0))
 	}
@@ -858,14 +866,18 @@ func TestTailTaskExecuteIdleTimerDeliversPersistedEventBeforeTimingOut(t *testin
 	defer cancel()
 	errCh := make(chan error, 1)
 	go func() { errCh <- uc.Execute(ctx, schema.TailTaskInput{TaskID: tailTestID(t), FromSeq: 1}, writer) }()
-	for timers.count() != 1 {
-		time.Sleep(time.Millisecond)
-	}
+	waitTailCondition(t, errCh, "waiting for initial idle timer", func() bool {
+		return timers.count() == 1
+	}, func() string {
+		return fmt.Sprintf("timers=%d, want 1", timers.count())
+	})
 	events.add(store.EventRecord{Seq: 1})
 	timers.fire(t, 0)
-	for len(writer.progressLines()) != 1 || timers.count() != 2 {
-		time.Sleep(time.Millisecond)
-	}
+	waitTailCondition(t, errCh, "waiting for persisted progress and replacement idle timer", func() bool {
+		return len(writer.progressLines()) == 1 && timers.count() == 2
+	}, func() string {
+		return fmt.Sprintf("progress=%#v timers=%d, want 1 progress line and 2 timers", writer.progressLines(), timers.count())
+	})
 	progress := writer.progressLines()
 	complete := writer.completeLines()
 	if progress[0].Seq != 1 || len(complete) != 0 || timers.timer(0).stops == 0 {
@@ -916,9 +928,11 @@ func TestTailTaskExecuteTerminalReplaysThenCompletesWithoutSubscription(t *testi
 			go func() {
 				errCh <- uc.Execute(context.Background(), schema.TailTaskInput{TaskID: tailTestID(t), FromSeq: 2}, writer)
 			}()
-			for timers.count() != 2 {
-				time.Sleep(time.Millisecond)
-			}
+			waitTailCondition(t, errCh, "waiting for terminal drain timer", func() bool {
+				return timers.count() == 2
+			}, func() string {
+				return fmt.Sprintf("timers=%d, want 2", timers.count())
+			})
 			if complete := writer.completeLines(); len(complete) != 0 || timers.timer(0).duration != tailTerminalDrainMaxWait || timers.timer(1).duration != tailTerminalDrainRetryInterval {
 				t.Fatalf("complete=%#v timers=%#v", complete, timers.timers)
 			}
@@ -971,9 +985,11 @@ func TestTailTaskExecutePreservesUnknownEventFields(t *testing.T) {
 	go func() {
 		errCh <- uc.Execute(context.Background(), schema.TailTaskInput{TaskID: tailTestID(t), FromSeq: 1}, writer)
 	}()
-	for timers.count() != 2 {
-		time.Sleep(time.Millisecond)
-	}
+	waitTailCondition(t, errCh, "waiting for terminal drain timer", func() bool {
+		return timers.count() == 2
+	}, func() string {
+		return fmt.Sprintf("timers=%d, want 2", timers.count())
+	})
 	timers.fire(t, 1)
 	if err := <-errCh; err != nil {
 		t.Fatal(err)
