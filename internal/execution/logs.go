@@ -55,6 +55,7 @@ type LogSkipReason string
 const (
 	LogSkipStillAlive          LogSkipReason = "still_alive"
 	LogSkipLivenessCheckFailed LogSkipReason = "liveness_check_failed"
+	LogSkipTaskLockMissing     LogSkipReason = "task_lock_missing"
 	LogSkipBelowAgeThreshold   LogSkipReason = "below_age_threshold"
 	LogSkipRemoveFailed        LogSkipReason = "remove_failed"
 	LogSkipRotationFailed      LogSkipReason = "rotation_failed"
@@ -83,6 +84,13 @@ type EvictLogsOutput struct {
 	Candidates        []LogDeletionCandidate
 	Deleted           []string
 	Skipped           []LogSkipped
+}
+
+type taskLockMissingScan map[domain.TaskID]struct{}
+
+func (scan taskLockMissingScan) skip(taskID domain.TaskID, path string) LogSkipped {
+	scan[taskID] = struct{}{}
+	return LogSkipped{Path: path, Reason: LogSkipTaskLockMissing}
 }
 
 // LogStore is the execution boundary for the fixed set of log lifecycle operations.
@@ -192,7 +200,9 @@ func (uc *EvictLogsUseCase) Plan(ctx context.Context, in EvictLogsInput) (EvictL
 		return EvictLogsOutput{}, err
 	}
 	return uc.withEvictionLock(func() (EvictLogsOutput, error) {
-		return uc.plan(ctx, in)
+		missing := taskLockMissingScan{}
+		defer uc.warnTaskLocksMissing(missing)
+		return uc.plan(ctx, in, missing)
 	})
 }
 
@@ -216,17 +226,19 @@ func (uc *EvictLogsUseCase) Execute(ctx context.Context, in EvictLogsInput, conf
 		return out, fmt.Errorf("explicit trigger requires confirmed candidates")
 	}
 	return uc.withEvictionLock(func() (EvictLogsOutput, error) {
-		return uc.execute(ctx, in, confirmed)
+		missing := taskLockMissingScan{}
+		defer uc.warnTaskLocksMissing(missing)
+		return uc.execute(ctx, in, confirmed, missing)
 	})
 }
 
-func (uc *EvictLogsUseCase) execute(ctx context.Context, in EvictLogsInput, confirmed []LogDeletionCandidate) (out EvictLogsOutput, err error) {
+func (uc *EvictLogsUseCase) execute(ctx context.Context, in EvictLogsInput, confirmed []LogDeletionCandidate, missing taskLockMissingScan) (out EvictLogsOutput, err error) {
 	if confirmed == nil {
-		out, err = uc.plan(ctx, in)
+		out, err = uc.plan(ctx, in, missing)
 		if err != nil {
 			return out, err
 		}
-		deleted, skipped, deleteErr := uc.deleteCandidates(ctx, out.Candidates)
+		deleted, skipped, deleteErr := uc.deleteCandidatesInScan(ctx, out.Candidates, missing)
 		out.Deleted, out.Skipped = deleted, append(out.Skipped, skipped...)
 		return out, deleteErr
 	}
@@ -236,12 +248,12 @@ func (uc *EvictLogsUseCase) execute(ctx context.Context, in EvictLogsInput, conf
 	out.RotatedDaemonWide = []string{}
 	out.Candidates = []LogDeletionCandidate{}
 	out.Candidates = append(out.Candidates, confirmed...)
-	deleted, skipped, err := uc.deleteCandidates(ctx, confirmed)
+	deleted, skipped, err := uc.deleteCandidatesInScan(ctx, confirmed, missing)
 	out.Deleted, out.Skipped = deleted, skipped
 	return out, err
 }
 
-func (uc *EvictLogsUseCase) plan(ctx context.Context, in EvictLogsInput) (EvictLogsOutput, error) {
+func (uc *EvictLogsUseCase) plan(ctx context.Context, in EvictLogsInput, missing taskLockMissingScan) (EvictLogsOutput, error) {
 	out := EvictLogsOutput{RotatedDaemonWide: []string{}, Candidates: []LogDeletionCandidate{}, Deleted: []string{}, Skipped: []LogSkipped{}}
 	for _, path := range []string{uc.paths.CodexdLog, uc.paths.RouteFallback} {
 		if err := ctx.Err(); err != nil {
@@ -336,6 +348,12 @@ func (uc *EvictLogsUseCase) plan(ctx context.Context, in EvictLogsInput) (EvictL
 		}
 		dead, err := uc.locks.Execute(ctx, id)
 		if err != nil {
+			if errors.Is(err, domain.ErrTaskNotFound) {
+				for _, path := range perTask[id] {
+					out.Skipped = append(out.Skipped, missing.skip(id, path))
+				}
+				continue
+			}
 			out.Skipped = append(out.Skipped, uc.skipFailure(filepath.Join(uc.paths.TaskLogsRoot, id.String()), LogSkipLivenessCheckFailed, err))
 			continue
 		}
@@ -403,7 +421,7 @@ func (uc *EvictLogsUseCase) rotateIfNeeded(ctx context.Context, in EvictLogsInpu
 	return rotated, nil
 }
 
-func (uc *EvictLogsUseCase) deleteCandidates(ctx context.Context, candidates []LogDeletionCandidate) (deleted []string, skipped []LogSkipped, err error) {
+func (uc *EvictLogsUseCase) deleteCandidatesInScan(ctx context.Context, candidates []LogDeletionCandidate, missing taskLockMissingScan) (deleted []string, skipped []LogSkipped, err error) {
 	deleted = []string{}
 	skipped = []LogSkipped{}
 	if err := uc.validateDeletionCandidates(candidates); err != nil {
@@ -416,6 +434,10 @@ func (uc *EvictLogsUseCase) deleteCandidates(ctx context.Context, candidates []L
 		if candidate.Category == LogCategoryPerTaskLog && candidate.TaskID != nil {
 			lease, dead, leaseErr := uc.locks.AcquireDeathLease(*candidate.TaskID)
 			if leaseErr != nil {
+				if errors.Is(leaseErr, domain.ErrTaskNotFound) {
+					skipped = append(skipped, missing.skip(*candidate.TaskID, candidate.Path))
+					continue
+				}
 				skipped = append(skipped, uc.skipFailure(candidate.Path, LogSkipLivenessCheckFailed, leaseErr))
 				continue
 			}
@@ -501,6 +523,13 @@ func (uc *EvictLogsUseCase) isDaemonWideGeneration(path string) bool {
 func (uc *EvictLogsUseCase) skipFailure(path string, reason LogSkipReason, err error) LogSkipped {
 	uc.logger.Warn("log lifecycle operation failed", "code", logRotationFailedCode, "path", path, "reason", reason, "error", err)
 	return LogSkipped{Path: path, Reason: reason}
+}
+
+func (uc *EvictLogsUseCase) warnTaskLocksMissing(missing taskLockMissingScan) {
+	if len(missing) == 0 {
+		return
+	}
+	uc.logger.Warn("task liveness locks are missing", "code", logRotationFailedCode, "reason", LogSkipTaskLockMissing, "count", len(missing))
 }
 
 func metricMonth(path string) string {

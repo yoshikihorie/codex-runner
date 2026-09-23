@@ -88,12 +88,14 @@ func TestNewEvictLogsUseCaseRejectsNonPositiveRetention(t *testing.T) {
 }
 
 func TestEvictLogsPlanSkipsTaskWhenLivenessLockIsMissing(t *testing.T) {
-	id := testLogTaskID(t)
-	path := filepath.Join(t.TempDir(), "stdout.log")
-	logs := &logStoreStub{perTask: map[domain.TaskID][]string{id: {path}}, ages: map[string]int{path: 2}}
+	paths, id := testLogPaths(t), testLogTaskID(t)
+	files := testTaskLogs(paths, id)
+	logs := &logStoreStub{perTask: map[domain.TaskID][]string{id: files}, ages: testAges(files, 2)}
 	uc, err := NewEvictLogsUseCase(logs, NewCheckLivenessUseCase(domain.LivenessLockFunc(func(string) (bool, error) {
 		return false, domain.ErrTaskNotFound
-	}), func(domain.TaskID) string { return filepath.Join(t.TempDir(), "task.lock") }), testLogPolicy(), testLogPaths(t))
+	}), func(taskID domain.TaskID) string {
+		return filepath.Join(paths.TaskLogsRoot, taskID.String(), "task.lock")
+	}), testLogPolicy(), paths)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -101,26 +103,210 @@ func TestEvictLogsPlanSkipsTaskWhenLivenessLockIsMissing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(out.Candidates) != 0 || len(out.Skipped) != 1 || out.Skipped[0].Reason != LogSkipLivenessCheckFailed {
-		t.Fatalf("Plan() = %+v, want liveness failure skip without candidates", out)
+	if len(out.Candidates) != 0 || len(out.Deleted) != 0 || len(out.Skipped) != len(files) {
+		t.Fatalf("Plan() = %+v, want one task-lock-missing skip per file without candidates", out)
+	}
+	for index, skipped := range out.Skipped {
+		if skipped.Path != files[index] || skipped.Reason != LogSkipReason("task_lock_missing") {
+			t.Fatalf("Skipped[%d] = %+v, want path=%q reason=task_lock_missing", index, skipped, files[index])
+		}
+	}
+	for _, path := range files {
+		if logs.ageCalls[path] != 0 {
+			t.Fatalf("AgeDays(%q) calls = %d, want 0", path, logs.ageCalls[path])
+		}
 	}
 }
 
 func TestEvictLogsDeleteCandidatesSkipsMissingLivenessLock(t *testing.T) {
-	id := testLogTaskID(t)
 	paths := testLogPaths(t)
-	path := filepath.Join(paths.TaskLogsRoot, id.String(), "stdout.log")
+	missingID, otherID := testLogTaskID(t), testLogTaskIDWithSuffix(t, "b2c3")
+	missingPaths := testTaskLogs(paths, missingID)
+	otherRoot := filepath.Join(paths.TaskLogsRoot, otherID.String())
+	if err := os.MkdirAll(otherRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	otherLock, err := AcquireForChild(otherRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := otherLock.Close(); err != nil {
+		t.Fatal(err)
+	}
+	otherPath := filepath.Join(otherRoot, "stdout.log")
 	logs := &logStoreStub{}
-	uc, err := NewEvictLogsUseCase(logs, NewCheckLivenessUseCase(nil, func(domain.TaskID) string { return filepath.Join(t.TempDir(), "task.lock") }), testLogPolicy(), paths)
+	var buffer bytes.Buffer
+	uc, err := NewEvictLogsUseCase(logs, NewCheckLivenessUseCase(nil, func(taskID domain.TaskID) string {
+		return filepath.Join(paths.TaskLogsRoot, taskID.String(), "task.lock")
+	}), testLogPolicy(), paths, slog.New(slog.NewJSONHandler(&buffer, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	deleted, skipped, err := uc.deleteCandidates(context.Background(), []LogDeletionCandidate{{Path: path, Category: LogCategoryPerTaskLog, TaskID: &id}})
+	out, err := uc.Execute(context.Background(), EvictLogsInput{Trigger: TriggerExplicit, OccurredAt: testLogNow()}, []LogDeletionCandidate{
+		{Path: missingPaths[0], Category: LogCategoryPerTaskLog, TaskID: &missingID},
+		{Path: missingPaths[1], Category: LogCategoryPerTaskLog, TaskID: &missingID},
+		{Path: missingPaths[2], Category: LogCategoryPerTaskLog, TaskID: &missingID},
+		{Path: otherPath, Category: LogCategoryPerTaskLog, TaskID: &otherID},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(deleted) != 0 || logs.removes != 0 || len(skipped) != 1 || skipped[0].Reason != LogSkipLivenessCheckFailed {
-		t.Fatalf("deleteCandidates() = deleted=%v skipped=%v removes=%d", deleted, skipped, logs.removes)
+	if !samePaths(out.Deleted, []string{otherPath}) || len(logs.removeCalls) != 1 || logs.removeCalls[0] != otherPath || len(out.Skipped) != len(missingPaths) {
+		t.Fatalf("Execute() = %+v removeCalls=%v", out, logs.removeCalls)
+	}
+	for index, skipped := range out.Skipped {
+		if skipped.Path != missingPaths[index] || skipped.Reason != LogSkipTaskLockMissing {
+			t.Fatalf("Skipped[%d] = %+v, want path=%q reason=%s", index, skipped, missingPaths[index], LogSkipTaskLockMissing)
+		}
+	}
+	records := testJSONLogRecords(t, buffer.Bytes())
+	matching := matchingLogRecords(records, logRotationFailedCode, "task_lock_missing")
+	if len(matching) != 1 || matching[0]["count"] != float64(1) || matching[0]["path"] != nil || matching[0]["task_id"] != nil {
+		t.Fatalf("task_lock_missing records = %#v, want one aggregate count=1 without path or task_id", matching)
+	}
+}
+
+func TestEvictLogsAutomaticAggregatesPlanAndDeleteMissingTaskLocks(t *testing.T) {
+	paths := testLogPaths(t)
+	planMissingID, deleteMissingID := testLogTaskID(t), testLogTaskIDWithSuffix(t, "b2c3")
+	planMissingPath := testTaskLogs(paths, planMissingID)[0]
+	deleteMissingPath := testTaskLogs(paths, deleteMissingID)[0]
+	logs := &logStoreStub{
+		perTask: map[domain.TaskID][]string{
+			planMissingID:   {planMissingPath},
+			deleteMissingID: {deleteMissingPath},
+		},
+		ages: map[string]int{deleteMissingPath: 2},
+	}
+	var buffer bytes.Buffer
+	lock := domain.LivenessLockFunc(func(path string) (bool, error) {
+		if strings.Contains(path, planMissingID.String()) {
+			return false, domain.ErrTaskNotFound
+		}
+		return true, nil
+	})
+	uc := testEvictLogsUseCase(t, logs, paths, lock, slog.New(slog.NewJSONHandler(&buffer, nil)))
+
+	out, err := uc.Execute(context.Background(), EvictLogsInput{Trigger: TriggerAutomatic, OccurredAt: testLogNow()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Candidates) != 1 || out.Candidates[0].Path != deleteMissingPath || len(out.Deleted) != 0 || len(out.Skipped) != 2 {
+		t.Fatalf("Execute() = %+v, want plan and delete missing locks skipped", out)
+	}
+	if out.Skipped[0].Path != planMissingPath || out.Skipped[0].Reason != LogSkipTaskLockMissing || out.Skipped[1].Path != deleteMissingPath || out.Skipped[1].Reason != LogSkipTaskLockMissing {
+		t.Fatalf("Skipped = %+v, want plan then delete task_lock_missing", out.Skipped)
+	}
+	if len(logs.removeCalls) != 0 {
+		t.Fatalf("Remove calls = %v, want none", logs.removeCalls)
+	}
+	matching := matchingLogRecords(testJSONLogRecords(t, buffer.Bytes()), logRotationFailedCode, string(LogSkipTaskLockMissing))
+	if len(matching) != 1 || matching[0]["count"] != float64(2) || matching[0]["path"] != nil || matching[0]["task_id"] != nil {
+		t.Fatalf("task_lock_missing records = %#v, want one aggregate count=2 without path or task_id", matching)
+	}
+}
+
+func TestEvictLogsExplicitSeparatesPlanAndExecuteMissingTaskLockWarnings(t *testing.T) {
+	paths := testLogPaths(t)
+	planMissingID, deleteMissingID := testLogTaskID(t), testLogTaskIDWithSuffix(t, "b2c3")
+	planMissingPath := testTaskLogs(paths, planMissingID)[0]
+	deleteMissingPath := testTaskLogs(paths, deleteMissingID)[0]
+	logs := &logStoreStub{
+		perTask: map[domain.TaskID][]string{
+			planMissingID:   {planMissingPath},
+			deleteMissingID: {deleteMissingPath},
+		},
+		ages: map[string]int{deleteMissingPath: 2},
+	}
+	var buffer bytes.Buffer
+	lock := domain.LivenessLockFunc(func(path string) (bool, error) {
+		if strings.Contains(path, planMissingID.String()) {
+			return false, domain.ErrTaskNotFound
+		}
+		return true, nil
+	})
+	uc := testEvictLogsUseCase(t, logs, paths, lock, slog.New(slog.NewJSONHandler(&buffer, nil)))
+	in := EvictLogsInput{Trigger: TriggerExplicit, OccurredAt: testLogNow()}
+
+	planned, err := uc.Plan(context.Background(), in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(planned.Candidates) != 1 || planned.Candidates[0].Path != deleteMissingPath || len(planned.Skipped) != 1 || planned.Skipped[0].Path != planMissingPath || planned.Skipped[0].Reason != LogSkipTaskLockMissing {
+		t.Fatalf("Plan() = %+v, want task A skipped and task B confirmed", planned)
+	}
+	planWarnings := matchingLogRecords(testJSONLogRecords(t, buffer.Bytes()), logRotationFailedCode, string(LogSkipTaskLockMissing))
+	if len(planWarnings) != 1 || planWarnings[0]["count"] != float64(1) || planWarnings[0]["path"] != nil || planWarnings[0]["task_id"] != nil {
+		t.Fatalf("Plan task_lock_missing records = %#v, want one aggregate count=1 without path or task_id", planWarnings)
+	}
+
+	buffer.Reset()
+	executed, err := uc.Execute(context.Background(), in, planned.Candidates)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(executed.Deleted) != 0 || len(executed.Skipped) != 1 || executed.Skipped[0].Path != deleteMissingPath || executed.Skipped[0].Reason != LogSkipTaskLockMissing {
+		t.Fatalf("Execute() = %+v, want only task B skipped", executed)
+	}
+	if len(logs.removeCalls) != 0 {
+		t.Fatalf("Remove calls = %v, want none", logs.removeCalls)
+	}
+	executeWarnings := matchingLogRecords(testJSONLogRecords(t, buffer.Bytes()), logRotationFailedCode, string(LogSkipTaskLockMissing))
+	if len(executeWarnings) != 1 || executeWarnings[0]["count"] != float64(1) || executeWarnings[0]["path"] != nil || executeWarnings[0]["task_id"] != nil {
+		t.Fatalf("Execute task_lock_missing records = %#v, want one aggregate count=1 without path or task_id", executeWarnings)
+	}
+	if len(planWarnings)+len(executeWarnings) != 2 {
+		t.Fatalf("explicit cleanup warning count = %d, want 2", len(planWarnings)+len(executeWarnings))
+	}
+}
+
+func TestEvictLogsAggregatesMissingTaskLockWarnings(t *testing.T) {
+	paths := testLogPaths(t)
+	ids := []domain.TaskID{testLogTaskID(t), testLogTaskIDWithSuffix(t, "b2c3"), testLogTaskIDWithSuffix(t, "c3d4")}
+	perTask := make(map[domain.TaskID][]string, len(ids))
+	for _, id := range ids {
+		perTask[id] = testTaskLogs(paths, id)
+	}
+	logs := &logStoreStub{perTask: perTask}
+	var buffer bytes.Buffer
+	uc := testEvictLogsUseCase(t, logs, paths, domain.LivenessLockFunc(func(string) (bool, error) {
+		return false, domain.ErrTaskNotFound
+	}), slog.New(slog.NewJSONHandler(&buffer, nil)))
+
+	out, err := uc.Execute(context.Background(), EvictLogsInput{Trigger: TriggerAutomatic, OccurredAt: testLogNow()}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out.Candidates) != 0 || len(out.Deleted) != 0 || len(out.Skipped) != len(ids)*3 {
+		t.Fatalf("Execute() = %+v, want all task logs skipped", out)
+	}
+	records := testJSONLogRecords(t, buffer.Bytes())
+	matching := matchingLogRecords(records, logRotationFailedCode, "task_lock_missing")
+	if len(matching) != 1 || matching[0]["count"] != float64(len(ids)) || matching[0]["path"] != nil || matching[0]["task_id"] != nil {
+		t.Fatalf("task_lock_missing records = %#v, want one aggregate count=%d without path or task_id", matching, len(ids))
+	}
+	encoded, err := json.Marshal(matching[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for id, files := range perTask {
+		if bytes.Contains(encoded, []byte(id.String())) {
+			t.Fatalf("aggregate record contains task ID %q: %s", id, encoded)
+		}
+		for _, path := range files {
+			if bytes.Contains(encoded, []byte(path)) {
+				t.Fatalf("aggregate record contains path %q: %s", path, encoded)
+			}
+		}
+	}
+
+	buffer.Reset()
+	logs.perTask = nil
+	if _, err := uc.Execute(context.Background(), EvictLogsInput{Trigger: TriggerAutomatic, OccurredAt: testLogNow()}, nil); err != nil {
+		t.Fatal(err)
+	}
+	if matching := matchingLogRecords(testJSONLogRecords(t, buffer.Bytes()), logRotationFailedCode, "task_lock_missing"); len(matching) != 0 {
+		t.Fatalf("task_lock_missing records with no matching task = %#v, want none", matching)
 	}
 }
 
@@ -337,21 +523,44 @@ func TestEvictLogsDeleteCandidatesContinuesAfterRemoveFailure(t *testing.T) {
 	var buffer bytes.Buffer
 	logs := &logStoreStub{removeErrs: map[string]error{a: errors.New("permission denied")}}
 	uc := testEvictLogsUseCase(t, logs, paths, domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }), slog.New(slog.NewTextHandler(&buffer, nil)))
-	deleted, skipped, err := uc.deleteCandidates(context.Background(), testGenerationCandidates(a, b, c))
-	if err != nil || !samePaths(deleted, []string{b, c}) || len(skipped) != 1 || skipped[0].Reason != LogSkipRemoveFailed || !strings.Contains(buffer.String(), logRotationFailedCode) || !strings.Contains(buffer.String(), a) {
-		t.Fatalf("deleted=%v skipped=%v log=%q err=%v", deleted, skipped, buffer.String(), err)
+	out, err := uc.Execute(context.Background(), EvictLogsInput{Trigger: TriggerExplicit, OccurredAt: testLogNow()}, testGenerationCandidates(a, b, c))
+	if err != nil || !samePaths(out.Deleted, []string{b, c}) || len(out.Skipped) != 1 || out.Skipped[0].Reason != LogSkipRemoveFailed || !strings.Contains(buffer.String(), logRotationFailedCode) || !strings.Contains(buffer.String(), a) {
+		t.Fatalf("out=%+v log=%q err=%v", out, buffer.String(), err)
 	}
 }
 
 func TestEvictLogsPlanLogsLivenessCheckFailure(t *testing.T) {
-	paths, id := testLogPaths(t), testLogTaskID(t)
-	files := testTaskLogs(paths, id)
+	paths := testLogPaths(t)
+	ids := []domain.TaskID{testLogTaskID(t), testLogTaskIDWithSuffix(t, "b2c3")}
+	perTask := make(map[domain.TaskID][]string, len(ids))
+	for _, id := range ids {
+		perTask[id] = testTaskLogs(paths, id)
+	}
 	var buffer bytes.Buffer
-	logs := &logStoreStub{perTask: map[domain.TaskID][]string{id: files}, ages: testAges(files, 2)}
-	uc := testEvictLogsUseCase(t, logs, paths, domain.LivenessLockFunc(func(string) (bool, error) { return false, errors.New("broken lock") }), slog.New(slog.NewTextHandler(&buffer, nil)))
+	logs := &logStoreStub{perTask: perTask}
+	uc := testEvictLogsUseCase(t, logs, paths, domain.LivenessLockFunc(func(string) (bool, error) { return false, errors.New("broken lock") }), slog.New(slog.NewJSONHandler(&buffer, nil)))
 	out, err := uc.Plan(context.Background(), EvictLogsInput{Trigger: TriggerAutomatic, OccurredAt: testLogNow()})
-	if err != nil || len(out.Candidates) != 0 || len(out.Skipped) != 1 || out.Skipped[0].Reason != LogSkipLivenessCheckFailed || !strings.Contains(buffer.String(), logRotationFailedCode) || !strings.Contains(buffer.String(), "broken lock") {
+	if err != nil || len(out.Candidates) != 0 || len(out.Skipped) != len(ids) {
 		t.Fatalf("out=%+v log=%q err=%v", out, buffer.String(), err)
+	}
+	for _, skipped := range out.Skipped {
+		if skipped.Reason != LogSkipLivenessCheckFailed {
+			t.Fatalf("Skipped = %+v, want liveness_check_failed", out.Skipped)
+		}
+	}
+	records := testJSONLogRecords(t, buffer.Bytes())
+	matching := matchingLogRecords(records, logRotationFailedCode, string(LogSkipLivenessCheckFailed))
+	if len(matching) != len(ids) {
+		t.Fatalf("liveness_check_failed records = %#v, want %d", matching, len(ids))
+	}
+	for _, record := range matching {
+		path, ok := record["path"].(string)
+		if !ok || !strings.HasPrefix(path, paths.TaskLogsRoot) || record["error"] == nil {
+			t.Fatalf("liveness_check_failed record = %#v, want identifying path and error", record)
+		}
+	}
+	if matching := matchingLogRecords(records, logRotationFailedCode, "task_lock_missing"); len(matching) != 0 {
+		t.Fatalf("task_lock_missing records = %#v, want none", matching)
 	}
 }
 
@@ -381,9 +590,9 @@ func TestEvictLogsDeleteCandidatesTreatsMissingFileAsSuccess(t *testing.T) {
 		t.Fatal(err)
 	}
 	uc := testEvictLogsUseCase(t, logs, paths, domain.LivenessLockFunc(func(string) (bool, error) { return true, nil }))
-	deleted, skipped, err := uc.deleteCandidates(context.Background(), testGenerationCandidates(missing, next))
-	if err != nil || !samePaths(deleted, []string{missing, next}) || len(skipped) != 0 {
-		t.Fatalf("deleted=%v skipped=%v err=%v", deleted, skipped, err)
+	out, err := uc.Execute(context.Background(), EvictLogsInput{Trigger: TriggerExplicit, OccurredAt: testLogNow()}, testGenerationCandidates(missing, next))
+	if err != nil || !samePaths(out.Deleted, []string{missing, next}) || len(out.Skipped) != 0 {
+		t.Fatalf("out=%+v err=%v", out, err)
 	}
 }
 
@@ -437,7 +646,7 @@ func TestEvictLogsAutomaticResumesAfterInterruptedDeletion(t *testing.T) {
 	logs := store.NewFileLogStore(nil)
 	uc := testEvictLogsUseCase(t, logs, paths, domain.LivenessLockFunc(store.TryAcquireLiveness))
 	first := []LogDeletionCandidate{{Path: files[0], Category: LogCategoryPerTaskLog, TaskID: &ids[0]}, {Path: files[1], Category: LogCategoryPerTaskLog, TaskID: &ids[1]}}
-	if _, _, err := uc.deleteCandidates(context.Background(), first); err != nil {
+	if _, err := uc.Execute(context.Background(), EvictLogsInput{Trigger: TriggerExplicit, OccurredAt: testLogNow()}, first); err != nil {
 		t.Fatal(err)
 	}
 	if got, err := os.ReadFile(files[2]); err != nil || string(got) != "complete" {
@@ -476,9 +685,9 @@ func TestEvictLogsDeletesOnlyPerTaskLogFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	uc := testEvictLogsUseCase(t, logs, paths, domain.LivenessLockFunc(store.TryAcquireLiveness))
-	deleted, _, err := uc.deleteCandidates(context.Background(), candidates)
-	if err != nil || len(deleted) != 3 {
-		t.Fatalf("deleted=%v err=%v", deleted, err)
+	out, err := uc.Execute(context.Background(), EvictLogsInput{Trigger: TriggerExplicit, OccurredAt: testLogNow()}, candidates)
+	if err != nil || len(out.Deleted) != 3 {
+		t.Fatalf("out=%+v err=%v", out, err)
 	}
 	for _, name := range names[3:] {
 		if _, err := os.Stat(filepath.Join(root, name)); err != nil {
@@ -603,6 +812,30 @@ func hasCandidate(candidates []LogDeletionCandidate, path string) bool {
 		}
 	}
 	return false
+}
+
+func testJSONLogRecords(t *testing.T, data []byte) []map[string]any {
+	t.Helper()
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	records := []map[string]any{}
+	for decoder.More() {
+		var record map[string]any
+		if err := decoder.Decode(&record); err != nil {
+			t.Fatalf("decode log record: %v\nlog=%s", err, data)
+		}
+		records = append(records, record)
+	}
+	return records
+}
+
+func matchingLogRecords(records []map[string]any, code, reason string) []map[string]any {
+	matching := []map[string]any{}
+	for _, record := range records {
+		if record["level"] == "WARN" && record["code"] == code && record["reason"] == reason {
+			matching = append(matching, record)
+		}
+	}
+	return matching
 }
 
 func testPingServer(conn net.Conn) {
