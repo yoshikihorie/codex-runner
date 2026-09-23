@@ -123,7 +123,7 @@ func (s *FileLogStore) ListRotatedGenerations(path string) ([]string, error) {
 		return nil, fmt.Errorf("log path must be a normalized absolute path: %q", path)
 	}
 	dir := filepath.Dir(path)
-	entries, err := os.ReadDir(dir)
+	entries, err := s.readDir(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -134,6 +134,9 @@ func (s *FileLogStore) ListRotatedGenerations(path string) ([]string, error) {
 			continue
 		}
 		info, err := entry.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -226,7 +229,7 @@ func (s *FileLogStore) ListMonthlyMetricsFiles(dir string) ([]string, error) {
 	if dir == "" || !filepath.IsAbs(dir) || filepath.Clean(dir) != dir {
 		return nil, fmt.Errorf("metrics directory must be a normalized absolute path: %q", dir)
 	}
-	entries, err := os.ReadDir(dir)
+	entries, err := s.readDir(dir)
 	if err != nil {
 		return nil, err
 	}
@@ -237,6 +240,9 @@ func (s *FileLogStore) ListMonthlyMetricsFiles(dir string) ([]string, error) {
 			continue
 		}
 		info, err := entry.Info()
+		if errors.Is(err, fs.ErrNotExist) {
+			continue
+		}
 		if err != nil {
 			return nil, err
 		}

@@ -68,6 +68,111 @@ func TestFileLogStoreListRotatedGenerationsIncludesOnlyValidGenerations(t *testi
 	}
 }
 
+func TestFileLogStoreListRotatedGenerationsSkipsGenerationRemovedAfterReadDir(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "codexd.log")
+	preceding := path + ".20260923T115959.000000000Z"
+	disappearing := path + ".20260923T120000.000000000Z"
+	following := path + ".20260923T120001.000000000Z"
+	for _, generation := range []string{preceding, disappearing, following} {
+		if err := os.WriteFile(generation, []byte("log"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	store := NewFileLogStore(nil)
+	store.readDir = func(path string) ([]os.DirEntry, error) {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.Remove(disappearing); err != nil {
+			return nil, err
+		}
+		return entries, nil
+	}
+
+	got, err := store.ListRotatedGenerations(path)
+	if err != nil {
+		t.Fatalf("ListRotatedGenerations() error = %v", err)
+	}
+	want := []string{preceding, following}
+	if len(got) != len(want) {
+		t.Fatalf("ListRotatedGenerations() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ListRotatedGenerations() = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestFileLogStoreListRotatedGenerationsSkipsInjectedNotExistInfoEntry(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "codexd.log")
+	preceding := path + ".20260923T115959.000000000Z"
+	disappearing := path + ".20260923T120000.000000000Z"
+	following := path + ".20260923T120001.000000000Z"
+	for _, generation := range []string{preceding, following} {
+		if err := os.WriteFile(generation, []byte("log"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	store := NewFileLogStore(nil)
+	store.readDir = func(path string) ([]os.DirEntry, error) {
+		return insertInfoErrorDirEntry(t, path, infoErrorDirEntry{
+			name: filepath.Base(disappearing),
+			err:  fmt.Errorf("generation disappeared: %w", fs.ErrNotExist),
+		}), nil
+	}
+
+	got, err := store.ListRotatedGenerations(path)
+	if err != nil {
+		t.Fatalf("ListRotatedGenerations() error = %v", err)
+	}
+	want := []string{preceding, following}
+	if len(got) != len(want) {
+		t.Fatalf("ListRotatedGenerations() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ListRotatedGenerations() = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestFileLogStoreListRotatedGenerationsReturnsNotExistWhenDirectoryDoesNotExist(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "missing", "codexd.log")
+
+	files, err := NewFileLogStore(nil).ListRotatedGenerations(path)
+	if files != nil {
+		t.Fatalf("ListRotatedGenerations() files = %v, want nil", files)
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("ListRotatedGenerations() error = %v, want ErrNotExist", err)
+	}
+}
+
+func TestFileLogStoreListRotatedGenerationsReturnsNonNotExistInfoError(t *testing.T) {
+	permissionErr := fmt.Errorf("generation info: %w", fs.ErrPermission)
+	store := NewFileLogStore(nil)
+	store.readDir = func(string) ([]os.DirEntry, error) {
+		return []os.DirEntry{infoErrorDirEntry{
+			name: "codexd.log.20260923T120000.000000000Z",
+			err:  permissionErr,
+		}}, nil
+	}
+
+	files, err := store.ListRotatedGenerations(filepath.Join(t.TempDir(), "codexd.log"))
+	if files != nil {
+		t.Fatalf("ListRotatedGenerations() files = %v, want nil", files)
+	}
+	if !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("ListRotatedGenerations() error = %v, want wrapped ErrPermission", err)
+	}
+}
+
 func TestFileLogStoreCompressGenerationPreservesModificationTime(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "codexd.log.20260821T123456.123456789Z")
@@ -139,6 +244,109 @@ func TestFileLogStoreListMonthlyMetricsFilesExcludesUnrelatedNames(t *testing.T)
 		if got[i] != want[i] {
 			t.Fatalf("ListMonthlyMetricsFiles() = %v, want %v", got, want)
 		}
+	}
+}
+
+func TestFileLogStoreListMonthlyMetricsFilesSkipsFileRemovedAfterReadDir(t *testing.T) {
+	dir := t.TempDir()
+	preceding := filepath.Join(dir, "task-metrics-2026-07.jsonl")
+	disappearing := filepath.Join(dir, "task-metrics-2026-08.jsonl")
+	following := filepath.Join(dir, "task-metrics-2026-09.jsonl")
+	for _, metricsFile := range []string{preceding, disappearing, following} {
+		if err := os.WriteFile(metricsFile, []byte("metric"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	store := NewFileLogStore(nil)
+	store.readDir = func(path string) ([]os.DirEntry, error) {
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return nil, err
+		}
+		if err := os.Remove(disappearing); err != nil {
+			return nil, err
+		}
+		return entries, nil
+	}
+
+	got, err := store.ListMonthlyMetricsFiles(dir)
+	if err != nil {
+		t.Fatalf("ListMonthlyMetricsFiles() error = %v", err)
+	}
+	want := []string{preceding, following}
+	if len(got) != len(want) {
+		t.Fatalf("ListMonthlyMetricsFiles() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ListMonthlyMetricsFiles() = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestFileLogStoreListMonthlyMetricsFilesSkipsInjectedNotExistInfoEntry(t *testing.T) {
+	dir := t.TempDir()
+	preceding := filepath.Join(dir, "task-metrics-2026-07.jsonl")
+	disappearing := filepath.Join(dir, "task-metrics-2026-08.jsonl")
+	following := filepath.Join(dir, "task-metrics-2026-09.jsonl")
+	for _, metricsFile := range []string{preceding, following} {
+		if err := os.WriteFile(metricsFile, []byte("metric"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	store := NewFileLogStore(nil)
+	store.readDir = func(path string) ([]os.DirEntry, error) {
+		return insertInfoErrorDirEntry(t, path, infoErrorDirEntry{
+			name: filepath.Base(disappearing),
+			err:  fmt.Errorf("monthly metrics file disappeared: %w", fs.ErrNotExist),
+		}), nil
+	}
+
+	got, err := store.ListMonthlyMetricsFiles(dir)
+	if err != nil {
+		t.Fatalf("ListMonthlyMetricsFiles() error = %v", err)
+	}
+	want := []string{preceding, following}
+	if len(got) != len(want) {
+		t.Fatalf("ListMonthlyMetricsFiles() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("ListMonthlyMetricsFiles() = %v, want %v", got, want)
+		}
+	}
+}
+
+func TestFileLogStoreListMonthlyMetricsFilesReturnsNotExistWhenDirectoryDoesNotExist(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "missing")
+
+	files, err := NewFileLogStore(nil).ListMonthlyMetricsFiles(dir)
+	if files != nil {
+		t.Fatalf("ListMonthlyMetricsFiles() files = %v, want nil", files)
+	}
+	if !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("ListMonthlyMetricsFiles() error = %v, want ErrNotExist", err)
+	}
+}
+
+func TestFileLogStoreListMonthlyMetricsFilesReturnsNonNotExistInfoError(t *testing.T) {
+	permissionErr := fmt.Errorf("monthly metrics file info: %w", fs.ErrPermission)
+	store := NewFileLogStore(nil)
+	store.readDir = func(string) ([]os.DirEntry, error) {
+		return []os.DirEntry{infoErrorDirEntry{
+			name: "task-metrics-2026-08.jsonl",
+			err:  permissionErr,
+		}}, nil
+	}
+
+	files, err := store.ListMonthlyMetricsFiles(t.TempDir())
+	if files != nil {
+		t.Fatalf("ListMonthlyMetricsFiles() files = %v, want nil", files)
+	}
+	if !errors.Is(err, fs.ErrPermission) {
+		t.Fatalf("ListMonthlyMetricsFiles() error = %v, want wrapped ErrPermission", err)
 	}
 }
 
@@ -237,11 +445,64 @@ func TestFileLogStoreListPerTaskLogFilesSkipsTaskRemovedAfterReadDir(t *testing.
 	}
 }
 
+func TestFileLogStoreListPerTaskLogFilesSkipsInjectedNotExistInfoEntry(t *testing.T) {
+	root := t.TempDir()
+	precedingTaskID, err := domain.NewTaskID("impl-20260923-115959-a1b2-preceding")
+	if err != nil {
+		t.Fatal(err)
+	}
+	disappearingTaskID, err := domain.NewTaskID("impl-20260923-120000-a1b2-disappearing")
+	if err != nil {
+		t.Fatal(err)
+	}
+	followingTaskID, err := domain.NewTaskID("impl-20260923-120001-c3d4-following")
+	if err != nil {
+		t.Fatal(err)
+	}
+	precedingTaskDir := filepath.Join(root, precedingTaskID.String())
+	followingTaskDir := filepath.Join(root, followingTaskID.String())
+	for _, taskDir := range []string{precedingTaskDir, followingTaskDir} {
+		if err := os.Mkdir(taskDir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(taskDir, "stdout.log"), nil, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	store := NewFileLogStore(nil)
+	store.readDir = func(path string) ([]os.DirEntry, error) {
+		return insertInfoErrorDirEntry(t, path, infoErrorDirEntry{
+			name: disappearingTaskID.String(),
+			err:  fmt.Errorf("task directory disappeared: %w", fs.ErrNotExist),
+		}), nil
+	}
+
+	files, err := store.ListPerTaskLogFiles(root)
+	if err != nil {
+		t.Fatalf("ListPerTaskLogFiles() error = %v", err)
+	}
+	if _, ok := files[disappearingTaskID]; ok {
+		t.Fatalf("ListPerTaskLogFiles() contains disappeared task %q", disappearingTaskID)
+	}
+	precedingLog := filepath.Join(precedingTaskDir, "stdout.log")
+	if got := files[precedingTaskID]; len(got) != 1 || got[0] != precedingLog {
+		t.Fatalf("ListPerTaskLogFiles()[%q] = %v, want [%q]", precedingTaskID, got, precedingLog)
+	}
+	followingLog := filepath.Join(followingTaskDir, "stdout.log")
+	if got := files[followingTaskID]; len(got) != 1 || got[0] != followingLog {
+		t.Fatalf("ListPerTaskLogFiles()[%q] = %v, want [%q]", followingTaskID, got, followingLog)
+	}
+}
+
 func TestFileLogStoreListPerTaskLogFilesReturnsNonNotExistInfoError(t *testing.T) {
 	permissionErr := fmt.Errorf("task directory info: %w", fs.ErrPermission)
 	store := NewFileLogStore(nil)
 	store.readDir = func(string) ([]os.DirEntry, error) {
-		return []os.DirEntry{infoErrorDirEntry{err: permissionErr}}, nil
+		return []os.DirEntry{infoErrorDirEntry{
+			name: "impl-20260923-120002-e5f6-error",
+			err:  permissionErr,
+		}}, nil
 	}
 
 	files, err := store.ListPerTaskLogFiles(t.TempDir())
@@ -269,13 +530,26 @@ func TestFileLogStoreListPerTaskLogFilesReturnsEmptyMapWhenRootDoesNotExist(t *t
 }
 
 type infoErrorDirEntry struct {
-	err error
+	name string
+	err  error
 }
 
-func (e infoErrorDirEntry) Name() string               { return "impl-20260923-120002-e5f6-error" }
+func (e infoErrorDirEntry) Name() string               { return e.name }
 func (e infoErrorDirEntry) IsDir() bool                { return true }
 func (e infoErrorDirEntry) Type() fs.FileMode          { return fs.ModeDir }
 func (e infoErrorDirEntry) Info() (fs.FileInfo, error) { return nil, e.err }
+
+func insertInfoErrorDirEntry(t *testing.T, path string, entry infoErrorDirEntry) []os.DirEntry {
+	t.Helper()
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("os.ReadDir(%q) returned %d entries, want 2", path, len(entries))
+	}
+	return []os.DirEntry{entries[0], entry, entries[1]}
+}
 
 func TestRollbackRotationDoesNotReplaceNewActiveLog(t *testing.T) {
 	dir := t.TempDir()
