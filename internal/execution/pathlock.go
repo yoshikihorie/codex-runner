@@ -99,9 +99,8 @@ func NewAcquirePathLockUseCase(mutex PathLockMutex, store PathLockStore, livenes
 
 // Execute atomically checks, repairs, and creates a path-lock snapshot.
 //
-// Known limitation: NormalizePath resolves symbolic links before this method persists ownership,
-// but the current output schema cannot return that normalized path to the caller. A link changed
-// between normalization and the caller's write can therefore make ownership differ from the write target.
+// Known limitation: a symbolic link can change between requested-path normalization and ownership
+// persistence. Once persisted, however, the normalized value is a stable lock ID and is not resolved again.
 func (uc *AcquirePathLockUseCase) Execute(_ context.Context, in AcquirePathLockInput) (out AcquirePathLockOutput, err error) {
 	if err = uc.mutex.Lock(); err != nil {
 		uc.logger.Error("acquire path lock mutex", append([]any{"task_id", in.TaskID.String(), "stage", "Lock"}, pathLockErrorLogArgs(err)...)...)
@@ -171,7 +170,7 @@ func (uc *AcquirePathLockUseCase) Execute(_ context.Context, in AcquirePathLockI
 	}
 	active := make([]*domain.PathLock, 0, len(survivors))
 	for _, snapshot := range survivors {
-		ownedPaths, storedPathIndex, normalizeErr := uc.normalizeAll(snapshot.OwnedPaths)
+		ownedPaths, storedPathIndex, normalizeErr := validateStoredPaths(snapshot.OwnedPaths)
 		if normalizeErr != nil {
 			uc.logger.Error("normalize stored path locks", append([]any{"task_id", in.TaskID.String(), "stage", "normalize-stored", "path_index", storedPathIndex, "path_count", len(snapshot.OwnedPaths)}, pathLockErrorLogArgs(normalizeErr)...)...)
 			return AcquirePathLockOutput{}, fmt.Errorf("%w: %v", domain.ErrPathLockInfraFailure, normalizeErr)
@@ -215,6 +214,19 @@ func (uc *AcquirePathLockUseCase) normalizeAll(rawPaths []string) ([]domain.Norm
 	normalized := make([]domain.NormalizedPath, 0, len(rawPaths))
 	for index, raw := range rawPaths {
 		path, err := uc.normalizeFn(raw, runtime.GOOS == "darwin")
+		if err != nil {
+			return nil, index, err
+		}
+		normalized = append(normalized, path)
+	}
+	return normalized, -1, nil
+}
+
+// validateStoredPaths reconstructs stable lock IDs without filesystem I/O.
+func validateStoredPaths(rawPaths []string) ([]domain.NormalizedPath, int, error) {
+	normalized := make([]domain.NormalizedPath, 0, len(rawPaths))
+	for index, raw := range rawPaths {
+		path, err := domain.NewNormalizedPath(raw)
 		if err != nil {
 			return nil, index, err
 		}

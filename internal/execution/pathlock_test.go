@@ -50,6 +50,13 @@ func livePathLockAcquirer(t *testing.T, locks PathLockStore) *AcquirePathLockUse
 	return mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, locks, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), store.NormalizePath, pathLockTaskStateReaderFake{})
 }
 
+func recordingPathNormalizer(calls *[]string) normalizePathFunc {
+	return func(raw string, isMacOS bool) (domain.NormalizedPath, error) {
+		*calls = append(*calls, raw)
+		return store.NormalizePath(raw, isMacOS)
+	}
+}
+
 type pathLockTestMutex struct {
 	locked, unlocked   bool
 	lockErr, unlockErr error
@@ -166,7 +173,11 @@ func TestAcquirePathLockSymlinkConflictWithLiveOwner_SCNLock0105(t *testing.T) {
 	if err := os.Symlink(realDir, alias); err != nil {
 		t.Fatal(err)
 	}
-	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{realFile}}}}
+	normalized, err := store.NormalizePath(realFile, runtime.GOOS == "darwin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{normalized.String()}}}}
 	out, err := livePathLockAcquirer(t, locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{filepath.Join(alias, "file.go")}})
 	if err != nil || out.Acquired || out.ConflictingTaskID == nil || *out.ConflictingTaskID != owner || locks.saved || len(locks.deleted) != 0 {
 		t.Fatalf("out=%+v err=%v store=%+v", out, err, locks)
@@ -179,8 +190,12 @@ func TestAcquirePathLockTrailingSeparatorConflictWithLiveOwner_SCNLock0106(t *te
 	if err := os.Mkdir(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{dir + string(filepath.Separator)}}}}
-	out, err := livePathLockAcquirer(t, locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{dir}})
+	normalized, err := store.NormalizePath(dir, runtime.GOOS == "darwin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{normalized.String()}}}}
+	out, err := livePathLockAcquirer(t, locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{dir + string(filepath.Separator)}})
 	if err != nil || out.Acquired || locks.saved || len(locks.deleted) != 0 {
 		t.Fatalf("out=%+v err=%v store=%+v", out, err, locks)
 	}
@@ -200,18 +215,207 @@ func TestAcquirePathLockMacOSCaseFoldConflictWithLiveOwner_SCNLock0107(t *testin
 	if err := os.WriteFile(upperFile, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	lowerFile := filepath.Join(root, "source", "a.go")
-	if _, err := os.Stat(lowerFile); err != nil {
-		if err := os.Mkdir(filepath.Join(root, "source"), 0o700); err != nil && !os.IsExist(err) {
-			t.Fatal(err)
-		}
-		if err := os.WriteFile(lowerFile, []byte("x"), 0o600); err != nil {
-			t.Fatal(err)
-		}
+	normalized, err := store.NormalizePath(upperFile, true)
+	if err != nil {
+		t.Fatal(err)
 	}
-	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{upperFile}}}}
+	lowerFile := filepath.Join(root, "source", "a.go")
+	if lowerFile == upperFile {
+		t.Fatal("case-variant request path unexpectedly matches stored input")
+	}
+	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{normalized.String()}}}}
 	out, err := livePathLockAcquirer(t, locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{lowerFile}})
 	if err != nil || out.Acquired || locks.saved || len(locks.deleted) != 0 {
+		t.Fatalf("out=%+v err=%v store=%+v", out, err, locks)
+	}
+}
+
+func TestAcquirePathLockMissingFinalComponentSucceeds_SCNLock0113(t *testing.T) {
+	_, requester := pathLockIDs(t)
+	parent := t.TempDir()
+	missing := filepath.Join(parent, "new-file.go")
+	locks := &pathLockTestStore{}
+	out, err := livePathLockAcquirer(t, locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{missing}})
+	resolvedParent, resolveErr := filepath.EvalSymlinks(parent)
+	if resolveErr != nil {
+		t.Fatal(resolveErr)
+	}
+	want := filepath.Join(resolvedParent, filepath.Base(missing))
+	if runtime.GOOS == "darwin" {
+		want = strings.ToLower(want)
+	}
+	if err != nil || !out.Acquired || !locks.saved || len(locks.savedPaths) != 1 || locks.savedPaths[0].String() != want {
+		t.Fatalf("out=%+v err=%v store=%+v", out, err, locks)
+	}
+}
+
+func TestAcquirePathLockTwoMissingComponentsFailClosed_SCNLock0114(t *testing.T) {
+	_, requester := pathLockIDs(t)
+	locks := &pathLockTestStore{}
+	missing := filepath.Join(t.TempDir(), "missing-parent", "new-file.go")
+	out, err := livePathLockAcquirer(t, locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{missing}})
+	if !errors.Is(err, domain.ErrPathLockInfraFailure) || out.Acquired || locks.saved {
+		t.Fatalf("out=%+v err=%v store=%+v", out, err, locks)
+	}
+}
+
+func TestAcquirePathLockDanglingSymlinkFailsClosed_SCNLock0115(t *testing.T) {
+	_, requester := pathLockIDs(t)
+	root := t.TempDir()
+	dangling := filepath.Join(root, "dangling")
+	if err := os.Symlink(filepath.Join(root, "missing-target"), dangling); err != nil {
+		t.Fatal(err)
+	}
+	locks := &pathLockTestStore{}
+	out, err := livePathLockAcquirer(t, locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{dangling}})
+	if !errors.Is(err, domain.ErrPathLockInfraFailure) || out.Acquired || locks.saved {
+		t.Fatalf("out=%+v err=%v store=%+v", out, err, locks)
+	}
+}
+
+func TestAcquirePathLockDoesNotRenormalizeDeletedStoredPath_SCNLock0116(t *testing.T) {
+	owner, requester := pathLockIDs(t)
+	root := t.TempDir()
+	deleted := filepath.Join(root, "deleted.go")
+	if err := os.WriteFile(deleted, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	normalizedDeleted, err := store.NormalizePath(deleted, runtime.GOOS == "darwin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(deleted); err != nil {
+		t.Fatal(err)
+	}
+	requested := filepath.Join(root, "other.go")
+	if err := os.WriteFile(requested, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	calls := []string{}
+	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{normalizedDeleted.String()}}}}
+	uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, locks, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), recordingPathNormalizer(&calls), pathLockTaskStateReaderFake{})
+	out, err := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{requested}})
+	if err != nil || !out.Acquired || !locks.saved || !reflect.DeepEqual(calls, []string{requested}) {
+		t.Fatalf("out=%+v err=%v calls=%v store=%+v", out, err, calls, locks)
+	}
+}
+
+func TestAcquirePathLockDoesNotRenormalizeRenamedStoredPath_SCNLock0116(t *testing.T) {
+	owner, requester := pathLockIDs(t)
+	root := t.TempDir()
+	original := filepath.Join(root, "original.go")
+	if err := os.WriteFile(original, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	normalizedOriginal, err := store.NormalizePath(original, runtime.GOOS == "darwin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(original, filepath.Join(root, "renamed.go")); err != nil {
+		t.Fatal(err)
+	}
+	requested := filepath.Join(root, "other.go")
+	if err := os.WriteFile(requested, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	calls := []string{}
+	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{normalizedOriginal.String()}}}}
+	uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, locks, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), recordingPathNormalizer(&calls), pathLockTaskStateReaderFake{})
+	out, err := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{requested}})
+	if err != nil || !out.Acquired || !locks.saved || !reflect.DeepEqual(calls, []string{requested}) {
+		t.Fatalf("out=%+v err=%v calls=%v store=%+v", out, err, calls, locks)
+	}
+}
+
+func TestAcquirePathLockStoredIDRemainsStableAfterCreation_SCNLock0117(t *testing.T) {
+	owner, requester := pathLockIDs(t)
+	path := filepath.Join(t.TempDir(), "new-file.go")
+	resolvedParent, err := filepath.EvalSymlinks(filepath.Dir(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	storedPath := filepath.Join(resolvedParent, filepath.Base(path))
+	if runtime.GOOS == "darwin" {
+		storedPath = strings.ToLower(storedPath)
+	}
+	normalized, err := domain.NewNormalizedPath(storedPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	calls := []string{}
+	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{normalized.String()}}}}
+	uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, locks, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), recordingPathNormalizer(&calls), pathLockTaskStateReaderFake{})
+	out, err := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{path}})
+	if err != nil || out.Acquired || locks.saved || !reflect.DeepEqual(calls, []string{path}) {
+		t.Fatalf("out=%+v err=%v calls=%v store=%+v", out, err, calls, locks)
+	}
+}
+
+func TestAcquirePathLockDoesNotRenormalizeStoredIDAfterSymlinkCreation_SCNLock0117(t *testing.T) {
+	owner, requester := pathLockIDs(t)
+	root := t.TempDir()
+	path := filepath.Join(root, "new-link")
+	normalized, err := store.NormalizePath(path, runtime.GOOS == "darwin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "target")
+	if err := os.WriteFile(target, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(target, path); err != nil {
+		t.Fatal(err)
+	}
+	requested := filepath.Join(root, "other.go")
+	if err := os.WriteFile(requested, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	calls := []string{}
+	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{normalized.String()}}}}
+	uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, locks, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), recordingPathNormalizer(&calls), pathLockTaskStateReaderFake{})
+	out, err := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{requested}})
+	if err != nil || !out.Acquired || !locks.saved || !reflect.DeepEqual(calls, []string{requested}) {
+		t.Fatalf("out=%+v err=%v calls=%v store=%+v", out, err, calls, locks)
+	}
+}
+
+func TestAcquirePathLockRejectsMalformedStoredPaths_SCNLock0118(t *testing.T) {
+	owner, requester := pathLockIDs(t)
+	requested := filepath.Join(t.TempDir(), "requested.go")
+	if err := os.WriteFile(requested, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, malformed := range []string{"", "relative", "/tmp/../tmp/path", "/tmp/path/"} {
+		t.Run(fmt.Sprintf("stored=%q", malformed), func(t *testing.T) {
+			calls := 0
+			normalize := func(raw string, isMacOS bool) (domain.NormalizedPath, error) {
+				calls++
+				return store.NormalizePath(raw, isMacOS)
+			}
+			locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{malformed}}}}
+			uc := mustNewAcquirePathLockUseCase(t, &pathLockTestMutex{}, locks, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), normalize, pathLockTaskStateReaderFake{})
+			out, err := uc.Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{requested}})
+			if !errors.Is(err, domain.ErrPathLockInfraFailure) || out.Acquired || locks.saved || calls != 1 {
+				t.Fatalf("out=%+v err=%v calls=%d store=%+v", out, err, calls, locks)
+			}
+		})
+	}
+}
+
+func TestAcquirePathLockParentAndChildRemainNonConflicting(t *testing.T) {
+	owner, requester := pathLockIDs(t)
+	parent := t.TempDir()
+	child := filepath.Join(parent, "child.go")
+	normalizedParent, err := store.NormalizePath(parent, runtime.GOOS == "darwin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	locks := &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{normalizedParent.String()}}}}
+	out, err := livePathLockAcquirer(t, locks).Execute(context.Background(), AcquirePathLockInput{TaskID: requester, RequestedPaths: []string{child}})
+	if err != nil || !out.Acquired || !locks.saved {
 		t.Fatalf("out=%+v err=%v store=%+v", out, err, locks)
 	}
 }
@@ -759,7 +963,6 @@ func TestAcquirePathLockUseCaseInfrastructureFailuresAreSentinelErrors(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	storedPath := t.TempDir()
 	failure := errors.New("infrastructure failure")
 	cases := []struct {
 		name      string
@@ -772,12 +975,7 @@ func TestAcquirePathLockUseCaseInfrastructureFailuresAreSentinelErrors(t *testin
 		{"list", &pathLockTestMutex{}, &pathLockTestStore{listErr: failure}, func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, false},
 		{"delete", &pathLockTestMutex{}, &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: taskID, OwnedPaths: []string{path.String()}}}, deleteErr: failure}, func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, true},
 		{"normalize requested", &pathLockTestMutex{}, &pathLockTestStore{}, func(string, bool) (domain.NormalizedPath, error) { return domain.NormalizedPath{}, failure }, false},
-		{"normalize stored", &pathLockTestMutex{}, &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: taskID, OwnedPaths: []string{storedPath}}}}, func(raw string, _ bool) (domain.NormalizedPath, error) {
-			if raw == storedPath {
-				return domain.NormalizedPath{}, failure
-			}
-			return domain.NewNormalizedPath(raw)
-		}, false},
+		{"normalize stored", &pathLockTestMutex{}, &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: taskID, OwnedPaths: []string{"relative"}}}}, func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, false},
 		{"save", &pathLockTestMutex{}, &pathLockTestStore{saveErr: failure}, func(raw string, _ bool) (domain.NormalizedPath, error) { return domain.NewNormalizedPath(raw) }, false},
 	}
 	for _, tc := range cases {
@@ -932,7 +1130,7 @@ func TestDiagnosePathLockErrorClassifiesEvalSymlinksCycle(t *testing.T) {
 	}
 }
 
-func TestAcquirePathLockUseCaseLogsFailureStages(t *testing.T) {
+func TestAcquirePathLockUseCaseLogsFailureStages_SCNLock0112(t *testing.T) {
 	requester, err := domain.NewTaskID("impl-20260809-120000-a1b2-log-requester")
 	if err != nil {
 		t.Fatal(err)
@@ -942,8 +1140,9 @@ func TestAcquirePathLockUseCaseLogsFailureStages(t *testing.T) {
 		t.Fatal(err)
 	}
 	requestedPath := "/tmp/" + pathLockLogCanary + "/requested"
-	storedPath := "/tmp/" + pathLockLogCanary + "/stored"
+	storedPath := pathLockLogCanary + "/stored"
 	rawFailure := &os.PathError{Op: pathLockLogCanary, Path: "/tmp/" + pathLockLogCanary, Err: syscall.ENOTDIR}
+	_, storedFailure := domain.NewNormalizedPath(storedPath)
 	for _, tc := range []struct {
 		name  string
 		stage string
@@ -969,7 +1168,7 @@ func TestAcquirePathLockUseCaseLogsFailureStages(t *testing.T) {
 		{"normalize-stored", "normalize-stored", func() (*pathLockTestMutex, *pathLockTestStore, domain.LivenessLock, normalizePathFunc) {
 			return &pathLockTestMutex{}, &pathLockTestStore{snapshots: []PathLockSnapshot{{TaskID: owner, OwnedPaths: []string{"/tmp/first", storedPath, "/tmp/third"}}}}, domain.LivenessLockFunc(func(string) (bool, error) { return false, nil }), func(raw string, _ bool) (domain.NormalizedPath, error) {
 				if raw == storedPath {
-					return domain.NormalizedPath{}, rawFailure
+					t.Fatal("stored path was passed to requested-path normalizer")
 				}
 				return domain.NewNormalizedPath(raw)
 			}
@@ -990,7 +1189,11 @@ func TestAcquirePathLockUseCaseLogsFailureStages(t *testing.T) {
 			if !errors.Is(acquireErr, domain.ErrPathLockInfraFailure) {
 				t.Fatal("expected path-lock infrastructure failure")
 			}
-			log := requireSafeStageLog(t, capture.snapshot(), requester, tc.stage, rawFailure)
+			expectedFailure := error(rawFailure)
+			if tc.stage == "normalize-stored" {
+				expectedFailure = storedFailure
+			}
+			log := requireSafeStageLog(t, capture.snapshot(), requester, tc.stage, expectedFailure)
 			if tc.stage == "normalize-requested" || tc.stage == "normalize-stored" {
 				if log.attrs["path_index"] != int64(1) || log.attrs["path_count"] != int64(3) {
 					t.Fatalf("normalization position=%#v", log.attrs)
