@@ -14,8 +14,6 @@ import (
 
 type ContractWriter interface {
 	WritePrompt(domain.TaskID, []byte) error
-	WriteReviewInput(domain.TaskID, []byte) error
-	WriteCombinedPrompt(domain.TaskID, []byte) error
 	OpenExecutionLogs(domain.TaskID) (*ExecutionLogs, error)
 	WriteExitCode(domain.TaskID, domain.ExitCode) error
 	WritePartialOutput(domain.TaskID, string) error
@@ -115,12 +113,6 @@ func (w *fileContractWriter) once(id domain.TaskID, path func(string, domain.Tas
 }
 func (w *fileContractWriter) WritePrompt(id domain.TaskID, b []byte) error {
 	return w.once(id, store.PromptMDPath, b)
-}
-func (w *fileContractWriter) WriteReviewInput(id domain.TaskID, b []byte) error {
-	return w.once(id, store.InputTXTPath, b)
-}
-func (w *fileContractWriter) WriteCombinedPrompt(id domain.TaskID, b []byte) error {
-	return w.once(id, store.CombinedPromptMDPath, b)
 }
 func (w *fileContractWriter) OpenExecutionLogs(id domain.TaskID) (*ExecutionLogs, error) {
 	if e := w.verifyTaskDir(id); e != nil {

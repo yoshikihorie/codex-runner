@@ -66,8 +66,6 @@ func TestContractWriterWritesAllContractFiles(t *testing.T) {
 		want  []byte
 	}{
 		{"prompt", func() error { return w.WritePrompt(id, []byte("prompt")) }, store.PromptMDPath, []byte("prompt")},
-		{"input", func() error { return w.WriteReviewInput(id, []byte("input")) }, store.InputTXTPath, []byte("input")},
-		{"combined", func() error { return w.WriteCombinedPrompt(id, []byte("combined")) }, store.CombinedPromptMDPath, []byte("combined")},
 		{"exit", func() error { return w.WriteExitCode(id, domain.NewExitCode(124)) }, store.ExitCodePath, []byte("124\n")},
 		{"partial", func() error { return w.WritePartialOutput(id, "partial") }, store.PartialOutputMDPath, []byte("partial")},
 		{"recovered", func() error { return w.WriteRecoveredMarker(id, time.Date(2026, 8, 6, 12, 0, 1, 0, time.UTC)) }, store.RecoveredAfterTimeoutPath, []byte("2026-08-06T12:00:01+0000\n")},
@@ -152,8 +150,6 @@ func TestContractWriterOnceFilesRejectClobber(t *testing.T) {
 		write func() error
 	}{
 		{"prompt", func() error { return w.WritePrompt(id, []byte("a")) }},
-		{"input", func() error { return w.WriteReviewInput(id, []byte("a")) }},
-		{"combined", func() error { return w.WriteCombinedPrompt(id, []byte("a")) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			if err := tc.write(); err != nil {

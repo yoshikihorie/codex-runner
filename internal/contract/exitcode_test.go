@@ -32,9 +32,7 @@ type exitCodeMismatchExpectation struct {
 	attempted int
 }
 
-func (*exitCodeWriterFake) WritePrompt(domain.TaskID, []byte) error         { return nil }
-func (*exitCodeWriterFake) WriteReviewInput(domain.TaskID, []byte) error    { return nil }
-func (*exitCodeWriterFake) WriteCombinedPrompt(domain.TaskID, []byte) error { return nil }
+func (*exitCodeWriterFake) WritePrompt(domain.TaskID, []byte) error { return nil }
 func (*exitCodeWriterFake) OpenExecutionLogs(domain.TaskID) (*ExecutionLogs, error) {
 	return nil, nil
 }

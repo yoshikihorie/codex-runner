@@ -23,13 +23,13 @@ func TestTaskPathsResolveContractFileNames(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := map[string]string{"task": p.taskJSON(), "events": p.eventsJSONL(), "prompt": p.promptMD(), "input": p.inputTXT(), "combined": p.combinedPromptMD(), "last": p.lastMessageMD(), "schema": p.outputSchemaJSON(), "exit": p.exitCode(), "stdout": p.stdoutLog(), "stderr": p.stderrLog(), "partial": p.partialOutputMD(), "recovered": p.recoveredAfterTimeout(), "adopted": p.adoptedAfterRestart()}
+	want := map[string]string{"task": p.taskJSON(), "events": p.eventsJSONL(), "prompt": p.promptMD(), "last": p.lastMessageMD(), "schema": p.outputSchemaJSON(), "exit": p.exitCode(), "stdout": p.stdoutLog(), "stderr": p.stderrLog(), "partial": p.partialOutputMD(), "recovered": p.recoveredAfterTimeout(), "adopted": p.adoptedAfterRestart()}
 	for name, got := range want {
 		if filepath.Dir(got) != filepath.Join(root, id.String()) {
 			t.Errorf("%s path = %q", name, got)
 		}
 	}
-	if filepath.Base(p.taskJSON()) != "task.json" || filepath.Base(p.eventsJSONL()) != "events.jsonl" || filepath.Base(p.promptMD()) != "prompt.md" || filepath.Base(p.inputTXT()) != "input.txt" || filepath.Base(p.combinedPromptMD()) != "combined-prompt.md" || filepath.Base(p.lastMessageMD()) != "last-message.md" || filepath.Base(p.exitCode()) != "exit-code" || filepath.Base(p.stdoutLog()) != "stdout.log" || filepath.Base(p.stderrLog()) != "stderr.log" || filepath.Base(p.partialOutputMD()) != "partial-output.md" || filepath.Base(p.recoveredAfterTimeout()) != "recovered-after-timeout" || filepath.Base(p.adoptedAfterRestart()) != "adopted-after-restart" {
+	if filepath.Base(p.taskJSON()) != "task.json" || filepath.Base(p.eventsJSONL()) != "events.jsonl" || filepath.Base(p.promptMD()) != "prompt.md" || filepath.Base(p.lastMessageMD()) != "last-message.md" || filepath.Base(p.exitCode()) != "exit-code" || filepath.Base(p.stdoutLog()) != "stdout.log" || filepath.Base(p.stderrLog()) != "stderr.log" || filepath.Base(p.partialOutputMD()) != "partial-output.md" || filepath.Base(p.recoveredAfterTimeout()) != "recovered-after-timeout" || filepath.Base(p.adoptedAfterRestart()) != "adopted-after-restart" {
 		t.Fatal("contract filenames differ from layout")
 	}
 }
@@ -75,7 +75,7 @@ func TestOpenTaskDirRejectsSymlinkedTaskDir(t *testing.T) {
 
 func TestTaskPathsRejectsZeroTaskID(t *testing.T) {
 	root, id := t.TempDir(), domain.TaskID{}
-	for name, path := range map[string]func(string, domain.TaskID) (string, error){"events": EventsJSONLPath, "prompt": PromptMDPath, "input": InputTXTPath, "combined": CombinedPromptMDPath, "exit": ExitCodePath, "stdout": StdoutLogPath, "stderr": StderrLogPath, "partial": PartialOutputMDPath, "recovered": RecoveredAfterTimeoutPath, "adopted": AdoptedAfterRestartPath} {
+	for name, path := range map[string]func(string, domain.TaskID) (string, error){"events": EventsJSONLPath, "prompt": PromptMDPath, "exit": ExitCodePath, "stdout": StdoutLogPath, "stderr": StderrLogPath, "partial": PartialOutputMDPath, "recovered": RecoveredAfterTimeoutPath, "adopted": AdoptedAfterRestartPath} {
 		if _, err := path(root, id); err == nil {
 			t.Errorf("%s accepted zero TaskID", name)
 		}

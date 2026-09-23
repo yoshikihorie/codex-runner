@@ -193,9 +193,7 @@ type adoptionWriterFake struct {
 	onWriteExitCode  func(domain.ExitCode)
 }
 
-func (*adoptionWriterFake) WritePrompt(domain.TaskID, []byte) error         { return nil }
-func (*adoptionWriterFake) WriteReviewInput(domain.TaskID, []byte) error    { return nil }
-func (*adoptionWriterFake) WriteCombinedPrompt(domain.TaskID, []byte) error { return nil }
+func (*adoptionWriterFake) WritePrompt(domain.TaskID, []byte) error { return nil }
 func (*adoptionWriterFake) OpenExecutionLogs(domain.TaskID) (*contract.ExecutionLogs, error) {
 	return nil, nil
 }

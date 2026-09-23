@@ -162,16 +162,12 @@ func runGoldenScenario(t *testing.T, scenario string, family domain.Subcommand, 
 		t.Fatal(err)
 	}
 	dir := filepath.Join(root, id.String())
-	if err := usecase.NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), task, timeout, "test-model", nil, "read-only", t.TempDir(), domain.ExecutionRouteDaemon, "golden prompt\n", now); err != nil {
-		t.Fatal(err)
-	}
+	prompt := "golden prompt\n"
 	if family == domain.SubcommandReview {
-		if err := writer.WriteReviewInput(id, []byte("diff input\n")); err != nil {
-			t.Fatal(err)
-		}
-		if err := writer.WriteCombinedPrompt(id, []byte("golden prompt\n---\n## Input\n\ndiff input\n")); err != nil {
-			t.Fatal(err)
-		}
+		prompt = "golden prompt\n---\n## Input\n\ndiff input\n"
+	}
+	if err := usecase.NewRecordTaskStartingUseCase(tasks, writer).Execute(context.Background(), task, timeout, "test-model", nil, "read-only", t.TempDir(), domain.ExecutionRouteDaemon, prompt, now); err != nil {
+		t.Fatal(err)
 	}
 	m, err := loadManifest(scenario)
 	if err != nil {
@@ -193,8 +189,8 @@ func runGoldenScenario(t *testing.T, scenario string, family domain.Subcommand, 
 			baseline[f.Name] = b
 		}
 	}
-	runner := &goldenRunner{writer: writer, taskDir: dir, taskID: id, family: family, rawExit: rawExit, model: "test-model", prompt: "golden prompt\n"}
-	launched, err := usecase.NewLaunchWithPTYUseCase(runner).Execute(context.Background(), execution.LaunchParams{TaskID: id, Subcommand: family, TaskDirPath: dir, AllowResume: true, Model: "test-model", SandboxMode: "read-only", PromptText: "golden prompt\n"})
+	runner := &goldenRunner{writer: writer, taskDir: dir, taskID: id, family: family, rawExit: rawExit, model: "test-model", prompt: prompt}
+	launched, err := usecase.NewLaunchWithPTYUseCase(runner).Execute(context.Background(), execution.LaunchParams{TaskID: id, Subcommand: family, TaskDirPath: dir, AllowResume: true, Model: "test-model", SandboxMode: "read-only", PromptText: prompt})
 	if err != nil {
 		t.Fatal(err)
 	}

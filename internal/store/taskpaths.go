@@ -30,8 +30,6 @@ func (p taskPaths) dir() string              { return p.root }
 func (p taskPaths) taskJSON() string         { return filepath.Join(p.root, "task.json") }
 func (p taskPaths) eventsJSONL() string      { return filepath.Join(p.root, "events.jsonl") }
 func (p taskPaths) promptMD() string         { return filepath.Join(p.root, "prompt.md") }
-func (p taskPaths) inputTXT() string         { return filepath.Join(p.root, "input.txt") }
-func (p taskPaths) combinedPromptMD() string { return filepath.Join(p.root, "combined-prompt.md") }
 func (p taskPaths) lastMessageMD() string    { return filepath.Join(p.root, "last-message.md") }
 func (p taskPaths) outputSchemaJSON() string { return filepath.Join(p.root, "output-schema.json") }
 func (p taskPaths) exitCode() string         { return filepath.Join(p.root, "exit-code") }
@@ -75,12 +73,6 @@ func EventsJSONLPath(r string, id domain.TaskID) (string, error) {
 }
 func PromptMDPath(r string, id domain.TaskID) (string, error) {
 	return taskPath(r, id, taskPaths.promptMD)
-}
-func InputTXTPath(r string, id domain.TaskID) (string, error) {
-	return taskPath(r, id, taskPaths.inputTXT)
-}
-func CombinedPromptMDPath(r string, id domain.TaskID) (string, error) {
-	return taskPath(r, id, taskPaths.combinedPromptMD)
 }
 func LastMessageMDPath(r string, id domain.TaskID) (string, error) {
 	return taskPath(r, id, taskPaths.lastMessageMD)

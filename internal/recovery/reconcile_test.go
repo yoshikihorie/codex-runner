@@ -229,9 +229,7 @@ type reconcileWriterFake struct {
 	afterEvent       func()
 }
 
-func (*reconcileWriterFake) WritePrompt(domain.TaskID, []byte) error         { return nil }
-func (*reconcileWriterFake) WriteReviewInput(domain.TaskID, []byte) error    { return nil }
-func (*reconcileWriterFake) WriteCombinedPrompt(domain.TaskID, []byte) error { return nil }
+func (*reconcileWriterFake) WritePrompt(domain.TaskID, []byte) error { return nil }
 func (*reconcileWriterFake) OpenExecutionLogs(domain.TaskID) (*contract.ExecutionLogs, error) {
 	return nil, nil
 }

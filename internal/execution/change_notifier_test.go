@@ -145,12 +145,6 @@ func TestNotifyingDecoratorsPromoteNonTargetMethods(t *testing.T) {
 	if err := writer.WritePrompt(id, []byte("prompt")); err != errSentinel {
 		t.Fatal(err)
 	}
-	if err := writer.WriteReviewInput(id, []byte("input")); err != errSentinel {
-		t.Fatal(err)
-	}
-	if err := writer.WriteCombinedPrompt(id, []byte("combined")); err != errSentinel {
-		t.Fatal(err)
-	}
 	if got, err := writer.OpenExecutionLogs(id); got != logs || err != errSentinel {
 		t.Fatalf("logs=%p err=%v", got, err)
 	}
@@ -167,8 +161,8 @@ func TestNotifyingDecoratorsPromoteNonTargetMethods(t *testing.T) {
 	if err := writer.WriteAdoptedMarker(id, at); err != errSentinel {
 		t.Fatal(err)
 	}
-	if writerDelegate.otherCalls.Load() != 8 {
-		t.Fatalf("writer calls = %d, want 8", writerDelegate.otherCalls.Load())
+	if writerDelegate.otherCalls.Load() != 6 {
+		t.Fatalf("writer calls = %d, want 6", writerDelegate.otherCalls.Load())
 	}
 
 	snapshot := changeNotifierSnapshot(id)
@@ -277,14 +271,6 @@ type contractWriterFake struct {
 }
 
 func (f *contractWriterFake) WritePrompt(domain.TaskID, []byte) error {
-	f.otherCalls.Add(1)
-	return f.otherErr
-}
-func (f *contractWriterFake) WriteReviewInput(domain.TaskID, []byte) error {
-	f.otherCalls.Add(1)
-	return f.otherErr
-}
-func (f *contractWriterFake) WriteCombinedPrompt(domain.TaskID, []byte) error {
 	f.otherCalls.Add(1)
 	return f.otherErr
 }

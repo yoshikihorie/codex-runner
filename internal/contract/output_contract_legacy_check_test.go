@@ -24,14 +24,13 @@ func TestOutputContractLegacyCheck(t *testing.T) {
 	if err != nil || id.String() != filepath.Base(dir) {
 		t.Fatal("legacy task directory basename is not a valid task ID")
 	}
-	_, inputErr := os.Lstat(filepath.Join(dir, "input.txt"))
-	_, combinedErr := os.Lstat(filepath.Join(dir, "combined-prompt.md"))
+	if strings.HasPrefix(id.String(), "review-") {
+		t.Skip("legacy review output intentionally differs from daemon review output")
+	}
 	_, recoveredErr := os.Lstat(filepath.Join(dir, "recovered-after-timeout"))
 	_, partialErr := os.Lstat(filepath.Join(dir, "partial-output.md"))
 	scenario := ""
-	if inputErr == nil || combinedErr == nil {
-		scenario = "review-normal"
-	} else if recoveredErr == nil {
+	if recoveredErr == nil {
 		scenario = "research-recovered"
 	} else if partialErr == nil {
 		scenario = "research-recovery-failed"

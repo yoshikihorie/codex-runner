@@ -165,9 +165,7 @@ type timeoutWriterFake struct {
 	trace     *[]string
 }
 
-func (*timeoutWriterFake) WritePrompt(domain.TaskID, []byte) error         { return nil }
-func (*timeoutWriterFake) WriteReviewInput(domain.TaskID, []byte) error    { return nil }
-func (*timeoutWriterFake) WriteCombinedPrompt(domain.TaskID, []byte) error { return nil }
+func (*timeoutWriterFake) WritePrompt(domain.TaskID, []byte) error { return nil }
 func (*timeoutWriterFake) OpenExecutionLogs(domain.TaskID) (*contract.ExecutionLogs, error) {
 	return nil, nil
 }
