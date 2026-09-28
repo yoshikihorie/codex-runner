@@ -439,6 +439,8 @@ func compatibilityModelAllowlist() map[string]map[domain.Subcommand]struct{} {
 		"gpt-5.6-sol":   subcommandSet(all),
 		"gpt-5.6-luna":  subcommandSet([]domain.Subcommand{domain.SubcommandRead}),
 		"gpt-6-astra":   subcommandSet([]domain.Subcommand{domain.SubcommandThink}),
+		"gpt-6-sol":     subcommandSet(all),
+		"gpt-6-luna":    subcommandSet([]domain.Subcommand{domain.SubcommandRead}),
 	}
 }
 

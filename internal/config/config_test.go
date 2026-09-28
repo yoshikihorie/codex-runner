@@ -127,6 +127,36 @@ func TestLoadExplicitUsesCompatibilityModelAllowlistWhenOmitted(t *testing.T) {
 	}
 }
 
+func TestLoadExplicitCompatibilityModelAllowlistIncludesGPT6SolAndLuna(t *testing.T) {
+	c := loadExplicitFile(t, "")
+	if !c.ModelAllowlistDefaulted() {
+		t.Fatal("compatibility model allowlist was not reported")
+	}
+	for _, tt := range []struct {
+		name       string
+		subcommand domain.Subcommand
+	}{
+		{name: "impl", subcommand: domain.SubcommandImpl},
+		{name: "review", subcommand: domain.SubcommandReview},
+		{name: "plan", subcommand: domain.SubcommandPlan},
+		{name: "research", subcommand: domain.SubcommandResearch},
+		{name: "read", subcommand: domain.SubcommandRead},
+		{name: "think", subcommand: domain.SubcommandThink},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			sol := "gpt-6-sol"
+			if model, ok := c.ResolveModel(tt.subcommand, &sol); model != sol || !ok {
+				t.Errorf("ResolveModel(%q, %q) = %q, %t; want %q, true", tt.subcommand, sol, model, ok, sol)
+			}
+			luna := "gpt-6-luna"
+			wantOK := tt.subcommand == domain.SubcommandRead
+			if model, ok := c.ResolveModel(tt.subcommand, &luna); model != luna || ok != wantOK {
+				t.Errorf("ResolveModel(%q, %q) = %q, %t; want %q, %t", tt.subcommand, luna, model, ok, luna, wantOK)
+			}
+		})
+	}
+}
+
 func TestLoadExplicitUsesConfiguredModelAllowlist(t *testing.T) {
 	c := loadExplicitFile(t, `model = "test-future-model"
 [model_allowlist]
