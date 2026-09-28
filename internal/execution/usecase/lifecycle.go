@@ -131,7 +131,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 	}
 	lock, err := o.deps.AcquireForChild(input.TaskDirPath)
 	if err != nil {
-		o.fail(ctx, input, input.WorkingDir, 130, true, launchFailureDetail{"LIVENESS_LOCK_IO_ERROR", "acquire_for_child", err})
+		o.fail(ctx, input, input.WorkingDir, 130, true, launchFailureDetail{code: "LIVENESS_LOCK_IO_ERROR", stage: "acquire_for_child", cause: err, beforeRecordStarting: true})
 		return
 	}
 	if o.stopForCancellation(ctx) {
@@ -145,13 +145,13 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 	if useWorktree {
 		if isNilValue(o.deps.CreateWorktree) {
 			_ = lock.Close()
-			o.fail(ctx, input, nil, 130, true)
+			o.fail(ctx, input, nil, 130, true, launchFailureDetail{beforeRecordStarting: true})
 			return
 		}
 		plannedWorkingDir, err = o.deps.CreateWorktree.ResolveWorkingDir(taskID)
 		if err != nil {
 			_ = lock.Close()
-			o.fail(ctx, input, nil, 130, true)
+			o.fail(ctx, input, nil, 130, true, launchFailureDetail{beforeRecordStarting: true})
 			return
 		}
 		launchPrompt = replaceSourceWorkingDir(input.PromptText, input.SourceWorkingDir, plannedWorkingDir)
@@ -163,12 +163,12 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 	}
 	if workingDir == nil {
 		_ = lock.Close()
-		o.fail(ctx, input, nil, 130, true)
+		o.fail(ctx, input, nil, 130, true, launchFailureDetail{beforeRecordStarting: true})
 		return
 	}
 	if err = o.deps.RecordStarting.Execute(ctx, input.Task, input.ResolvedTimeout, input.Model, input.ReasoningEffort, input.SandboxMode, *workingDir, domain.ExecutionRouteDaemon, launchPrompt, input.Now); err != nil {
 		_ = lock.Close()
-		o.fail(ctx, input, workingDir, 130, true, launchFailureDetail{"CONTRACT_WRITE_FAILED", "record_task_starting", err})
+		o.fail(ctx, input, workingDir, 130, true, launchFailureDetail{code: "CONTRACT_WRITE_FAILED", stage: "record_task_starting", cause: err, beforeRecordStarting: true})
 		return
 	}
 	if useWorktree {
@@ -180,7 +180,7 @@ func (o *TaskLifecycleOrchestrator) Run(ctx context.Context, input TaskLifecycle
 		if createErr != nil || out.WorkingDir != plannedWorkingDir {
 			_ = lock.Close()
 			if createErr != nil {
-				o.fail(ctx, input, workingDir, 130, true, launchFailureDetail{"WORKTREE_CREATE_FAILED", "create_worktree", createErr})
+				o.fail(ctx, input, workingDir, 130, true, launchFailureDetail{code: "WORKTREE_CREATE_FAILED", stage: "create_worktree", cause: createErr})
 			} else {
 				o.fail(ctx, input, workingDir, 130, true)
 			}
@@ -425,9 +425,10 @@ func (o *TaskLifecycleOrchestrator) waitLaunched(taskID domain.TaskID, launched 
 }
 
 type launchFailureDetail struct {
-	code  string
-	stage string
-	cause error
+	code                 string
+	stage                string
+	cause                error
+	beforeRecordStarting bool
 }
 
 func (o *TaskLifecycleOrchestrator) fail(ctx context.Context, input TaskLifecycleInput, workingDir *string, rawExitCode int, estimated bool, details ...launchFailureDetail) bool {
@@ -442,8 +443,7 @@ func (o *TaskLifecycleOrchestrator) fail(ctx context.Context, input TaskLifecycl
 		return false
 	}
 	snapshot, loadErr := o.deps.Tasks.Load(taskID)
-	initialFailure := detail.stage == "acquire_for_child" || detail.stage == "record_task_starting"
-	if loadErr != nil && !(initialFailure && errors.Is(loadErr, domain.ErrTaskNotFound)) {
+	if loadErr != nil && !(detail.beforeRecordStarting && errors.Is(loadErr, domain.ErrTaskNotFound)) {
 		o.deps.TaskMu.Unlock(taskID)
 		o.logger.Warn("reload task before launch failure", "task_id", taskID.String(), "error", loadErr)
 		return false

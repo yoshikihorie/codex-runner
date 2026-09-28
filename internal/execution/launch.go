@@ -439,9 +439,6 @@ func (r *processRunner) Launch(ctx context.Context, p LaunchParams) (*LaunchedPr
 
 	cmd, err := launchNewSession(context.WithoutCancel(ctx), head, p.WorkingDir, proc.SafeChildEnv(), p.LivenessLockFile, logs.Stdout, logs.Stderr, args...)
 	if err != nil {
-		if p.PTYEnabled {
-			return nil, fmt.Errorf("%w: %v", domain.ErrPTYAllocationFailed, err)
-		}
 		return nil, fmt.Errorf("%w: %v", domain.ErrChildProcessLaunchFailed, err)
 	}
 

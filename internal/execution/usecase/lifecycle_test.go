@@ -1342,6 +1342,38 @@ func TestTaskLifecycleRunLaunchPreparationFailuresFailAndStop(t *testing.T) {
 	}
 }
 
+func TestTaskLifecyclePreparationFailuresWithoutSnapshotReleaseResources(t *testing.T) {
+	cases := []struct {
+		name      string
+		configure func(*lifecycleFixture)
+	}{
+		{name: "missing worktree", configure: func(f *lifecycleFixture) { f.orchestrator.deps.CreateWorktree = nil }},
+		{name: "resolve worktree", configure: func(f *lifecycleFixture) { f.worktree.resolveErr = errors.New("resolve worktree") }},
+		{name: "missing working directory", configure: func(f *lifecycleFixture) {
+			f.input.WorktreeMode = domain.WorktreeModeCurrent
+			f.input.WorkingDir = nil
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newLifecycleFixture(t)
+			// This is deps.Tasks, not the store used inside FailLaunch.
+			f.tasks.loads = []lifecycleLoadResult{{err: domain.ErrTaskNotFound}}
+			tc.configure(f)
+			f.run()
+			if f.failStore.saveCalls != 1 || len(f.failStore.saved) != 1 || f.failStore.saved[0].State != domain.StateFailed || f.failStore.saved[0].FailureCode != nil {
+				t.Fatalf("launch failure was not saved without a code: saved=%+v trace=%v", f.failStore.saved, f.trace)
+			}
+			if f.failLocks.calls != 1 || f.failSlots.calls != 1 || !lifecycleTraceSubsequence(f.trace, "task-unlock", "release-path-lock", "release-slot") {
+				t.Fatalf("resources not released after task unlock: %v", f.trace)
+			}
+			if _, err := f.acquire.file.Stat(); !errors.Is(err, os.ErrClosed) {
+				t.Fatalf("liveness lock remains open: %v", err)
+			}
+		})
+	}
+}
+
 func TestTaskLifecycleRunRecordsLaunchFailureCodes(t *testing.T) {
 	cases := []struct {
 		name, code, stage string
@@ -1428,18 +1460,29 @@ func TestTaskLifecycleInitialFailureReleasesResourcesAfterPersistenceErrors(t *t
 }
 
 func TestTaskLifecycleInitialFailureRejectsOtherLoadErrors(t *testing.T) {
-	for _, stage := range []string{"acquire", "starting"} {
-		f := newLifecycleFixture(t)
-		f.tasks.loads = []lifecycleLoadResult{{err: errors.New("read error")}}
-		if stage == "acquire" {
-			f.acquire.err = errors.New("acquire")
-		} else {
-			f.starting.err = errors.New("starting")
-		}
-		f.run()
-		if f.failStore.saveCalls != 0 || f.failSlots.calls != 0 || f.failLocks.calls != 0 || f.pending.calls != 0 || f.killed.lockedCalls != 0 {
-			t.Fatalf("%s continued after load error: %v", stage, f.trace)
-		}
+	cases := []struct {
+		name      string
+		configure func(*lifecycleFixture)
+	}{
+		{name: "acquire", configure: func(f *lifecycleFixture) { f.acquire.err = errors.New("acquire") }},
+		{name: "starting", configure: func(f *lifecycleFixture) { f.starting.err = errors.New("starting") }},
+		{name: "missing worktree", configure: func(f *lifecycleFixture) { f.orchestrator.deps.CreateWorktree = nil }},
+		{name: "resolve worktree", configure: func(f *lifecycleFixture) { f.worktree.resolveErr = errors.New("resolve worktree") }},
+		{name: "missing working directory", configure: func(f *lifecycleFixture) {
+			f.input.WorktreeMode = domain.WorktreeModeCurrent
+			f.input.WorkingDir = nil
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newLifecycleFixture(t)
+			f.tasks.loads = []lifecycleLoadResult{{err: errors.New("read error")}}
+			tc.configure(f)
+			f.run()
+			if f.failStore.saveCalls != 0 || f.failSlots.calls != 0 || f.failLocks.calls != 0 || f.pending.calls != 0 || f.killed.lockedCalls != 0 {
+				t.Fatalf("continued after load error: %v", f.trace)
+			}
+		})
 	}
 }
 

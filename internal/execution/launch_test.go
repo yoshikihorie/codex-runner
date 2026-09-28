@@ -424,15 +424,14 @@ func TestProcessRunnerLaunchMapsErrorsAndClosesLock(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		pty  bool
-		want error
-	}{{"pty", true, domain.ErrPTYAllocationFailed}, {"non-pty", false, domain.ErrChildProcessLaunchFailed}} {
+	}{{"pty", true}, {"non-pty", false}} {
 		t.Run(tt.name, func(t *testing.T) {
 			lock := launchTestLock(t)
 			p := launchTestParams(t, lock)
 			p.PTYEnabled = tt.pty
 			_, err := NewProcessRunner(launchTestLogs{logs: launchTestLogsFor(t)}).Launch(context.Background(), p)
-			if !errors.Is(err, tt.want) {
-				t.Fatalf("error = %v, want %v", err, tt.want)
+			if !errors.Is(err, domain.ErrChildProcessLaunchFailed) || errors.Is(err, domain.ErrPTYAllocationFailed) {
+				t.Fatalf("error = %v, want child process launch failure only", err)
 			}
 			if _, statErr := lock.Stat(); statErr == nil {
 				t.Fatal("lock remains open")

@@ -1,8 +1,8 @@
 # codex-runner
 
-OpenAI Codex CLI を長時間・非同期で安全に走らせる常駐プロセス `codexd` の設計リポジトリです。
+OpenAI Codex CLI を長時間・非同期で安全に走らせる常駐プロセス `codexd` の Go 実装と設計資料を公開するリポジトリです。
 
-> **Status: Stage 1（常駐プロセス基盤）実装中です。** `internal/` 配下に主要コンポーネント（TaskStore・ContractWriter・実行監視の一部等）は実装済みですが、`codexd` 常駐プロセス全体としてはまだ完成していません。
+> **Status: 段階 -1〜3 は完了しました。** `codexd` を launchd で常駐させ、impl / review / plan / research / read / think を常駐プロセス経由で実行しています。旧経路への自動切り戻しは廃止し、接続できない場合は終了コード 3 で停止します。
 
 このプロジェクトは有志による非公式のツールです。OpenAI とは関係がなく、OpenAI が提供・保証するものでもありません。Codex は OpenAI の製品名です。
 
@@ -10,16 +10,16 @@ This is an unofficial, community-built project. It is not affiliated with, endor
 
 ## English summary
 
-codex-runner is a design-stage project for `codexd`, a local daemon for long-running, asynchronous OpenAI Codex CLI jobs.
+codex-runner provides a Go implementation and design documents for `codexd`, a local daemon for long-running, asynchronous OpenAI Codex CLI jobs.
 It is primarily intended for orchestrators such as Claude Code that delegate implementation, review, and research work to Codex CLI asynchronously.
 It can also be used by any local orchestrator that invokes Codex CLI as a subprocess.
 The design addresses the loss of a `codex exec` job when its invoking shell terminates.
 It records task state and preserves the existing task-output format for callers.
-The proposed implementation uses a separate session, file locks, and Codex JSON events, with an optional pseudo-terminal fallback that is disabled by default.
+The implementation uses a separate session, file locks, and Codex JSON events, with optional pseudo-terminal support that is disabled by default.
 It is designed for a single local user and a Unix domain socket; it is never a network service.
-This repository currently contains design documents and an in-progress Go implementation (Stage 1: daemon foundation).
-Core components exist under `internal/`, but the `codexd` daemon as a whole is not yet complete.
-Feedback on the design is especially welcome.
+Stages -1 through 3 are complete. The daemon runs under launchd and handles impl, review, plan, research, read, and think requests through one daemon route. If the daemon cannot be reached, the caller exits with code 3 instead of switching to the former route.
+The caller's thin Bash entry point is maintained in the user's local configuration and is not included in this repository.
+Feedback is welcome.
 
 ## 何を解決するのか
 
@@ -75,7 +75,7 @@ codex exec --json
 
 ## ロードマップ
 
-段階 -1 の事前確認から始め、応急処置、常駐プロセスとの併存、全実行系の移行、旧経路の削除へ進む構想です。各段階には切り戻し手段を設けます。詳細は [ロードマップ](docs/roadmap.md) を参照してください。
+段階 -1〜3 はすべて完了し、2026-09-24 に旧経路を削除して常駐プロセス経由の入口に一本化しました。元の移行計画は [ロードマップ](docs/roadmap.md) を参照してください。
 
 ## 設計書
 
@@ -83,7 +83,19 @@ codex exec --json
 
 ## 動作環境
 
-設計の調査は macOS、Go、Codex CLI 0.144.5 を前提に確認しています。現在は Stage 1（常駐プロセス基盤）の実装が進行中です。
+macOS と Go 1.22 以降を対象とします。Codex CLI 0.156.1 で動作確認しています。設計前の調査では Codex CLI 0.144.5 を使用しました。
+
+## ビルド・テスト
+
+リポジトリのルートで次を実行します。
+
+```bash
+go build ./...
+go vet ./...
+go test -race ./...
+```
+
+実装は `cmd/codexd`（常駐プロセス）、`cmd/codex-cleanup`、`internal/` 配下の config / contract / domain / execution / metrics / proc / recovery / store / transport にあります。launchd への登録は利用者の環境に合わせて行ってください。呼び出し元の薄い Bash 入口はこのリポジトリに含まれません。
 
 ## ライセンス
 
