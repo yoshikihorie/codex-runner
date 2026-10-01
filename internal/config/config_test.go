@@ -56,6 +56,7 @@ func TestDefaultTaskPlacementRootValue(t *testing.T) {
 }
 
 func TestResolveTaskPlacementRootValidation(t *testing.T) {
+	withCodexBinaryCandidate(t)
 	parent := t.TempDir()
 	file := filepath.Join(parent, "not-a-directory")
 	if err := os.WriteFile(file, nil, 0o600); err != nil {
@@ -64,8 +65,13 @@ func TestResolveTaskPlacementRootValidation(t *testing.T) {
 	for _, root := range []string{"", "relative", parent + "/../" + filepath.Base(parent) + "/tasks", parent + string(os.PathSeparator), filepath.Join(file, "tasks")} {
 		root := root
 		t.Run(root, func(t *testing.T) {
-			if _, err := resolve(rawConfig{TaskPlacementRoot: &root}); err == nil {
-				t.Fatal("resolve accepted invalid task placement root")
+			_, err := resolve(rawConfig{TaskPlacementRoot: &root})
+			if err == nil {
+				t.Fatalf("resolve(%q) error = %v; want invalid task placement root", root, err)
+			}
+			var loadError *LoadError
+			if !errors.As(err, &loadError) || loadError.Key != "task_placement_root" || !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("resolve(%q) error = %#v; want task_placement_root LoadError and ErrInvalidConfig", root, err)
 			}
 		})
 	}
@@ -248,6 +254,7 @@ func TestLoadExplicitRejectsModelOverrideMissingFromAllowlist(t *testing.T) {
 }
 
 func TestConfiguredModelAllowlistIsCopied(t *testing.T) {
+	withCodexBinaryCandidate(t)
 	model := "model"
 	raw := rawConfig{Model: &model, ModelAllowlist: map[string][]string{model: {"read"}}}
 	c, err := resolve(raw)
@@ -673,6 +680,7 @@ func TestLoadExplicitRejectsOutOfRangeNumericSettings(t *testing.T) {
 }
 
 func TestLoadExplicitRejectsInvalidValues(t *testing.T) {
+	withCodexBinaryCandidate(t)
 	for _, test := range []struct{ name, contents, key string }{
 		{"range", "max_concurrent_tasks = 0", "max_concurrent_tasks"},
 		{"upper range", "max_concurrent_tasks = 17", "max_concurrent_tasks"},
@@ -730,6 +738,9 @@ func TestAllowedValues(t *testing.T) {
 
 func TestFindCodexBinarySkipsRelativeCandidatesWhenHomeIsEmpty(t *testing.T) {
 	if os.Getenv("CONFIG_FIND_CODEX_BINARY_HELPER") == "1" {
+		originalCandidates := codexBinaryPathCandidates
+		codexBinaryPathCandidates = []string{filepath.Join(".npm-global", "bin", "codex")}
+		t.Cleanup(func() { codexBinaryPathCandidates = originalCandidates })
 		if path, err := findCodexBinary(); err == nil || path != "" {
 			t.Fatalf("findCodexBinary() = %q, %v; want no relative candidate", path, err)
 		}
