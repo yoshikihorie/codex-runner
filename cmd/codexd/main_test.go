@@ -881,6 +881,7 @@ func (r failOnReadReader) Read([]byte) (int, error) {
 }
 
 func TestRunEntrypointDispatchesDaemonMode(t *testing.T) {
+	newInc89Home(t)
 	previousDaemon := runDaemonMode
 	defer func() { runDaemonMode = previousDaemon }()
 
@@ -914,6 +915,7 @@ func TestRunEntrypointDispatchesDaemonMode(t *testing.T) {
 }
 
 func TestRunEntrypointDispatchesClientRequest(t *testing.T) {
+	newInc89Home(t)
 	previousDaemon := runDaemonMode
 	previousRequest := newClientRequest
 	previousDial := dialAndSend
@@ -971,6 +973,7 @@ func TestRunEntrypointDispatchesClientRequest(t *testing.T) {
 }
 
 func TestRunClientRejectsInvalidInputBeforeSending(t *testing.T) {
+	newInc89Home(t)
 	previousRequest := newClientRequest
 	previousDial := dialAndSend
 	defer func() {
@@ -998,13 +1001,19 @@ func TestRunClientRejectsInvalidInputBeforeSending(t *testing.T) {
 		if code := runClient(context.Background(), args, input, &stdout, &stderr); code != 2 {
 			t.Fatalf("args=%q code=%d, want 2", args, code)
 		}
-		if stdout.Len() != 0 || stderr.Len() == 0 {
-			t.Fatalf("args=%q stdout=%q stderr=%q", args, stdout.String(), stderr.String())
+		if args[0] == string(domain.ProtocolVerbPing) {
+			assertInc89Unavailable(t, stdout.String())
+		} else if stdout.Len() != 0 {
+			t.Fatalf("args=%q stdout=%q", args, stdout.String())
+		}
+		if stderr.Len() == 0 {
+			t.Fatalf("args=%q stderr is empty", args)
 		}
 	}
 }
 
 func TestRunClientBuildsNonSubmitRequests(t *testing.T) {
+	newInc89Home(t)
 	previousRequest := newClientRequest
 	previousDial := dialAndSend
 	defer func() {
@@ -1055,6 +1064,7 @@ func TestRunClientBuildsNonSubmitRequests(t *testing.T) {
 }
 
 func TestRunSubmitClientUsesExplicitZeroValueFlags(t *testing.T) {
+	newInc89Home(t)
 	previousRequest := newClientRequest
 	previousDial := dialAndSend
 	defer func() {
@@ -1080,6 +1090,7 @@ func TestRunSubmitClientUsesExplicitZeroValueFlags(t *testing.T) {
 }
 
 func TestRunSubmitClientUsesRequestFileWithoutReadingStdin(t *testing.T) {
+	newInc89Home(t)
 	previousRequest := newClientRequest
 	previousDial := dialAndSend
 	defer func() {
@@ -1130,6 +1141,7 @@ func TestRunSubmitClientUsesRequestFileWithoutReadingStdin(t *testing.T) {
 }
 
 func TestRunSubmitClientRejectsUnreadableRequestFilesBeforeSending(t *testing.T) {
+	newInc89Home(t)
 	previousRequest := newClientRequest
 	previousDial := dialAndSend
 	defer func() {
@@ -1169,6 +1181,7 @@ func TestRunSubmitClientRejectsUnreadableRequestFilesBeforeSending(t *testing.T)
 }
 
 func TestRunSubmitClientPreservesOmittedOptionalFlags(t *testing.T) {
+	newInc89Home(t)
 	previousRequest := newClientRequest
 	previousDial := dialAndSend
 	defer func() {
@@ -1196,6 +1209,7 @@ func TestRunSubmitClientPreservesOmittedOptionalFlags(t *testing.T) {
 }
 
 func TestRunSubmitClientUsesExplicitZeroTimeout(t *testing.T) {
+	newInc89Home(t)
 	previousRequest := newClientRequest
 	previousDial := dialAndSend
 	defer func() {
@@ -1223,6 +1237,7 @@ func TestRunSubmitClientUsesExplicitZeroTimeout(t *testing.T) {
 }
 
 func TestRunClientRejectsMalformedSubmitJSONBeforeSending(t *testing.T) {
+	newInc89Home(t)
 	previousRequest := newClientRequest
 	previousDial := dialAndSend
 	defer func() {
@@ -1270,6 +1285,7 @@ func TestRunClientRejectsMalformedSubmitJSONBeforeSending(t *testing.T) {
 }
 
 func TestRunClientRejectsInvalidFlagsBeforeSending(t *testing.T) {
+	newInc89Home(t)
 	previousRequest := newClientRequest
 	previousDial := dialAndSend
 	defer func() {
@@ -1314,6 +1330,7 @@ func TestRunClientRejectsInvalidFlagsBeforeSending(t *testing.T) {
 }
 
 func TestRunEntrypointPreservesClientExitCodeTwo(t *testing.T) {
+	newInc89Home(t)
 	previousRequest := newClientRequest
 	previousDial := dialAndSend
 	defer func() {
@@ -1861,5 +1878,276 @@ func TestReportMainErrorSuppressesAlreadyReportedError(t *testing.T) {
 	reportMainError(&stderr, os.ErrInvalid)
 	if got := stderr.String(); got == "" {
 		t.Fatal("reportMainError did not print an unreported error")
+	}
+}
+
+// newInc89Home provides an isolated default configuration and executable fixture.
+func newInc89Home(t *testing.T) string {
+	t.Helper()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	binary := filepath.Join(home, ".npm-global", "bin", "codex")
+	if err := os.MkdirAll(filepath.Dir(binary), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(binary, nil, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	return home
+}
+
+func writeInc89Config(t *testing.T, home, contents string) string {
+	t.Helper()
+	path := filepath.Join(home, ".claude", "codexd", "config.toml")
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(path, []byte(contents), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func inc89ValidConfig(home string) string {
+	return fmt.Sprintf("codex_binary_path = %q\n", filepath.Join(home, ".npm-global", "bin", "codex"))
+}
+
+func inc89Args(verb string) []string {
+	args := []string{verb}
+	switch domain.ProtocolVerb(verb) {
+	case domain.ProtocolVerbSubmit:
+		args = append(args, "--subcommand", "review")
+	case domain.ProtocolVerbTail, domain.ProtocolVerbStatus, domain.ProtocolVerbCancel:
+		args = append(args, "--task-id", "task")
+	}
+	return args
+}
+
+func inc89Verbs() []string {
+	return []string{string(domain.ProtocolVerbSubmit), string(domain.ProtocolVerbTail), string(domain.ProtocolVerbStatus), string(domain.ProtocolVerbCancel), string(domain.ProtocolVerbPing)}
+}
+
+type inc89Result struct {
+	code, requests, sends  int
+	socket, stdout, stderr string
+}
+
+func runInc89Client(t *testing.T, args []string, requestErr error) inc89Result {
+	t.Helper()
+	previousRequest, previousDial := newClientRequest, dialAndSend
+	defer func() { newClientRequest, dialAndSend = previousRequest, previousDial }()
+	var result inc89Result
+	newClientRequest = func(verb domain.ProtocolVerb, _ string, _ json.RawMessage) (transport.Request, error) {
+		result.requests++
+		return transport.Request{RequestID: "inc89-request", Verb: string(verb)}, requestErr
+	}
+	dialAndSend = func(_ context.Context, socket string, _ client.Timeouts, _ transport.Request, _ io.Writer) (transport.Response, int, error) {
+		result.sends++
+		result.socket = socket
+		return transport.Response{}, 0, nil
+	}
+	var stdout, stderr bytes.Buffer
+	result.code = runClient(context.Background(), args, strings.NewReader(`{}`), &stdout, &stderr)
+	result.stdout, result.stderr = stdout.String(), stderr.String()
+	return result
+}
+
+func assertInc89Unavailable(t *testing.T, output string) {
+	t.Helper()
+	want, err := json.Marshal(struct {
+		OK          bool                        `json:"ok"`
+		Unavailable bool                        `json:"unavailable"`
+		Reason      domain.ExecutionRouteReason `json:"reason"`
+	}{Unavailable: true, Reason: domain.ExecutionRouteReasonClientUnavailable})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if output != string(want)+"\n" {
+		t.Errorf("stdout=%q, want %s followed by one newline", output, want)
+	}
+}
+
+func assertInc89Rejected(t *testing.T, result inc89Result, ping bool) {
+	t.Helper()
+	if result.code != 2 || result.requests != 0 || result.sends != 0 || result.stderr == "" {
+		t.Errorf("result=%+v, want exit 2, zero request/send calls, and diagnostic", result)
+	}
+	if ping {
+		assertInc89Unavailable(t, result.stdout)
+	} else if result.stdout != "" {
+		t.Errorf("stdout=%q, want empty", result.stdout)
+	}
+}
+
+func TestInc89AConfiguredSocket(t *testing.T) {
+	for _, verb := range inc89Verbs() {
+		t.Run(verb, func(t *testing.T) {
+			home := newInc89Home(t)
+			socket := filepath.Join(home, "configured.sock")
+			writeInc89Config(t, home, inc89ValidConfig(home)+fmt.Sprintf("socket_path = %q\n", socket))
+			result := runInc89Client(t, inc89Args(verb), nil)
+			if result.code != 0 || result.requests != 1 || result.sends != 1 || result.socket != socket || result.stderr != "" {
+				t.Errorf("result=%+v, want socket=%q", result, socket)
+			}
+		})
+	}
+}
+
+func TestInc89BExplicitSocket(t *testing.T) {
+	for _, verb := range inc89Verbs() {
+		t.Run(verb, func(t *testing.T) {
+			home := newInc89Home(t)
+			writeInc89Config(t, home, inc89ValidConfig(home)+fmt.Sprintf("socket_path = %q\n", filepath.Join(home, "configured.sock")))
+			socket := filepath.Join(home, "explicit.sock")
+			result := runInc89Client(t, append(inc89Args(verb), "--socket-path", socket), nil)
+			if result.code != 0 || result.requests != 1 || result.sends != 1 || result.socket != socket || result.stderr != "" {
+				t.Errorf("result=%+v, want socket=%q", result, socket)
+			}
+		})
+	}
+}
+
+func TestInc89CDefaultSocket(t *testing.T) {
+	for _, present := range []bool{false, true} {
+		for _, verb := range inc89Verbs() {
+			t.Run(fmt.Sprintf("config-%t/%s", present, verb), func(t *testing.T) {
+				home := newInc89Home(t)
+				if present {
+					writeInc89Config(t, home, inc89ValidConfig(home))
+				}
+				socket, err := config.DefaultSocketPath()
+				if err != nil {
+					t.Fatal(err)
+				}
+				result := runInc89Client(t, inc89Args(verb), nil)
+				if result.code != 0 || result.requests != 1 || result.sends != 1 || result.socket != socket || result.stderr != "" {
+					t.Errorf("result=%+v, want socket=%q", result, socket)
+				}
+			})
+		}
+	}
+}
+
+func TestInc89DInvalidConfiguration(t *testing.T) {
+	for _, tc := range []struct{ name, contents string }{
+		{"syntax", "socket_path = ["},
+		{"type", "socket_path = 42\n"},
+		{"relative", "socket_path = 'relative.sock'\n"},
+		{"tilde", "socket_path = '~/x.sock'\n"},
+		{"empty", "socket_path = ''\n"},
+		{"unknown", "unknown_inc89_key = true\n"},
+		{"read-error", ""},
+		{"missing-binary", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			home := newInc89Home(t)
+			contents := inc89ValidConfig(home) + tc.contents
+			if tc.name == "missing-binary" {
+				contents = fmt.Sprintf("codex_binary_path = %q\n", filepath.Join(home, "missing-codex"))
+			}
+			path := writeInc89Config(t, home, contents)
+			if tc.name == "read-error" {
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			// Each configuration case also checks submit/status stdout without adding cases.
+			for _, verb := range []string{string(domain.ProtocolVerbSubmit), string(domain.ProtocolVerbStatus)} {
+				assertInc89Rejected(t, runInc89Client(t, inc89Args(verb), nil), false)
+			}
+		})
+	}
+}
+
+func TestInc89EExplicitValidationAndBypass(t *testing.T) {
+	for _, name := range []string{"empty", "relative", "broken-config", "unreadable-config"} {
+		t.Run(name, func(t *testing.T) {
+			home := newInc89Home(t)
+			path := writeInc89Config(t, home, "socket_path = [")
+			if name == "unreadable-config" {
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Mkdir(path, 0o700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			socket := filepath.Join(home, "explicit.sock")
+			if name == "empty" {
+				socket = ""
+			}
+			if name == "relative" {
+				socket = "relative.sock"
+			}
+			result := runInc89Client(t, append(inc89Args(string(domain.ProtocolVerbStatus)), "--socket-path", socket), nil)
+			if name == "empty" || name == "relative" {
+				assertInc89Rejected(t, result, false)
+			} else if result.code != 0 || result.requests != 1 || result.sends != 1 || result.socket != socket || result.stderr != "" {
+				t.Errorf("result=%+v, want explicit socket %q", result, socket)
+			}
+		})
+	}
+}
+
+func TestInc89FHomeFailure(t *testing.T) {
+	newInc89Home(t)
+	t.Setenv("HOME", "")
+	assertInc89Rejected(t, runInc89Client(t, inc89Args(string(domain.ProtocolVerbStatus)), nil), false)
+}
+
+func TestInc89FDaemonSocketMatches(t *testing.T) {
+	home := newInc89Home(t)
+	socket := filepath.Join(home, "shared.sock")
+	writeInc89Config(t, home, inc89ValidConfig(home)+fmt.Sprintf("socket_path = %q\n", socket))
+	daemonCfg, err := loadConfig(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	result := runInc89Client(t, inc89Args(string(domain.ProtocolVerbStatus)), nil)
+	if result.code != 0 || result.requests != 1 || result.sends != 1 || result.socket != daemonCfg.SocketPath() || result.socket != socket {
+		t.Errorf("result=%+v, daemon socket=%q", result, daemonCfg.SocketPath())
+	}
+}
+
+func TestInc89GPingUnavailable(t *testing.T) {
+	for _, name := range []string{"config", "relative", "empty", "positional", "unknown-flag", "timeout", "request-error"} {
+		t.Run(name, func(t *testing.T) {
+			home := newInc89Home(t)
+			writeInc89Config(t, home, inc89ValidConfig(home))
+			args := inc89Args(string(domain.ProtocolVerbPing))
+			var requestErr error
+			switch name {
+			case "config":
+				writeInc89Config(t, home, "socket_path = [")
+			case "relative":
+				args = append(args, "--socket-path", "relative.sock")
+			case "empty":
+				args = append(args, "--socket-path", "")
+			case "positional":
+				args = append(args, "extra")
+			case "unknown-flag":
+				args = append(args, "--unknown-inc89")
+			case "timeout":
+				writeInc89Config(t, home, "socket_path = [")
+				args = append(args, "--connect-timeout-seconds", "0")
+			case "request-error":
+				requestErr = errors.New("fixture request failure")
+			}
+			result := runInc89Client(t, args, requestErr)
+			if requestErr == nil {
+				assertInc89Rejected(t, result, true)
+			} else {
+				if result.code != 2 || result.requests != 1 || result.sends != 0 || result.stderr == "" {
+					t.Errorf("result=%+v", result)
+				}
+				assertInc89Unavailable(t, result.stdout)
+			}
+			if name == "timeout" && !strings.Contains(result.stderr, "connect timeout must be positive") {
+				t.Errorf("timeout must fail before loading configuration: %q", result.stderr)
+			}
+		})
 	}
 }

@@ -111,3 +111,17 @@ func equalAttributes(got, want []any) bool {
 type configErrorCause struct{}
 
 func (configErrorCause) Error() string { return "test-only cause" }
+
+func TestInc89FTOMLContentsNotExposed(t *testing.T) {
+	home := newInc89Home(t)
+	const marker = "INC89_TEST_ONLY_PRIVATE_VALUE"
+	writeInc89Config(t, home, "socket_path = [\""+marker+"\" invalid]\n")
+	result := runInc89Client(t, inc89Args("status"), nil)
+	assertInc89Rejected(t, result, false)
+	if !strings.Contains(result.stderr, "decode TOML configuration") {
+		t.Errorf("missing safe diagnostic: %q", result.stderr)
+	}
+	if strings.Contains(result.stdout+result.stderr, marker) || strings.Contains(result.stderr, home) {
+		t.Errorf("configuration contents or path exposed: %+v", result)
+	}
+}

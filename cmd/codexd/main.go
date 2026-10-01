@@ -516,14 +516,14 @@ func runCancelClient(ctx context.Context, args []string, stdout, stderr io.Write
 func runPingClient(ctx context.Context, args []string, stdout, stderr io.Writer) int {
 	flags, socketPath, connectTimeout := newClientFlagSet("ping", stderr)
 	if err := flags.Parse(args); err != nil {
-		return 2
+		return clientPreflightError(domain.ProtocolVerbPing, stdout, stderr, "")
 	}
 	if len(flags.Args()) != 0 {
-		return clientUsageError(stderr, "ping accepts no positional arguments")
+		return clientPreflightError(domain.ProtocolVerbPing, stdout, stderr, "ping accepts no positional arguments")
 	}
 	cfg, err := resolveClientConfig(*socketPath, *connectTimeout, specifiedFlags(flags)["socket-path"])
 	if err != nil {
-		return clientUsageError(stderr, err.Error())
+		return clientPreflightError(domain.ProtocolVerbPing, stdout, stderr, err.Error())
 	}
 	return sendClientRequest(ctx, cfg, domain.ProtocolVerbPing, "", nil, stdout, stderr)
 }
@@ -537,17 +537,7 @@ func newClientFlagSet(name string, stderr io.Writer) (*flag.FlagSet, *string, *i
 }
 
 func resolveClientConfig(socketPath string, connectTimeout int, socketPathSpecified bool) (clientConfig, error) {
-	if socketPath == "" {
-		if socketPathSpecified {
-			return clientConfig{}, errors.New("socket path must be absolute")
-		}
-		var err error
-		socketPath, err = config.DefaultSocketPath()
-		if err != nil {
-			return clientConfig{}, fmt.Errorf("resolve default socket path: %w", err)
-		}
-	}
-	if !filepath.IsAbs(socketPath) {
+	if socketPathSpecified && socketPath == "" {
 		return clientConfig{}, errors.New("socket path must be absolute")
 	}
 	if connectTimeout <= 0 {
@@ -555,6 +545,17 @@ func resolveClientConfig(socketPath string, connectTimeout int, socketPathSpecif
 	}
 	if int64(connectTimeout) > int64(time.Duration(1<<63-1)/time.Second) {
 		return clientConfig{}, errors.New("connect timeout is too large")
+	}
+	if socketPathSpecified {
+		if !filepath.IsAbs(socketPath) {
+			return clientConfig{}, errors.New("socket path must be absolute")
+		}
+	} else {
+		cfg, err := config.LoadDefault()
+		if err != nil {
+			return clientConfig{}, errors.New(safeConfigErrorMessage(err))
+		}
+		socketPath = cfg.SocketPath()
 	}
 	return clientConfig{
 		socketPath: socketPath,
@@ -594,13 +595,34 @@ func decodeClientParams(input io.Reader) (map[string]json.RawMessage, error) {
 func sendClientRequest(ctx context.Context, cfg clientConfig, verb domain.ProtocolVerb, taskID string, params json.RawMessage, stdout, stderr io.Writer) int {
 	req, err := newClientRequest(verb, taskID, params)
 	if err != nil {
-		return clientUsageError(stderr, "create client request")
+		return clientPreflightError(verb, stdout, stderr, "create client request")
 	}
 	_, code, err := dialAndSend(ctx, cfg.socketPath, cfg.timeouts, req, stdout)
 	if err != nil {
 		fmt.Fprintln(stderr, "client communication failed")
 	}
 	return code
+}
+
+// clientPreflightError reports failures before communication; transport retains
+// its own ping failure reasons once dialAndSend has been called.
+func clientPreflightError(verb domain.ProtocolVerb, stdout, stderr io.Writer, message string) int {
+	if verb == domain.ProtocolVerbPing {
+		line, err := json.Marshal(struct {
+			OK          bool                        `json:"ok"`
+			Unavailable bool                        `json:"unavailable"`
+			Reason      domain.ExecutionRouteReason `json:"reason"`
+		}{Unavailable: true, Reason: domain.ExecutionRouteReasonClientUnavailable})
+		if err != nil {
+			fmt.Fprintln(stderr, "encode unavailable response")
+		} else if _, err := fmt.Fprintln(stdout, string(line)); err != nil {
+			fmt.Fprintln(stderr, "write unavailable response")
+		}
+	}
+	if message != "" {
+		return clientUsageError(stderr, message)
+	}
+	return 2
 }
 
 func clientUsageError(stderr io.Writer, message string) int {
