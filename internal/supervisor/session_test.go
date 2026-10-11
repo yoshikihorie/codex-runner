@@ -11,7 +11,7 @@ func TestTransitionTableAll160Cells(t *testing.T) {
 	events := []TransitionEvent{EventDetectorIdle, EventDetectorWorking, EventDetectorPermission, EventDetectorRecommendation, EventDetectorUndetermined, EventUnexpectedExit, EventHandoffExit, EventStartupTimeout, EventContextRotate, EventRotationDone, EventRotationFailed, EventStop, EventResume, EventRecoveryWaitDone, EventStopSession, EventReconcile}
 	// Specification-derived expected cells. '-' means rejected; '=' means accepted without changing state.
 	rows := []string{
-		"idle,working,awaiting_permission,-,=,recovering,-,failed,-,-,-,stopped,-,-,exited,exited",
+		"idle,=,awaiting_permission,-,=,recovering,-,failed,-,-,-,stopped,-,-,exited,exited",
 		"=,working,awaiting_permission,awaiting_recommendation,=,recovering,-,-,rotating,-,-,stopped,-,-,exited,-",
 		"idle,=,awaiting_permission,awaiting_recommendation,=,recovering,-,-,=,-,-,stopped,-,-,exited,-",
 		"idle,working,=,awaiting_recommendation,=,recovering,-,-,=,-,-,stopped,-,-,exited,-",
@@ -106,6 +106,7 @@ func TestConditionalTransitions(t *testing.T) {
 		{"resume child idle", SessionStopped, EventResume, TransitionContext{ChildAlive: true, ClaudeSessionID: true, ObservedState: SessionIdle}, SessionIdle, true},
 		{"resume child undetermined", SessionStopped, EventResume, TransitionContext{ChildAlive: true}, SessionWorking, true},
 		{"resume rotation", SessionStopped, EventResume, TransitionContext{RotationStep: RotateSendRemoteControl}, SessionRotating, true},
+		{"resume clears auto continue latch", SessionStopped, EventResume, TransitionContext{ClaudeSessionID: true}, SessionStarting, true},
 		{"reconcile initial empty pid", SessionStarting, EventReconcile, TransitionContext{Generation: 1}, SessionExited, true},
 		{"reconcile respawn", SessionStarting, EventReconcile, TransitionContext{Generation: 2}, SessionStarting, false},
 	}
@@ -230,5 +231,15 @@ func TestRotationDoneReturnsObservedRdStates(t *testing.T) {
 		if got != want || ok != wantOK {
 			t.Errorf("Rd observed %s = (%s,%v), want (%s,%v)", state, got, ok, want, wantOK)
 		}
+	}
+}
+
+func TestApplyResumeClearsAutoContinueDisabledReason(t *testing.T) {
+	s := ManagedSession{State: SessionStopped, StopScope: StopScopeSession, StopReason: StopSession, AutoContinueDisabledReason: AutoContinueDisabledPermissionModeUnsafe}
+	if err := s.Apply(EventResume, TransitionContext{ClaudeSessionID: true}, time.Now().UTC()); err != nil {
+		t.Fatal(err)
+	}
+	if s.AutoContinueDisabledReason != "" {
+		t.Fatalf("auto_continue_disabled_reason=%q, want empty", s.AutoContinueDisabledReason)
 	}
 }

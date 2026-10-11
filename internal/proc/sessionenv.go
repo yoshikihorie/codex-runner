@@ -32,6 +32,8 @@ var strippedSessionEnvNames = map[string]struct{}{
 	"CLAUDE_CODE_SESSION_ATTENDED": {},
 	"CLAUDE_PID":                   {},
 	"CLAUDE_EFFORT":                {},
+	"CLAUDE_CONFIG_DIR":            {},
+	"CODEX_HOME":                   {},
 }
 
 // BuildSessionEnv inherits the parent environment except for exact-name removals.

@@ -99,6 +99,7 @@ func (u *StopControlUseCase) Stop(ctx context.Context, id *supervisor.SessionID)
 			u.record("", supervisor.EventKindStopSet, supervisor.StopGlobal)
 		}
 		for _, s := range sessions {
+			before := s
 			changed := false
 			transitioned := false
 			if s.State == supervisor.SessionStopped {
@@ -116,7 +117,7 @@ func (u *StopControlUseCase) Stop(ctx context.Context, id *supervisor.SessionID)
 			if !changed {
 				continue
 			}
-			if err = u.sessions.Save(ctx, s); err != nil {
+			if err = u.persistSessionPatch(ctx, before, s); err != nil {
 				return out, err
 			}
 			if transitioned {
@@ -134,6 +135,7 @@ func (u *StopControlUseCase) Stop(ctx context.Context, id *supervisor.SessionID)
 	if err != nil {
 		return out, err
 	}
+	before := s
 	wasStopped := u.stops.IsStopped(*id)
 	if err := u.stops.EnableSession(*id); err != nil {
 		return out, err
@@ -158,7 +160,7 @@ func (u *StopControlUseCase) Stop(ctx context.Context, id *supervisor.SessionID)
 	if !changed {
 		return out, nil
 	}
-	if err = u.sessions.Save(ctx, s); err != nil {
+	if err = u.persistSessionPatch(ctx, before, s); err != nil {
 		return out, err
 	}
 	if transitioned {
@@ -182,7 +184,7 @@ func (u *StopControlUseCase) Resume(ctx context.Context, id *supervisor.SessionI
 	}
 	if id != nil {
 		if _, err := supervisor.NewSessionID(id.String()); err != nil {
-			return out, errors.New("SUP_SESSION_NOT_FOUND")
+			return out, ErrSessionNotFound
 		}
 	}
 	u.mu.Lock()
@@ -204,8 +206,9 @@ func (u *StopControlUseCase) Resume(ctx context.Context, id *supervisor.SessionI
 				continue
 			}
 			if s.StopReason != supervisor.StopGlobal {
+				before := s
 				s.StopScope = supervisor.StopScopeNone
-				if err = u.sessions.Save(ctx, s); err != nil {
+				if err = u.persistSessionPatch(ctx, before, s); err != nil {
 					return out, err
 				}
 				out.StillStopped = append(out.StillStopped, StillStopped{s.SessionID, "reason_not_resumed_by_global"})
@@ -253,6 +256,7 @@ func (u *StopControlUseCase) Resume(ctx context.Context, id *supervisor.SessionI
 	return out, nil
 }
 func (u *StopControlUseCase) resumeOne(ctx context.Context, s *supervisor.ManagedSession, scope supervisor.SupervisorStopScope) error {
+	before := *s
 	ctxTransition := supervisor.TransitionContext{ChildAlive: s.ChildPID > 0, OrphanChildAlive: s.StopReason == supervisor.StopOrphanChildAlive, HasRotation: s.Rotation != nil, ClaudeSessionID: s.ClaudeSessionID != "", HasPreviousClaudeSessionID: s.PreviousClaudeSessionID != "", ObservedState: s.PreviousState}
 	if u.transitionCtx != nil {
 		var err error
@@ -269,10 +273,11 @@ func (u *StopControlUseCase) resumeOne(ctx context.Context, s *supervisor.Manage
 		if err := s.Apply(supervisor.EventResume, ctxTransition, u.now()); err != nil {
 			return err
 		}
-		return u.sessions.Save(ctx, *s)
+		return u.persistSessionPatch(ctx, before, *s)
 	}); err != nil {
 		return err
 	}
+	before = *s
 	if scope == supervisor.StopScopeSession {
 		u.record(s.SessionID, supervisor.EventKindStopCleared, "")
 	}
@@ -304,20 +309,27 @@ func (u *StopControlUseCase) resumeOne(ctx context.Context, s *supervisor.Manage
 		}
 		u.record(s.SessionID, supervisor.EventKindRestartCountersReset, "")
 	}
-	if err := u.sessions.Save(ctx, *s); err != nil {
+	if err := u.persistSessionPatch(ctx, before, *s); err != nil {
 		return err
 	}
 	u.record(s.SessionID, supervisor.EventKindSessionResumed, "")
 	u.notify(ctx, supervisor.EventKindSessionResumed, s.SessionID)
-	return u.stops.GuardResume(scope, s.SessionID, func() error {
-		if s.Rotation != nil && u.rotationResumer != nil {
-			return u.rotationResumer(ctx, *s)
-		}
-		if s.ChildPID == 0 && u.recoveryStarter != nil {
-			return u.recoveryStarter(ctx, *s)
-		}
-		return nil
-	})
+	if err := u.stops.GuardResume(scope, s.SessionID, func() error { return nil }); err != nil {
+		return err
+	}
+	if s.Rotation != nil && u.rotationResumer != nil {
+		return u.rotationResumer(ctx, *s)
+	}
+	if s.ChildPID == 0 && u.recoveryStarter != nil {
+		return u.recoveryStarter(ctx, *s)
+	}
+	return nil
+}
+
+func (u *StopControlUseCase) persistSessionPatch(ctx context.Context, before, after supervisor.ManagedSession) error {
+	return UpdateSessionPatch(sessionLocker, after.SessionID,
+		func() (supervisor.ManagedSession, error) { return u.find(ctx, after.SessionID) },
+		func(session supervisor.ManagedSession) error { return u.sessions.Save(ctx, session) }, before, after)
 }
 func resumeReason(s supervisor.ManagedSession, err error) string {
 	message := err.Error()
@@ -348,7 +360,7 @@ func (u *StopControlUseCase) find(ctx context.Context, id supervisor.SessionID) 
 			return s, nil
 		}
 	}
-	return supervisor.ManagedSession{}, errors.New("SUP_SESSION_NOT_FOUND")
+	return supervisor.ManagedSession{}, ErrSessionNotFound
 }
 func (u *StopControlUseCase) record(id supervisor.SessionID, k supervisor.SupervisorEventKind, r supervisor.SupervisorStopReason) {
 	if recorder, ok := u.events.(CheckedStopEventRecorder); ok {

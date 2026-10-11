@@ -18,6 +18,18 @@ type EventStoreRecorder struct {
 	Log    SupervisorOperationalLogger
 }
 
+// RecordStructured preserves event-specific fields such as code and state transition.
+func (r EventStoreRecorder) RecordStructured(event store.Event) error {
+	if r.Events == nil {
+		return fmt.Errorf("event store is unavailable")
+	}
+	_, err := r.Events.Record(event)
+	if err != nil {
+		r.warn(event.Kind, err)
+	}
+	return err
+}
+
 func (r EventStoreRecorder) RecordEvent(id supervisor.SessionID, kind supervisor.SupervisorEventKind, reason supervisor.SupervisorStopReason, exit supervisor.SupervisorExitReason, rotate supervisor.SupervisorRotateFailReason, at time.Time) {
 	if err := r.RecordEventChecked(id, kind, reason, exit, rotate, at); err != nil {
 		r.warn(kind, err)
@@ -42,6 +54,18 @@ func (r EventStoreRecorder) RecordEventChecked(id supervisor.SessionID, kind sup
 		return fmt.Errorf("event store is unavailable")
 	}
 	_, err := r.Events.Record(event)
+	return err
+}
+
+// RecordStartFailed writes the project-scoped start failure contract without a session ID.
+func (r EventStoreRecorder) RecordStartFailed(projectID string, reason store.SupervisorStartFailReason, at time.Time) error {
+	if !reason.Valid() {
+		return fmt.Errorf("invalid session start failure reason: %q", reason)
+	}
+	if r.Events == nil {
+		return fmt.Errorf("event store is unavailable")
+	}
+	_, err := r.Events.Record(store.Event{Kind: supervisor.EventKindSessionStartFailed, ProjectID: projectID, Reason: store.EventReason(reason), At: at})
 	return err
 }
 

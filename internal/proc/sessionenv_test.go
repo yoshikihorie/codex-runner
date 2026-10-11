@@ -62,16 +62,16 @@ func TestValidateSessionEnvRejectsEachForbiddenName(t *testing.T) {
 	}
 }
 
-func TestSessionEnvRemovalContractHasEighteenExactNames(t *testing.T) {
+func TestSessionEnvRemovalContractHasTwentyExactNames(t *testing.T) {
 	want := []string{
 		"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL",
 		"CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX", "CLAUDE_CODE_USE_FOUNDRY", "AWS_BEARER_TOKEN_BEDROCK",
 		"CLAUDECODE", "CLAUDE_CODE_ENTRYPOINT", "CLAUDE_CODE_MESSAGING_SOCKET", "CLAUDE_CODE_MESSAGING_TOKEN",
 		"CLAUDE_CODE_EXECPATH", "CLAUDE_CODE_SESSION_ID", "CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ATTENDED",
-		"CLAUDE_PID", "CLAUDE_EFFORT",
+		"CLAUDE_PID", "CLAUDE_EFFORT", "CLAUDE_CONFIG_DIR", "CODEX_HOME",
 	}
-	if len(want) != 18 || len(strippedSessionEnvNames) != 18 {
-		t.Fatalf("removal names: specification=%d implementation=%d, want 18", len(want), len(strippedSessionEnvNames))
+	if len(want) != 20 || len(strippedSessionEnvNames) != 20 {
+		t.Fatalf("removal names: specification=%d implementation=%d, want 20", len(want), len(strippedSessionEnvNames))
 	}
 	for _, name := range want {
 		if _, ok := strippedSessionEnvNames[name]; !ok {

@@ -43,6 +43,28 @@ func TestEventStoreRestoresSequenceAndOmitsBody(t *testing.T) {
 	}
 }
 
+func TestEventStoreRecordsSessionStartFailureWithoutSessionID(t *testing.T) {
+	store := NewEventStore(t.TempDir())
+	for _, reason := range []string{"user_settings", "project_settings", "project_local_settings", "claude_json", "managed", "codex_auth", "child_env"} {
+		event, err := store.Record(Event{Kind: supervisor.EventKindSessionStartFailed, ProjectID: "demo-project", Reason: EventReason(reason)})
+		if err != nil {
+			t.Fatalf("reason %q: %v", reason, err)
+		}
+		if event.SessionID != "" || event.ProjectID != "demo-project" || string(event.Reason) != reason {
+			t.Fatalf("start failure event = %#v", event)
+		}
+	}
+	for _, invalid := range []Event{
+		{Kind: supervisor.EventKindSessionStartFailed, ProjectID: "not_a_slug", Reason: "codex_auth"},
+		{Kind: supervisor.EventKindSessionStartFailed, ProjectID: "demo-project", Reason: "made_up"},
+		{Kind: supervisor.EventKindSessionStartFailed, SessionID: "demo-1", ProjectID: "demo-project", Reason: "codex_auth"},
+	} {
+		if _, err := store.Record(invalid); err == nil {
+			t.Errorf("accepted invalid start failure: %#v", invalid)
+		}
+	}
+}
+
 func TestEventStoreRejectsUnknownKindAndRotates(t *testing.T) {
 	root := t.TempDir()
 	store := NewEventStoreWithOptions(root, 160, 2)

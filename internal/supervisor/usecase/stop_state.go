@@ -12,6 +12,7 @@ import (
 
 // StopState serializes STOP flags and marker-file operations under one lock.
 type StopState struct {
+	startMu   sync.Mutex
 	mu        sync.Mutex
 	root      string
 	global    bool
@@ -27,7 +28,13 @@ func (s *StopState) SetRemovalHandler(fn func(supervisor.SessionID)) {
 	defer s.mu.Unlock()
 	s.onRemoved = fn
 }
-func (s *StopState) SetGlobal(stopped bool) { s.mu.Lock(); defer s.mu.Unlock(); s.global = stopped }
+func (s *StopState) SetGlobal(stopped bool) {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.global = stopped
+}
 func (s *StopState) SetSession(id supervisor.SessionID, stopped bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -53,6 +60,19 @@ func (s *StopState) IsGlobalStopped() bool {
 	defer s.mu.Unlock()
 	return s.global || s.markerExistsLocked("")
 }
+
+// GuardStart serializes spawn with STOP writers without holding the state mutex during I/O.
+func (s *StopState) GuardStart(start func() error) error {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+	s.mu.Lock()
+	stopped := s.global || s.markerExistsLocked("")
+	s.mu.Unlock()
+	if stopped {
+		return ErrStopActive
+	}
+	return start()
+}
 func (s *StopState) IsSessionStopped(id supervisor.SessionID) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -61,12 +81,16 @@ func (s *StopState) IsSessionStopped(id supervisor.SessionID) bool {
 
 // GuardResume keeps the final STOP check and state transition exclusive with Poll/Stop file updates.
 func (s *StopState) GuardResume(scope supervisor.SupervisorStopScope, id supervisor.SessionID, transition func() error) error {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.global || s.markerExistsLocked("") {
+	globalStopped := s.global || s.markerExistsLocked("")
+	sessionStopped := s.sessions[id] || s.markerExistsLocked(id.String())
+	s.mu.Unlock()
+	if globalStopped {
 		return errors.New("still_stopped_by_global")
 	}
-	if s.sessions[id] || s.markerExistsLocked(id.String()) {
+	if sessionStopped {
 		if scope == supervisor.StopScopeGlobal {
 			return errors.New("still_stopped_by_global")
 		}
@@ -85,7 +109,11 @@ func (s *StopState) markerExistsLocked(id string) bool {
 	_, err := os.Lstat(s.filePath(id))
 	return err == nil || !errors.Is(err, os.ErrNotExist)
 }
-func (s *StopState) WriteGlobal() error { return s.write("") }
+func (s *StopState) WriteGlobal() error {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
+	return s.write("")
+}
 func (s *StopState) WriteSession(id supervisor.SessionID) error {
 	if _, err := supervisor.NewSessionID(id.String()); err != nil {
 		return err
@@ -93,6 +121,8 @@ func (s *StopState) WriteSession(id supervisor.SessionID) error {
 	return s.write(id.String())
 }
 func (s *StopState) EnableGlobal() error {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.writeLocked(""); err != nil {
@@ -105,6 +135,8 @@ func (s *StopState) EnableSession(id supervisor.SessionID) error {
 	if _, err := supervisor.NewSessionID(id.String()); err != nil {
 		return err
 	}
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.writeLocked(id.String()); err != nil {
@@ -183,6 +215,8 @@ func (s *StopState) CheckAndRepair(id supervisor.SessionID) error {
 
 // Poll latches markers created outside the process and repairs markers removed outside resume.
 func (s *StopState) Poll(id supervisor.SessionID) error {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.markerExistsLocked("") {
@@ -212,6 +246,8 @@ func (s *StopState) Poll(id supervisor.SessionID) error {
 
 // RepairFromSessions restores marker files represented by persisted stop scopes at startup.
 func (s *StopState) RepairFromSessions(sessions []supervisor.ManagedSession) error {
+	s.startMu.Lock()
+	defer s.startMu.Unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, session := range sessions {

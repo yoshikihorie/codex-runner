@@ -11,15 +11,34 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
+	"sync"
 	"time"
 )
 
 var ErrStateFileCorrupt = errors.New("SUP_STATE_FILE_CORRUPT")
 
+// NewlyQuarantinedError marks the one Load call that renamed a corrupt record.
+type NewlyQuarantinedError struct{ Cause error }
+
+func (e *NewlyQuarantinedError) Error() string {
+	return ErrStateFileCorrupt.Error() + ": " + e.Cause.Error()
+}
+func (e *NewlyQuarantinedError) Unwrap() error { return ErrStateFileCorrupt }
+
 type SessionStore struct {
-	root        string
-	writeAtomic func(string, []byte, os.FileMode) error
+	root         string
+	writeAtomic  func(string, []byte, os.FileMode) error
+	quarantineMu sync.Mutex
+	onQuarantine func(supervisor.SessionID)
+}
+
+// SetQuarantineHandler registers the reporter for a newly renamed corrupt record.
+func (s *SessionStore) SetQuarantineHandler(report func(supervisor.SessionID)) {
+	s.quarantineMu.Lock()
+	defer s.quarantineMu.Unlock()
+	s.onQuarantine = report
 }
 
 // NewSessionStore creates a store rooted at stateDir.
@@ -124,7 +143,76 @@ func (s *SessionStore) quarantine(path string, cause error) error {
 	if e := os.Rename(path, name); e != nil {
 		return fmt.Errorf("%w: %v (quarantine: %v)", ErrStateFileCorrupt, cause, e)
 	}
-	return fmt.Errorf("%w: %v", ErrStateFileCorrupt, cause)
+	if id, err := supervisor.NewSessionID(strings.TrimSuffix(filepath.Base(path), ".json")); err == nil {
+		s.quarantineMu.Lock()
+		report := s.onQuarantine
+		s.quarantineMu.Unlock()
+		if report != nil {
+			report(id)
+		}
+	}
+	return &NewlyQuarantinedError{Cause: cause}
+}
+
+// List loads every direct session record and returns IDs for records that could not be read.
+func (s *SessionStore) List() (sessions []supervisor.ManagedSession, newlyCorruptIDs []supervisor.SessionID, previouslyCorruptIDs []supervisor.SessionID, err error) {
+	dir := filepath.Join(s.root, "sessions")
+	entries, err := os.ReadDir(dir)
+	if err != nil && !errors.Is(err, os.ErrNotExist) {
+		return nil, nil, nil, err
+	}
+	newCorruptSet := make(map[supervisor.SessionID]struct{})
+	oldCorruptSet := make(map[supervisor.SessionID]struct{})
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasSuffix(name, ".json") {
+			id, idErr := supervisor.NewSessionID(strings.TrimSuffix(name, ".json"))
+			if idErr != nil {
+				continue
+			}
+			session, loadErr := s.Load(id)
+			if loadErr != nil {
+				if errors.Is(loadErr, os.ErrNotExist) {
+					continue
+				}
+				if errors.Is(loadErr, ErrStateFileCorrupt) {
+					newCorruptSet[id] = struct{}{}
+					continue
+				}
+				return nil, nil, nil, loadErr
+			}
+			sessions = append(sessions, session)
+		}
+		if strings.Contains(name, ".json.corrupt-") {
+			idText := strings.SplitN(name, ".json.corrupt-", 2)[0]
+			if id, idErr := supervisor.NewSessionID(idText); idErr == nil {
+				oldCorruptSet[id] = struct{}{}
+			}
+		}
+	}
+	for id := range newCorruptSet {
+		newlyCorruptIDs = append(newlyCorruptIDs, id)
+	}
+	for id := range oldCorruptSet {
+		previouslyCorruptIDs = append(previouslyCorruptIDs, id)
+	}
+	sort.Slice(sessions, func(i, j int) bool { return sessions[i].SessionID < sessions[j].SessionID })
+	sort.Slice(newlyCorruptIDs, func(i, j int) bool { return newlyCorruptIDs[i] < newlyCorruptIDs[j] })
+	sort.Slice(previouslyCorruptIDs, func(i, j int) bool { return previouslyCorruptIDs[i] < previouslyCorruptIDs[j] })
+	return sessions, newlyCorruptIDs, previouslyCorruptIDs, nil
+}
+
+// Delete removes a session record; deleting a missing record succeeds.
+func (s *SessionStore) Delete(id supervisor.SessionID) error {
+	path, err := s.sessionPath(id)
+	if err != nil {
+		return err
+	}
+	err = os.Remove(path)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil
+	}
+	return err
 }
 
 // CorruptSessionIDs lists valid session IDs whose records have been quarantined.
@@ -157,7 +245,7 @@ func validateSession(v supervisor.ManagedSession, id supervisor.SessionID) error
 	if v.SchemaVersion != 1 || v.SessionID != id || !validState(v.State) || !validCLI(v.CLI) || v.Generation < 1 || v.StateSince.IsZero() || v.SendGate.NextSeq == 0 || v.RestartTimes == nil || v.ChildPID < 0 {
 		return fmt.Errorf("invalid session fields")
 	}
-	if !validStopScope(v.StopScope) || !validStopReason(v.StopReason) || !validExitReason(v.ExitReason) || v.PreviousState != "" && !validState(v.PreviousState) {
+	if !validAutoContinueDisabledReason(v.AutoContinueDisabledReason) || !validStopScope(v.StopScope) || !validStopReason(v.StopReason) || !validExitReason(v.ExitReason) || v.PreviousState != "" && !validState(v.PreviousState) {
 		return fmt.Errorf("invalid enum")
 	}
 	if v.State != supervisor.SessionStopped && v.StopReason != "" {
@@ -219,6 +307,9 @@ func validState(x supervisor.SupervisorSessionState) bool {
 }
 func validCLI(x supervisor.SupervisorCli) bool {
 	return x == supervisor.CLIClaude || x == supervisor.CLICodex
+}
+func validAutoContinueDisabledReason(x supervisor.AutoContinueDisabledReason) bool {
+	return x == "" || x == supervisor.AutoContinueDisabledPermissionModeUnsafe
 }
 func validStopScope(x supervisor.SupervisorStopScope) bool {
 	return x == supervisor.StopScopeNone || x == supervisor.StopScopeSession || x == supervisor.StopScopeGlobal

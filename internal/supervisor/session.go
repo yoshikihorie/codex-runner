@@ -179,35 +179,40 @@ const (
 	FailureVerifyBinaryChanged      SupervisorFailureReason = "verify_binary_changed"
 )
 
+type AutoContinueDisabledReason string
+
+const AutoContinueDisabledPermissionModeUnsafe AutoContinueDisabledReason = "permission_mode_unsafe"
+
 type ManagedSession struct {
-	SchemaVersion             int                     `json:"schema_version"`
-	SessionID                 SessionID               `json:"session_id"`
-	ProjectID                 string                  `json:"project_id"`
-	CLI                       SupervisorCli           `json:"cli"`
-	Generation                int                     `json:"generation"`
-	State                     SupervisorSessionState  `json:"state"`
-	StateSince                time.Time               `json:"state_since"`
-	StopScope                 SupervisorStopScope     `json:"stop_scope"`
-	StopReason                SupervisorStopReason    `json:"stop_reason,omitempty"`
-	ExitReason                SupervisorExitReason    `json:"exit_reason,omitempty"`
-	ClaudeSessionID           string                  `json:"claude_session_id,omitempty"`
-	PreviousClaudeSessionID   string                  `json:"previous_claude_session_id,omitempty"`
-	ChildPID                  int                     `json:"child_pid,omitempty"`
-	ChildStartedAt            *time.Time              `json:"child_started_at,omitempty"`
-	SendGate                  SendGateRecord          `json:"send_gate"`
-	LastSend                  *LastSendRecord         `json:"last_send,omitempty"`
-	RestartCount              int                     `json:"restart_count"`
-	RestartTimes              []time.Time             `json:"restart_times"`
-	Rotation                  *RotationRecord         `json:"rotation,omitempty"`
-	PendingRemoteControl      bool                    `json:"pending_remote_control,omitempty"`
-	PendingRemoteControlSince *time.Time              `json:"pending_remote_control_since,omitempty"`
-	PreviousState             SupervisorSessionState  `json:"previous_state,omitempty"`
-	LastVerifiedFingerprint   string                  `json:"last_verified_fingerprint,omitempty"`
-	LastVerifiedResult        string                  `json:"last_verified_result,omitempty"`
-	LastFailureFingerprint    string                  `json:"last_failure_fingerprint,omitempty"`
-	LastFailureReason         SupervisorFailureReason `json:"last_failure_reason,omitempty"`
-	LastPushFailedHead        string                  `json:"last_push_failed_head,omitempty"`
-	GitConfigFingerprint      string                  `json:"git_config_fingerprint,omitempty"`
+	SchemaVersion              int                        `json:"schema_version"`
+	SessionID                  SessionID                  `json:"session_id"`
+	ProjectID                  string                     `json:"project_id"`
+	CLI                        SupervisorCli              `json:"cli"`
+	Generation                 int                        `json:"generation"`
+	State                      SupervisorSessionState     `json:"state"`
+	StateSince                 time.Time                  `json:"state_since"`
+	StopScope                  SupervisorStopScope        `json:"stop_scope"`
+	StopReason                 SupervisorStopReason       `json:"stop_reason,omitempty"`
+	ExitReason                 SupervisorExitReason       `json:"exit_reason,omitempty"`
+	ClaudeSessionID            string                     `json:"claude_session_id,omitempty"`
+	PreviousClaudeSessionID    string                     `json:"previous_claude_session_id,omitempty"`
+	ChildPID                   int                        `json:"child_pid,omitempty"`
+	ChildStartedAt             *time.Time                 `json:"child_started_at,omitempty"`
+	SendGate                   SendGateRecord             `json:"send_gate"`
+	LastSend                   *LastSendRecord            `json:"last_send,omitempty"`
+	RestartCount               int                        `json:"restart_count"`
+	RestartTimes               []time.Time                `json:"restart_times"`
+	Rotation                   *RotationRecord            `json:"rotation,omitempty"`
+	AutoContinueDisabledReason AutoContinueDisabledReason `json:"auto_continue_disabled_reason,omitempty"`
+	PendingRemoteControl       bool                       `json:"pending_remote_control,omitempty"`
+	PendingRemoteControlSince  *time.Time                 `json:"pending_remote_control_since,omitempty"`
+	PreviousState              SupervisorSessionState     `json:"previous_state,omitempty"`
+	LastVerifiedFingerprint    string                     `json:"last_verified_fingerprint,omitempty"`
+	LastVerifiedResult         string                     `json:"last_verified_result,omitempty"`
+	LastFailureFingerprint     string                     `json:"last_failure_fingerprint,omitempty"`
+	LastFailureReason          SupervisorFailureReason    `json:"last_failure_reason,omitempty"`
+	LastPushFailedHead         string                     `json:"last_push_failed_head,omitempty"`
+	GitConfigFingerprint       string                     `json:"git_config_fingerprint,omitempty"`
 }
 
 type TransitionEvent string
@@ -269,6 +274,9 @@ func Transition(from SupervisorSessionState, event TransitionEvent, c Transition
 		targets := map[TransitionEvent]SupervisorSessionState{EventDetectorIdle: SessionIdle, EventDetectorWorking: SessionWorking, EventDetectorPermission: SessionAwaitingPermission, EventDetectorRecommendation: SessionAwaitingRecommendation}
 		switch from {
 		case SessionStarting, SessionIdle, SessionWorking, SessionAwaitingPermission, SessionAwaitingRecommendation:
+			if from == SessionStarting && event == EventDetectorWorking {
+				return from, true
+			}
 			if from == SessionStarting && event == EventDetectorRecommendation {
 				return "", false
 			}
@@ -487,6 +495,7 @@ func (s *ManagedSession) Apply(event TransitionEvent, c TransitionContext, now t
 		s.StateSince = now
 	}
 	if previous == SessionStopped && to != SessionStopped {
+		s.AutoContinueDisabledReason = ""
 		s.StopReason = ""
 		s.StopScope = StopScopeNone
 	}

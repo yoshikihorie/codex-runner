@@ -25,6 +25,7 @@ type Event struct {
 	At        time.Time                         `json:"ts"`
 	Kind      supervisor.SupervisorEventKind    `json:"kind"`
 	SessionID string                            `json:"session_id,omitempty"`
+	ProjectID string                            `json:"project_id,omitempty"`
 	FromState supervisor.SupervisorSessionState `json:"from_state,omitempty"`
 	ToState   supervisor.SupervisorSessionState `json:"to_state,omitempty"`
 	SendID    string                            `json:"send_id,omitempty"`
@@ -157,7 +158,7 @@ func validateEvent(event Event) error {
 	if !supervisor.ValidSupervisorEventKind(event.Kind) {
 		return fmt.Errorf("invalid supervisor event kind: %q", event.Kind)
 	}
-	if event.Reason != "" && !validReasonForEvent(event.Kind, event.Reason) {
+	if event.Reason != "" && !validReasonForEvent(event.Kind, event.Reason) && !(event.Kind == supervisor.EventKindSessionStartFailed && validStartFailureReason(event.Reason)) {
 		return fmt.Errorf("invalid reason %q for event %q", event.Reason, event.Kind)
 	}
 	if event.Code != "" && !validEventCode(event.Code) {
@@ -170,6 +171,16 @@ func validateEvent(event Event) error {
 		if _, err := supervisor.NewSessionID(event.SessionID); err != nil {
 			return err
 		}
+	}
+	if event.ProjectID != "" && !slugPattern.MatchString(event.ProjectID) {
+		return fmt.Errorf("invalid project id")
+	}
+	if event.Kind == supervisor.EventKindSessionStartFailed {
+		if event.SessionID != "" || event.ProjectID == "" || !validStartFailureReason(event.Reason) || event.FromState != "" || event.ToState != "" || event.Code != "" || event.SendID != "" || event.SendKind != "" || len(event.Basis) != 0 || event.Step != "" || event.Count != 0 || event.CommitSHA != "" || event.Remote != "" || event.Branch != "" {
+			return errors.New("invalid session start failure event")
+		}
+	} else if event.ProjectID != "" {
+		return errors.New("project id is only valid for session start failure")
 	}
 	if event.FromState != "" && !validState(event.FromState) || event.ToState != "" && !validState(event.ToState) {
 		return errors.New("invalid supervisor session state")
@@ -195,6 +206,10 @@ func validateEvent(event Event) error {
 		return errors.New("invalid git remote")
 	}
 	return nil
+}
+
+func validStartFailureReason(reason EventReason) bool {
+	return SupervisorStartFailReason(reason).Valid()
 }
 
 func (s *EventStore) initialize() error {
