@@ -171,6 +171,31 @@ func TestSupervisorConfigRejectsEveryCanonicalReason(t *testing.T) {
 	}
 }
 
+func TestSupervisorConfigRejectsStickyWritableNotifyParent(t *testing.T) {
+	t.Setenv("HOME", canonicalTestPath(t, t.TempDir()))
+	dir := filepath.Join(t.TempDir(), "sticky")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o1777); err != nil {
+		t.Fatal(err)
+	}
+	command := filepath.Join(dir, "notify")
+	if err := os.WriteFile(command, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	body := validSupervisorBase(t)
+	for _, line := range strings.Split(body, "\n") {
+		if strings.HasPrefix(line, "notify_command = ") {
+			body = strings.Replace(body, line, "notify_command = \""+command+"\"", 1)
+			break
+		}
+	}
+	if err := loadSupervisorText(t, body); err == nil || !strings.Contains(err.Error(), "not_executable") {
+		t.Fatalf("error=%v, want not_executable", err)
+	}
+}
+
 func TestSupervisorConfigRejectsProbeCases(t *testing.T) {
 	home := canonicalTestPath(t, t.TempDir())
 	t.Setenv("HOME", home)

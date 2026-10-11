@@ -11,6 +11,7 @@ import (
 	"strings"
 	"syscall"
 
+	"github.com/yoshikihorie/codex-runner/internal/proc"
 	"github.com/yoshikihorie/codex-runner/internal/supervisor/textpolicy"
 
 	"github.com/BurntSushi/toml"
@@ -193,14 +194,11 @@ func LoadSupervisorConfig(path string) (SupervisorConfig, error) {
 		if !filepath.IsAbs(c.NotifyCommand) {
 			return SupervisorConfig{}, supervisorInvalid("notify_command", "relative_path", nil)
 		}
-		real, err := filepath.EvalSymlinks(c.NotifyCommand)
+		real, err := proc.ValidateExecutable(c.NotifyCommand)
 		if err != nil {
-			return SupervisorConfig{}, supervisorInvalid("notify_command", "not_executable", err)
+			return SupervisorConfig{}, supervisorInvalid("notify_command", executableConfigReason(err), err)
 		}
 		c.NotifyCommand = real
-		if err := isSafeNotifyExecutable(c.NotifyCommand); err != nil {
-			return SupervisorConfig{}, supervisorInvalid("notify_command", "not_executable", err)
-		}
 	}
 	for _, p := range []*string{&c.SocketPath, &c.StateDir} {
 		if *p != "" && !filepath.IsAbs(*p) {
@@ -324,9 +322,9 @@ func LoadSupervisorConfig(path string) (SupervisorConfig, error) {
 			if !filepath.IsAbs(bin) {
 				return SupervisorConfig{}, supervisorInvalid("projects.verify_command", "relative_path", nil)
 			}
-			real, e := filepath.EvalSymlinks(bin)
+			real, e := proc.ValidateExecutable(bin)
 			if e != nil {
-				return SupervisorConfig{}, supervisorInvalid("projects.verify_command", "not_executable", e)
+				return SupervisorConfig{}, supervisorInvalid("projects.verify_command", executableConfigReason(e), e)
 			}
 			repository := resolved
 			if inRepository {
@@ -334,9 +332,6 @@ func LoadSupervisorConfig(path string) (SupervisorConfig, error) {
 			}
 			if pathWithin(real, repository) {
 				return SupervisorConfig{}, supervisorInvalid("projects.verify_command", "verify_command_inside_repo", nil)
-			}
-			if e = isExecutableFile(real); e != nil {
-				return SupervisorConfig{}, supervisorInvalid("projects.verify_command", "not_executable", e)
 			}
 			b, e := os.ReadFile(real)
 			if e != nil {
@@ -519,23 +514,26 @@ func ownedByCurrentUser(info os.FileInfo) bool {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	return ok && (int(stat.Uid) == os.Getuid() || stat.Uid == 0)
 }
-func isSafeNotifyExecutable(path string) error {
-	info, err := os.Stat(path)
-	if err != nil {
-		return err
+func executableConfigReason(err error) string {
+	var validationErr *proc.ExecutableValidationError
+	if !errors.As(err, &validationErr) {
+		return "file_unreadable"
 	}
-	if !info.Mode().IsRegular() || info.Mode().Perm()&0111 == 0 || info.Mode().Perm()&0022 != 0 || !ownedByCurrentUser(info) {
-		return fmt.Errorf("unsafe executable")
+	switch validationErr.Reason {
+	case "not_owned":
+		return "not_owned"
+	case "not_absolute":
+		return "relative_path"
+	case "not_found":
+		if errors.Is(validationErr.Err, fs.ErrNotExist) {
+			return "not_executable"
+		}
+		return "file_unreadable"
+	default:
+		return "not_executable"
 	}
-	parent, err := os.Stat(filepath.Dir(path))
-	if err != nil {
-		return err
-	}
-	if parent.Mode().Perm()&0022 != 0 || !ownedByCurrentUser(parent) {
-		return fmt.Errorf("unsafe executable directory")
-	}
-	return nil
 }
+
 func checkSupervisorPathConflicts(c SupervisorConfig) error {
 	home, err := validatedSupervisorHome()
 	if err != nil {
