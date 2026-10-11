@@ -51,6 +51,36 @@ func TestLoadSupervisorConfigRejectsInvalid(t *testing.T) {
 	}
 }
 
+func TestValidBranchRejectsRefsAndSpecialNames(t *testing.T) {
+	for _, branch := range []string{"refs/heads/x", "refs/tags/x", "HEAD", "has\ttab", "has\x01control", "has\x7fdel"} {
+		if validBranch(branch) {
+			t.Errorf("accepted %q", branch)
+		}
+	}
+	for _, branch := range []string{"topic", "release/v2"} {
+		if !validBranch(branch) {
+			t.Errorf("rejected %q", branch)
+		}
+	}
+}
+
+func TestLoadSupervisorConfigRejectsAmbiguousBranchAndInvalidRemoteNames(t *testing.T) {
+	for _, remote := range []string{"a/b", "o$rigin", "orígin", "o#r", "tab\tname", ".", "..", "-bad"} {
+		t.Run("remote_"+remote, func(t *testing.T) {
+			t.Setenv("HOME", canonicalTestPath(t, t.TempDir()))
+			body := addRootSetting(validSupervisorBase(t), "[[push_allowlist]]\nremote = \""+remote+"\"\nurl = \"https://example.test/other\"\nbranch = \"other\"\n")
+			if err := loadSupervisorText(t, body); err == nil || !strings.Contains(err.Error(), "type_mismatch") {
+				t.Fatalf("error=%v", err)
+			}
+		})
+	}
+	t.Setenv("HOME", canonicalTestPath(t, t.TempDir()))
+	body := validSupervisorBase(t) + "[[push_allowlist]]\nremote = \"backup\"\nurl = \"https://example.test/other\"\nbranch = \"feature\"\n"
+	if err := loadSupervisorText(t, body); err == nil || !strings.Contains(err.Error(), "duplicate_allowlist_entry") {
+		t.Fatalf("error=%v, want duplicate_allowlist_entry", err)
+	}
+}
+
 func TestSupervisorConfigRejectsEveryCanonicalReason(t *testing.T) {
 	home := canonicalTestPath(t, t.TempDir())
 	t.Setenv("HOME", home)

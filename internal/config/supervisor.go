@@ -367,12 +367,9 @@ func LoadSupervisorConfig(path string) (SupervisorConfig, error) {
 		}
 	}
 	allowlistEntries := make(map[SupervisorPushAllow]struct{}, len(c.PushAllowlist))
+	allowlistBranches := make(map[string]string, len(c.PushAllowlist))
 	for _, a := range c.PushAllowlist {
-		if _, exists := allowlistEntries[a]; exists {
-			return SupervisorConfig{}, supervisorInvalid("push_allowlist", "duplicate_allowlist_entry", nil)
-		}
-		allowlistEntries[a] = struct{}{}
-		if !supervisorRemotePattern.MatchString(a.Remote) {
+		if !supervisorRemotePattern.MatchString(a.Remote) || a.Remote == "." || a.Remote == ".." || strings.HasPrefix(a.Remote, "-") {
 			return SupervisorConfig{}, supervisorInvalid("push_allowlist.remote", "type_mismatch", nil)
 		}
 		if a.URL == "" {
@@ -384,6 +381,14 @@ func LoadSupervisorConfig(path string) (SupervisorConfig, error) {
 		if containsExactString(c.ProtectedBranches, a.Branch) {
 			return SupervisorConfig{}, supervisorInvalid("push_allowlist.branch", "protected_branch_in_allowlist", nil)
 		}
+		if _, exists := allowlistEntries[a]; exists {
+			return SupervisorConfig{}, supervisorInvalid("push_allowlist", "duplicate_allowlist_entry", nil)
+		}
+		if remote, exists := allowlistBranches[a.Branch]; exists && remote != a.Remote {
+			return SupervisorConfig{}, supervisorInvalid("push_allowlist", "duplicate_allowlist_entry", nil)
+		}
+		allowlistEntries[a] = struct{}{}
+		allowlistBranches[a.Branch] = a.Remote
 	}
 	return c, nil
 }
@@ -401,7 +406,15 @@ func isExecutableFile(p string) error {
 	return nil
 }
 func validBranch(s string) bool {
-	return s != "" && supervisorBranchPattern.MatchString(s) && !strings.Contains(s, "..") && !strings.Contains(s, "//") && !strings.HasSuffix(s, "/") && !strings.HasSuffix(s, ".")
+	if s == "" || s == "HEAD" || strings.HasPrefix(s, "refs/") || !supervisorBranchPattern.MatchString(s) || strings.Contains(s, "..") || strings.Contains(s, "//") || strings.HasSuffix(s, "/") || strings.HasSuffix(s, ".") {
+		return false
+	}
+	for _, r := range s {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 func containsExactString(a []string, s string) bool {
 	for _, v := range a {
