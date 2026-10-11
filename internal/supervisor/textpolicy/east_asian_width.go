@@ -1,7 +1,43 @@
-package supervisor
+package textpolicy
 
-// eastAsianWideRanges contains Unicode 15.1 EastAsianWidth W/F ranges.
-var eastAsianWideRanges = [...]runeRange{
+import "unicode"
+
+// RuneWidth returns terminal columns for one rune. Combining marks, joiners,
+// variation selectors, and emoji skin tone modifiers have zero width.
+func RuneWidth(r rune) int {
+	if unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) || r == 0x200d || r >= 0xfe00 && r <= 0xfe0f || r >= 0x1f3fb && r <= 0x1f3ff {
+		return 0
+	}
+	if isWide(r) {
+		return 2
+	}
+	return 1
+}
+
+// DisplayWidth sums RuneWidth for every rune.
+func DisplayWidth(value string) int {
+	width := 0
+	for _, r := range value {
+		width += RuneWidth(r)
+	}
+	return width
+}
+
+func isWide(r rune) bool {
+	lo, hi := 0, len(wideRanges)
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if wideRanges[mid].last < r {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	return lo < len(wideRanges) && wideRanges[lo].first <= r
+}
+
+// wideRanges contains Unicode 15.1 EastAsianWidth W/F ranges.
+var wideRanges = [...]wideRange{
 	{0x1100, 0x115F},
 	{0x231A, 0x231B},
 	{0x2329, 0x2329},
@@ -290,4 +326,4 @@ var eastAsianWideRanges = [...]runeRange{
 	{0x323B0, 0x3FFFD},
 }
 
-type runeRange struct{ first, last rune }
+type wideRange struct{ first, last rune }

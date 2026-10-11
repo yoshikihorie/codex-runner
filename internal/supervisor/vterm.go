@@ -1,9 +1,9 @@
 package supervisor
 
 import (
+	"github.com/yoshikihorie/codex-runner/internal/supervisor/textpolicy"
 	"strings"
 	"sync"
-	"unicode"
 	"unicode/utf8"
 )
 
@@ -721,30 +721,5 @@ func (v *VirtualTerminal) CursorPos() CursorPosition {
 	s := v.current()
 	return CursorPosition{Row: s.row, Col: s.col}
 }
-func runeWidth(r rune) int {
-	if unicode.Is(unicode.Mn, r) || unicode.Is(unicode.Me, r) || r == 0x200d || r == 0xfe0f || (r >= 0x1f3fb && r <= 0x1f3ff) {
-		return 0
-	}
-	if isWideRune(r) {
-		return 2
-	}
-	return 1
-}
-func isWideRune(r rune) bool {
-	if r == 0x276f || r == 0x23f5 || r == 0x2733 || r == 0x2500 {
-		return false
-	}
-	low, high := 0, len(eastAsianWideRanges)
-	for low < high {
-		mid := low + (high-low)/2
-		if r < eastAsianWideRanges[mid].first {
-			high = mid
-		} else if r > eastAsianWideRanges[mid].last {
-			low = mid + 1
-		} else {
-			return true
-		}
-	}
-	return false
-}
+func runeWidth(r rune) int       { return textpolicy.RuneWidth(r) }
 func clamp(n, low, high int) int { return min(max(n, low), high) }
