@@ -221,6 +221,28 @@ func TestSCNsup01038RespawnKinds(t *testing.T) {
 	}
 }
 
+func TestRespawnSession_SCN0439_HandoffResume(t *testing.T) {
+	u, sessions, spy, id := respawnFixture(t)
+	sessions.session.State = supervisor.SessionRotating
+	sessions.session.RestartCount = 2
+	sessions.session.RestartTimes = []time.Time{u.Now()}
+	if err := u.Execute(context.Background(), id, RespawnHandoffResume); err != nil {
+		t.Fatal(err)
+	}
+	if sessions.session.State != supervisor.SessionRotating || sessions.session.Generation != 2 || sessions.session.RestartCount != 2 || len(sessions.session.RestartTimes) != 1 || !slices.Contains(spy.argv, "--resume") || spy.argv[len(spy.argv)-1] != sessions.session.PreviousClaudeSessionID {
+		t.Fatalf("session=%+v argv=%v", sessions.session, spy.argv)
+	}
+}
+
+func TestRespawnSession_SCN0412_RotatingSpawnFailureReturned(t *testing.T) {
+	u, sessions, spy, id := respawnFixture(t)
+	sessions.session.State = supervisor.SessionRotating
+	spy.err = errors.New("spawn failed")
+	if err := u.Execute(context.Background(), id, RespawnHandoffStage5); err == nil || sessions.session.State != supervisor.SessionRotating {
+		t.Fatalf("err=%v state=%s", err, sessions.session.State)
+	}
+}
+
 func TestSCNsup01039RespawnFailureKeepsRecord(t *testing.T) {
 	u, sessions, spy, id := respawnFixture(t)
 	spy.err = errors.New("pty failed")

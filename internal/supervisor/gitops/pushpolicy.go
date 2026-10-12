@@ -1,7 +1,7 @@
 package gitops
 
 import (
-	"fmt"
+	"errors"
 	"path"
 	"regexp"
 	"strings"
@@ -9,28 +9,29 @@ import (
 
 type PushAllowlistEntry struct{ Remote, URL, Branch string }
 type PushInput struct {
-	FetchURLs, PushURLs                []string
-	ReceivepackConfigured              bool
-	RemoteHelperConfigured             bool
-	CurrentRef                         string
-	ProtectedBranches                  []string
-	Allowlist                          []PushAllowlistEntry
-	RemoteHeadSHA                      string
-	RemoteHeadLocal                    bool
-	RemoteHeadUnavailable              bool
-	CommitSHAs, SupervisorCommitSHAs   []string
-	HeadSHA, PreviousFailedHead        string
-	GitConfigChanged, GitConfigInclude bool
+	LocalGitError, RemoteHeadLocalError, CommitListError error
+	FetchURLs, PushURLs                                  []string
+	ReceivepackConfigured                                bool
+	RemoteHelperConfigured                               bool
+	CurrentRef                                           string
+	ProtectedBranches                                    []string
+	Allowlist                                            []PushAllowlistEntry
+	RemoteHeadSHA                                        string
+	RemoteHeadLocal                                      bool
+	RemoteHeadUnavailable                                bool
+	CommitSHAs, SupervisorCommitSHAs                     []string
+	HeadSHA, PreviousFailedHead                          string
+	GitConfigChanged, GitConfigInclude                   bool
 }
 type PushDecision struct {
-	Allowed                    bool
-	Reason                     string
-	Remote, Branch             string
-	Noop, NoPushes, Suppressed bool
+	Allowed, ReadyForRemote, ReadyForCommits bool
+	Reason                                   string
+	Remote, Branch                           string
+	Noop, NoPushes, Suppressed               bool
 }
 type PushPolicy struct{}
 
-const SupervisorGitHardeningArgs = "-c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.sshCommand= -c push.recurseSubmodules=no -c push.pushOption= -c protocol.ext.allow=never -c commit.gpgsign=false -c core.excludesFile=/dev/null -c core.attributesFile=/dev/null"
+const SupervisorGitHardeningArgs = "-c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.sshCommand= -c push.recurseSubmodules=no -c push.pushOption= -c protocol.ext.allow=never -c commit.gpgsign=false -c push.gpgSign=false -c core.excludesFile=/dev/null -c core.attributesFile=/dev/null -c core.gitProxy= -c http.proxy= -c credential.helper=" // specifications/10-shared/validation-rules.md SUPERVISOR_GIT_HARDENING_ARGS
 
 var hardeningArgs = strings.Fields(SupervisorGitHardeningArgs)
 var shaPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -86,22 +87,36 @@ func ResolveAllowlistEntry(entries []PushAllowlistEntry, branch string, fetchURL
 	return PushAllowlistEntry{}, false
 }
 
-func (PushPolicy) Evaluate(p PushInput) PushDecision {
+// Evaluate keeps the original all-input entry point for existing callers.
+func (policy PushPolicy) Evaluate(p PushInput) PushDecision {
+	d := policy.EvaluateLocal(p)
+	if !d.ReadyForRemote {
+		return d
+	}
+	d = policy.EvaluateRemote(p, d)
+	if !d.ReadyForCommits {
+		return d
+	}
+	return policy.EvaluateCommits(p, d)
+}
+
+// EvaluateBeforeURLs covers checks 3-5 before a remote URL is read.
+func (PushPolicy) EvaluateBeforeURLs(p PushInput) PushDecision {
 	d := PushDecision{}
-	deny := func(s string) PushDecision { d.Reason = s; return d }
+	deny := func(reason string) PushDecision { d.Reason = reason; return d }
 	if len(p.Allowlist) == 0 {
 		d.Noop = true
 		return d
+	}
+	if p.LocalGitError != nil {
+		return deny(localGitFailureReason(p.LocalGitError))
 	}
 	if p.CurrentRef == "" || !strings.HasPrefix(p.CurrentRef, "refs/heads/") {
 		return deny("detached_head")
 	}
 	branch := strings.TrimPrefix(p.CurrentRef, "refs/heads/")
 	d.Branch = branch
-	if !validRefName(branch) {
-		return deny("argv_not_allowed")
-	}
-	if strings.HasPrefix(branch, "refs/") || branch == "HEAD" {
+	if !validRefName(branch) || strings.HasPrefix(branch, "refs/") || branch == "HEAD" {
 		return deny("argv_not_allowed")
 	}
 	protected := append([]string{"main", "master", "develop"}, p.ProtectedBranches...)
@@ -110,14 +125,37 @@ func (PushPolicy) Evaluate(p PushInput) PushDecision {
 			return deny("protected_branch")
 		}
 	}
-	match, ok := ResolveAllowlistEntry(p.Allowlist, branch, p.FetchURLs, p.PushURLs)
-	if !ok {
+	var remote string
+	for _, entry := range p.Allowlist {
+		if entry.Branch != branch {
+			continue
+		}
+		if remote != "" && remote != entry.Remote {
+			return deny("not_in_allowlist")
+		}
+		remote = entry.Remote
+	}
+	if remote == "" {
 		return deny("not_in_allowlist")
 	}
-	if !validRemote(match.Remote) {
+	if !validRemote(remote) {
 		return deny("argv_not_allowed")
 	}
-	d.Remote = match.Remote
+	d.Remote = remote
+	return d
+}
+
+// EvaluateLocal covers checks 3-8. Only ReadyForRemote permits ls-remote.
+func (policy PushPolicy) EvaluateLocal(p PushInput) PushDecision {
+	d := policy.EvaluateBeforeURLs(p)
+	if d.Noop || d.Reason != "" {
+		return d
+	}
+	deny := func(reason string) PushDecision { d.Reason = reason; return d }
+	match, ok := ResolveAllowlistEntry(p.Allowlist, d.Branch, p.FetchURLs, p.PushURLs)
+	if !ok || match.Remote != d.Remote {
+		return deny("not_in_allowlist")
+	}
 	if len(p.FetchURLs) != 1 || len(p.PushURLs) != 1 {
 		return deny("multiple_urls")
 	}
@@ -136,61 +174,96 @@ func (PushPolicy) Evaluate(p PushInput) PushDecision {
 	if p.GitConfigChanged {
 		return deny("git_config_changed")
 	}
+	d.ReadyForRemote = true
+	return d
+}
+
+// EvaluateRemote covers check 9 after the caller obtains the actual remote head.
+func (PushPolicy) EvaluateRemote(p PushInput, local PushDecision) PushDecision {
+	if !local.ReadyForRemote || local.Reason != "" {
+		return local
+	}
+	local.ReadyForRemote = false
+	deny := func(reason string) PushDecision { local.Reason = reason; return local }
 	if p.RemoteHeadUnavailable {
 		return deny("remote_head_unavailable")
 	}
 	if p.RemoteHeadSHA == "" {
 		return deny("no_tracking_ref")
 	}
+	if !shaPattern.MatchString(p.RemoteHeadSHA) {
+		return deny("remote_head_unavailable")
+	}
+	if p.RemoteHeadLocalError != nil {
+		return deny(localGitFailureReason(p.RemoteHeadLocalError))
+	}
 	if !p.RemoteHeadLocal {
 		return deny("remote_head_not_local")
+	}
+	local.ReadyForCommits = true
+	return local
+}
+
+// EvaluateCommits covers checks 10-11. Allowed is set only after both pass.
+func (PushPolicy) EvaluateCommits(p PushInput, remote PushDecision) PushDecision {
+	if !remote.ReadyForCommits || remote.Reason != "" {
+		return remote
+	}
+	remote.ReadyForCommits = false
+	deny := func(reason string) PushDecision { remote.Reason = reason; return remote }
+	if p.CommitListError != nil {
+		return deny(localGitFailureReason(p.CommitListError))
 	}
 	if !shaPattern.MatchString(p.HeadSHA) {
 		return deny("foreign_commits")
 	}
-	if !shaPattern.MatchString(p.RemoteHeadSHA) {
-		return deny("remote_head_unavailable")
-	}
 	set := map[string]bool{}
-	for _, s := range p.SupervisorCommitSHAs {
-		if !shaPattern.MatchString(s) {
+	for _, sha := range p.SupervisorCommitSHAs {
+		if !shaPattern.MatchString(sha) {
 			return deny("foreign_commits")
 		}
-		set[s] = true
+		set[sha] = true
 	}
-	for _, s := range p.CommitSHAs {
-		if !shaPattern.MatchString(s) {
-			return deny("foreign_commits")
-		}
-		if !set[s] {
+	for _, sha := range p.CommitSHAs {
+		if !shaPattern.MatchString(sha) || !set[sha] {
 			return deny("foreign_commits")
 		}
 	}
 	if len(p.CommitSHAs) == 0 {
-		d.NoPushes = true
-		return d
+		remote.NoPushes = true
+		return remote
 	}
 	if !set[p.HeadSHA] || len(p.SupervisorCommitSHAs) == 0 || p.SupervisorCommitSHAs[len(p.SupervisorCommitSHAs)-1] != p.HeadSHA {
 		return deny("foreign_commits")
 	}
-	if p.HeadSHA == p.PreviousFailedHead && p.HeadSHA != "" {
-		d.Suppressed = true
-		return d
+	if p.HeadSHA == p.PreviousFailedHead {
+		remote.Suppressed = true
+		return remote
 	}
-	d.Allowed = true
-	return d
+	remote.Allowed = true
+	return remote
 }
 
-func ValidatePushArgv(argv []string, remote, branch string) error {
+func localGitFailureReason(err error) string {
+	if errors.Is(err, ErrGitOutputTooLarge) {
+		return "git_output_too_large"
+	}
+	return "git_failed"
+}
+
+func ValidatePushArgv(argv []string, remote, branch, inspectedSHA string) error {
+	if !shaPattern.MatchString(inspectedSHA) {
+		return ErrPushArgvNotAllowed
+	}
 	if len(argv) < 2 || !path.IsAbs(argv[0]) || path.Clean(argv[0]) != argv[0] || strings.HasPrefix(branch, "refs/") || branch == "HEAD" {
-		return fmt.Errorf("argv_not_allowed")
+		return ErrPushArgvNotAllowed
 	}
 	if !validRemote(remote) || !validRefName(branch) {
-		return fmt.Errorf("argv_not_allowed")
+		return ErrPushArgvNotAllowed
 	}
-	want := append([]string{argv[0]}, BuildPushArgv(remote, branch)...)
+	want := append([]string{argv[0]}, BuildPushArgv(remote, branch, inspectedSHA)...)
 	if !equal(argv, want) {
-		return fmt.Errorf("argv_not_allowed")
+		return ErrPushArgvNotAllowed
 	}
 	return nil
 }
@@ -205,8 +278,8 @@ func equal(a, b []string) bool {
 	}
 	return true
 }
-func BuildPushArgv(remote, branch string) []string {
+func BuildPushArgv(remote, branch, inspectedSHA string) []string {
 	args := append([]string{}, hardeningArgs...)
-	args = append(args, "-c", "push.followTags=false", "push", "--no-verify", "--recurse-submodules=no", "--", remote, "refs/heads/"+branch+":refs/heads/"+branch)
+	args = append(args, "-c", "remote."+remote+".proxy=", "-c", "push.followTags=false", "push", "--no-verify", "--recurse-submodules=no", "--", remote, inspectedSHA+":refs/heads/"+branch)
 	return args
 }

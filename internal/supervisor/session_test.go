@@ -105,7 +105,7 @@ func TestConditionalTransitions(t *testing.T) {
 		{"resume rotation exit timeout", SessionStopped, EventResume, TransitionContext{HasRotation: true, ChildAlive: true, RotationExitTimedOut: true}, SessionStopped, false},
 		{"resume child idle", SessionStopped, EventResume, TransitionContext{ChildAlive: true, ClaudeSessionID: true, ObservedState: SessionIdle}, SessionIdle, true},
 		{"resume child undetermined", SessionStopped, EventResume, TransitionContext{ChildAlive: true}, SessionWorking, true},
-		{"resume rotation", SessionStopped, EventResume, TransitionContext{RotationStep: RotateSendRemoteControl}, SessionRotating, true},
+		{"resume rotation", SessionStopped, EventResume, TransitionContext{RotationStep: RotateSendParallelInstruction}, SessionRotating, true},
 		{"resume clears auto continue latch", SessionStopped, EventResume, TransitionContext{ClaudeSessionID: true}, SessionStarting, true},
 		{"reconcile initial empty pid", SessionStarting, EventReconcile, TransitionContext{Generation: 1}, SessionExited, true},
 		{"reconcile respawn", SessionStarting, EventReconcile, TransitionContext{Generation: 2}, SessionStarting, false},
@@ -234,14 +234,24 @@ func TestStoppedSessionStopIsIdempotent(t *testing.T) {
 }
 
 func TestRotationDoneReturnsObservedRdStates(t *testing.T) {
-	for _, state := range []SupervisorSessionState{SessionIdle, SessionWorking, SessionAwaitingRecommendation, SessionExited} {
+	for _, state := range []SupervisorSessionState{SessionIdle, SessionWorking, SessionAwaitingPermission, SessionAwaitingRecommendation, SessionExited, ""} {
 		got, ok := Transition(SessionRotating, EventRotationDone, TransitionContext{ObservedState: state})
 		want, wantOK := state, true
-		if state == SessionExited {
+		if state != SessionIdle && state != SessionWorking && state != SessionAwaitingPermission && state != SessionAwaitingRecommendation {
 			want = SessionRotating
 		}
 		if got != want || ok != wantOK {
 			t.Errorf("Rd observed %s = (%s,%v), want (%s,%v)", state, got, ok, want, wantOK)
+		}
+	}
+}
+
+func TestRotationDone_SCN0418_ObservedStateDestination(t *testing.T) {
+	for _, state := range []SupervisorSessionState{SessionIdle, SessionWorking, SessionAwaitingPermission, SessionAwaitingRecommendation} {
+		got, ok := Transition(SessionRotating, EventRotationDone, TransitionContext{ObservedState: state})
+		want := state
+		if !ok || got != want {
+			t.Fatalf("observed %s: (%s, %v), want %s", state, got, ok, want)
 		}
 	}
 }

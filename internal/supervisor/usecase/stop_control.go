@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -62,7 +61,7 @@ func NewProcessResumeTransitionContext(isAlive func(int) bool, processStartedAt 
 				orphan = true
 			}
 		}
-		return supervisor.TransitionContext{ChildAlive: alive || orphan, OrphanChildAlive: orphan, HasRotation: s.Rotation != nil, ClaudeSessionID: s.ClaudeSessionID != "", HasPreviousClaudeSessionID: s.PreviousClaudeSessionID != "", ObservedState: s.PreviousState}, nil
+		return supervisor.TransitionContext{ChildAlive: alive || orphan, OrphanChildAlive: orphan, HasRotation: s.Rotation != nil, RotationExitTimedOut: s.Rotation != nil && s.Rotation.FailReason == supervisor.RotateFailExitTimeout, ClaudeSessionID: s.ClaudeSessionID != "", HasPreviousClaudeSessionID: s.PreviousClaudeSessionID != "", ObservedState: s.PreviousState}, nil
 	}
 }
 
@@ -83,13 +82,17 @@ type StopControlUseCase struct {
 	notifier        StopNotifier
 	now             func() time.Time
 	rotationResumer func(context.Context, supervisor.ManagedSession) error
+	rotation        *RotateSessionUseCase
+	supervisorCtx   context.Context
 	recoveryStarter func(context.Context, supervisor.ManagedSession) error
 	suppression     ResumeSuppression
 	maintenance     ResumeMaintenance
 	transitionCtx   ResumeTransitionContext
+	autoContinue    *AutoContinueUseCase
 }
 
 func (u *StopControlUseCase) SetResumeSuppression(s ResumeSuppression) { u.suppression = s }
+func (u *StopControlUseCase) SetAutoContinue(a *AutoContinueUseCase)   { u.autoContinue = a }
 func (u *StopControlUseCase) SetResumeMaintenance(m ResumeMaintenance) { u.maintenance = m }
 func (u *StopControlUseCase) SetResumeTransitionContext(provider ResumeTransitionContext) {
 	u.transitionCtx = provider
@@ -109,6 +112,13 @@ func (u *StopControlUseCase) SetResumeContinuations(rotation, recovery func(cont
 	u.rotationResumer = rotation
 	u.recoveryStarter = recovery
 }
+
+// SetRotationUseCase prepares the persisted resume before publishing rotating,
+// then starts one worker using the supervisor lifetime.
+func (u *StopControlUseCase) SetRotationUseCase(rotation *RotateSessionUseCase, supervisorCtx context.Context) {
+	u.rotation = rotation
+	u.supervisorCtx = supervisorCtx
+}
 func (u *StopControlUseCase) Stop(ctx context.Context, id *supervisor.SessionID) (StopOutput, error) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -126,6 +136,9 @@ func (u *StopControlUseCase) Stop(ctx context.Context, id *supervisor.SessionID)
 			u.record("", supervisor.EventKindStopSet, supervisor.StopGlobal)
 		}
 		for _, s := range sessions {
+			if u.autoContinue != nil && !wasStopped {
+				u.autoContinue.ClearCandidate(s.SessionID)
+			}
 			before := s
 			changed := false
 			transitioned := false
@@ -169,6 +182,9 @@ func (u *StopControlUseCase) Stop(ctx context.Context, id *supervisor.SessionID)
 	}
 	if !wasStopped {
 		u.record(*id, supervisor.EventKindStopSet, supervisor.StopSession)
+		if u.autoContinue != nil {
+			u.autoContinue.ClearCandidate(*id)
+		}
 	}
 	changed := false
 	transitioned := false
@@ -246,8 +262,11 @@ func (u *StopControlUseCase) Resume(ctx context.Context, id *supervisor.SessionI
 				continue
 			}
 			if err = u.resumeOne(ctx, &s, supervisor.StopScopeGlobal); err != nil {
-				out.StillStopped = append(out.StillStopped, StillStopped{s.SessionID, resumeReason(s, err)})
-				continue
+				if reason, known := resumeReason(s, err); known {
+					out.StillStopped = append(out.StillStopped, StillStopped{s.SessionID, reason})
+					continue
+				}
+				return out, err
 			}
 			out.Resumed = append(out.Resumed, s.SessionID)
 		}
@@ -274,16 +293,24 @@ func (u *StopControlUseCase) Resume(ctx context.Context, id *supervisor.SessionI
 		out.StillStopped = append(out.StillStopped, StillStopped{*id, "stop_recreated"})
 		return out, nil
 	}
-	s.StopScope = supervisor.StopScopeNone
 	if err = u.resumeOne(ctx, &s, supervisor.StopScopeSession); err != nil {
-		out.StillStopped = append(out.StillStopped, StillStopped{*id, resumeReason(s, err)})
-		return out, nil
+		if reason, known := resumeReason(s, err); known {
+			out.StillStopped = append(out.StillStopped, StillStopped{*id, reason})
+			return out, nil
+		}
+		return out, err
 	}
 	out.Resumed = append(out.Resumed, *id)
 	return out, nil
 }
 func (u *StopControlUseCase) resumeOne(ctx context.Context, s *supervisor.ManagedSession, scope supervisor.SupervisorStopScope) error {
 	before := *s
+	resumeStep := supervisor.SupervisorRotateStep("")
+	if s.Rotation != nil {
+		resumeStep = s.Rotation.Step
+		rotationBefore := *s.Rotation
+		before.Rotation = &rotationBefore
+	}
 	ctxTransition := supervisor.TransitionContext{}
 	if u.transitionCtx != nil {
 		var err error
@@ -299,6 +326,16 @@ func (u *StopControlUseCase) resumeOne(ctx context.Context, s *supervisor.Manage
 	ctxTransition.ResumeScope = scope
 	if s.Rotation != nil {
 		ctxTransition.RotationStep = s.Rotation.Step
+		ctxTransition.RotationExitTimedOut = s.Rotation.FailReason == supervisor.RotateFailExitTimeout
+		if s.Rotation.Step == supervisor.RotateSendExit && ctxTransition.ChildAlive && (ctxTransition.RotationExitTimedOut || s.SendGate.Pending != nil && s.SendGate.Pending.Kind == supervisor.SendKindHandoffExit || s.LastSend != nil && s.LastSend.Kind == supervisor.SendKindHandoffExit) {
+			return errors.New("exit_process_alive")
+		}
+		if !ctxTransition.ChildAlive && (s.Rotation.Step == supervisor.RotateSendEnd || s.Rotation.Step == supervisor.RotateConfirmHandoff) && s.ClaudeSessionID == "" && s.PreviousClaudeSessionID == "" {
+			return errors.New("claude_session_id_missing")
+		}
+	}
+	if u.autoContinue != nil {
+		u.autoContinue.Reset(s.SessionID)
 	}
 	if err := u.stops.GuardResume(scope, s.SessionID, func() error {
 		if err := s.Apply(supervisor.EventResume, ctxTransition, u.now()); err != nil {
@@ -307,6 +344,11 @@ func (u *StopControlUseCase) resumeOne(ctx context.Context, s *supervisor.Manage
 				u.notify(ctx, supervisor.EventKindOrphanChildAlive, s.SessionID)
 			}
 			return err
+		}
+		if s.Rotation != nil && u.rotation != nil {
+			if err := u.rotation.PrepareResume(s); err != nil {
+				return err
+			}
 		}
 		return u.persistSessionPatch(ctx, before, *s)
 	}); err != nil {
@@ -334,6 +376,9 @@ func (u *StopControlUseCase) resumeOne(ctx context.Context, s *supervisor.Manage
 			return err
 		}
 	}
+	if s.Rotation != nil {
+		s.RestartCount = 0
+	}
 	if s.ChildPID == 0 && s.Rotation == nil && u.recoveryStarter != nil {
 		s.RestartCount = 0
 		s.RestartTimes = nil
@@ -347,10 +392,32 @@ func (u *StopControlUseCase) resumeOne(ctx context.Context, s *supervisor.Manage
 	if err := u.persistSessionPatch(ctx, before, *s); err != nil {
 		return err
 	}
+	if s.Rotation != nil && u.rotation != nil {
+		if resumeStep != s.Rotation.Step {
+			if err := u.rotation.record(s.SessionID, supervisor.EventKindRotateStepDone, resumeStep, "", ""); err != nil {
+				return err
+			}
+		}
+		if err := u.rotation.record(s.SessionID, supervisor.EventKindRotateResumed, resumeStep, "", ""); err != nil {
+			return err
+		}
+	}
 	u.record(s.SessionID, supervisor.EventKindSessionResumed, "")
 	u.notify(ctx, supervisor.EventKindSessionResumed, s.SessionID)
 	if err := u.stops.GuardResume(scope, s.SessionID, func() error { return nil }); err != nil {
 		return err
+	}
+	if s.Rotation != nil && u.rotation != nil {
+		lifetime := u.supervisorCtx
+		if lifetime == nil {
+			lifetime = ctx
+		}
+		go func() {
+			if err := u.rotation.Run(lifetime, s.SessionID); err != nil && !errors.Is(err, context.Canceled) {
+				slog.Warn("rotation worker ended after resume", "reason", "run_failed")
+			}
+		}()
+		return nil
 	}
 	if s.Rotation != nil && u.rotationResumer != nil {
 		return u.rotationResumer(ctx, *s)
@@ -366,24 +433,20 @@ func (u *StopControlUseCase) persistSessionPatch(ctx context.Context, before, af
 		func() (supervisor.ManagedSession, error) { return u.find(ctx, after.SessionID) },
 		func(session supervisor.ManagedSession) error { return u.sessions.Save(ctx, session) }, before, after)
 }
-func resumeReason(s supervisor.ManagedSession, err error) string {
-	message := err.Error()
-	if strings.Contains(message, "stop_recreated") {
-		return "stop_recreated"
+func resumeReason(s supervisor.ManagedSession, err error) (string, bool) {
+	switch err.Error() {
+	case "stop_recreated", "still_stopped_by_global", "exit_process_alive", "claude_session_id_missing":
+		return err.Error(), true
+	case "SUP_ORPHAN_CHILD_ALIVE":
+		return "orphan_child_alive", true
+	case "SUP_CLAUDE_SESSION_ID_MISSING":
+		return "claude_session_id_missing", true
+	case "SUP_ROTATE_STEP_FAILED":
+		if s.Rotation != nil && s.Rotation.Step == supervisor.RotateSendExit && s.Rotation.FailReason == supervisor.RotateFailExitTimeout {
+			return "exit_process_alive", true
+		}
 	}
-	if strings.Contains(message, "still_stopped_by_global") {
-		return "still_stopped_by_global"
-	}
-	if strings.Contains(message, "SUP_ORPHAN_CHILD_ALIVE") {
-		return "orphan_child_alive"
-	}
-	if strings.Contains(message, "SUP_ROTATE_STEP_FAILED") {
-		return "exit_process_alive"
-	}
-	if s.ClaudeSessionID == "" && s.PreviousClaudeSessionID == "" && s.ChildPID == 0 && s.Rotation == nil {
-		return "claude_session_id_missing"
-	}
-	return "exit_process_alive"
+	return "", false
 }
 func (u *StopControlUseCase) find(ctx context.Context, id supervisor.SessionID) (supervisor.ManagedSession, error) {
 	sessions, err := u.sessions.List(ctx)

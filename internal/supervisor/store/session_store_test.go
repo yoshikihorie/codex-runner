@@ -13,6 +13,43 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/supervisor"
 )
 
+func TestSetGitPhaseIfEligibleRejectsRotating(t *testing.T) {
+	st := NewSessionStore(t.TempDir())
+	id := mustID(t, "phase-rotation-1")
+	v := supervisor.ManagedSession{SessionID: id, ProjectID: "alpha", CLI: supervisor.CLIClaude, Generation: 1,
+		State: supervisor.SessionRotating, StateSince: time.Now().UTC(), StopScope: supervisor.StopScopeNone,
+		RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 1},
+		Rotation: &supervisor.RotationRecord{Step: supervisor.RotateSendEnd},
+	}
+	if err := st.Save(v); err != nil {
+		t.Fatal(err)
+	}
+	ok, err := st.SetGitPhaseIfEligible(id, supervisor.GitPhaseEvaluating)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal("commit phase entered while rotating")
+	}
+}
+
+func TestSessionStoreRejectsRotationBeforeStage2(t *testing.T) {
+	for _, step := range []supervisor.SupervisorRotateStep{"", supervisor.RotateWaitIdle} {
+		t.Run(string(step), func(t *testing.T) {
+			st := NewSessionStore(t.TempDir())
+			v := supervisor.ManagedSession{SessionID: mustID(t, "invalid-rotation-step-1"), ProjectID: "alpha",
+				CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionRotating,
+				StateSince: time.Now().UTC(), StopScope: supervisor.StopScopeNone,
+				RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 1},
+				Rotation: &supervisor.RotationRecord{Step: step},
+			}
+			if err := st.Save(v); err == nil {
+				t.Fatalf("step %q was accepted", step)
+			}
+		})
+	}
+}
+
 func TestSessionStoreUpdateSessionWritesOnlyChanges(t *testing.T) {
 	st := NewSessionStore(t.TempDir())
 	id := mustID(t, "update-store-1")
@@ -59,7 +96,7 @@ func TestSessionStoreRoundTripAndOmitsScreenText(t *testing.T) {
 	root := filepath.Join(os.Getenv("HOME"), "state")
 	st := NewSessionStore(root)
 	now := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
-	s := supervisor.ManagedSession{SchemaVersion: 1, SessionID: mustID(t, "alpha-1"), ProjectID: "alpha", CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionStarting, StateSince: now, StopScope: supervisor.StopScopeNone, ClaudeSessionID: "00000000-0000-0000-0000-000000000001", PreviousClaudeSessionID: "00000000-0000-0000-0000-000000000002", ChildPID: 42, SendGate: supervisor.SendGateRecord{NextSeq: 9, EverSent: true, LastSendConfirmed: true, LastConfirmedAt: &now, UnconfirmedDiscarded: true, Pending: &supervisor.PendingSend{SendID: "alpha-1-s9", Kind: supervisor.SendKindRemoteControl, IssuedAt: now}}, LastSend: &supervisor.LastSendRecord{SendID: "alpha-1-s8", Kind: supervisor.SendKindRemoteControl, IssuedAt: now, Confirmed: true}, RestartCount: 2, RestartTimes: []time.Time{now}, Rotation: &supervisor.RotationRecord{Step: supervisor.RotateSendRemoteControl, StartedAt: now, StepStartedAt: &now, EndIssuedAt: &now, CheckpointSnapshot: supervisor.RotationCheckpointSnapshot{Exists: true, HeadHash: "0123456789012345678901234567890123456789"}, RespawnWaitUntil: &now, FailReason: "exit_timeout"}, PendingRemoteControl: true, PendingRemoteControlSince: &now, PreviousState: supervisor.SessionWorking, LastVerifiedFingerprint: strings.Repeat("a", 64), LastVerifiedResult: "passed", LastFailureFingerprint: strings.Repeat("b", 64), LastFailureReason: "verify_binary_changed", LastPushFailedHead: "0123456789012345678901234567890123456789", GitConfigFingerprint: strings.Repeat("c", 64), AutoContinueDisabledReason: supervisor.AutoContinueDisabledPermissionModeUnsafe}
+	s := supervisor.ManagedSession{SchemaVersion: 1, SessionID: mustID(t, "alpha-1"), ProjectID: "alpha", CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionStarting, StateSince: now, StopScope: supervisor.StopScopeNone, ClaudeSessionID: "00000000-0000-0000-0000-000000000001", PreviousClaudeSessionID: "00000000-0000-0000-0000-000000000002", ChildPID: 42, SendGate: supervisor.SendGateRecord{NextSeq: 9, EverSent: true, LastSendConfirmed: true, LastConfirmedAt: &now, UnconfirmedDiscarded: true, Pending: &supervisor.PendingSend{SendID: "alpha-1-s9", Kind: supervisor.SendKindRemoteControl, IssuedAt: now}}, LastSend: &supervisor.LastSendRecord{SendID: "alpha-1-s8", Kind: supervisor.SendKindRemoteControl, IssuedAt: now, Confirmed: true}, RestartCount: 2, RestartTimes: []time.Time{now}, Rotation: &supervisor.RotationRecord{Step: supervisor.RotateSendParallelInstruction, StartedAt: now, StepStartedAt: &now, EndIssuedAt: &now, CheckpointSnapshot: &supervisor.RotationCheckpointSnapshot{Exists: true, HeadHash: strings.Repeat("d", 64)}, RespawnWaitUntil: &now, FailReason: "exit_timeout"}, PendingRemoteControl: true, PendingRemoteControlSince: &now, PreviousState: supervisor.SessionWorking, LastVerifiedFingerprint: strings.Repeat("a", 64), LastVerifiedResult: "passed", LastFailureFingerprint: strings.Repeat("b", 64), LastFailureReason: "verify_binary_changed", LastPushFailedHead: "0123456789012345678901234567890123456789", GitConfigFingerprint: strings.Repeat("c", 64), AutoContinueDisabledReason: supervisor.AutoContinueDisabledPermissionModeUnsafe}
 	if err := st.Save(s); err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +122,63 @@ func TestSessionStoreRoundTripAndOmitsScreenText(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0600 {
 		t.Fatalf("permissions=%o", info.Mode().Perm())
+	}
+}
+
+func TestSessionStoreRotationCheckpointHeadHashSHA256(t *testing.T) {
+	now := time.Now().UTC()
+	id := mustID(t, "rotation-hash-1")
+	base := supervisor.ManagedSession{SessionID: id, ProjectID: "rotation-hash", CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionIdle, StateSince: now, StopScope: supervisor.StopScopeNone, RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 1}}
+	for _, tc := range []struct {
+		name, hash string
+		valid      bool
+	}{
+		{"sha256", strings.Repeat("a", 64), true},
+		{"git sha", strings.Repeat("a", 40), false},
+		{"uppercase", strings.Repeat("A", 64), false},
+		{"non hex", strings.Repeat("g", 64), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			v := base
+			v.Rotation = &supervisor.RotationRecord{Step: supervisor.RotateSendEnd, StartedAt: now, CheckpointSnapshot: &supervisor.RotationCheckpointSnapshot{Exists: true, HeadHash: tc.hash}}
+			st := NewSessionStore(t.TempDir())
+			err := st.Save(v)
+			if !tc.valid {
+				if !errors.Is(err, ErrStateFileCorrupt) {
+					t.Fatalf("Save error=%v", err)
+				}
+				data, err := json.Marshal(v)
+				if err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(st.root, "sessions", id.String()+".json")
+				if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(path, data, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := st.Load(id); !errors.Is(err, ErrStateFileCorrupt) {
+					t.Fatalf("Load error=%v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, err := NewSessionStore(st.root).Load(id)
+			if err != nil || got.Rotation == nil || got.Rotation.CheckpointSnapshot.HeadHash != tc.hash {
+				t.Fatalf("Load rotation=%+v error=%v", got.Rotation, err)
+			}
+		})
+	}
+}
+
+func TestSessionStoreRejectsRemoteControlAsRotationStep(t *testing.T) {
+	now := time.Now().UTC()
+	v := supervisor.ManagedSession{SessionID: mustID(t, "rotation-step-1"), ProjectID: "rotation-step", CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionIdle, StateSince: now, StopScope: supervisor.StopScopeNone, RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 1}, Rotation: &supervisor.RotationRecord{Step: supervisor.SupervisorRotateStep("send_remote_control"), StartedAt: now}}
+	if err := NewSessionStore(t.TempDir()).Save(v); !errors.Is(err, ErrStateFileCorrupt) {
+		t.Fatalf("Save error=%v", err)
 	}
 }
 

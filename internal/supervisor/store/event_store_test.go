@@ -94,6 +94,18 @@ func TestSCNsup0509_EventRejectsUnknownReasonCodeAndStep(t *testing.T) {
 	}
 }
 
+func TestEventStore_SCN04_05_IdleWaitTimeoutReason(t *testing.T) {
+	store := NewEventStore(t.TempDir())
+	if _, err := store.Record(Event{Kind: supervisor.EventKindRotateIdleWaitTimeout, Reason: ReasonIdleWaitTimeout}); err != nil {
+		t.Fatalf("rejected idle wait timeout reason: %v", err)
+	}
+	for _, reason := range []EventReason{ReasonSendNotConfirmed, ReasonStopGlobal, "made_up"} {
+		if _, err := store.Record(Event{Kind: supervisor.EventKindRotateIdleWaitTimeout, Reason: reason}); err == nil {
+			t.Errorf("accepted invalid timeout reason %q", reason)
+		}
+	}
+}
+
 func TestSCNsup0537_EventSequenceRestoredAfterRotation(t *testing.T) {
 	root := t.TempDir()
 	first := NewEventStoreWithOptions(root, 100, 2)
@@ -156,7 +168,7 @@ func TestEventStoreReasonEnumsAndEventSpecificReasons(t *testing.T) {
 		supervisor.EventKindSessionExited:         {"stop_session_requested"},
 		supervisor.EventKindRotateFailed:          {"idle_wait_timeout", "send_not_confirmed", "mtime_not_updated", "head_generation_unchanged", "not_idle_after_handoff", "exit_timeout", "spawn_failed", "startup_timeout", "start_not_settled", "child_absent", "restart_limit"},
 		supervisor.EventKindCommitFailed:          {"path_escape", "staged_out_of_scope", "out_of_scope_uncommitted", "rename_partial", "git_config_changed", "gitattributes_filter", "git_config_include", "tree_mismatch_before_commit", "commit_rejected", "git_timeout", "git_unavailable", "git_failed", "git_output_too_large"},
-		supervisor.EventKindPushBlocked:           {"detached_head", "protected_branch", "not_in_allowlist", "multiple_urls", "url_mismatch", "receivepack_configured", "git_config_changed", "no_tracking_ref", "foreign_commits", "argv_not_allowed", "git_config_include", "remote_head_unavailable", "remote_head_not_local"},
+		supervisor.EventKindPushBlocked:           {"detached_head", "protected_branch", "not_in_allowlist", "multiple_urls", "url_mismatch", "receivepack_configured", "remote_helper_configured", "git_config_changed", "no_tracking_ref", "foreign_commits", "argv_not_allowed", "git_config_include", "remote_head_unavailable", "remote_head_not_local", "git_failed", "git_output_too_large"},
 		supervisor.EventKindVerifyFailed:          {"verify_binary_changed", "verify_cwd_invalid", "verify_exec_failed"},
 		supervisor.EventKindRestartLimitExceeded:  {"restart_limit_consecutive", "restart_limit_daily"},
 	}
@@ -178,6 +190,13 @@ func TestEventStoreReasonEnumsAndEventSpecificReasons(t *testing.T) {
 		if _, err := store.Record(event); err == nil {
 			t.Errorf("accepted mismatched reason for %s: %q", event.Kind, event.Reason)
 		}
+	}
+}
+
+func TestEventStore_RejectsRemoteControlAsRotationStep(t *testing.T) {
+	s := NewEventStore(t.TempDir())
+	if _, err := s.Record(Event{Kind: supervisor.EventKindRotateStepDone, Step: "send_remote_control"}); err == nil {
+		t.Fatal("remote control was accepted as an eighth rotation step")
 	}
 }
 
@@ -320,5 +339,25 @@ func TestSensitivePathEventPatternValidatedWithoutPath(t *testing.T) {
 	}
 	if _, err := st.Record(Event{Kind: supervisor.EventKindSensitivePathBlocked, SessionID: "alpha-1", Code: "SUP_SENSITIVE_PATH_BLOCKED", Pattern: "owned/.env.local"}); err == nil {
 		t.Fatal("path accepted as pattern")
+	}
+}
+
+func TestEventStore_SCN53_PushRejectReasonVocabulary(t *testing.T) {
+	reasons := []EventReason{
+		ReasonDetachedHead, ReasonProtectedBranch, ReasonNotInAllowlist, ReasonMultipleURLs,
+		ReasonURLMismatch, ReasonReceivepackConfigured, ReasonRemoteHelperConfigured, ReasonGitConfigChanged,
+		ReasonNoTrackingRef, ReasonForeignCommits, ReasonArgvNotAllowed, ReasonGitConfigInclude,
+		ReasonRemoteHeadUnavailable, ReasonRemoteHeadNotLocal, ReasonGitFailed, ReasonGitOutputTooLarge,
+	}
+	if len(reasons) != 16 {
+		t.Fatalf("push reject reason count=%d", len(reasons))
+	}
+	for _, reason := range reasons {
+		if err := validateEvent(Event{Kind: supervisor.EventKindPushBlocked, Reason: reason, Code: "SUP_PUSH_REJECTED_POLICY"}); err != nil {
+			t.Errorf("reason %s: %v", reason, err)
+		}
+	}
+	if err := validateEvent(Event{Kind: supervisor.EventKindPushBlocked, Reason: ReasonGitTimeout, Code: "SUP_PUSH_REJECTED_POLICY"}); err == nil {
+		t.Fatal("accepted commit-only git_timeout as push reason")
 	}
 }

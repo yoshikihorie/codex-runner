@@ -160,6 +160,21 @@ func (s *SessionStore) SetGitPhase(id supervisor.SessionID, phase supervisor.Git
 		s.phases[id] = phase
 	}
 }
+
+// SetGitPhaseIfEligible shares the session update lock with rotation Start.
+func (s *SessionStore) SetGitPhaseIfEligible(id supervisor.SessionID, phase supervisor.GitPhase) (bool, error) {
+	unlock := SharedSessionLocker.Lock(id)
+	defer unlock()
+	v, err := s.Load(id)
+	if err != nil {
+		return false, err
+	}
+	if v.State != supervisor.SessionIdle && v.State != supervisor.SessionAwaitingRecommendation || v.Rotation != nil {
+		return false, nil
+	}
+	s.SetGitPhase(id, phase)
+	return true, nil
+}
 func (s *SessionStore) quarantine(path string, cause error) error {
 	name := path + ".corrupt-" + time.Now().UTC().Format("20060102T150405.000000000")
 	if e := os.Rename(path, name); e != nil {
@@ -290,15 +305,8 @@ func validateSession(v supervisor.ManagedSession, id supervisor.SessionID) error
 			return fmt.Errorf("invalid fingerprint")
 		}
 	}
-	for _, fp := range []string{v.LastPushFailedHead, func() string {
-		if v.Rotation != nil {
-			return v.Rotation.CheckpointSnapshot.HeadHash
-		}
-		return ""
-	}()} {
-		if fp != "" && !shaPattern.MatchString(fp) {
-			return fmt.Errorf("invalid fingerprint")
-		}
+	if v.LastPushFailedHead != "" && !shaPattern.MatchString(v.LastPushFailedHead) {
+		return fmt.Errorf("invalid fingerprint")
 	}
 	if v.SendGate.Pending != nil && !validSendKind(v.SendGate.Pending.Kind) || v.LastSend != nil && !validSendKind(v.LastSend.Kind) {
 		return fmt.Errorf("invalid send kind")
@@ -309,7 +317,7 @@ func validateSession(v supervisor.ManagedSession, id supervisor.SessionID) error
 	if v.LastVerifiedResult != "" && v.LastVerifiedResult != "passed" && v.LastVerifiedResult != "failed" {
 		return fmt.Errorf("invalid verified result")
 	}
-	if v.Rotation != nil && (!validRotationStep(v.Rotation.Step) || !validRotationFailure(string(v.Rotation.FailReason)) || v.Rotation.CheckpointSnapshot.HeadHash != "" && !shaPattern.MatchString(v.Rotation.CheckpointSnapshot.HeadHash)) {
+	if v.Rotation != nil && (!validRotationStep(v.Rotation.Step) || !validRotationFailure(string(v.Rotation.FailReason)) || v.Rotation.CheckpointSnapshot != nil && v.Rotation.CheckpointSnapshot.HeadHash != "" && !fingerprintPattern.MatchString(v.Rotation.CheckpointSnapshot.HeadHash)) {
 		return fmt.Errorf("invalid rotation")
 	}
 	if v.LastFailureReason != "" && !validFailure(string(v.LastFailureReason)) {
@@ -355,7 +363,7 @@ func validSendKind(x supervisor.SupervisorSendKind) bool {
 }
 func validRotationStep(x supervisor.SupervisorRotateStep) bool {
 	switch x {
-	case "", supervisor.RotateWaitIdle, supervisor.RotateSendEnd, supervisor.RotateConfirmHandoff, supervisor.RotateSendExit, supervisor.RotateRestart, supervisor.RotateSendStart, supervisor.RotateSendParallelInstruction, supervisor.RotateSendRemoteControl:
+	case supervisor.RotateSendEnd, supervisor.RotateConfirmHandoff, supervisor.RotateSendExit, supervisor.RotateRestart, supervisor.RotateSendStart, supervisor.RotateSendParallelInstruction:
 		return true
 	}
 	return false

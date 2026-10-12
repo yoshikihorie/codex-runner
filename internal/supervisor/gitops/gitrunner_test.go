@@ -134,7 +134,9 @@ func TestGitRunnerFixedOperations(t *testing.T) {
 	if err := r.CatFileExists(ctx, strings.TrimSpace(string(head))); err != nil {
 		t.Fatal(err)
 	}
-	for name, call := range map[string]func() ([]byte, error){"git dir": func() ([]byte, error) { return r.RevParseGitDir(ctx) }, "common dir": func() ([]byte, error) { return r.RevParseGitCommonDir(ctx) }, "rev list": func() ([]byte, error) { return r.RevListSince(ctx, strings.TrimSpace(string(head))) }, "diff cached": func() ([]byte, error) { return r.DiffCached(ctx) }, "symbolic ref": func() ([]byte, error) { return r.SymbolicRef(ctx) }} {
+	for name, call := range map[string]func() ([]byte, error){"git dir": func() ([]byte, error) { return r.RevParseGitDir(ctx) }, "common dir": func() ([]byte, error) { return r.RevParseGitCommonDir(ctx) }, "rev list": func() ([]byte, error) {
+		return r.RevListSince(ctx, strings.TrimSpace(string(head)), strings.TrimSpace(string(head)))
+	}, "diff cached": func() ([]byte, error) { return r.DiffCached(ctx) }, "symbolic ref": func() ([]byte, error) { return r.SymbolicRef(ctx) }} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := call(); err != nil {
 				t.Fatal(err)
@@ -159,6 +161,14 @@ func TestGitRunnerRemoteOperationsAndPushValidation(t *testing.T) {
 		t.Fatal(err)
 	}
 	runGit(t, dir, "remote", "add", "origin", bare)
+	for key, value := range map[string]string{
+		"core.gitProxy":       "proxy.example.invalid",
+		"http.proxy":          "http://proxy.example.invalid:8080",
+		"credential.helper":   "invalid-helper",
+		"remote.origin.proxy": "http://proxy.example.invalid:8080",
+	} {
+		runGit(t, dir, "config", key, value)
+	}
 	marker := filepath.Join(dir, "uploadpack-ran")
 	malicious := "touch " + marker + "; git-upload-pack"
 	runGit(t, dir, "config", "remote.origin.uploadpack", malicious)
@@ -176,7 +186,11 @@ func TestGitRunnerRemoteOperationsAndPushValidation(t *testing.T) {
 	if _, err := os.Stat(marker); !os.IsNotExist(err) {
 		t.Fatalf("configured uploadpack executed: %v", err)
 	}
-	if err := r.Push(ctx, "origin", "work"); err != nil {
+	head, err := r.RevParseHead(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Push(ctx, "origin", "work", strings.TrimSpace(string(head))); err != nil {
 		t.Fatal(err)
 	}
 	out, err := r.LsRemote(ctx, "origin", "refs/heads/work")
@@ -184,7 +198,7 @@ func TestGitRunnerRemoteOperationsAndPushValidation(t *testing.T) {
 		t.Fatalf("ls-remote %q: %v", out, err)
 	}
 	for _, pair := range [][2]string{{"-evil", "work"}, {"origin", "HEAD"}, {"origin", "refs/heads/work"}, {"origin", "bad name"}} {
-		if err := ValidatePushArgv([]string{"/usr/bin/git", "push", "--force"}, pair[0], pair[1]); err == nil {
+		if err := ValidatePushArgv([]string{"/usr/bin/git", "push", "--force"}, pair[0], pair[1], strings.TrimSpace(string(head))); err == nil {
 			t.Fatalf("accepted unsafe push %v", pair)
 		}
 	}
@@ -234,7 +248,11 @@ func TestGitRunnerHardeningIsPresentAndValidatedPushArgvIsExecutedUnchanged(t *t
 	if _, err := r.Status(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if err := r.Push(context.Background(), "origin", "work"); err != nil {
+	sha := stringOf('b', 40)
+	if err := r.Push(context.Background(), "origin", "work", sha); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.LsRemote(context.Background(), "origin", "refs/heads/work"); err != nil {
 		t.Fatal(err)
 	}
 	data, err := os.ReadFile(log)
@@ -242,8 +260,8 @@ func TestGitRunnerHardeningIsPresentAndValidatedPushArgvIsExecutedUnchanged(t *t
 		t.Fatal(err)
 	}
 	sections := strings.Split(strings.TrimSpace(string(data)), "\n\n")
-	if len(sections) != 3 {
-		t.Fatalf("expected three operations recorded: %q", data)
+	if len(sections) != 4 {
+		t.Fatalf("expected four operations recorded: %q", data)
 	}
 	for _, section := range sections {
 		for _, arg := range strings.Fields(SupervisorGitHardeningArgs) {
@@ -252,9 +270,13 @@ func TestGitRunnerHardeningIsPresentAndValidatedPushArgvIsExecutedUnchanged(t *t
 			}
 		}
 	}
-	want := strings.Join(BuildPushArgv("origin", "work"), "\n") + "\n"
+	want := strings.Join(BuildPushArgv("origin", "work", sha), "\n") + "\n"
 	if sections[2] != strings.TrimSpace(want) {
 		t.Fatalf("push argv changed: got %q want %q", sections[2], strings.TrimSpace(want))
+	}
+	lsRemoteWant := append(strings.Fields(SupervisorGitHardeningArgs), "-c", "remote.origin.proxy=", "ls-remote", "--upload-pack=git-upload-pack", "--end-of-options", "origin", "refs/heads/work")
+	if sections[3] != strings.Join(lsRemoteWant, "\n") {
+		t.Fatalf("ls-remote argv changed: got %q want %q", sections[3], lsRemoteWant)
 	}
 }
 
@@ -263,8 +285,13 @@ func TestGitRunnerFixedInputsAndNotFound(t *testing.T) {
 	runGit(t, dir, "init", "-q")
 	r := newGitRunnerWithBinary(t, "/usr/bin/git", dir, "", " ")
 	r.stateDir = t.TempDir()
-	if _, err := r.RevListSince(context.Background(), "--output=/tmp/unsafe"); err == nil {
+	if _, err := r.RevListSince(context.Background(), "--output=/tmp/unsafe", strings.Repeat("b", 40)); err == nil {
 		t.Fatal("accepted option as revision")
+	}
+	for _, head := range []string{"HEAD", strings.Repeat("B", 40), strings.Repeat("b", 39)} {
+		if _, err := r.RevListSince(context.Background(), strings.Repeat("a", 40), head); err == nil {
+			t.Fatalf("accepted invalid head %q", head)
+		}
 	}
 	if err := r.CatFileExists(context.Background(), "--help"); err == nil {
 		t.Fatal("accepted option as sha")
@@ -277,5 +304,26 @@ func TestGitRunnerFixedInputsAndNotFound(t *testing.T) {
 	}
 	if _, err := r.RevParseToplevel(context.Background()); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestGitRunnerRevListSinceUsesInspectedHead(t *testing.T) {
+	home := t.TempDir()
+	dir := t.TempDir()
+	pushPolicyGit(t, dir, home, "init", "-q", "--object-format=sha1", "-b", "topic")
+	if err := os.WriteFile(filepath.Join(dir, "file"), []byte("base"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pushPolicyGit(t, dir, home, "add", "file")
+	pushPolicyGit(t, dir, home, "-c", "user.name=Setup", "-c", "user.email=setup@example.invalid", "commit", "-q", "-m", "base")
+	base := pushPolicyGit(t, dir, home, "rev-parse", "HEAD")
+	if err := os.WriteFile(filepath.Join(dir, "file"), []byte("next"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pushPolicyGit(t, dir, home, "add", "file")
+	pushPolicyGit(t, dir, home, "-c", "user.name=Setup", "-c", "user.email=setup@example.invalid", "commit", "-q", "-m", "next")
+	r := newGitRunnerWithBinary(t, "/usr/bin/git", dir, "", "")
+	if out, err := r.RevListSince(context.Background(), base, base); err != nil || len(out) != 0 {
+		t.Fatalf("rev-list followed moving HEAD: %q %v", out, err)
 	}
 }

@@ -4,8 +4,11 @@ import (
 	"context"
 	"errors"
 	"io"
+	"log/slog"
+	"path/filepath"
 	"reflect"
 	"slices"
+	"sync"
 	"syscall"
 	"time"
 
@@ -28,6 +31,14 @@ type ObserveSessionUseCase struct {
 	Respawn                 *RespawnSessionUseCase
 	SendInput               *SendInputUseCase
 	InitialRemoteControl    *InitialRemoteControl
+	Rotation                *RotateSessionUseCase
+	AutoContinue            *AutoContinueUseCase
+	PermissionPending       *PermissionPendingUseCase
+	CommitVerified          *CommitVerifiedChangesUseCase
+	EvaluateCommit          func(context.Context, supervisor.SessionID) error
+	PlanRotation            PlanRotationUseCase
+	PendingRemoteControl    *PendingRemoteControlUseCase
+	RotationStatuslineAt    func(supervisor.SessionID) *time.Time
 	SupervisorContext       context.Context
 	CompletionSelection     func([]string) (bool, string)
 	RecordStructured        func(store.Event) error
@@ -39,6 +50,36 @@ type ObserveSessionUseCase struct {
 	Now                     func() time.Time
 }
 
+var rotationObservationWakes sync.Map
+
+func rotationWakeChannel(id supervisor.SessionID) <-chan struct{} {
+	value, _ := rotationObservationWakes.LoadOrStore(id, make(chan struct{}, 1))
+	return value.(chan struct{})
+}
+
+func signalRotationObservation(id supervisor.SessionID) {
+	value, _ := rotationObservationWakes.LoadOrStore(id, make(chan struct{}, 1))
+	ch := value.(chan struct{})
+	select {
+	case ch <- struct{}{}:
+	default:
+	}
+}
+
+func (u ObserveSessionUseCase) rotationStatuslineAt(id supervisor.SessionID) *time.Time {
+	if u.RotationStatuslineAt != nil {
+		return u.RotationStatuslineAt(id)
+	}
+	if u.Detect.StateDir == "" {
+		return nil
+	}
+	record, err := readStatusline(filepath.Join(u.Detect.StateDir, "statusline", id.String()+".json"))
+	if err != nil {
+		return nil
+	}
+	return &record.ObservedAt
+}
+
 func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.ManagedSession, pty interface {
 	Read([]byte) (int, error)
 	Wait() (int, error)
@@ -46,6 +87,41 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 }, vt *supervisor.VirtualTerminal) error {
 	if pty == nil || vt == nil || u.Sessions == nil {
 		return errors.New("observer dependencies are required")
+	}
+	gitPhaseDone := make(chan time.Time, 1)
+	var gitPhaseReported sync.Map
+	if u.CommitVerified != nil {
+		unregister := u.CommitVerified.RegisterGitPhase(initial.SessionID, func(since time.Time) {
+			gitPhaseReported.Store(since, true)
+			current, err := u.Sessions.Load(initial.SessionID)
+			if err != nil || !current.StateSince.Equal(since) {
+				return
+			}
+			select {
+			case gitPhaseDone <- since:
+			default:
+			}
+		})
+		defer unregister()
+		u.EvaluateCommit = u.CommitVerified.Execute
+	}
+	if u.AutoContinue != nil {
+		var stopped func(supervisor.SessionID) bool
+		if u.Stop != nil {
+			stopped = u.Stop.IsStopped
+		}
+		u.AutoContinue.Bind(u.Sessions, u.SendInput, stopped, u.RecordStructured, u.Notify)
+		if u.SendInput != nil {
+			u.SendInput.BindRecommendationIssued(u.AutoContinue.RecordIssued)
+		}
+	}
+	if u.PermissionPending != nil {
+		u.PermissionPending.Bind(func(id supervisor.SessionID, kind supervisor.SupervisorEventKind) error {
+			if u.RecordStructured != nil {
+				return u.RecordStructured(store.Event{Kind: kind, SessionID: id.String()})
+			}
+			return nil
+		}, u.Notify)
 	}
 	if u.RecordStructured != nil || u.Notify != nil {
 		bindQuarantine(u.Sessions, func(id supervisor.SessionID) { u.recordEvent(id, supervisor.EventKindStateFileCorrupt, store.Event{}) })
@@ -107,6 +183,12 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 	var exitedAt time.Time
 	defer func() {
 		stopReader()
+		if current, err := u.Sessions.Load(initial.SessionID); err == nil && terminal(current.State) {
+			rotationObservationWakes.Delete(initial.SessionID)
+			if u.Rotation != nil {
+				u.Rotation.EndSession(initial.SessionID)
+			}
+		}
 		if u.SendInput != nil && u.SendInput.PTYs != nil {
 			if writer, ok := pty.(PTYWriter); ok {
 				u.SendInput.PTYs.Remove(initial.SessionID, writer)
@@ -122,9 +204,30 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 	var undeterminedSince time.Time
 	undeterminedNotified := false
 	lastIllegal := ""
+	var rotationPendingSince *time.Time
+	rotationIdleWaitNotified := false
+	var rotationDecisionState supervisor.SupervisorSessionState
+	var rotationDecisionSince time.Time
+	rotationContextUnknownRecorded := false
+	rotationNotApplicableRecorded := false
+	pendingDone := make(chan struct{}, 1)
+	pendingInFlight := false
+	var recommendationSince time.Time
+	commitStarted := false
+	autoAttempted := false
+	contextWasKnown := false
+	var permissionWarnedSince time.Time
+	var lastDetected detect.DetectedState
 	for {
-		var screenUpdatedAt time.Time
 		select {
+		case <-pendingDone:
+			pendingInFlight = false
+		default:
+		}
+		var screenUpdatedAt time.Time
+		var gitPhaseCompleted time.Time
+		select {
+		case gitPhaseCompleted = <-gitPhaseDone:
 		case waited := <-waits:
 			exited = true
 			exitedAt = now().UTC()
@@ -180,6 +283,10 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 		if err != nil {
 			return err
 		}
+		if u.AutoContinue != nil && current.State == supervisor.SessionStopped && lastDetected == detect.StateWorking && result.State == detect.StateAwaitingRecommendation {
+			u.AutoContinue.entered(initial.SessionID, now().UTC())
+		}
+		lastDetected = result.State
 		if u.Observed != nil {
 			u.Observed.Set(initial.SessionID, result.State)
 		}
@@ -298,6 +405,144 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 				}
 			}
 		}
+		current, err = u.Sessions.Load(initial.SessionID)
+		if err != nil {
+			return err
+		}
+		if current.State != rotationDecisionState || !current.StateSince.Equal(rotationDecisionSince) {
+			rotationDecisionState = current.State
+			rotationDecisionSince = current.StateSince
+			rotationContextUnknownRecorded = false
+			rotationNotApplicableRecorded = false
+		}
+		if u.Rotation != nil {
+			if current.Rotation != nil && (current.State == supervisor.SessionRotating || current.State == supervisor.SessionStopped && current.PreviousState == supervisor.SessionRotating && (current.StopReason == supervisor.StopGlobal || current.StopReason == supervisor.StopSession)) && !u.Rotation.IsRunning(initial.SessionID) {
+				if err := u.Rotation.validateCore(); err != nil {
+					return err
+				}
+				lifetime := u.SupervisorContext
+				if lifetime == nil {
+					lifetime = ctx
+				}
+				go func() {
+					if err := u.Rotation.Run(lifetime, initial.SessionID); err != nil && !errors.Is(err, context.Canceled) {
+						slog.Warn("rotation worker ended", "reason", "run_failed")
+					}
+				}()
+			}
+			if !exited && !u.Rotation.IsRunning(initial.SessionID) && current.Rotation == nil {
+				decision := u.PlanRotation.Evaluate(RotationPlanInput{Session: current, Detected: result, StatuslineObservedAt: u.rotationStatuslineAt(initial.SessionID), ObservedState: result.State, PendingSince: rotationPendingSince, Stopped: stoppedByControl, Now: now().UTC()})
+				if decision.ContextUnknown && !rotationContextUnknownRecorded {
+					rotationContextUnknownRecorded = true
+					u.recordEvent(initial.SessionID, supervisor.EventKindContextUnknown, store.Event{})
+				}
+				if decision.NotApplicable && !rotationNotApplicableRecorded {
+					rotationNotApplicableRecorded = true
+					u.recordEvent(initial.SessionID, supervisor.EventKindRotationNotApplicable, store.Event{})
+				}
+				if decision.Start {
+					if err := u.Rotation.validateCore(); err != nil {
+						return err
+					}
+					rotationPendingSince = nil
+					rotationIdleWaitNotified = false
+					lifetime := u.SupervisorContext
+					if lifetime == nil {
+						lifetime = ctx
+					}
+					go func() {
+						if err := u.Rotation.Execute(lifetime, initial.SessionID, nil); err != nil && !errors.Is(err, context.Canceled) {
+							slog.Warn("rotation worker ended", "reason", "execute_failed")
+						}
+					}()
+				} else if decision.Pending {
+					if rotationPendingSince == nil {
+						pending := now().UTC()
+						rotationPendingSince = &pending
+						u.recordEvent(initial.SessionID, supervisor.EventKindRotatePending, store.Event{})
+					} else if decision.IdleWaitTimeout && !rotationIdleWaitNotified {
+						rotationIdleWaitNotified = true
+						u.recordEvent(initial.SessionID, supervisor.EventKindRotateIdleWaitTimeout, store.Event{Reason: store.ReasonIdleWaitTimeout})
+					}
+				} else if result.State != detect.StateAwaitingPermission {
+					rotationPendingSince = nil
+					rotationIdleWaitNotified = false
+				}
+			}
+			signalRotationObservation(initial.SessionID)
+		}
+		if u.PermissionPending != nil {
+			if current.State != supervisor.SessionAwaitingPermission {
+				permissionWarnedSince = time.Time{}
+			}
+			if err := u.PermissionPending.Observe(initial.SessionID, current.State, current.StateSince, now().UTC()); err != nil {
+				if !permissionWarnedSince.Equal(current.StateSince) {
+					permissionWarnedSince = current.StateSince
+					slog.Warn("permission pending observation failed", "error", err)
+				}
+			}
+		}
+		if u.AutoContinue != nil && !exited && current.State == supervisor.SessionAwaitingRecommendation {
+			enteredFromWorking := nextState == supervisor.SessionAwaitingRecommendation && fromState == supervisor.SessionWorking
+			if !current.StateSince.Equal(recommendationSince) {
+				recommendationSince = current.StateSince
+				commitStarted = false
+				autoAttempted = false
+				contextWasKnown = false
+			}
+			if enteredFromWorking {
+				u.AutoContinue.entered(initial.SessionID, current.StateSince)
+			}
+			statuslineAt := u.rotationStatuslineAt(initial.SessionID)
+			decision := u.PlanRotation.Evaluate(RotationPlanInput{Session: current, Detected: result, StatuslineObservedAt: statuslineAt, ObservedState: result.State, Now: now().UTC()})
+			if decision.ContextUnknown && !rotationContextUnknownRecorded {
+				rotationContextUnknownRecorded = true
+				u.recordEvent(initial.SessionID, supervisor.EventKindContextUnknown, store.Event{})
+			}
+			settled := now().Sub(current.StateSince) >= commitSettle
+			contextPercent := result.ContextPercent
+			if decision.ContextUnknown {
+				contextPercent = nil
+			}
+			contextKnown := contextPercent != nil
+			if settled && u.EvaluateCommit != nil && !commitStarted {
+				commitStarted = true
+				staySince := current.StateSince
+				go func() {
+					if err := u.EvaluateCommit(ctx, initial.SessionID); err != nil {
+						slog.Warn("commit evaluation failed", "error", err)
+					}
+					if _, reported := gitPhaseReported.Load(staySince); !reported {
+						current, err := u.Sessions.Load(initial.SessionID)
+						if err == nil && current.StateSince.Equal(staySince) {
+							select {
+							case gitPhaseDone <- staySince:
+							default:
+							}
+						}
+					}
+				}()
+			}
+			if settled && (gitPhaseCompleted.Equal(current.StateSince) || contextKnown && !contextWasKnown && autoAttempted || !autoAttempted && u.EvaluateCommit == nil) {
+				u.AutoContinue.EvaluateAsync(ctx, AutoContinueInput{
+					SessionID: initial.SessionID, Rows: vt.Screen(), ContextPercent: contextPercent,
+					RequireSettle: true, Settled: true, StaySince: current.StateSince,
+				}, nil)
+				autoAttempted = true
+			}
+			contextWasKnown = contextKnown
+		}
+		if u.PendingRemoteControl != nil && current.PendingRemoteControl && !pendingInFlight {
+			pendingInFlight = true
+			lifetime := u.SupervisorContext
+			if lifetime == nil {
+				lifetime = ctx
+			}
+			go func() {
+				_ = u.PendingRemoteControl.OnObserved(lifetime, initial.SessionID, result.State)
+				pendingDone <- struct{}{}
+			}()
+		}
 		if !exited && nextState != "" && u.InitialRemoteControl != nil && (fromState == supervisor.SessionStarting || nextState == supervisor.SessionIdle) {
 			current, err = u.Sessions.Load(initial.SessionID)
 			if err != nil {
@@ -345,8 +590,23 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 			if err != nil {
 				return err
 			}
+			if current.PendingRemoteControl && u.PendingRemoteControl != nil {
+				if err := UpdateSession(u.Sessions, initial.SessionID, func(s *supervisor.ManagedSession) error {
+					s.PendingRemoteControl = false
+					s.PendingRemoteControlSince = nil
+					return nil
+				}); err != nil {
+					return err
+				}
+				u.recordEvent(initial.SessionID, supervisor.EventKindRemoteControlExpired, store.Event{})
+				current.PendingRemoteControl = false
+			}
 			u.recordExitOutcome(initial.SessionID, current, wasStopped)
-			u.startRecovery(initial.SessionID, current, nextState)
+			if current.Rotation == nil {
+				u.startRecovery(initial.SessionID, current, nextState)
+			} else {
+				signalRotationObservation(initial.SessionID)
+			}
 		}
 		if result.State == detect.StateUndetermined {
 			if undeterminedSince.IsZero() {

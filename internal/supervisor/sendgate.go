@@ -4,6 +4,7 @@ import "time"
 
 // Canonical values: specifications/10-shared/validation-rules.md §3.
 const SupervisorSendConfirmTimeout = 60 * time.Second
+const SupervisorExitGrace = 60 * time.Second // SUPERVISOR_EXIT_GRACE_SECONDS, validation-rules.md §3.
 const SupervisorSendEnterDelay = 200 * time.Millisecond
 
 // Canonical values: specifications/10-shared/published-language/enums.md SupervisorSendBlockedReason.

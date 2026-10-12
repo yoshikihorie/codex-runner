@@ -20,6 +20,7 @@ const (
 	RespawnRecovery       RespawnKind = "recovery"
 	RespawnResumeRecovery RespawnKind = "resume_recovery"
 	RespawnHandoffStage5  RespawnKind = "handoff_stage5"
+	RespawnHandoffResume  RespawnKind = "handoff_resume"
 )
 
 type RespawnSessionUseCase struct {
@@ -43,7 +44,7 @@ type RespawnSessionUseCase struct {
 var respawnMutex sync.Mutex
 
 func (u RespawnSessionUseCase) Execute(ctx context.Context, id supervisor.SessionID, kind RespawnKind) error {
-	if kind != RespawnRecovery && kind != RespawnResumeRecovery && kind != RespawnHandoffStage5 {
+	if kind != RespawnRecovery && kind != RespawnResumeRecovery && kind != RespawnHandoffStage5 && kind != RespawnHandoffResume {
 		return fmt.Errorf("invalid respawn kind: %q", kind)
 	}
 	if u.Store == nil {
@@ -112,7 +113,7 @@ func (u RespawnSessionUseCase) executeLocked(ctx context.Context, id supervisor.
 	if err != nil {
 		return err
 	}
-	if kind == RespawnHandoffStage5 {
+	if kind == RespawnHandoffStage5 || kind == RespawnHandoffResume {
 		if session.State != supervisor.SessionRotating {
 			return nil
 		}
@@ -125,15 +126,25 @@ func (u RespawnSessionUseCase) executeLocked(ctx context.Context, id supervisor.
 		project.ID = session.ProjectID
 	}
 	projectID := session.ProjectID
-	fail := func(reason store.SupervisorStartFailReason) { u.fail(id, projectID, reason) }
+	fail := func(reason store.SupervisorStartFailReason) {
+		if session.State != supervisor.SessionRotating {
+			u.fail(id, projectID, reason)
+		}
+	}
+	failed := func(cause error) error {
+		if session.State == supervisor.SessionRotating {
+			return cause
+		}
+		return u.markFailed(id, cause)
+	}
 	preflight := launchPreflight{config: u.Config, billing: u.Billing, parentEnv: u.ParentEnv, failure: fail}
 	env, err := preflight.check(project)
 	if err != nil {
-		return u.markFailed(id, err)
+		return failed(err)
 	}
 	settingsPath, err := preflight.settings(id)
 	if err != nil {
-		return u.markFailed(id, err)
+		return failed(err)
 	}
 	resumeID := session.ClaudeSessionID
 	if resumeID == "" {
@@ -147,16 +158,16 @@ func (u RespawnSessionUseCase) executeLocked(ctx context.Context, id supervisor.
 	argv, err := launch.BuildLaunchArgv(string(project.CLI), project.BinaryPath, settingsPath, resumeID)
 	if err != nil {
 		fail(store.StartFailLaunchArgvInvalid)
-		return u.markFailed(id, err)
+		return failed(err)
 	}
 	// Count and persist the attempt before spawn, so a failed launch still consumes it.
 	var attempted supervisor.ManagedSession
 	err = UpdateSession(u.Store, id, func(s *supervisor.ManagedSession) error {
-		if (kind == RespawnHandoffStage5 && s.State != supervisor.SessionRotating) || (kind != RespawnHandoffStage5 && s.State != supervisor.SessionStarting) || (u.Stop != nil && u.Stop.IsStopped(id)) {
+		if ((kind == RespawnHandoffStage5 || kind == RespawnHandoffResume) && s.State != supervisor.SessionRotating) || ((kind != RespawnHandoffStage5 && kind != RespawnHandoffResume) && s.State != supervisor.SessionStarting) || (u.Stop != nil && u.Stop.IsStopped(id)) {
 			return ErrStopActive
 		}
 		s.Generation++
-		if kind != RespawnResumeRecovery {
+		if kind != RespawnResumeRecovery && kind != RespawnHandoffResume {
 			s.RestartCount++
 			cutoff := u.now().Add(-supervisor.RestartWindow)
 			kept := s.RestartTimes[:0]
@@ -192,7 +203,7 @@ func (u RespawnSessionUseCase) executeLocked(ctx context.Context, id supervisor.
 	pty, err := starter.Start(project.BinaryPath, argv, env, project.CWD, u.Config.Columns, u.Config.Rows)
 	if err != nil {
 		fail(store.StartFailSpawnFailed)
-		return u.markFailed(id, err)
+		return failed(err)
 	}
 	started := u.now()
 	ownedChildren.Register(id, pty.Pid())
@@ -215,7 +226,7 @@ func (u RespawnSessionUseCase) executeLocked(ctx context.Context, id supervisor.
 			<-done
 		}
 		fail(store.StartFailSpawnFailed)
-		return u.markFailed(id, err)
+		return failed(err)
 	}
 	if u.PTYs != nil {
 		if writer, ok := pty.(PTYWriter); ok {

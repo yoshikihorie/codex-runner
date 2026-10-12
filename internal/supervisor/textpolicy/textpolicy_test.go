@@ -41,10 +41,46 @@ func TestClassifyBoundaries(t *testing.T) {
 			t.Errorf("Classify(%q) = %v, %v; want safe", value, categories, unknown)
 		}
 	}
-	for _, value := range []string{"git push --force-with-lease", "reset --hard.", "(--force)", "rm -fr"} {
+	for _, value := range []string{"git push --force-with-lease", "reset --hard.", "(--force)", "rm -fr", "force push,then continue"} {
 		if categories, _ := Classify(value); len(categories) == 0 {
 			t.Errorf("Classify(%q) missed forbidden phrase", value)
 		}
+	}
+}
+
+func TestClassify_SCN28_SymbolBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		text string
+		want Category
+	}{
+		{"`git push --force` を実行", CategoryForcePush},
+		{"git push --force=true", CategoryForcePush},
+		{"「--force」で push", CategoryForcePush},
+		{"main:--force", CategoryForcePush},
+		{"--forceで push", CategoryForcePush},
+		{"`git push -f`", CategoryForcePush},
+		{"`git reset --hard`", CategoryDeletion},
+		{"`rm -rf build`", CategoryDeletion},
+		{"ＦＯＲＣＥ　ＰＵＳＨ して", CategoryForcePush},
+		{"git push -f origin x", CategoryForcePush},
+		{"git push +main:main", CategoryForcePush},
+		{"main を merge する", CategoryGitHistory},
+		{"rebase してから進める", CategoryGitHistory},
+		{"migrate を実行する", CategoryMigration},
+		{"sudo で実行する", CategoryPrivilege},
+		{"ファイルを rm -rf で消す", CategoryDeletion},
+		{"強制プッシュは避ける", CategoryForcePush},
+	} {
+		got, unknown := Classify(tc.text)
+		if unknown || !containsCategory(got, tc.want) {
+			t.Errorf("Classify(%q) = %v, %v; want %s", tc.text, got, unknown, tc.want)
+		}
+	}
+	if got, unknown := Classify("the profile page を直す"); unknown || len(got) != 0 {
+		t.Errorf("false positive: %v, %v", got, unknown)
+	}
+	if got, unknown := Classify("--forcefulで進める"); unknown || len(got) != 0 {
+		t.Errorf("symbol prefix false positive: %v, %v", got, unknown)
 	}
 }
 
@@ -53,6 +89,86 @@ func TestClassifyNormalization(t *testing.T) {
 		if categories, _ := Classify(value); len(categories) == 0 {
 			t.Errorf("Classify(%q) missed normalized term", value)
 		}
+	}
+}
+
+func TestNFKCNormalization(t *testing.T) {
+	for _, tc := range []struct{ input, want string }{
+		{"ｇｉｔ　ｐｕｓｈ", "git push"},
+		{"ﾃﾞﾌﾟﾛｲ", "デプロイ"},
+		{"ﬁ", "fi"},
+		{"①", "1"},
+		{"海", "海"},
+		{"for\u200bce", "force"},
+	} {
+		if got := normalize(tc.input); got != tc.want {
+			t.Errorf("normalize(%q) = %q, want %q", tc.input, got, tc.want)
+		}
+	}
+	for _, value := range []string{"ＦＯＲＣＥ　ＰＵＳＨ", "for\u200bce push", "git\u200b push --force", "ﾃﾞﾌﾟﾛｲ"} {
+		if categories, unknown := Classify(value); unknown || len(categories) == 0 {
+			t.Errorf("Classify(%q) = %v, %v; want forbidden", value, categories, unknown)
+		}
+	}
+}
+
+func TestMixedVocabularyBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		word, match, miss string
+		category          Category
+	}{
+		{"rm -rf", "rm -rf files", "term -rf files", CategoryDeletion},
+		{"reset --hard", "reset --hard now", "reset --hardening now", CategoryDeletion},
+		{"gh pr", "gh pr list", "gh prefix list", CategoryPullRequest},
+		{"prod 環境", "prod 環境へ", "product 環境へ", CategoryProduction},
+		{"API キー", "API キーを確認", "XAPI キーを確認", CategoryBilling},
+	} {
+		t.Run(tc.word, func(t *testing.T) {
+			if categories, _ := Classify(tc.match); !containsCategory(categories, tc.category) {
+				t.Errorf("Classify(%q) = %v; want %s", tc.match, categories, tc.category)
+			}
+			if matches(normalize(tc.miss), normalize(tc.word)) {
+				t.Errorf("%q unexpectedly matched %q", tc.miss, tc.word)
+			}
+		})
+	}
+	for _, value := range []string{"--forceful", "--force-extra", "-file", "-f-extra", "+", "x+main", "merge_request", "predeploy"} {
+		if categories, unknown := Classify(value); unknown || len(categories) != 0 {
+			t.Errorf("Classify(%q) = %v, %v; want safe", value, categories, unknown)
+		}
+	}
+}
+
+func TestG20SymbolAndMixedJapaneseBoundaries(t *testing.T) {
+	for _, tc := range []struct {
+		text     string
+		category Category
+	}{
+		{"--force:main", CategoryForcePush}, {"必ず--forceでpush", CategoryForcePush},
+		{"強制的に-fで", CategoryForcePush}, {"FLAGS=--force", CategoryForcePush},
+		{"で+mainを", CategoryForcePush}, {"APIキーを設定", CategoryBilling},
+		{"prod環境へ", CategoryProduction},
+	} {
+		got, unknown := Classify(tc.text)
+		if unknown || !containsCategory(got, tc.category) {
+			t.Errorf("Classify(%q) = %v, %v; want %s", tc.text, got, unknown, tc.category)
+		}
+	}
+	for _, text := range []string{"-file", "self-fix", "x+main", "the profile page を直す", "XAPIキー"} {
+		if got, unknown := Classify(text); unknown || len(got) != 0 {
+			t.Errorf("Classify(%q) = %v, %v; want safe", text, got, unknown)
+		}
+	}
+}
+
+func TestNormalizeRecommendationForHash(t *testing.T) {
+	first := NormalizeRecommendationForHash("  Ｇｉｔ　ｐｕｓｈ  する  ")
+	second := NormalizeRecommendationForHash("git push\tする")
+	if first != second {
+		t.Fatalf("whitespace variants differ: %q != %q", first, second)
+	}
+	if first == NormalizeRecommendationForHash("git pull する") {
+		t.Fatal("different words normalized to the same value")
 	}
 }
 

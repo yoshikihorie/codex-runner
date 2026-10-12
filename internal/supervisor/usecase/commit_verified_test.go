@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -23,6 +24,13 @@ type commitTestSessions struct {
 
 func (s *commitTestSessions) SetGitPhase(_ supervisor.SessionID, phase supervisor.GitPhase) {
 	s.phase = phase
+}
+func (s *commitTestSessions) SetGitPhaseIfEligible(_ supervisor.SessionID, phase supervisor.GitPhase) (bool, error) {
+	if s.value.State != supervisor.SessionIdle && s.value.State != supervisor.SessionAwaitingRecommendation || s.value.Rotation != nil {
+		return false, nil
+	}
+	s.phase = phase
+	return true, nil
 }
 
 func (s *commitTestSessions) Load(supervisor.SessionID) (supervisor.ManagedSession, error) {
@@ -879,9 +887,9 @@ func TestCommit_RequiresGitPhaseStore(t *testing.T) {
 func TestCommit_PhaseCompletionRequestsAutoContinue(t *testing.T) {
 	u, sessions, _, _, _ := commitTestFixture(t)
 	calls := 0
-	u.AfterGitPhase = func(id supervisor.SessionID) {
+	u.AfterGitPhase = func(id supervisor.SessionID, at time.Time) {
 		calls++
-		if id != sessions.value.SessionID || sessions.phase != supervisor.GitPhaseNone {
+		if id != sessions.value.SessionID || !at.Equal(sessions.value.StateSince) || sessions.phase != supervisor.GitPhaseNone {
 			t.Fatalf("re-evaluation before phase completion: phase=%q id=%q", sessions.phase, id)
 		}
 	}
@@ -891,6 +899,63 @@ func TestCommit_PhaseCompletionRequestsAutoContinue(t *testing.T) {
 	if calls != 1 {
 		t.Fatalf("re-evaluations=%d", calls)
 	}
+}
+
+func TestCommit_GitPhaseDispatcherConcurrentRegistration(t *testing.T) {
+	u := &CommitVerifiedChangesUseCase{}
+	id := supervisor.SessionID("dispatch-session")
+	since := time.Now()
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			called := make(chan time.Time, 1)
+			unregister := u.RegisterGitPhase(id, func(at time.Time) {
+				select {
+				case called <- at:
+				default:
+				}
+			})
+			u.AfterGitPhase(id, since)
+			select {
+			case got := <-called:
+				if !got.Equal(since) {
+					t.Errorf("since=%v", got)
+				}
+			case <-time.After(time.Second):
+				t.Error("notification lost")
+			}
+			unregister()
+		}()
+	}
+	wg.Wait()
+}
+
+func TestCommit_GitPhaseDispatcherRegistersDuringExecute(t *testing.T) {
+	u, sessions, _, _, _ := commitTestFixture(t)
+	id := sessions.value.SessionID
+	var wg sync.WaitGroup
+	start := make(chan struct{})
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			unregister := u.RegisterGitPhase(id, func(time.Time) {})
+			unregister()
+		}()
+	}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		<-start
+		if err := u.Execute(context.Background(), id); err != nil {
+			t.Error(err)
+		}
+	}()
+	close(start)
+	wg.Wait()
 }
 
 func TestCommit_RealSessionStorePersistsFailureAndSuppressesRetry(t *testing.T) {

@@ -112,9 +112,10 @@ type LastSendRecord struct {
 	Confirmed bool               `json:"confirmed"`
 }
 type RotationCheckpointSnapshot struct {
-	Exists   bool       `json:"exists"`
-	Mtime    *time.Time `json:"mtime,omitempty"`
-	HeadHash string     `json:"head_hash,omitempty"`
+	Exists         bool       `json:"exists"`
+	Mtime          *time.Time `json:"mtime,omitempty"`
+	HeadHash       string     `json:"head_hash,omitempty"`
+	Undeterminable bool       `json:"undeterminable,omitempty"`
 }
 type SupervisorRotateStep string
 
@@ -126,7 +127,6 @@ const (
 	RotateRestart                 SupervisorRotateStep = "restart"
 	RotateSendStart               SupervisorRotateStep = "send_start"
 	RotateSendParallelInstruction SupervisorRotateStep = "send_parallel_instruction"
-	RotateSendRemoteControl       SupervisorRotateStep = "send_remote_control"
 )
 
 type SupervisorRotateFailReason string
@@ -146,13 +146,17 @@ const (
 )
 
 type RotationRecord struct {
-	Step               SupervisorRotateStep       `json:"step"`
-	StartedAt          time.Time                  `json:"started_at"`
-	StepStartedAt      *time.Time                 `json:"step_started_at,omitempty"`
-	EndIssuedAt        *time.Time                 `json:"end_issued_at,omitempty"`
-	CheckpointSnapshot RotationCheckpointSnapshot `json:"checkpoint_snapshot,omitempty"`
-	RespawnWaitUntil   *time.Time                 `json:"respawn_wait_until,omitempty"`
-	FailReason         SupervisorRotateFailReason `json:"fail_reason,omitempty"`
+	Step                        SupervisorRotateStep        `json:"step"`
+	StartedAt                   time.Time                   `json:"started_at"`
+	StepStartedAt               *time.Time                  `json:"step_started_at,omitempty"`
+	EndIssuedAt                 *time.Time                  `json:"end_issued_at,omitempty"`
+	CheckpointSnapshot          *RotationCheckpointSnapshot `json:"checkpoint_snapshot,omitempty"`
+	ResumeEnd                   bool                        `json:"resume_end,omitempty"`
+	ResumeSpawn                 bool                        `json:"resume_spawn,omitempty"`
+	RespawnWaitUntil            *time.Time                  `json:"respawn_wait_until,omitempty"`
+	Stage5Started               bool                        `json:"stage5_started,omitempty"`
+	Stage7ConfirmedWhileStopped bool                        `json:"stage7_confirmed_while_stopped,omitempty"`
+	FailReason                  SupervisorRotateFailReason  `json:"fail_reason,omitempty"`
 }
 type SupervisorStopScope string
 

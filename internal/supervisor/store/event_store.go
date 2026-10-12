@@ -359,6 +359,7 @@ const (
 	ReasonMultipleURLs               EventReason = "multiple_urls"
 	ReasonURLMismatch                EventReason = "url_mismatch"
 	ReasonReceivepackConfigured      EventReason = "receivepack_configured"
+	ReasonRemoteHelperConfigured     EventReason = "remote_helper_configured"
 	ReasonNoTrackingRef              EventReason = "no_tracking_ref"
 	ReasonForeignCommits             EventReason = "foreign_commits"
 	ReasonArgvNotAllowed             EventReason = "argv_not_allowed"
@@ -385,7 +386,7 @@ func validReasonForEvent(kind supervisor.SupervisorEventKind, value EventReason)
 	case supervisor.EventKindCommitFailed:
 		return contains(ReasonPathEscape, ReasonStagedOutOfScope, ReasonOutOfScopeUncommitted, ReasonRenamePartial, ReasonGitConfigChanged, ReasonGitattributesFilter, ReasonGitConfigInclude, ReasonTreeMismatchBeforeCommit, ReasonCommitRejected, ReasonGitTimeout, ReasonGitUnavailable, ReasonGitFailed, ReasonGitOutputTooLarge)
 	case supervisor.EventKindPushBlocked:
-		return contains(ReasonDetachedHead, ReasonProtectedBranch, ReasonNotInAllowlist, ReasonMultipleURLs, ReasonURLMismatch, ReasonReceivepackConfigured, ReasonGitConfigChanged, ReasonNoTrackingRef, ReasonForeignCommits, ReasonArgvNotAllowed, ReasonGitConfigInclude, ReasonRemoteHeadUnavailable, ReasonRemoteHeadNotLocal)
+		return contains(ReasonDetachedHead, ReasonProtectedBranch, ReasonNotInAllowlist, ReasonMultipleURLs, ReasonURLMismatch, ReasonReceivepackConfigured, ReasonRemoteHelperConfigured, ReasonGitConfigChanged, ReasonNoTrackingRef, ReasonForeignCommits, ReasonArgvNotAllowed, ReasonGitConfigInclude, ReasonRemoteHeadUnavailable, ReasonRemoteHeadNotLocal, ReasonGitFailed, ReasonGitOutputTooLarge)
 	case supervisor.EventKindVerifyFailed:
 		return contains(ReasonVerifyBinaryChanged, ReasonVerifyCWDInvalid, ReasonVerifyExecFailed)
 	case supervisor.EventKindSessionStopped:
@@ -398,6 +399,8 @@ func validReasonForEvent(kind supervisor.SupervisorEventKind, value EventReason)
 		return value == ReasonStopSessionRequested
 	case supervisor.EventKindRotateFailed:
 		return contains(ReasonIdleWaitTimeout, ReasonSendNotConfirmed, ReasonMtimeNotUpdated, ReasonHeadGenerationUnchanged, ReasonNotIdleAfterHandoff, ReasonExitTimeout, ReasonSpawnFailed, ReasonStartupTimeout, ReasonStartNotSettled, ReasonChildAbsent, ReasonRestartLimit)
+	case supervisor.EventKindRotateIdleWaitTimeout:
+		return value == ReasonIdleWaitTimeout
 	default:
 		return false
 	}
@@ -413,7 +416,7 @@ func validEventCode(v string) bool {
 
 func validEventStep(v string) bool {
 	switch v {
-	case "wait_idle", "send_end", "confirm_handoff", "send_exit", "restart", "send_start", "send_parallel_instruction", "send_remote_control":
+	case "wait_idle", "send_end", "confirm_handoff", "send_exit", "restart", "send_start", "send_parallel_instruction":
 		return true
 	}
 	return false

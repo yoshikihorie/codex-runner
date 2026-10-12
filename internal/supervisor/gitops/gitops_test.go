@@ -1,7 +1,7 @@
 package gitops
 
 import (
-	"fmt"
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -93,51 +93,6 @@ func TestPathScopeRejectsEscapeAndGitMetadata(t *testing.T) {
 	}
 	if _, err := s.Resolve("does-not-exist"); err != nil {
 		t.Errorf("resolve non-existent in-scope path: %v", err)
-	}
-}
-
-func TestValidatePushArgvExactShape(t *testing.T) {
-	valid := append([]string{"/usr/bin/git"}, BuildPushArgv("origin", "topic")...)
-	if err := ValidatePushArgv(valid, "origin", "topic"); err != nil {
-		t.Fatal(err)
-	}
-	for i := 1; i < len(valid); i++ {
-		t.Run(fmt.Sprintf("index_%d", i), func(t *testing.T) {
-			bad := append([]string(nil), valid...)
-			if i < len(valid)-2 {
-				bad[i] += "x"
-			} else if i == len(valid)-2 {
-				bad[i] = ".."
-			} else {
-				bad[i] = "refs/heads/topic:refs/heads/other"
-			}
-			if ValidatePushArgv(bad, "origin", "topic") == nil {
-				t.Errorf("accepted changed argv[%d]=%q", i, bad[i])
-			}
-		})
-	}
-	for _, b := range []string{".hidden", "a b", "a\nb", "a\x00b", "a~b", "a^b", "a@{b", "a.lock", "a//b"} {
-		if ValidatePushArgv(append([]string{"/usr/bin/git"}, BuildPushArgv("origin", b)...), "origin", b) == nil {
-			t.Errorf("accepted branch %q", b)
-		}
-	}
-	for _, r := range []string{".", "..", "-bad"} {
-		if ValidatePushArgv(append([]string{"/usr/bin/git"}, BuildPushArgv(r, "topic")...), r, "topic") == nil {
-			t.Errorf("accepted remote %q", r)
-		}
-	}
-	for _, r := range []string{"a/b", "o$rigin", "orígin", "o#r", "tab\tname"} {
-		if ValidatePushArgv(append([]string{"/usr/bin/git"}, BuildPushArgv(r, "topic")...), r, "topic") == nil {
-			t.Errorf("accepted remote %q", r)
-		}
-	}
-	for _, b := range []string{"a\tb", "a\x01b", "a\x7fb", "refs/tags/v1", "HEAD"} {
-		if ValidatePushArgv(append([]string{"/usr/bin/git"}, BuildPushArgv("origin", b)...), "origin", b) == nil {
-			t.Errorf("accepted prohibited branch %q", b)
-		}
-	}
-	if ValidatePushArgv(append([]string{"/usr/../usr/bin/git"}, BuildPushArgv("origin", "topic")...), "origin", "topic") == nil {
-		t.Fatal("accepted non-normalized git path")
 	}
 }
 
@@ -332,193 +287,12 @@ func TestPorcelainAcceptsIgnoredAndCopyStatuses(t *testing.T) {
 	}
 }
 
-func TestPushPolicyReasonsAndArgv(t *testing.T) {
-	base := PushInput{FetchURLs: []string{"url"}, PushURLs: []string{"url"}, CurrentRef: "refs/heads/topic", Allowlist: []PushAllowlistEntry{{Remote: "origin", URL: "url", Branch: "topic"}}, RemoteHeadSHA: stringOf('a', 40), RemoteHeadLocal: true, CommitSHAs: []string{stringOf('b', 40)}, SupervisorCommitSHAs: []string{stringOf('b', 40)}, HeadSHA: stringOf('b', 40)}
-	cases := []struct {
-		name   string
-		change func(*PushInput)
-		want   string
-	}{
-		{"detached_head", func(p *PushInput) { p.CurrentRef = "" }, "detached_head"}, {"protected_branch", func(p *PushInput) { p.CurrentRef = "refs/heads/main" }, "protected_branch"}, {"not_in_allowlist", func(p *PushInput) { p.Allowlist = []PushAllowlistEntry{{Remote: "origin", URL: "url", Branch: "else"}} }, "not_in_allowlist"},
-		{"multiple_urls", func(p *PushInput) { p.FetchURLs = append(p.FetchURLs, "url") }, "multiple_urls"}, {"url_mismatch", func(p *PushInput) { p.PushURLs = []string{"else"} }, "url_mismatch"}, {"receivepack_configured", func(p *PushInput) { p.ReceivepackConfigured = true }, "receivepack_configured"}, {"remote_helper_configured", func(p *PushInput) { p.RemoteHelperConfigured = true }, "remote_helper_configured"},
-		{"git_config_changed", func(p *PushInput) { p.GitConfigChanged = true }, "git_config_changed"}, {"git_config_include", func(p *PushInput) { p.GitConfigInclude = true }, "git_config_include"}, {"no_tracking_ref", func(p *PushInput) { p.RemoteHeadSHA = "" }, "no_tracking_ref"},
-		{"remote_head_unavailable", func(p *PushInput) { p.RemoteHeadUnavailable = true }, "remote_head_unavailable"}, {"remote_head_not_local", func(p *PushInput) { p.RemoteHeadLocal = false }, "remote_head_not_local"}, {"foreign_commits", func(p *PushInput) { p.CommitSHAs = []string{stringOf('c', 40)} }, "foreign_commits"},
-		{"argv_not_allowed", func(p *PushInput) {
-			p.Allowlist = []PushAllowlistEntry{{Remote: "-bad", URL: "url", Branch: "topic"}}
-		}, "argv_not_allowed"}, {"push_suppressed_same_head", func(p *PushInput) { p.PreviousFailedHead = p.HeadSHA }, ""},
-	}
-	seen := map[string]bool{}
-	for _, tc := range cases {
-		p := base
-		tc.change(&p)
-		d := PushPolicy{}.Evaluate(p)
-		if tc.name == "push_suppressed_same_head" {
-			if !d.Suppressed || d.Reason != "" {
-				t.Errorf("suppressed decision=%+v", d)
-			}
-			continue
-		}
-		seen[d.Reason] = true
-		if d.Reason != tc.want {
-			t.Errorf("%s got %q", tc.name, d.Reason)
-		}
-	}
-	for _, tc := range cases {
-		if tc.name == "push_suppressed_same_head" {
-			continue
-		}
-		if !seen[tc.want] {
-			t.Errorf("reason absent: %s", tc.want)
-		}
-	}
-	if d := (PushPolicy{}).Evaluate(PushInput{}); !d.Noop || d.Reason != "" {
-		t.Errorf("empty allowlist decision=%+v", d)
-	}
-	for _, argv := range [][]string{{"--force"}, {"-f"}, {"--force-with-lease"}, {"+refs/heads/x:refs/heads/x"}, {"--mirror"}, {"--delete"}, {":refs/heads/x"}, {"--tags"}, {"origin", "refs/heads/a:refs/heads/a", "refs/heads/b:refs/heads/b"}, {"-bad", "refs/heads/x:refs/heads/x"}, {}} {
-		if ValidatePushArgv(append([]string{"/usr/bin/git"}, argv...), "origin", "x") == nil {
-			t.Errorf("accepted argv %q", argv)
-		}
-	}
-	if err := ValidatePushArgv(append([]string{"/usr/bin/git"}, BuildPushArgv("origin", "x")...), "origin", "x"); err != nil {
-		t.Fatal(err)
-	}
-	if got := BuildPushArgv("origin", "x"); !reflect.DeepEqual(got[len(got)-3:len(got)-2], []string{"--"}) {
-		t.Fatal("missing separator")
-	}
-}
-
-func TestPushPolicyCoversCanonicalReasons(t *testing.T) {
-	// Canonical reason vocabulary from FD-sup-03 §6.
-	want := []string{"detached_head", "protected_branch", "not_in_allowlist", "multiple_urls", "url_mismatch", "receivepack_configured", "remote_helper_configured", "git_config_changed", "git_config_include", "remote_head_unavailable", "no_tracking_ref", "remote_head_not_local", "foreign_commits", "argv_not_allowed"}
-	seen := map[string]bool{}
-	base := PushInput{FetchURLs: []string{"url"}, PushURLs: []string{"url"}, CurrentRef: "refs/heads/topic", Allowlist: []PushAllowlistEntry{{Remote: "origin", URL: "url", Branch: "topic"}}, RemoteHeadSHA: stringOf('a', 40), RemoteHeadLocal: true, CommitSHAs: []string{stringOf('b', 40)}, SupervisorCommitSHAs: []string{stringOf('b', 40)}, HeadSHA: stringOf('b', 40)}
-	cases := []struct {
-		change func(*PushInput)
-		reason string
-	}{
-		{func(p *PushInput) { p.CurrentRef = "" }, "detached_head"}, {func(p *PushInput) { p.CurrentRef = "refs/heads/main" }, "protected_branch"}, {func(p *PushInput) { p.Allowlist = []PushAllowlistEntry{{Branch: "other"}} }, "not_in_allowlist"},
-		{func(p *PushInput) { p.FetchURLs = []string{"url", "url"} }, "multiple_urls"}, {func(p *PushInput) { p.PushURLs = []string{"else"} }, "url_mismatch"}, {func(p *PushInput) { p.ReceivepackConfigured = true }, "receivepack_configured"}, {func(p *PushInput) { p.RemoteHelperConfigured = true }, "remote_helper_configured"},
-		{func(p *PushInput) { p.GitConfigChanged = true }, "git_config_changed"}, {func(p *PushInput) { p.GitConfigInclude = true }, "git_config_include"}, {func(p *PushInput) { p.RemoteHeadUnavailable = true }, "remote_head_unavailable"},
-		{func(p *PushInput) { p.RemoteHeadSHA = "" }, "no_tracking_ref"}, {func(p *PushInput) { p.RemoteHeadLocal = false }, "remote_head_not_local"}, {func(p *PushInput) { p.CommitSHAs = []string{"bad"} }, "foreign_commits"},
-		{func(p *PushInput) { p.Allowlist = []PushAllowlistEntry{{Remote: "-bad", URL: "url", Branch: "topic"}} }, "argv_not_allowed"},
-	}
-	for _, tc := range cases {
-		p := base
-		tc.change(&p)
-		got := (PushPolicy{}).Evaluate(p).Reason
-		if got != tc.reason {
-			t.Errorf("reason=%q want=%q", got, tc.reason)
-		}
-		seen[got] = true
-	}
-	for _, reason := range want {
-		if !seen[reason] {
-			t.Errorf("canonical reason not exercised: %s", reason)
-		}
-	}
-}
-
-func TestPushPolicySetAndHeadSemantics(t *testing.T) {
-	base := PushInput{FetchURLs: []string{"url"}, PushURLs: []string{"url"}, CurrentRef: "refs/heads/topic", Allowlist: []PushAllowlistEntry{{Remote: "origin", URL: "url", Branch: "topic"}}, RemoteHeadSHA: stringOf('a', 40), RemoteHeadLocal: true, CommitSHAs: []string{stringOf('b', 40), stringOf('c', 40)}, SupervisorCommitSHAs: []string{stringOf('a', 40), stringOf('b', 40), stringOf('c', 40)}, HeadSHA: stringOf('c', 40)}
-	if d := (PushPolicy{}).Evaluate(base); !d.Allowed {
-		t.Fatalf("base: %+v", d)
-	}
-	reversed := base
-	reversed.CommitSHAs = []string{stringOf('c', 40), stringOf('b', 40)}
-	if d := (PushPolicy{}).Evaluate(reversed); !d.Allowed {
-		t.Fatalf("reversed: %+v", d)
-	}
-	bad := base
-	bad.HeadSHA = ""
-	if (PushPolicy{}).Evaluate(bad).Allowed {
-		t.Fatal("accepted empty head")
-	}
-	bad = base
-	bad.CommitSHAs = []string{""}
-	if (PushPolicy{}).Evaluate(bad).Allowed {
-		t.Fatal("accepted empty commit")
-	}
-	bad = base
-	bad.SupervisorCommitSHAs = []string{stringOf('b', 40), stringOf('c', 40)}
-	if !(PushPolicy{}).Evaluate(bad).Allowed {
-		t.Fatal("expected supervisor tail=head")
-	}
-	bad = base
-	bad.SupervisorCommitSHAs = []string{stringOf('c', 40), stringOf('b', 40)}
-	if (PushPolicy{}).Evaluate(bad).Allowed {
-		t.Fatal("accepted head not latest supervisor commit")
-	}
-	bad = base
-	bad.CommitSHAs = nil
-	if d := (PushPolicy{}).Evaluate(bad); !d.NoPushes || d.Allowed {
-		t.Fatalf("empty push set: %+v", d)
-	}
-	bad = base
-	bad.Allowlist = []PushAllowlistEntry{{Remote: "origin", URL: "url", Branch: "topic"}, {Remote: "backup", URL: "url", Branch: "topic"}}
-	if (PushPolicy{}).Evaluate(bad).Allowed {
-		t.Fatal("accepted ambiguous remote")
-	}
-	bad = base
-	bad.Allowlist = []PushAllowlistEntry{{Remote: "origin", URL: "url1", Branch: "topic"}, {Remote: "origin", URL: "url", Branch: "topic"}}
-	if d := (PushPolicy{}).Evaluate(bad); !d.Allowed {
-		t.Fatalf("URL matching entry was not selected: %+v", d)
-	}
-	bad = base
-	bad.RemoteHeadSHA = "BAD"
-	if d := (PushPolicy{}).Evaluate(bad); d.Reason != "remote_head_unavailable" {
-		t.Fatalf("malformed remote head: %+v", d)
-	}
-	bad = base
-	bad.HeadSHA = ""
-	if d := (PushPolicy{}).Evaluate(bad); d.Reason != "foreign_commits" {
-		t.Fatalf("empty head reason: %+v", d)
-	}
-	bad = base
-	bad.CommitSHAs = []string{""}
-	if d := (PushPolicy{}).Evaluate(bad); d.Reason != "foreign_commits" {
-		t.Fatalf("empty commit reason: %+v", d)
-	}
-	bad = base
-	bad.RemoteHeadSHA = strings.Repeat("A", 40)
-	if d := (PushPolicy{}).Evaluate(bad); d.Reason != "remote_head_unavailable" {
-		t.Fatalf("uppercase remote sha: %+v", d)
-	}
-	bad = base
-	bad.CurrentRef = "refs/heads/"
-	if (PushPolicy{}).Evaluate(bad).Allowed {
-		t.Fatal("accepted empty branch")
-	}
-	for _, branch := range []string{"master", "develop", "release"} {
-		p := base
-		p.CurrentRef = "refs/heads/" + branch
-		if branch == "release" {
-			p.ProtectedBranches = []string{"release"}
-		}
-		if (PushPolicy{}).Evaluate(p).Reason != "protected_branch" {
-			t.Errorf("branch %q was not protected", branch)
-		}
-	}
-	p := base
-	p.PushURLs = []string{"url", "url"}
-	if (PushPolicy{}).Evaluate(p).Reason != "multiple_urls" {
-		t.Fatal("multiple push URLs not rejected")
-	}
-}
-
 func TestPorcelainRejectsInvalidXYAndEmptyPath(t *testing.T) {
 	for _, data := range [][]byte{[]byte("xM path\x00"), []byte(" M \x00"), []byte(" M path\x00\x00"), []byte("?M mixed\x00"), []byte("!M mixed\x00"), []byte("   path\x00"), []byte("?? no-final-nul"), []byte(" R target\x00")} {
 		if _, err := ParsePorcelainV1(data); err == nil {
 			t.Errorf("accepted malformed %q", data)
 		}
 	}
-}
-
-func stringOf(b byte, n int) string {
-	out := make([]byte, n)
-	for i := range out {
-		out[i] = b
-	}
-	return string(out)
 }
 
 func TestRepoLockerTryLock(t *testing.T) {
@@ -560,5 +334,29 @@ func TestMalformedConfigFailsClosed(t *testing.T) {
 		if !GitConfigFingerprintFromEntries(nil, config).HasInclude {
 			t.Fatalf("malformed config accepted: %q", config)
 		}
+	}
+}
+
+func TestGitRunnerPushUsesInspectedSHA(t *testing.T) {
+	dir := t.TempDir()
+	log := filepath.Join(dir, "push-argv")
+	fake := filepath.Join(dir, "git-fake")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$@\" > '" + log + "'\n"
+	if err := os.WriteFile(fake, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	runner := newGitRunnerWithBinary(t, fake, dir, "", " ")
+	runner.stateDir = t.TempDir()
+	sha := strings.Repeat("b", 40)
+	if err := runner.Push(context.Background(), "origin", "topic", sha); err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(log)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Join(BuildPushArgv("origin", "topic", sha), "\n") + "\n"
+	if string(got) != want {
+		t.Fatalf("argv=%q want=%q", got, want)
 	}
 }

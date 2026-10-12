@@ -23,13 +23,36 @@ const (
 	supervisorCommitMessagePrefix = "supervisor: verified changes in " // SUPERVISOR_COMMIT_MESSAGE_TEMPLATE
 )
 
-var ErrGitTimeout = errors.New("git_timeout")
+var (
+	ErrGitTimeout         = errors.New("git_timeout")
+	ErrGitOutputTooLarge  = errors.New("git_output_too_large")
+	ErrPushArgvNotAllowed = errors.New("argv_not_allowed")
+	ErrGitUnavailable     = errors.New("git_unavailable")
+)
+
+// PushRunError marks a failed git invocation separately from the argv gate.
+type PushRunError struct{ Cause error }
+
+func (e *PushRunError) Error() string { return e.Cause.Error() }
+func (e *PushRunError) Unwrap() error { return e.Cause }
+
+// PushErrorReason is the event classification for a GitRunner.Push error.
+func PushErrorReason(err error) string {
+	if err == nil {
+		return ""
+	}
+	if errors.Is(err, ErrPushArgvNotAllowed) {
+		return "argv_not_allowed"
+	}
+	return "push_failed"
+}
 
 type GitRunner struct {
 	git, dir, authorName, authorEmail string
 	stateDir                          string
 	passSSHAuthSock                   bool
 	parentEnv                         []string
+	pushTimeout                       time.Duration
 }
 
 type gitExitError struct{ code int }
@@ -38,10 +61,23 @@ func (e gitExitError) Error() string { return fmt.Sprintf("git_exit_%d", e.code)
 
 func NewGitRunner(dir, authorName, authorEmail, stateDirectory string) *GitRunner {
 	git, _ := proc.FindGitBinary()
-	return &GitRunner{git: git, dir: dir, authorName: authorName, authorEmail: authorEmail, parentEnv: os.Environ(), stateDir: stateDirectory, passSSHAuthSock: true}
+	return &GitRunner{git: git, dir: dir, authorName: authorName, authorEmail: authorEmail, parentEnv: os.Environ(), stateDir: stateDirectory, passSSHAuthSock: true, pushTimeout: gitPushTimeout}
 }
 
 func (r *GitRunner) SetPassSSHAuthSock(pass bool) { r.passSSHAuthSock = pass }
+
+// SetParentEnv supplies an isolated parent environment for tests and embedding.
+func (r *GitRunner) SetParentEnv(env []string) { r.parentEnv = append([]string(nil), env...) }
+
+// SetPushTimeout overrides the canonical limit when a short test deadline is needed.
+func (r *GitRunner) SetPushTimeout(timeout time.Duration) { r.pushTimeout = timeout }
+
+func (r *GitRunner) effectivePushTimeout() time.Duration {
+	if r.pushTimeout > 0 {
+		return r.pushTimeout
+	}
+	return gitPushTimeout
+}
 
 func (r *GitRunner) run(ctx context.Context, purpose proc.GitEnvPurpose, timeout time.Duration, literal bool, args ...string) ([]byte, error) {
 	return r.runCommand(ctx, purpose, timeout, literal, true, args...)
@@ -96,7 +132,7 @@ func (r *GitRunner) runCommand(ctx context.Context, purpose proc.GitEnvPurpose, 
 		return nil, ErrGitTimeout
 	}
 	if capture && (stdout.exceeded || stderr.exceeded) {
-		return nil, fmt.Errorf("git_output_too_large")
+		return nil, ErrGitOutputTooLarge
 	}
 	if err != nil {
 		var exit *exec.ExitError
@@ -209,12 +245,11 @@ func validProjectID(id string) bool {
 	}
 	return !strings.Contains(id, "--")
 }
-func (r *GitRunner) RevListSince(ctx context.Context, baseSHA string) ([]byte, error) {
-	baseSHA = strings.ToLower(baseSHA)
-	if !shaPattern.MatchString(baseSHA) {
+func (r *GitRunner) RevListSince(ctx context.Context, baseSHA, headSHA string) ([]byte, error) {
+	if !shaPattern.MatchString(baseSHA) || !shaPattern.MatchString(headSHA) {
 		return nil, fmt.Errorf("argv_not_allowed")
 	}
-	return r.run(ctx, proc.GitEnvLocal, gitOperationTimeout, false, "rev-list", "--end-of-options", baseSHA+"..HEAD")
+	return r.run(ctx, proc.GitEnvLocal, gitOperationTimeout, false, "rev-list", "--end-of-options", baseSHA+".."+headSHA)
 }
 func (r *GitRunner) RemoteURLs(ctx context.Context, remote string) (fetch, push []byte, err error) {
 	if !validRemote(remote) {
@@ -260,7 +295,7 @@ func (r *GitRunner) LsRemote(ctx context.Context, remote, ref string) ([]byte, e
 	if !validRemote(remote) || strings.HasPrefix(ref, "-") {
 		return nil, fmt.Errorf("argv_not_allowed")
 	}
-	return r.run(ctx, proc.GitEnvPush, gitPushTimeout, false, "ls-remote", "--upload-pack=git-upload-pack", "--end-of-options", remote, ref)
+	return r.run(ctx, proc.GitEnvPush, r.effectivePushTimeout(), false, "-c", "remote."+remote+".proxy=", "ls-remote", "--upload-pack=git-upload-pack", "--end-of-options", remote, ref)
 }
 func (r *GitRunner) CatFileExists(ctx context.Context, sha string) error {
 	sha = strings.ToLower(sha)
@@ -277,12 +312,21 @@ func (r *GitRunner) CatFileExists(ctx context.Context, sha string) error {
 func (r *GitRunner) RevParseToplevel(ctx context.Context) ([]byte, error) {
 	return r.run(ctx, proc.GitEnvLocal, gitOperationTimeout, false, "rev-parse", "--show-toplevel")
 }
-func (r *GitRunner) Push(ctx context.Context, remote, branch string) error {
-	argv := append([]string{r.git}, BuildPushArgv(remote, branch)...)
-	if err := ValidatePushArgv(argv, remote, branch); err != nil {
+func (r *GitRunner) Push(ctx context.Context, remote, branch, inspectedSHA string) error {
+	if r.git == "" {
+		return &PushRunError{Cause: ErrGitUnavailable}
+	}
+	argv := append([]string{r.git}, BuildPushArgv(remote, branch, inspectedSHA)...)
+	if err := ValidatePushArgv(argv, remote, branch, inspectedSHA); err != nil {
 		return err
 	}
-	return r.runExact(ctx, proc.GitEnvPush, gitPushTimeout, argv)
+	if err := r.runExact(ctx, proc.GitEnvPush, r.effectivePushTimeout(), argv); err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		return &PushRunError{Cause: err}
+	}
+	return nil
 }
 
 func (r *GitRunner) runExact(ctx context.Context, purpose proc.GitEnvPurpose, timeout time.Duration, argv []string) error {

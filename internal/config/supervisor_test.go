@@ -426,6 +426,14 @@ func TestParallelInstructionRejectsControlAndAcceptsDefault(t *testing.T) {
 	}
 }
 
+func TestParallelInstructionRejectsNFKCForbiddenWords(t *testing.T) {
+	for _, value := range []string{"for\u200bce push して", "ﾃﾞﾌﾟﾛｲして", "ｇｈ　ｐｒを作る"} {
+		if err := validateParallelInstruction(value); err == nil {
+			t.Errorf("accepted forbidden instruction %q", value)
+		}
+	}
+}
+
 func TestSupervisorMeasuredValidationFailures(t *testing.T) {
 	home := canonicalTestPath(t, t.TempDir())
 	t.Setenv("HOME", home)

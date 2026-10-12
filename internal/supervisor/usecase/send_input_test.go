@@ -22,6 +22,99 @@ import (
 
 type sendTestStore struct{ session supervisor.ManagedSession }
 
+func TestSendInput_SCN23_ParallelInstructionFromProjectOrDefault(t *testing.T) {
+	id := supervisor.SessionID("parallel-23")
+	s := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, ProjectID: "project-a"}}
+	u := &SendInputUseCase{Sessions: s, ProjectInstructions: map[string]string{"project-a": "project instruction"}}
+	if got := u.parallelInstructionFor(s.session); got != "project instruction" {
+		t.Fatalf("project instruction=%q", got)
+	}
+	s.session.ProjectID = "project-b"
+	if got := u.parallelInstructionFor(s.session); got != defaultParallelInstruction {
+		t.Fatalf("default instruction=%q", got)
+	}
+}
+
+func TestSendInput_SCN0418_HandoffFailuresLeaveRotationState(t *testing.T) {
+	for _, abort := range []bool{false, true} {
+		t.Run(fmt.Sprint(abort), func(t *testing.T) {
+			id, _ := supervisor.NewSessionID("alpha-1")
+			s := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, State: supervisor.SessionRotating, SendGate: supervisor.SendGateRecord{NextSeq: 1}}}
+			screen := &sendTestScreen{shot: blankScreen()}
+			pty := &sendTestPTY{onWrite: func() { echoScreen(screen, "#end") }}
+			var writer PTYWriter = pty
+			if abort {
+				writer = failingBeforeCRPTY{errors.New("before CR")}
+			}
+			u := SendInputUseCase{Sessions: s, Screens: screen, PTY: writer, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir()), ConfirmTimeout: time.Millisecond}
+			_, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindHandoffEnd, Origin: supervisor.SendOriginHandoff})
+			if err == nil || s.session.State != supervisor.SessionRotating {
+				t.Fatalf("err=%v state=%s", err, s.session.State)
+			}
+			if abort && s.session.SendGate.Pending != nil {
+				t.Fatal("pre-CR abort left pending")
+			}
+			if !abort && s.session.SendGate.Pending == nil {
+				t.Fatal("unconfirmed send lost pending")
+			}
+		})
+	}
+}
+
+func TestSendInput_SCN21_EndIssuedAtPersistedBeforePTYWrite(t *testing.T) {
+	id, _ := supervisor.NewSessionID("issued-end-21")
+	s := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, State: supervisor.SessionRotating, Rotation: &supervisor.RotationRecord{Step: supervisor.RotateSendEnd}, SendGate: supervisor.SendGateRecord{NextSeq: 1}}}
+	screen := &sendTestScreen{shot: blankScreen()}
+	checked := false
+	pty := &sendTestPTY{onWrite: func() {
+		if s.session.SendGate.Pending != nil && s.session.Rotation.EndIssuedAt != nil && s.session.Rotation.EndIssuedAt.Equal(s.session.SendGate.Pending.IssuedAt) {
+			checked = true
+		}
+		echoScreen(screen, "#end")
+	}}
+	u := SendInputUseCase{Sessions: s, Screens: screen, PTY: pty, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir()), ConfirmTimeout: time.Millisecond}
+	_, _ = u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindHandoffEnd, Origin: supervisor.SendOriginHandoff})
+	if !checked {
+		t.Fatalf("issued time not durable before PTY write: %+v", s.session.Rotation)
+	}
+}
+
+func TestSendInput_SCN40_ResumeReadyNeedsFreshQuietIdle(t *testing.T) {
+	id, _ := supervisor.NewSessionID("resume-ready-40")
+	resumeAt := time.Date(2026, 10, 12, 0, 0, 0, 0, time.UTC)
+	shot := blankScreen()
+	shot.ObservedAt = resumeAt.Add(time.Second)
+	shot.ChangedAt = resumeAt.Add(time.Second)
+	screen := &sendTestScreen{shot: shot}
+	u := &SendInputUseCase{Screens: screen, Now: func() time.Time { return shot.ChangedAt.Add(detect.QuietPeriod) }}
+	if !u.ResumeReady(id, resumeAt) {
+		t.Fatal("fresh quiet idle rejected")
+	}
+	screen.shot.ChangedAt = resumeAt
+	if u.ResumeReady(id, resumeAt) {
+		t.Fatal("pre-resume screen accepted")
+	}
+	screen.shot = shot
+	screen.shot.State = detect.StateWorking
+	if u.ResumeReady(id, resumeAt) {
+		t.Fatal("working screen accepted")
+	}
+}
+
+func TestSendInput_SCN0418_ExitUsesCallerTimeout(t *testing.T) {
+	id, _ := supervisor.NewSessionID("alpha-1")
+	s := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, State: supervisor.SessionRotating, SendGate: supervisor.SendGateRecord{NextSeq: 1}}}
+	screen := &sendTestScreen{shot: blankScreen()}
+	pty := &sendTestPTY{onWrite: func() { echoScreen(screen, "/exit") }}
+	u := SendInputUseCase{Sessions: s, Screens: screen, PTY: pty, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir()), ConfirmTimeout: time.Hour}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	_, err := u.Execute(ctx, SendInput{SessionID: id, Kind: supervisor.SendKindHandoffExit, Origin: supervisor.SendOriginHandoff, ConfirmTimeout: time.Millisecond})
+	if err == nil || errors.Is(err, context.DeadlineExceeded) || s.session.State != supervisor.SessionRotating {
+		t.Fatalf("err=%v state=%s", err, s.session.State)
+	}
+}
+
 type sendStateFlipStore struct {
 	sendTestStore
 	loads int
@@ -978,7 +1071,7 @@ func TestSCNsup0222AmbiguousPTYErrorKeepsPending(t *testing.T) {
 
 func TestSCNsup0219SendInputRejectsArbitraryKindAndHasNoTextField(t *testing.T) {
 	typ := reflect.TypeOf(SendInput{})
-	if typ.NumField() != 3 || typ.Field(0).Type != reflect.TypeOf(supervisor.SessionID("")) || typ.Field(1).Type != reflect.TypeOf(supervisor.SupervisorSendKind("")) || typ.Field(2).Type != reflect.TypeOf(supervisor.SendOriginNormal) {
+	if typ.NumField() != 4 || typ.Field(0).Type != reflect.TypeOf(supervisor.SessionID("")) || typ.Field(1).Type != reflect.TypeOf(supervisor.SupervisorSendKind("")) || typ.Field(2).Type != reflect.TypeOf(supervisor.SendOriginNormal) || typ.Field(3).Type != reflect.TypeOf(time.Duration(0)) {
 		t.Fatalf("unexpected input type: %v", typ)
 	}
 	id, _ := supervisor.NewSessionID("alpha-1")

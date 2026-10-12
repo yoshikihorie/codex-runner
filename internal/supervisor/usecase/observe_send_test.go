@@ -5,6 +5,7 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,9 +61,10 @@ func TestObserveSuppliesCompletionSelectionToEnterGate(t *testing.T) {
 }
 
 type observeSendPTY struct {
-	reads chan []byte
-	exits chan int
-	once  sync.Once
+	reads  chan []byte
+	exits  chan int
+	once   sync.Once
+	writes atomic.Int32
 }
 
 func newObserveSendPTY() *observeSendPTY {
@@ -75,8 +77,13 @@ func (p *observeSendPTY) Read(dst []byte) (int, error) {
 	}
 	return copy(dst, b), nil
 }
-func (p *observeSendPTY) Wait() (int, error) { return <-p.exits, nil }
-func (p *observeSendPTY) Close() error       { p.once.Do(func() { close(p.reads) }); return nil }
+func (p *observeSendPTY) Wait() (int, error)             { return <-p.exits, nil }
+func (p *observeSendPTY) Close() error                   { p.once.Do(func() { close(p.reads) }); return nil }
+func (p *observeSendPTY) Write(data []byte) (int, error) { p.writes.Add(1); return len(data), nil }
+func (p *observeSendPTY) WriteLine(context.Context, string, time.Duration, func() bool) error {
+	p.writes.Add(1)
+	return nil
+}
 
 func observeSendFixture(t *testing.T, state supervisor.SupervisorSessionState) (supervisor.ManagedSession, *store.SessionStore, *store.EventStore) {
 	t.Helper()

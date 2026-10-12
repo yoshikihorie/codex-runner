@@ -15,9 +15,10 @@ import (
 )
 
 type SendInput struct {
-	SessionID supervisor.SessionID
-	Kind      supervisor.SupervisorSendKind
-	Origin    supervisor.SendOrigin
+	SessionID      supervisor.SessionID
+	Kind           supervisor.SupervisorSendKind
+	Origin         supervisor.SendOrigin
+	ConfirmTimeout time.Duration
 }
 type SendResult struct {
 	SendID    string
@@ -27,6 +28,9 @@ type SendResult struct {
 
 var errSendStateChanged = errors.New("session state changed before issue")
 var errSendPendingAppeared = errors.New("pending send appeared before issue")
+
+// Canonical value: specifications/10-shared/validation-rules.md SUPERVISOR_PARALLEL_INSTRUCTION_DEFAULT.
+const defaultParallelInstruction = "自動作業計画モード 並列で作業して。実装は ~/.claude/scripts/codex.sh impl --model gpt-6-luna を明示して委譲する"
 
 type ScreenSnapshot struct {
 	Rows                  []string
@@ -77,25 +81,28 @@ type SendConfirmation struct {
 
 // SendInputUseCase is the sole PTY input path. NotifyConfirmation is called by the observer after screen updates.
 type SendInputUseCase struct {
-	Sessions            SessionRecordStore
-	Screens             ScreenReader
-	PTY                 PTYWriter
-	PTYs                *PTYRegistry
-	IsStopped           func(supervisor.SessionID) bool
-	StopState           *StopState
-	ParallelInstruction func(supervisor.SessionID) string
-	RecordStructured    func(store.Event) error
-	OperationalLog      *store.SupervisorLog
-	Notify              func(supervisor.SupervisorEventKind, string)
-	LogBlocked          func(supervisor.SessionID, supervisor.SupervisorSendBlockedReason)
-	Now                 func() time.Time
-	ConfirmTimeout      time.Duration
-	mu                  sync.Mutex
-	locks               map[supervisor.SessionID]*sync.Mutex
-	confirm             map[supervisor.SessionID]chan SendConfirmation
-	crWritten           map[supervisor.SessionID]string
-	crAt                map[supervisor.SessionID]time.Time
-	ended               map[supervisor.SessionID]bool
+	Sessions             SessionRecordStore
+	Screens              ScreenReader
+	PTY                  PTYWriter
+	PTYs                 *PTYRegistry
+	IsStopped            func(supervisor.SessionID) bool
+	StopState            *StopState
+	ParallelInstruction  func(supervisor.SessionID) string
+	ProjectInstructions  map[string]string
+	RecordStructured     func(store.Event) error
+	OperationalLog       *store.SupervisorLog
+	Notify               func(supervisor.SupervisorEventKind, string)
+	LogBlocked           func(supervisor.SessionID, supervisor.SupervisorSendBlockedReason)
+	RecommendationIssued func(supervisor.SessionID, [32]byte, time.Time)
+	Now                  func() time.Time
+	ConfirmTimeout       time.Duration
+	issuedBindOnce       sync.Once
+	mu                   sync.Mutex
+	locks                map[supervisor.SessionID]*sync.Mutex
+	confirm              map[supervisor.SessionID]chan SendConfirmation
+	crWritten            map[supervisor.SessionID]string
+	crAt                 map[supervisor.SessionID]time.Time
+	ended                map[supervisor.SessionID]bool
 }
 
 func (u *SendInputUseCase) sessionLock(id supervisor.SessionID) *sync.Mutex {
@@ -149,6 +156,18 @@ func (u *SendInputUseCase) now() time.Time {
 		return u.Now().UTC()
 	}
 	return time.Now().UTC()
+}
+
+func (u *SendInputUseCase) ResumeReady(id supervisor.SessionID, resumedAt time.Time) bool {
+	if u.Screens == nil {
+		return false
+	}
+	shot := u.Screens.Snapshot(id)
+	return shot.State == detect.StateIdle &&
+		shot.ObservedAt.After(resumedAt) &&
+		shot.ChangedAt.After(resumedAt) &&
+		u.now().Sub(shot.ChangedAt) >= detect.QuietPeriod &&
+		screenReadyForWrite(shot)
 }
 func (u *SendInputUseCase) record(e store.Event) error {
 	if u.RecordStructured != nil {
@@ -245,6 +264,10 @@ func (u *SendInputUseCase) EndSession(id supervisor.SessionID) {
 func snapshotObservedAt(s ScreenSnapshot) time.Time {
 	return s.ObservedAt
 }
+func (u *SendInputUseCase) BindRecommendationIssued(record func(supervisor.SessionID, [32]byte, time.Time)) {
+	u.issuedBindOnce.Do(func() { u.RecommendationIssued = record })
+}
+
 func snapshotChangedAt(s ScreenSnapshot) time.Time {
 	return s.ChangedAt
 }
@@ -262,10 +285,7 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 	if err != nil {
 		return SendResult{}, err
 	}
-	parallel := ""
-	if u.ParallelInstruction != nil {
-		parallel = u.ParallelInstruction(in.SessionID)
-	}
+	parallel := u.parallelInstructionFor(s)
 	message, fixed := supervisor.FixedText(in.Kind, parallel)
 	shot := u.Screens.Snapshot(in.SessionID)
 	fresh := !s.SendGate.UnconfirmedDiscarded || shot.State == detect.StateIdle && snapshotObservedAt(shot).After(s.StateSince) && !snapshotChangedAt(shot).IsZero() && u.now().Sub(snapshotChangedAt(shot)) >= detect.QuietPeriod && screenReadyForWrite(shot)
@@ -305,6 +325,10 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 		pending = supervisor.PendingSend{SendID: fmt.Sprintf("%s-s%d", in.SessionID, seq), Kind: in.Kind, IssuedAt: u.now()}
 		v.SendGate.NextSeq = seq + 1
 		v.SendGate.Pending = &pending
+		if in.Kind == supervisor.SendKindHandoffEnd && in.Origin == supervisor.SendOriginHandoff && v.Rotation != nil {
+			issued := pending.IssuedAt
+			v.Rotation.EndIssuedAt = &issued
+		}
 		v.SendGate.LastSendConfirmed = false
 		v.SendGate.EverSent = true
 		return nil
@@ -321,6 +345,11 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 	result := SendResult{SendID: pending.SendID}
 	if err = u.record(store.Event{Kind: supervisor.EventKindSendIssued, SessionID: in.SessionID.String(), SendID: pending.SendID, SendKind: in.Kind}); err != nil {
 		return result, errors.Join(err, u.blockBeforeText(in.SessionID, pending, prevEver, prev, supervisor.SendBlockedState))
+	}
+	if in.Kind == supervisor.SendKindRecommendationContinue && u.RecommendationIssued != nil {
+		if hash, ok := ctx.Value(recommendationHashContextKey{}).([32]byte); ok {
+			u.RecommendationIssued(in.SessionID, hash, pending.IssuedAt)
+		}
 	}
 	if u.stopped(in.SessionID) {
 		result.Blocked = supervisor.SendBlockedStop
@@ -341,14 +370,20 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 	err = pty.WriteLine(ctx, message, supervisor.SupervisorSendEnterDelay, before)
 	if err != nil {
 		if beforeAllowed {
-			return result, errors.Join(err, u.unconfirmed(in.SessionID, pending))
+			return result, errors.Join(err, u.unconfirmed(in.SessionID, pending, in.Origin))
 		}
 		if !beforeCalled && (strings.ContainsAny(message, "\r\n") || supervisor.SupervisorSendEnterDelay < 0 || err.Error() == "line text must not contain CR or LF" || err.Error() == "delay must not be negative") {
 			return result, errors.Join(err, u.blockBeforeText(in.SessionID, pending, prevEver, prev, supervisor.SendBlockedState))
 		}
-		return result, errors.Join(err, u.abortBeforeCR(in.SessionID, pending, prevEver, prev))
+		return result, errors.Join(err, u.abortBeforeCR(in.SessionID, pending, prevEver, prev, in.Origin))
 	}
-	timeout := u.ConfirmTimeout
+	timeout := in.ConfirmTimeout
+	if timeout <= 0 && in.Kind == supervisor.SendKindHandoffExit && in.Origin == supervisor.SendOriginHandoff {
+		timeout = supervisor.SupervisorExitGrace
+	}
+	if timeout <= 0 {
+		timeout = u.ConfirmTimeout
+	}
 	if timeout <= 0 {
 		timeout = supervisor.SupervisorSendConfirmTimeout
 	}
@@ -385,6 +420,9 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 				if current.State == supervisor.SessionStopped && current.StopReason == supervisor.StopProcessExitWithPending {
 					return result, errors.New("process exited with pending send")
 				}
+				if in.Origin == supervisor.SendOriginHandoff {
+					return result, errors.New("process exited with pending send")
+				}
 				if err := UpdateSession(u.Sessions, in.SessionID, func(v *supervisor.ManagedSession) error {
 					v.State = supervisor.SessionStopped
 					v.StopReason = supervisor.StopProcessExitWithPending
@@ -409,22 +447,32 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 			}
 			return u.confirmSend(in.SessionID, pending)
 		case <-timer.C:
-			if err := u.unconfirmed(in.SessionID, pending); err != nil {
+			if err := u.unconfirmed(in.SessionID, pending, in.Origin); err != nil {
 				return result, err
 			}
 			return result, errors.New("SUP_SEND_NOT_CONFIRMED")
 		case <-ctx.Done():
-			return result, errors.Join(ctx.Err(), u.unconfirmed(in.SessionID, pending))
+			return result, errors.Join(ctx.Err(), u.unconfirmed(in.SessionID, pending, in.Origin))
 		}
 	}
 }
 
-func (u *SendInputUseCase) abortBeforeCR(id supervisor.SessionID, p supervisor.PendingSend, ever, confirmed bool) error {
+func (u *SendInputUseCase) parallelInstructionFor(s supervisor.ManagedSession) string {
+	if u.ParallelInstruction != nil {
+		return u.ParallelInstruction(s.SessionID)
+	}
+	if value := u.ProjectInstructions[s.ProjectID]; value != "" {
+		return value
+	}
+	return defaultParallelInstruction
+}
+
+func (u *SendInputUseCase) abortBeforeCR(id supervisor.SessionID, p supervisor.PendingSend, ever, confirmed bool, origin supervisor.SendOrigin) error {
 	if err := UpdateSession(u.Sessions, id, func(v *supervisor.ManagedSession) error {
 		v.SendGate.Pending = nil
 		v.SendGate.EverSent = ever
 		v.SendGate.LastSendConfirmed = confirmed
-		if v.State != supervisor.SessionStopped {
+		if origin != supervisor.SendOriginHandoff && v.State != supervisor.SessionStopped {
 			v.State = supervisor.SessionStopped
 			v.StopReason = supervisor.StopSendAborted
 		}
@@ -435,7 +483,7 @@ func (u *SendInputUseCase) abortBeforeCR(id supervisor.SessionID, p supervisor.P
 	if err := u.record(store.Event{Kind: supervisor.EventKindSendAborted, SessionID: id.String(), SendID: p.SendID, SendKind: p.Kind, Code: "SUP_SEND_ABORTED"}); err != nil {
 		return err
 	}
-	if u.Notify != nil {
+	if origin != supervisor.SendOriginHandoff && u.Notify != nil {
 		u.Notify(supervisor.EventKindSendAborted, id.String())
 	}
 	return nil
@@ -454,9 +502,9 @@ func (u *SendInputUseCase) blockBeforeText(id supervisor.SessionID, p supervisor
 	return err
 }
 
-func (u *SendInputUseCase) unconfirmed(id supervisor.SessionID, p supervisor.PendingSend) error {
+func (u *SendInputUseCase) unconfirmed(id supervisor.SessionID, p supervisor.PendingSend, origin supervisor.SendOrigin) error {
 	if err := UpdateSession(u.Sessions, id, func(v *supervisor.ManagedSession) error {
-		if v.State != supervisor.SessionStopped {
+		if origin != supervisor.SendOriginHandoff && v.State != supervisor.SessionStopped {
 			v.State = supervisor.SessionStopped
 			v.StopReason = supervisor.StopSendNotConfirmed
 		}
@@ -467,7 +515,7 @@ func (u *SendInputUseCase) unconfirmed(id supervisor.SessionID, p supervisor.Pen
 	if err := u.record(store.Event{Kind: supervisor.EventKindSendUnconfirmed, SessionID: id.String(), SendID: p.SendID, SendKind: p.Kind, Code: "SUP_SEND_NOT_CONFIRMED"}); err != nil {
 		return err
 	}
-	if u.Notify != nil {
+	if origin != supervisor.SendOriginHandoff && u.Notify != nil {
 		u.Notify(supervisor.EventKindSendUnconfirmed, id.String())
 	}
 	return nil

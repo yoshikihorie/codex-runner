@@ -72,10 +72,56 @@ type CommitVerifiedChangesUseCase struct {
 	// It must not acquire the same RepoLocker again.
 	AfterCommit func(context.Context, supervisor.ManagedSession, CommitLocksHeld) error
 	// AfterGitPhase requests auto-continue re-evaluation after git_phase becomes none.
-	AfterGitPhase func(supervisor.SessionID)
-	Now           func() time.Time
-	suppressMu    sync.Mutex
-	suppressed    map[supervisor.SessionID]string
+	AfterGitPhase     func(supervisor.SessionID, time.Time)
+	Now               func() time.Time
+	gitPhaseOnce      sync.Once
+	gitPhaseMu        sync.Mutex
+	gitPhaseListeners map[supervisor.SessionID]map[uint64]func(time.Time)
+	gitPhaseNext      uint64
+	suppressMu        sync.Mutex
+	suppressed        map[supervisor.SessionID]string
+}
+
+// RegisterGitPhase installs one stable dispatcher and registers a session observer.
+func (u *CommitVerifiedChangesUseCase) RegisterGitPhase(id supervisor.SessionID, notify func(time.Time)) func() {
+	u.gitPhaseOnce.Do(func() {
+		u.gitPhaseMu.Lock()
+		defer u.gitPhaseMu.Unlock()
+		previous := u.AfterGitPhase
+		u.AfterGitPhase = func(session supervisor.SessionID, since time.Time) {
+			if previous != nil {
+				previous(session, since)
+			}
+			u.gitPhaseMu.Lock()
+			listeners := make([]func(time.Time), 0, len(u.gitPhaseListeners[session]))
+			for _, listener := range u.gitPhaseListeners[session] {
+				listeners = append(listeners, listener)
+			}
+			u.gitPhaseMu.Unlock()
+			for _, listener := range listeners {
+				listener(since)
+			}
+		}
+	})
+	u.gitPhaseMu.Lock()
+	defer u.gitPhaseMu.Unlock()
+	if u.gitPhaseListeners == nil {
+		u.gitPhaseListeners = make(map[supervisor.SessionID]map[uint64]func(time.Time))
+	}
+	if u.gitPhaseListeners[id] == nil {
+		u.gitPhaseListeners[id] = make(map[uint64]func(time.Time))
+	}
+	u.gitPhaseNext++
+	key := u.gitPhaseNext
+	u.gitPhaseListeners[id][key] = notify
+	return func() {
+		u.gitPhaseMu.Lock()
+		defer u.gitPhaseMu.Unlock()
+		delete(u.gitPhaseListeners[id], key)
+		if len(u.gitPhaseListeners[id]) == 0 {
+			delete(u.gitPhaseListeners, id)
+		}
+	}
 }
 
 type commitSnapshot struct {
@@ -316,6 +362,7 @@ func (u *CommitVerifiedChangesUseCase) Execute(ctx context.Context, id superviso
 	}
 	phases, ok := u.Sessions.(interface {
 		SetGitPhase(supervisor.SessionID, supervisor.GitPhase)
+		SetGitPhaseIfEligible(supervisor.SessionID, supervisor.GitPhase) (bool, error)
 	})
 	if !ok {
 		return fmt.Errorf("git phase store is required")
@@ -336,11 +383,20 @@ func (u *CommitVerifiedChangesUseCase) Execute(ctx context.Context, id superviso
 	if u.stopped(id) || s.State != supervisor.SessionIdle && s.State != supervisor.SessionAwaitingRecommendation || now().Sub(s.StateSince) < commitSettle || len(u.OwnedPaths) == 0 || len(u.VerifyCommand) == 0 {
 		return nil
 	}
-	phases.SetGitPhase(id, supervisor.GitPhaseEvaluating)
+	eligible, err := phases.SetGitPhaseIfEligible(id, supervisor.GitPhaseEvaluating)
+	if err != nil {
+		return err
+	}
+	if !eligible {
+		return nil
+	}
 	defer func() {
 		phases.SetGitPhase(id, supervisor.GitPhaseNone)
-		if u.AfterGitPhase != nil {
-			u.AfterGitPhase(id)
+		u.gitPhaseMu.Lock()
+		afterGitPhase := u.AfterGitPhase
+		u.gitPhaseMu.Unlock()
+		if afterGitPhase != nil {
+			afterGitPhase(id, s.StateSince)
 		}
 	}()
 	rootBytes, err := u.Git.RevParseToplevel(ctx)
