@@ -18,6 +18,9 @@ func TreeFingerprint(headSHA string, entries []FingerprintEntry) string {
 		if a.Path != b.Path {
 			return a.Path < b.Path
 		}
+		if a.Mode != b.Mode {
+			return a.Mode < b.Mode
+		}
 		return a.ContentHash < b.ContentHash
 	})
 	ordered = append([]FingerprintEntry{{Scope: "head", ContentHash: headSHA}}, ordered...)

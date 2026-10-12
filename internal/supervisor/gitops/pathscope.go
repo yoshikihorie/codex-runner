@@ -158,3 +158,13 @@ func (s *PathScope) Resolve(path string) (string, error) {
 	}
 	return filepath.ToSlash(rel), e
 }
+
+// OwnsLexically reports whether a repository-relative path falls under an owned name before symlink resolution.
+func (s *PathScope) OwnsLexically(path string) bool {
+	for _, owned := range s.paths {
+		if owned == "." || path == owned || strings.HasPrefix(path, strings.TrimSuffix(owned, "/")+"/") {
+			return true
+		}
+	}
+	return false
+}

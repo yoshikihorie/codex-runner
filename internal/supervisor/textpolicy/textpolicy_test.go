@@ -99,3 +99,17 @@ func containsCategory(categories []Category, want Category) bool {
 	}
 	return false
 }
+
+func TestValidateParallelInstructionRejectsFormatAndSeparators(t *testing.T) {
+	for _, value := range []string{"run\u2028now", "run\u2029now", "run\u202enow", "run\u200bnow"} {
+		if ValidateParallelInstruction(value, 100, 100) {
+			t.Fatalf("accepted %q", value)
+		}
+	}
+}
+
+func TestFix3ParallelInstructionRejectsInvalidUTF8(t *testing.T) {
+	if ValidateParallelInstruction(string([]byte{'a', 0xff, 'b'}), 100, 100) {
+		t.Fatal("accepted invalid UTF-8")
+	}
+}

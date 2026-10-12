@@ -78,7 +78,9 @@ func IsForbidden(text string) bool {
 
 // ValidateParallelInstruction retains the established configuration API.
 func ValidateParallelInstruction(value string, maxRunes, maxWidth int) bool {
-	if value == "" || len([]rune(value)) > maxRunes || DisplayWidth(value) > maxWidth || strings.ContainsFunc(value, unicode.IsControl) {
+	if !utf8.ValidString(value) || value == "" || len([]rune(value)) > maxRunes || DisplayWidth(value) > maxWidth || strings.ContainsFunc(value, func(r rune) bool {
+		return unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || r == '\u2028' || r == '\u2029'
+	}) {
 		return false
 	}
 	runes := []rune(value)

@@ -155,10 +155,13 @@ func TestEventStoreReasonEnumsAndEventSpecificReasons(t *testing.T) {
 		supervisor.EventKindSessionStopped:        {"stop_global", "stop_session", "supervisor_restarted", "send_not_confirmed", "send_aborted", "process_exit_with_pending", "recommendation_forbidden", "recommendation_undetermined", "recommendation_repeated", "auto_continue_limit", "rotate_step_failed", "respawn_failed", "recovery_start_timeout", "claude_session_id_missing", "restart_limit_consecutive", "restart_limit_daily", "orphan_child_alive", "state_file_corrupt"},
 		supervisor.EventKindSessionExited:         {"stop_session_requested"},
 		supervisor.EventKindRotateFailed:          {"idle_wait_timeout", "send_not_confirmed", "mtime_not_updated", "head_generation_unchanged", "not_idle_after_handoff", "exit_timeout", "spawn_failed", "startup_timeout", "start_not_settled", "child_absent", "restart_limit"},
-		supervisor.EventKindCommitFailed:          {"path_escape", "staged_out_of_scope", "out_of_scope_uncommitted", "rename_partial", "git_config_changed", "gitattributes_filter", "git_config_include", "tree_mismatch_before_commit", "commit_rejected", "git_timeout", "git_unavailable"},
+		supervisor.EventKindCommitFailed:          {"path_escape", "staged_out_of_scope", "out_of_scope_uncommitted", "rename_partial", "git_config_changed", "gitattributes_filter", "git_config_include", "tree_mismatch_before_commit", "commit_rejected", "git_timeout", "git_unavailable", "git_failed", "git_output_too_large"},
 		supervisor.EventKindPushBlocked:           {"detached_head", "protected_branch", "not_in_allowlist", "multiple_urls", "url_mismatch", "receivepack_configured", "git_config_changed", "no_tracking_ref", "foreign_commits", "argv_not_allowed", "git_config_include", "remote_head_unavailable", "remote_head_not_local"},
-		supervisor.EventKindVerifyFailed:          {"verify_binary_changed"},
+		supervisor.EventKindVerifyFailed:          {"verify_binary_changed", "verify_cwd_invalid", "verify_exec_failed"},
 		supervisor.EventKindRestartLimitExceeded:  {"restart_limit_consecutive", "restart_limit_daily"},
+	}
+	if _, err := store.Record(Event{Kind: supervisor.EventKindVerifyFailed, Code: "SUP_VERIFY_FAILED"}); err != nil {
+		t.Errorf("rejected verify failure without reason: %v", err)
 	}
 	for kind, reasons := range reasonEnums {
 		for _, reason := range reasons {
@@ -308,4 +311,14 @@ func bytesFirstLine(data []byte) []byte {
 		return data[:i]
 	}
 	return data
+}
+
+func TestSensitivePathEventPatternValidatedWithoutPath(t *testing.T) {
+	st := NewEventStore(t.TempDir())
+	if _, err := st.Record(Event{Kind: supervisor.EventKindSensitivePathBlocked, SessionID: "alpha-1", Code: "SUP_SENSITIVE_PATH_BLOCKED", Pattern: ".env*"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := st.Record(Event{Kind: supervisor.EventKindSensitivePathBlocked, SessionID: "alpha-1", Code: "SUP_SENSITIVE_PATH_BLOCKED", Pattern: "owned/.env.local"}); err == nil {
+		t.Fatal("path accepted as pattern")
+	}
 }

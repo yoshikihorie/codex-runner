@@ -201,6 +201,16 @@ func TestBuildGitConfigFingerprintEntriesIncludesWorktreeAndToleratesHookLinks(t
 	}
 }
 
+func TestBuildGitConfigFingerprintEntriesRejectsBrokenConfigLink(t *testing.T) {
+	common, worktree := t.TempDir(), t.TempDir()
+	if err := os.Symlink("missing-target", filepath.Join(common, "config")); err != nil {
+		t.Fatal(err)
+	}
+	if _, include, err := BuildGitConfigFingerprintEntries(common, worktree); !include && err == nil {
+		t.Fatal("existing config link with unreadable target was accepted")
+	}
+}
+
 func TestSensitiveMatcher(t *testing.T) {
 	m := NewSensitivePathMatcher()
 	for _, p := range []string{".env.local", "tls.pem", "id_rsa.pub", "credentials-prod", "cert.p12", ".ENV", "Server.PEM", "id_RSA", "id_ed25519", "id_ecdsa", "id_dsa"} {
@@ -330,7 +340,7 @@ func TestPushPolicyReasonsAndArgv(t *testing.T) {
 		want   string
 	}{
 		{"detached_head", func(p *PushInput) { p.CurrentRef = "" }, "detached_head"}, {"protected_branch", func(p *PushInput) { p.CurrentRef = "refs/heads/main" }, "protected_branch"}, {"not_in_allowlist", func(p *PushInput) { p.Allowlist = []PushAllowlistEntry{{Remote: "origin", URL: "url", Branch: "else"}} }, "not_in_allowlist"},
-		{"multiple_urls", func(p *PushInput) { p.FetchURLs = append(p.FetchURLs, "url") }, "multiple_urls"}, {"url_mismatch", func(p *PushInput) { p.PushURLs = []string{"else"} }, "url_mismatch"}, {"receivepack_configured", func(p *PushInput) { p.ReceivepackConfigured = true }, "receivepack_configured"},
+		{"multiple_urls", func(p *PushInput) { p.FetchURLs = append(p.FetchURLs, "url") }, "multiple_urls"}, {"url_mismatch", func(p *PushInput) { p.PushURLs = []string{"else"} }, "url_mismatch"}, {"receivepack_configured", func(p *PushInput) { p.ReceivepackConfigured = true }, "receivepack_configured"}, {"remote_helper_configured", func(p *PushInput) { p.RemoteHelperConfigured = true }, "remote_helper_configured"},
 		{"git_config_changed", func(p *PushInput) { p.GitConfigChanged = true }, "git_config_changed"}, {"git_config_include", func(p *PushInput) { p.GitConfigInclude = true }, "git_config_include"}, {"no_tracking_ref", func(p *PushInput) { p.RemoteHeadSHA = "" }, "no_tracking_ref"},
 		{"remote_head_unavailable", func(p *PushInput) { p.RemoteHeadUnavailable = true }, "remote_head_unavailable"}, {"remote_head_not_local", func(p *PushInput) { p.RemoteHeadLocal = false }, "remote_head_not_local"}, {"foreign_commits", func(p *PushInput) { p.CommitSHAs = []string{stringOf('c', 40)} }, "foreign_commits"},
 		{"argv_not_allowed", func(p *PushInput) {
@@ -379,7 +389,7 @@ func TestPushPolicyReasonsAndArgv(t *testing.T) {
 
 func TestPushPolicyCoversCanonicalReasons(t *testing.T) {
 	// Canonical reason vocabulary from FD-sup-03 §6.
-	want := []string{"detached_head", "protected_branch", "not_in_allowlist", "multiple_urls", "url_mismatch", "receivepack_configured", "git_config_changed", "git_config_include", "remote_head_unavailable", "no_tracking_ref", "remote_head_not_local", "foreign_commits", "argv_not_allowed"}
+	want := []string{"detached_head", "protected_branch", "not_in_allowlist", "multiple_urls", "url_mismatch", "receivepack_configured", "remote_helper_configured", "git_config_changed", "git_config_include", "remote_head_unavailable", "no_tracking_ref", "remote_head_not_local", "foreign_commits", "argv_not_allowed"}
 	seen := map[string]bool{}
 	base := PushInput{FetchURLs: []string{"url"}, PushURLs: []string{"url"}, CurrentRef: "refs/heads/topic", Allowlist: []PushAllowlistEntry{{Remote: "origin", URL: "url", Branch: "topic"}}, RemoteHeadSHA: stringOf('a', 40), RemoteHeadLocal: true, CommitSHAs: []string{stringOf('b', 40)}, SupervisorCommitSHAs: []string{stringOf('b', 40)}, HeadSHA: stringOf('b', 40)}
 	cases := []struct {
@@ -387,7 +397,7 @@ func TestPushPolicyCoversCanonicalReasons(t *testing.T) {
 		reason string
 	}{
 		{func(p *PushInput) { p.CurrentRef = "" }, "detached_head"}, {func(p *PushInput) { p.CurrentRef = "refs/heads/main" }, "protected_branch"}, {func(p *PushInput) { p.Allowlist = []PushAllowlistEntry{{Branch: "other"}} }, "not_in_allowlist"},
-		{func(p *PushInput) { p.FetchURLs = []string{"url", "url"} }, "multiple_urls"}, {func(p *PushInput) { p.PushURLs = []string{"else"} }, "url_mismatch"}, {func(p *PushInput) { p.ReceivepackConfigured = true }, "receivepack_configured"},
+		{func(p *PushInput) { p.FetchURLs = []string{"url", "url"} }, "multiple_urls"}, {func(p *PushInput) { p.PushURLs = []string{"else"} }, "url_mismatch"}, {func(p *PushInput) { p.ReceivepackConfigured = true }, "receivepack_configured"}, {func(p *PushInput) { p.RemoteHelperConfigured = true }, "remote_helper_configured"},
 		{func(p *PushInput) { p.GitConfigChanged = true }, "git_config_changed"}, {func(p *PushInput) { p.GitConfigInclude = true }, "git_config_include"}, {func(p *PushInput) { p.RemoteHeadUnavailable = true }, "remote_head_unavailable"},
 		{func(p *PushInput) { p.RemoteHeadSHA = "" }, "no_tracking_ref"}, {func(p *PushInput) { p.RemoteHeadLocal = false }, "remote_head_not_local"}, {func(p *PushInput) { p.CommitSHAs = []string{"bad"} }, "foreign_commits"},
 		{func(p *PushInput) { p.Allowlist = []PushAllowlistEntry{{Remote: "-bad", URL: "url", Branch: "topic"}} }, "argv_not_allowed"},
@@ -534,5 +544,21 @@ func TestRepoLockerTryLock(t *testing.T) {
 	}
 	if _, ok := l.TryLock(filepath.Join(root, "missing")); ok {
 		t.Fatal("nonexistent repository path locked")
+	}
+}
+
+func TestTreeFingerprintDistinguishesMode(t *testing.T) {
+	a := []FingerprintEntry{{Scope: "owned", Path: "owned/file", ContentHash: "same", Mode: "100644"}}
+	b := []FingerprintEntry{{Scope: "owned", Path: "owned/file", ContentHash: "same", Mode: "120000"}}
+	if TreeFingerprint("head", a) == TreeFingerprint("head", b) {
+		t.Fatal("mode change was invisible")
+	}
+}
+
+func TestMalformedConfigFailsClosed(t *testing.T) {
+	for _, config := range [][]byte{[]byte("[core]\n bare = false\n= invalid\n"), []byte("[core\n"), []byte("[core]\n key = value\n[core \"unterminated]\n"), []byte("[core]\n key = \"unterminated\n"), []byte("[core]\n key = bad\x00value\n"), []byte("[core]\n @invalid = value\n")} {
+		if !GitConfigFingerprintFromEntries(nil, config).HasInclude {
+			t.Fatalf("malformed config accepted: %q", config)
+		}
 	}
 }

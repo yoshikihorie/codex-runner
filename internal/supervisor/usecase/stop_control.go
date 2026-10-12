@@ -6,8 +6,10 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
+	"github.com/yoshikihorie/codex-runner/internal/proc"
 	"github.com/yoshikihorie/codex-runner/internal/supervisor"
 )
 
@@ -39,6 +41,31 @@ type ResumeMaintenance interface {
 	ResetRestartCounters(context.Context, supervisor.SessionID) error
 }
 type ResumeTransitionContext func(context.Context, supervisor.ManagedSession) (supervisor.TransitionContext, error)
+
+// NewProcessResumeTransitionContext checks both PID liveness and process identity.
+func NewProcessResumeTransitionContext(isAlive func(int) bool, processStartedAt func(int) (time.Time, bool)) ResumeTransitionContext {
+	if isAlive == nil {
+		isAlive = func(pid int) bool { return syscall.Kill(pid, 0) == nil }
+	}
+	if processStartedAt == nil {
+		processStartedAt = proc.ProcessStartTime
+	}
+	return func(_ context.Context, s supervisor.ManagedSession) (supervisor.TransitionContext, error) {
+		alive := false
+		orphan := false
+		if ownedChildren.Owns(s.SessionID, s.ChildPID) {
+			alive = true
+		} else if s.ChildPID > 0 && isAlive(s.ChildPID) {
+			if s.ChildStartedAt == nil {
+				orphan = true
+			} else if started, ok := processStartedAt(s.ChildPID); !ok || withinOneSecond(started, *s.ChildStartedAt) {
+				orphan = true
+			}
+		}
+		return supervisor.TransitionContext{ChildAlive: alive || orphan, OrphanChildAlive: orphan, HasRotation: s.Rotation != nil, ClaudeSessionID: s.ClaudeSessionID != "", HasPreviousClaudeSessionID: s.PreviousClaudeSessionID != "", ObservedState: s.PreviousState}, nil
+	}
+}
+
 type ResumeOutput struct {
 	Resumed      []supervisor.SessionID
 	StillStopped []StillStopped
@@ -69,7 +96,7 @@ func (u *StopControlUseCase) SetResumeTransitionContext(provider ResumeTransitio
 }
 
 func NewStopControlUseCase(stops *StopState, sessions SessionRepository, events StopEventRecorder, notifier StopNotifier) *StopControlUseCase {
-	u := &StopControlUseCase{stops: stops, sessions: sessions, events: events, notifier: notifier, now: time.Now}
+	u := &StopControlUseCase{stops: stops, sessions: sessions, events: events, notifier: notifier, now: time.Now, transitionCtx: NewProcessResumeTransitionContext(nil, nil)}
 	stops.SetRemovalHandler(func(id supervisor.SessionID) {
 		u.record(id, supervisor.EventKindStopFileRemoved, "")
 		u.notify(context.Background(), supervisor.EventKindStopFileRemoved, id)
@@ -257,7 +284,7 @@ func (u *StopControlUseCase) Resume(ctx context.Context, id *supervisor.SessionI
 }
 func (u *StopControlUseCase) resumeOne(ctx context.Context, s *supervisor.ManagedSession, scope supervisor.SupervisorStopScope) error {
 	before := *s
-	ctxTransition := supervisor.TransitionContext{ChildAlive: s.ChildPID > 0, OrphanChildAlive: s.StopReason == supervisor.StopOrphanChildAlive, HasRotation: s.Rotation != nil, ClaudeSessionID: s.ClaudeSessionID != "", HasPreviousClaudeSessionID: s.PreviousClaudeSessionID != "", ObservedState: s.PreviousState}
+	ctxTransition := supervisor.TransitionContext{}
 	if u.transitionCtx != nil {
 		var err error
 		ctxTransition, err = u.transitionCtx(ctx, *s)
@@ -265,12 +292,20 @@ func (u *StopControlUseCase) resumeOne(ctx context.Context, s *supervisor.Manage
 			return err
 		}
 	}
+	if !ctxTransition.ChildAlive && s.ChildPID > 0 {
+		s.ChildPID = 0
+		s.ChildStartedAt = nil
+	}
 	ctxTransition.ResumeScope = scope
 	if s.Rotation != nil {
 		ctxTransition.RotationStep = s.Rotation.Step
 	}
 	if err := u.stops.GuardResume(scope, s.SessionID, func() error {
 		if err := s.Apply(supervisor.EventResume, ctxTransition, u.now()); err != nil {
+			if ctxTransition.OrphanChildAlive {
+				u.record(s.SessionID, supervisor.EventKindResumeRefused, "")
+				u.notify(ctx, supervisor.EventKindOrphanChildAlive, s.SessionID)
+			}
 			return err
 		}
 		return u.persistSessionPatch(ctx, before, *s)
@@ -299,7 +334,7 @@ func (u *StopControlUseCase) resumeOne(ctx context.Context, s *supervisor.Manage
 			return err
 		}
 	}
-	if s.ChildPID == 0 {
+	if s.ChildPID == 0 && s.Rotation == nil && u.recoveryStarter != nil {
 		s.RestartCount = 0
 		s.RestartTimes = nil
 		if u.maintenance != nil {
@@ -339,7 +374,7 @@ func resumeReason(s supervisor.ManagedSession, err error) string {
 	if strings.Contains(message, "still_stopped_by_global") {
 		return "still_stopped_by_global"
 	}
-	if strings.Contains(message, "SUP_ORPHAN_CHILD_ALIVE") || s.StopReason == supervisor.StopOrphanChildAlive {
+	if strings.Contains(message, "SUP_ORPHAN_CHILD_ALIVE") {
 		return "orphan_child_alive"
 	}
 	if strings.Contains(message, "SUP_ROTATE_STEP_FAILED") {

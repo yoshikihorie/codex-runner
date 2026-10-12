@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/supervisor"
+	"github.com/yoshikihorie/codex-runner/internal/supervisor/gitops"
 )
 
 // Event contains only fields permitted by FD-sup-05 §16.1; it has no body field.
@@ -34,6 +35,7 @@ type Event struct {
 	Code      string                            `json:"code,omitempty"`
 	Step      string                            `json:"step,omitempty"`
 	Reason    EventReason                       `json:"reason,omitempty"`
+	Pattern   string                            `json:"pattern,omitempty"`
 	Count     int                               `json:"count,omitempty"`
 	CommitSHA string                            `json:"commit_sha,omitempty"`
 	Remote    string                            `json:"remote,omitempty"`
@@ -163,6 +165,9 @@ func validateEvent(event Event) error {
 	}
 	if event.Code != "" && !validEventCode(event.Code) {
 		return fmt.Errorf("invalid supervisor event code: %q", event.Code)
+	}
+	if event.Pattern != "" && (event.Kind != supervisor.EventKindSensitivePathBlocked || !gitops.ValidSensitivePattern(event.Pattern)) {
+		return fmt.Errorf("invalid sensitive path pattern")
 	}
 	if event.Step != "" && !validEventStep(event.Step) {
 		return fmt.Errorf("invalid supervisor event step: %q", event.Step)
@@ -344,6 +349,10 @@ const (
 	ReasonCommitRejected             EventReason = "commit_rejected"
 	ReasonGitTimeout                 EventReason = "git_timeout"
 	ReasonGitUnavailable             EventReason = "git_unavailable"
+	ReasonGitFailed                  EventReason = "git_failed"
+	ReasonGitOutputTooLarge          EventReason = "git_output_too_large"
+	ReasonVerifyCWDInvalid           EventReason = "verify_cwd_invalid"
+	ReasonVerifyExecFailed           EventReason = "verify_exec_failed"
 	ReasonDetachedHead               EventReason = "detached_head"
 	ReasonProtectedBranch            EventReason = "protected_branch"
 	ReasonNotInAllowlist             EventReason = "not_in_allowlist"
@@ -374,11 +383,11 @@ func validReasonForEvent(kind supervisor.SupervisorEventKind, value EventReason)
 	case supervisor.EventKindRecommendationBlocked:
 		return contains(ReasonForcePush, ReasonPullRequest, ReasonDeploy, ReasonDeletion, ReasonProduction, ReasonBilling, ReasonGitHistory, ReasonMigration, ReasonPrivilege, ReasonUndetermined, ReasonRepeated, ReasonConsecutiveLimit)
 	case supervisor.EventKindCommitFailed:
-		return contains(ReasonPathEscape, ReasonStagedOutOfScope, ReasonOutOfScopeUncommitted, ReasonRenamePartial, ReasonGitConfigChanged, ReasonGitattributesFilter, ReasonGitConfigInclude, ReasonTreeMismatchBeforeCommit, ReasonCommitRejected, ReasonGitTimeout, ReasonGitUnavailable)
+		return contains(ReasonPathEscape, ReasonStagedOutOfScope, ReasonOutOfScopeUncommitted, ReasonRenamePartial, ReasonGitConfigChanged, ReasonGitattributesFilter, ReasonGitConfigInclude, ReasonTreeMismatchBeforeCommit, ReasonCommitRejected, ReasonGitTimeout, ReasonGitUnavailable, ReasonGitFailed, ReasonGitOutputTooLarge)
 	case supervisor.EventKindPushBlocked:
 		return contains(ReasonDetachedHead, ReasonProtectedBranch, ReasonNotInAllowlist, ReasonMultipleURLs, ReasonURLMismatch, ReasonReceivepackConfigured, ReasonGitConfigChanged, ReasonNoTrackingRef, ReasonForeignCommits, ReasonArgvNotAllowed, ReasonGitConfigInclude, ReasonRemoteHeadUnavailable, ReasonRemoteHeadNotLocal)
 	case supervisor.EventKindVerifyFailed:
-		return value == ReasonVerifyBinaryChanged
+		return contains(ReasonVerifyBinaryChanged, ReasonVerifyCWDInvalid, ReasonVerifyExecFailed)
 	case supervisor.EventKindSessionStopped:
 		return contains(ReasonStopGlobal, ReasonStopSession, ReasonSupervisorRestarted, ReasonSendNotConfirmed, ReasonSendAborted, ReasonProcessExitWithPending, ReasonRecommendationForbidden, ReasonRecommendationUndetermined, ReasonRecommendationRepeated, ReasonAutoContinueLimit, ReasonRotateStepFailed, ReasonRespawnFailed, ReasonRecoveryStartTimeout, ReasonClaudeSessionIDMissing, ReasonRestartLimitConsecutive, ReasonRestartLimitDaily, ReasonOrphanChildAlive, ReasonStateFileCorrupt)
 	case supervisor.EventKindStopSet:

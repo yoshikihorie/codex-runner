@@ -29,6 +29,8 @@ func (e *NewlyQuarantinedError) Unwrap() error { return ErrStateFileCorrupt }
 
 type SessionStore struct {
 	root         string
+	phaseMu      sync.Mutex
+	phases       map[supervisor.SessionID]supervisor.GitPhase
 	writeAtomic  func(string, []byte, os.FileMode) error
 	quarantineMu sync.Mutex
 	onQuarantine func(supervisor.SessionID)
@@ -136,7 +138,27 @@ func (s *SessionStore) Load(id supervisor.SessionID) (supervisor.ManagedSession,
 	if err != nil {
 		return supervisor.ManagedSession{}, s.quarantine(path, err)
 	}
+	s.phaseMu.Lock()
+	v.GitPhase = s.phases[id]
+	if v.GitPhase == "" {
+		v.GitPhase = supervisor.GitPhaseNone
+	}
+	s.phaseMu.Unlock()
 	return v, nil
+}
+
+// SetGitPhase records the transient commit/push evaluation state in memory.
+func (s *SessionStore) SetGitPhase(id supervisor.SessionID, phase supervisor.GitPhase) {
+	s.phaseMu.Lock()
+	defer s.phaseMu.Unlock()
+	if s.phases == nil {
+		s.phases = make(map[supervisor.SessionID]supervisor.GitPhase)
+	}
+	if phase == supervisor.GitPhaseNone {
+		delete(s.phases, id)
+	} else {
+		s.phases[id] = phase
+	}
 }
 func (s *SessionStore) quarantine(path string, cause error) error {
 	name := path + ".corrupt-" + time.Now().UTC().Format("20060102T150405.000000000")
@@ -340,7 +362,7 @@ func validRotationStep(x supervisor.SupervisorRotateStep) bool {
 }
 func validFailure(x string) bool {
 	switch x {
-	case "", "path_escape", "staged_out_of_scope", "out_of_scope_uncommitted", "rename_partial", "git_config_changed", "gitattributes_filter", "git_config_include", "tree_mismatch_before_commit", "commit_rejected", "git_timeout", "git_unavailable", "verify_binary_changed":
+	case "", "path_escape", "staged_out_of_scope", "out_of_scope_uncommitted", "rename_partial", "git_config_changed", "gitattributes_filter", "git_config_include", "tree_mismatch_before_commit", "commit_rejected", "git_timeout", "git_unavailable", "git_failed", "git_output_too_large", "verify_binary_changed", "verify_cwd_invalid", "verify_exec_failed":
 		return true
 	}
 	return false

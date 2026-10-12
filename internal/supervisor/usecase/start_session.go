@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -56,6 +55,7 @@ type StartSessionUseCase struct {
 	Stop               *StopState
 	Billing            launch.BillingGuard
 	Starter            PTYStarter
+	PTYs               *PTYRegistry
 	Lock               func() (func(), error)
 	Now                func() time.Time
 	RecordStructured   func(store.Event) error
@@ -129,65 +129,16 @@ func (u StartSessionUseCase) executeLocked(projectID string, id supervisor.Sessi
 	if active >= u.Config.MaxSessions {
 		return nil, ErrSessionLimitReached
 	}
-	if !filepath.IsAbs(project.CWD) {
-		u.startFailure(projectID, store.StartFailProjectCWDUnavailable)
-		return nil, ErrProjectCWDUnavailable
-	}
-	st, err := os.Stat(project.CWD)
-	if err != nil || !st.IsDir() {
-		u.startFailure(projectID, store.StartFailProjectCWDUnavailable)
-		return nil, ErrProjectCWDUnavailable
-	}
-	owner, ok := st.Sys().(*syscall.Stat_t)
-	if !ok || owner.Uid != uint32(os.Getuid()) {
-		u.startFailure(projectID, store.StartFailProjectCWDUnavailable)
-		return nil, ErrProjectCWDUnavailable
-	}
-	if st, err = os.Stat(project.BinaryPath); err != nil || !filepath.IsAbs(project.BinaryPath) || st.IsDir() || st.Mode()&0111 == 0 {
-		u.startFailure(projectID, store.StartFailSpawnFailed)
-		return nil, ErrSpawnFailed
-	}
-	if err := launch.ValidateProjectModel(project.Model); err != nil {
-		u.startFailure(projectID, store.StartFailLaunchArgvInvalid)
+	preflight := launchPreflight{config: u.Config, billing: u.Billing, parentEnv: u.ParentEnv, validateModel: true, failure: func(reason store.SupervisorStartFailReason) { u.startFailure(projectID, reason) }}
+	env, err := preflight.check(project)
+	if err != nil {
 		return nil, err
 	}
-	envParent := os.Environ()
-	if u.ParentEnv != nil {
-		envParent = u.ParentEnv()
-	}
-	env := proc.BuildSessionEnv(envParent)
-	if err := u.Billing.Check(project.CWD, env); err != nil {
-		reason := billingStartFailureReason(err)
-		if reason.Valid() {
-			u.startFailure(projectID, reason)
-			return nil, fmt.Errorf("%w: %s", ErrBillingGuardFailed, reason)
-		}
-		return nil, ErrBillingGuardFailed
-	}
-	if u.Config.StateDir == "" || !filepath.IsAbs(u.Config.StateDir) {
-		return nil, errors.New("state directory must be absolute")
+	settingsPath, err := preflight.settings(id)
+	if err != nil {
+		return nil, err
 	}
 	cols, rows := u.Config.Columns, u.Config.Rows
-	if cols == 0 || rows == 0 {
-		return nil, ErrPTYSizeInvalid
-	}
-	statusDir := filepath.Join(u.Config.StateDir, "statusline")
-	if err := os.MkdirAll(statusDir, 0700); err != nil {
-		return nil, err
-	}
-	settingsPath := filepath.Join(statusDir, id.String()+".settings.json")
-	data, err := launch.BuildSettingsJSON(u.Config.CodexdPath, id.String(), u.Config.StateDir)
-	if err != nil {
-		u.startFailure(projectID, store.StartFailSettingsGenerationFailed)
-		return nil, err
-	}
-	if err = launch.WriteSettingsFile(settingsPath, data); err != nil {
-		u.startFailure(projectID, store.StartFailSettingsGenerationFailed)
-		return nil, err
-	}
-	if err = os.Remove(filepath.Join(statusDir, id.String()+".json")); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, err
-	}
 	now := time.Now().UTC()
 	if u.Now != nil {
 		now = u.Now().UTC()
@@ -221,11 +172,13 @@ func (u StartSessionUseCase) executeLocked(projectID string, id supervisor.Sessi
 	}
 	session.ChildPID = pty.Pid()
 	session.ChildStartedAt = &started
+	ownedChildren.Register(id, pty.Pid())
 	if err = UpdateSession(u.Store, id, func(current *supervisor.ManagedSession) error {
 		current.ChildPID = session.ChildPID
 		current.ChildStartedAt = session.ChildStartedAt
 		return nil
 	}); err != nil {
+		ownedChildren.Remove(id, pty.Pid())
 		grace := u.CleanupGrace
 		if grace <= 0 {
 			grace = timeoutKillGrace
@@ -244,6 +197,11 @@ func (u StartSessionUseCase) executeLocked(projectID string, id supervisor.Sessi
 		return nil, fmt.Errorf("%w: %v", ErrSpawnFailed, err)
 	}
 	u.eventNotify(id, supervisor.EventKindSessionStarted)
+	if u.PTYs != nil {
+		if writer, ok := pty.(PTYWriter); ok {
+			u.PTYs.Register(id, writer)
+		}
+	}
 	return pty, nil
 }
 func (u StartSessionUseCase) existingSessions() ([]supervisor.ManagedSession, error) {

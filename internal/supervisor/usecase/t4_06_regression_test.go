@@ -435,7 +435,8 @@ func TestSCNsup01023ReconcileDoesNotSignalOrphan(t *testing.T) {
 	if err := child.Process.Signal(syscall.Signal(0)); err != nil {
 		t.Fatalf("reconcile signaled the previous child: %v", err)
 	}
-	if len(result) != 1 || result[0].State != supervisor.SessionStopped || result[0].StopReason != supervisor.StopOrphanChildAlive || !orphanNotified {
+	// FD-sup-05.md:183-186 separates the reconciliation stop reason from the orphan notification.
+	if len(result) != 1 || result[0].State != supervisor.SessionStopped || result[0].StopReason != supervisor.StopSupervisorRestarted || !orphanNotified {
 		t.Fatalf("orphan reconcile result=%#v notified=%t", result, orphanNotified)
 	}
 }
@@ -1126,7 +1127,8 @@ func TestReconcileUsesDarwinProcessStartTime(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if rows[0].StopReason != supervisor.StopOrphanChildAlive {
+	// FD-sup-05.md:183-186 assigns supervisor_restarted while reporting a live orphan separately.
+	if rows[0].StopReason != supervisor.StopSupervisorRestarted {
 		t.Fatalf("orphan stop reason=%s", rows[0].StopReason)
 	}
 }
@@ -1194,7 +1196,8 @@ func TestReconcileRealStoreOrphanEventAndResumeGuard(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(rows) != 1 || rows[0].StopReason != supervisor.StopOrphanChildAlive {
+	// FD-sup-05.md:183-186 keeps the reconciliation reason independent of orphan_child_alive.
+	if len(rows) != 1 || rows[0].StopReason != supervisor.StopSupervisorRestarted {
 		t.Fatalf("reconciled=%#v", rows)
 	}
 	eventRows, _, err := events.ReadAll()
@@ -1203,14 +1206,19 @@ func TestReconcileRealStoreOrphanEventAndResumeGuard(t *testing.T) {
 	}
 	found := false
 	for _, event := range eventRows {
-		if event.Kind == supervisor.EventKindSessionStopped && event.Reason == store.ReasonOrphanChildAlive {
+		if event.Kind == supervisor.EventKindSessionStopped && event.Reason == store.EventReason(supervisor.StopSupervisorRestarted) {
 			found = true
 		}
 	}
 	if !found {
 		t.Fatalf("orphan stop event missing: %#v", eventRows)
 	}
-	ctx := supervisor.TransitionContext{ChildAlive: true, OrphanChildAlive: rows[0].StopReason == supervisor.StopOrphanChildAlive, ResumeScope: supervisor.StopScopeNone}
+	// FD-sup-01.md:175-179 checks the live unowned PID, rather than inferring orphanhood from stop_reason.
+	ctx, err := NewProcessResumeTransitionContext(nil, nil)(context.Background(), rows[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx.ResumeScope = supervisor.StopScopeNone
 	if err := rows[0].Apply(supervisor.EventResume, ctx, time.Now()); err == nil || !strings.Contains(err.Error(), "SUP_ORPHAN_CHILD_ALIVE") {
 		t.Fatalf("orphan resume error=%v", err)
 	}

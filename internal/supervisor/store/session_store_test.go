@@ -67,6 +67,7 @@ func TestSessionStoreRoundTripAndOmitsScreenText(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	s.GitPhase = supervisor.GitPhaseNone
 	if !reflect.DeepEqual(got, s) {
 		t.Fatalf("round trip mismatch:\n got %#v\nwant %#v", got, s)
 	}
@@ -84,6 +85,37 @@ func TestSessionStoreRoundTripAndOmitsScreenText(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0600 {
 		t.Fatalf("permissions=%o", info.Mode().Perm())
+	}
+}
+
+func TestSCNsup0230SendSequenceSurvivesRestart(t *testing.T) {
+	root := t.TempDir()
+	id := mustID(t, "send-seq-1")
+	now := time.Now().UTC()
+	first := NewSessionStore(root)
+	s := supervisor.ManagedSession{SchemaVersion: 1, SessionID: id, ProjectID: "send-seq", CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionStopped, StateSince: now, StopScope: supervisor.StopScopeNone, RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 2, EverSent: true, Pending: &supervisor.PendingSend{SendID: "send-seq-1-s1", Kind: supervisor.SendKindRemoteControl, IssuedAt: now}}}
+	if err := first.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	second := NewSessionStore(root)
+	got, err := second.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.SendGate.NextSeq != 2 || got.SendGate.Pending == nil || got.SendGate.Pending.SendID != "send-seq-1-s1" {
+		t.Fatalf("lost send state: %+v", got.SendGate)
+	}
+	got.SendGate = supervisor.SendGateRecord{NextSeq: 4, EverSent: true, LastSendConfirmed: true, LastConfirmedAt: &now}
+	if err := second.Save(got); err != nil {
+		t.Fatal(err)
+	}
+	third := NewSessionStore(root)
+	confirmed, err := third.Load(id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if confirmed.SendGate.NextSeq != 4 || !confirmed.SendGate.LastSendConfirmed || confirmed.SendGate.LastConfirmedAt == nil || !confirmed.SendGate.LastConfirmedAt.Equal(now) {
+		t.Fatalf("confirmed state was lost: %+v", confirmed.SendGate)
 	}
 }
 
@@ -405,5 +437,48 @@ func TestSessionStoreListSeparatesNewAndPreviouslyQuarantinedIDs(t *testing.T) {
 	}
 	if len(newlyQuarantined) != 1 || newlyQuarantined[0] != newID || len(alreadyQuarantined) != 1 || alreadyQuarantined[0] != oldID {
 		t.Fatalf("new=%v old=%v", newlyQuarantined, alreadyQuarantined)
+	}
+}
+
+func TestSessionStoreAcceptsCommitFailureReasons(t *testing.T) {
+	for _, reason := range []supervisor.SupervisorFailureReason{supervisor.FailureGitFailed, supervisor.FailureGitOutputTooLarge, supervisor.FailureVerifyCWDInvalid, supervisor.FailureVerifyExecFailed} {
+		t.Run(string(reason), func(t *testing.T) {
+			s := NewSessionStore(t.TempDir())
+			v := supervisor.ManagedSession{SessionID: mustID(t, "failure-reason-1"), ProjectID: "failure-reason", CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionIdle, StateSince: time.Now().UTC(), StopScope: supervisor.StopScopeNone, RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 1}}
+			v.LastFailureReason = reason
+			v.LastFailureFingerprint = strings.Repeat("a", 64)
+			if err := s.Save(v); err != nil {
+				t.Fatal(err)
+			}
+			got, err := s.Load(v.SessionID)
+			if err != nil || got.LastFailureReason != reason || got.LastFailureFingerprint != v.LastFailureFingerprint {
+				t.Fatalf("got=%+v err=%v", got, err)
+			}
+		})
+	}
+}
+
+func TestSessionStoreGitPhaseIsMemoryOnly(t *testing.T) {
+	st := NewSessionStore(t.TempDir())
+	v := supervisor.ManagedSession{SessionID: mustID(t, "phase-test-1"), ProjectID: "phase-test", CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionIdle, StateSince: time.Now().UTC(), StopScope: supervisor.StopScopeNone, RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 1}}
+	if err := st.Save(v); err != nil {
+		t.Fatal(err)
+	}
+	st.SetGitPhase(v.SessionID, supervisor.GitPhaseEvaluating)
+	got, err := st.Load(v.SessionID)
+	if err != nil || got.GitPhase != supervisor.GitPhaseEvaluating {
+		t.Fatalf("got=%+v err=%v", got, err)
+	}
+	data, err := os.ReadFile(st.path(v.SessionID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(data), "git_phase") {
+		t.Fatal("transient phase persisted")
+	}
+	st.SetGitPhase(v.SessionID, supervisor.GitPhaseNone)
+	got, err = st.Load(v.SessionID)
+	if err != nil || got.GitPhase != supervisor.GitPhaseNone {
+		t.Fatalf("got=%+v err=%v", got, err)
 	}
 }

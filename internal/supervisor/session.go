@@ -176,6 +176,10 @@ const (
 	FailureCommitRejected           SupervisorFailureReason = "commit_rejected"
 	FailureGitTimeout               SupervisorFailureReason = "git_timeout"
 	FailureGitUnavailable           SupervisorFailureReason = "git_unavailable"
+	FailureGitFailed                SupervisorFailureReason = "git_failed"
+	FailureGitOutputTooLarge        SupervisorFailureReason = "git_output_too_large"
+	FailureVerifyCWDInvalid         SupervisorFailureReason = "verify_cwd_invalid"
+	FailureVerifyExecFailed         SupervisorFailureReason = "verify_exec_failed"
 	FailureVerifyBinaryChanged      SupervisorFailureReason = "verify_binary_changed"
 )
 
@@ -183,7 +187,15 @@ type AutoContinueDisabledReason string
 
 const AutoContinueDisabledPermissionModeUnsafe AutoContinueDisabledReason = "permission_mode_unsafe"
 
+type GitPhase string
+
+const (
+	GitPhaseNone       GitPhase = "none"
+	GitPhaseEvaluating GitPhase = "evaluating"
+)
+
 type ManagedSession struct {
+	GitPhase                   GitPhase                   `json:"-"`
 	SchemaVersion              int                        `json:"schema_version"`
 	SessionID                  SessionID                  `json:"session_id"`
 	ProjectID                  string                     `json:"project_id"`
@@ -236,11 +248,8 @@ const (
 	EventReconcile              TransitionEvent = "Rc"
 )
 
-// Canonical thresholds copied from specifications/10-shared/validation-rules.md.
-const supervisorRestartMaxCount = 3
-const supervisorRestartMaxPerDay = 10
-
 type TransitionContext struct {
+	CLI                        SupervisorCli
 	Generation                 int
 	ChildPID                   int
 	ExitCode                   int
@@ -434,13 +443,7 @@ func exitStopReason(c TransitionContext) SupervisorStopReason {
 	if !c.ClaudeSessionID {
 		return StopClaudeSessionIDMissing
 	}
-	if c.RestartCount >= supervisorRestartMaxCount {
-		return StopRestartLimitConsecutive
-	}
-	if c.DailyRestartCount >= supervisorRestartMaxPerDay {
-		return StopRestartLimitDaily
-	}
-	return ""
+	return RestartLimitCounts(c.RestartCount, c.DailyRestartCount)
 }
 func classifyExit(c TransitionContext) (SupervisorSessionState, bool) {
 	if c.HasPendingSend {
@@ -449,10 +452,13 @@ func classifyExit(c TransitionContext) (SupervisorSessionState, bool) {
 	if c.ExitCode == 0 {
 		return SessionExited, true
 	}
+	if c.CLI == CLICodex {
+		return SessionExited, true
+	}
 	if !c.ClaudeSessionID {
 		return SessionStopped, true
 	}
-	if c.RestartCount >= supervisorRestartMaxCount || c.DailyRestartCount >= supervisorRestartMaxPerDay {
+	if RestartLimitCounts(c.RestartCount, c.DailyRestartCount) != "" {
 		return SessionStopped, true
 	}
 	return SessionRecovering, true
@@ -464,6 +470,9 @@ func CanTransition(from SupervisorSessionState, event TransitionEvent) bool {
 
 // Apply evaluates an event and updates the managed session when it is allowed.
 func (s *ManagedSession) Apply(event TransitionEvent, c TransitionContext, now time.Time) error {
+	if c.CLI == "" {
+		c.CLI = s.CLI
+	}
 	if event == EventResume && c.ResumeScope == StopScopeGlobal && (s.StopScope != StopScopeGlobal || s.StopReason != StopGlobal) {
 		s.StopScope = StopScopeNone
 		return nil

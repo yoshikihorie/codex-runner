@@ -11,6 +11,7 @@ type PushAllowlistEntry struct{ Remote, URL, Branch string }
 type PushInput struct {
 	FetchURLs, PushURLs                []string
 	ReceivepackConfigured              bool
+	RemoteHelperConfigured             bool
 	CurrentRef                         string
 	ProtectedBranches                  []string
 	Allowlist                          []PushAllowlistEntry
@@ -29,7 +30,7 @@ type PushDecision struct {
 }
 type PushPolicy struct{}
 
-const SupervisorGitHardeningArgs = "-c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.sshCommand= -c push.recurseSubmodules=no -c push.pushOption= -c protocol.ext.allow=never -c commit.gpgsign=false"
+const SupervisorGitHardeningArgs = "-c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.sshCommand= -c push.recurseSubmodules=no -c push.pushOption= -c protocol.ext.allow=never -c commit.gpgsign=false -c core.excludesFile=/dev/null -c core.attributesFile=/dev/null"
 
 var hardeningArgs = strings.Fields(SupervisorGitHardeningArgs)
 var shaPattern = regexp.MustCompile(`^[0-9a-f]{40}$`)
@@ -125,6 +126,9 @@ func (PushPolicy) Evaluate(p PushInput) PushDecision {
 	}
 	if p.ReceivepackConfigured {
 		return deny("receivepack_configured")
+	}
+	if p.RemoteHelperConfigured {
+		return deny("remote_helper_configured")
 	}
 	if p.GitConfigInclude {
 		return deny("git_config_include")

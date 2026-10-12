@@ -120,6 +120,18 @@ func TestConditionalTransitions(t *testing.T) {
 	}
 }
 
+func TestSCNsup0524CodexAbnormalExitIsTerminal(t *testing.T) {
+	for _, state := range []SupervisorSessionState{SessionStarting, SessionWorking} {
+		s := ManagedSession{CLI: CLICodex, State: state, Generation: 1}
+		if err := s.Apply(EventUnexpectedExit, TransitionContext{CLI: s.CLI, ExitCode: 1, ClaudeSessionID: true}, time.Now().UTC()); err != nil {
+			t.Fatal(err)
+		}
+		if s.State != SessionExited || s.StopReason != "" {
+			t.Fatalf("state=%s session=%+v", state, s)
+		}
+	}
+}
+
 func TestResumeRefusalHasCanonicalReason(t *testing.T) {
 	s := ManagedSession{State: SessionStopped, StopReason: StopSendNotConfirmed, StopScope: StopScopeSession, Generation: 1}
 	err := s.Apply(EventResume, TransitionContext{OrphanChildAlive: true}, time.Now())

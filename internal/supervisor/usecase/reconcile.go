@@ -42,14 +42,15 @@ func (u ReconcileOnStartupUseCase) Execute() ([]supervisor.ManagedSession, error
 	}
 	for i := range sessions {
 		s := &sessions[i]
+		hadChildPID := s.ChildPID > 0
 		orphanAlive := false
 		if s.ChildPID > 0 {
 			alive := u.IsAlive
 			if alive == nil {
 				alive = func(pid int) bool { return syscall.Kill(pid, 0) == nil }
 			}
-			if alive(s.ChildPID) && s.ChildStartedAt != nil {
-				if started, available := u.processStartedAt(s.ChildPID); available && withinOneSecond(started, *s.ChildStartedAt) {
+			if alive(s.ChildPID) {
+				if started, available := u.processStartedAt(s.ChildPID); !available || s.ChildStartedAt == nil || withinOneSecond(started, *s.ChildStartedAt) {
 					orphanAlive = true
 					u.eventNotify(s.SessionID, supervisor.EventKindOrphanChildAlive, "")
 				}
@@ -70,28 +71,13 @@ func (u ReconcileOnStartupUseCase) Execute() ([]supervisor.ManagedSession, error
 				return sessions, err
 			}
 		}
-		if s.State == supervisor.SessionStopped && orphanAlive {
-			if err := UpdateSessionWith(sessionLocker, s.SessionID, func() (supervisor.ManagedSession, error) { return u.Store.Load(s.SessionID) }, u.Store.Save, func(current *supervisor.ManagedSession) error {
-				current.StopReason = supervisor.StopOrphanChildAlive
-				return nil
-			}); err != nil {
-				return sessions, err
-			}
-			*s, err = u.Store.Load(s.SessionID)
-			if err != nil {
-				return sessions, err
-			}
-		}
 		if s.State == supervisor.SessionStopped || s.State == supervisor.SessionExited || s.State == supervisor.SessionFailed {
 			continue
 		}
 		event := supervisor.EventStop
 		stopReason := supervisor.StopSupervisorRestarted
-		if orphanAlive {
-			stopReason = supervisor.StopOrphanChildAlive
-		}
 		ctx := supervisor.TransitionContext{Generation: s.Generation, StopReason: stopReason}
-		if s.State == supervisor.SessionStarting && s.ChildPID == 0 && s.Generation == 1 {
+		if s.State == supervisor.SessionStarting && !hadChildPID && s.Generation == 1 {
 			event = supervisor.EventReconcile
 		}
 		if err := UpdateSessionWith(sessionLocker, s.SessionID,
@@ -104,9 +90,15 @@ func (u ReconcileOnStartupUseCase) Execute() ([]supervisor.ManagedSession, error
 		if err != nil {
 			return sessions, err
 		}
+		previousState := s.State
 		*s = updated
+		if u.RecordStructured != nil && previousState != s.State {
+			_ = u.RecordStructured(store.Event{Kind: supervisor.EventKindStateChanged, SessionID: s.SessionID.String(), FromState: previousState, ToState: s.State})
+		}
 		if event == supervisor.EventReconcile {
-			u.eventNotify(s.SessionID, supervisor.EventKindSessionStartInterrupted, "")
+			if u.RecordStructured != nil {
+				_ = u.RecordStructured(store.Event{Kind: supervisor.EventKindSessionStartInterrupted, SessionID: s.SessionID.String()})
+			}
 		} else {
 			u.eventNotify(s.SessionID, supervisor.EventKindSessionStopped, store.EventReason(stopReason))
 		}

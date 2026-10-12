@@ -16,9 +16,17 @@ type ConfigFingerprint struct {
 }
 
 func configHasInclude(config []byte) bool {
+	include, valid := parseConfigInclude(config)
+	return include || !valid
+}
+
+func parseConfigInclude(config []byte) (bool, bool) {
 	s := strings.TrimPrefix(string(config), "\xef\xbb\xbf")
 	section := ""
 	for _, line := range strings.Split(s, "\n") {
+		if strings.IndexByte(line, 0) >= 0 || !configQuotesClosed(line) {
+			return false, false
+		}
 		line = strings.TrimSpace(strings.TrimSuffix(line, "\r"))
 		if line == "" {
 			continue
@@ -26,15 +34,18 @@ func configHasInclude(config []byte) bool {
 		for strings.HasPrefix(line, "[") {
 			end := strings.IndexByte(line, ']')
 			if end < 0 {
-				return true
+				return false, false
 			}
 			section = strings.ToLower(strings.TrimSpace(strings.Trim(line[1:end], "\\\"")))
+			if section == "" || strings.Count(line[:end], "\"")%2 != 0 {
+				return false, false
+			}
 			line = strings.TrimSpace(line[end+1:])
 			if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, ";") {
 				break
 			}
 			if !strings.HasPrefix(line, "[") {
-				return true
+				return false, false
 			}
 		}
 		if line == "" {
@@ -49,14 +60,49 @@ func configHasInclude(config []byte) bool {
 				key = key[:i]
 			}
 			if strings.EqualFold(strings.TrimSpace(key), "path") {
-				return true
+				return true, true
 			}
 		}
+		key := line
+		if i := strings.IndexAny(key, "= \t"); i >= 0 {
+			key = key[:i]
+		}
+		if section == "" || !validConfigKey(key) || strings.Contains(line, "[") {
+			return false, false
+		}
 	}
-	return false
+	return false, true
 }
 
-type FingerprintEntry struct{ Scope, Status, Path, ContentHash string }
+func validConfigKey(key string) bool {
+	letter := func(c byte) bool { return c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' }
+	if key == "" || !letter(key[0]) {
+		return false
+	}
+	for i := 1; i < len(key); i++ {
+		c := key[i]
+		if !letter(c) && (c < '0' || c > '9') && c != '-' {
+			return false
+		}
+	}
+	return true
+}
+
+func configQuotesClosed(line string) bool {
+	quoted := false
+	for i := 0; i < len(line); i++ {
+		if line[i] == '\\' && quoted && i+1 < len(line) {
+			i++
+			continue
+		}
+		if line[i] == '"' {
+			quoted = !quoted
+		}
+	}
+	return !quoted
+}
+
+type FingerprintEntry struct{ Scope, Status, Path, Mode, ContentHash string }
 
 func appendSized(dst []byte, value string) []byte {
 	var size [8]byte
@@ -71,6 +117,7 @@ func EntriesFingerprint(entries []FingerprintEntry) string {
 		b = appendSized(b, e.Scope)
 		b = appendSized(b, e.Status)
 		b = appendSized(b, e.Path)
+		b = appendSized(b, e.Mode)
 		b = appendSized(b, e.ContentHash)
 	}
 	sum := sha256.Sum256(b)
@@ -108,16 +155,36 @@ func BuildGitConfigFingerprintEntries(commonDir string, gitDir string) ([]Finger
 	hasInclude := false
 	configs := []string{filepath.Join(commonDir, "config"), filepath.Join(gitDir, "config.worktree")}
 	for _, p := range configs {
-		data, e := os.ReadFile(p)
-		if e != nil && !os.IsNotExist(e) {
-			hasInclude = true
+		info, statErr := os.Lstat(p)
+		if os.IsNotExist(statErr) {
 			continue
 		}
-		if e == nil {
-			h := sha256.Sum256(data)
-			hasInclude = hasInclude || configHasInclude(data)
-			entries = append(entries, FingerprintEntry{Scope: "config", Path: filepath.Base(p), ContentHash: hex.EncodeToString(h[:])})
+		if statErr != nil {
+			return nil, true, statErr
 		}
+		data, e := os.ReadFile(p)
+		if e != nil {
+			return nil, true, e
+		}
+		h := sha256.Sum256(data)
+		hasInclude = hasInclude || configHasInclude(data)
+		entries = append(entries, FingerprintEntry{Scope: "config", Status: info.Mode().String(), Path: filepath.Base(p), ContentHash: hex.EncodeToString(h[:])})
+	}
+	for _, name := range []string{"exclude", "attributes"} {
+		p := filepath.Join(commonDir, "info", name)
+		info, e := os.Lstat(p)
+		if os.IsNotExist(e) {
+			continue
+		}
+		if e != nil {
+			return nil, true, e
+		}
+		data, e := os.ReadFile(p)
+		if e != nil {
+			return nil, true, e
+		}
+		h := sha256.Sum256(data)
+		entries = append(entries, FingerprintEntry{Scope: "info", Status: info.Mode().String(), Path: name, ContentHash: hex.EncodeToString(h[:])})
 	}
 	hooks := filepath.Join(commonDir, "hooks")
 	names, e := os.ReadDir(hooks)

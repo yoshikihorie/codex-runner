@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"reflect"
+	"slices"
 	"syscall"
 	"time"
 
@@ -22,6 +24,12 @@ type ObserveSessionUseCase struct {
 	Detect                  DetectSessionStateUseCase
 	Sessions                SessionRecordStore
 	Stop                    *StopState
+	Recover                 *RecoverSessionUseCase
+	Respawn                 *RespawnSessionUseCase
+	SendInput               *SendInputUseCase
+	InitialRemoteControl    *InitialRemoteControl
+	SupervisorContext       context.Context
+	CompletionSelection     func([]string) (bool, string)
 	RecordStructured        func(store.Event) error
 	Observed                *ObservedStateStore
 	Notify                  func(supervisor.SupervisorEventKind, string)
@@ -96,8 +104,14 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 		}{code, err}
 	}()
 	var exited bool
+	var exitedAt time.Time
 	defer func() {
 		stopReader()
+		if u.SendInput != nil && u.SendInput.PTYs != nil {
+			if writer, ok := pty.(PTYWriter); ok {
+				u.SendInput.PTYs.Remove(initial.SessionID, writer)
+			}
+		}
 		if exited {
 			_ = pty.Close()
 		}
@@ -109,9 +123,12 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 	undeterminedNotified := false
 	lastIllegal := ""
 	for {
+		var screenUpdatedAt time.Time
 		select {
 		case waited := <-waits:
 			exited = true
+			exitedAt = now().UTC()
+			ownedChildren.Remove(initial.SessionID, initial.ChildPID)
 			code := waited.code
 			if waited.err != nil {
 				code = -1
@@ -121,10 +138,26 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 		case item := <-reads:
 			if len(item.data) > 0 {
 				before := vt.Screen()
+				var beforeCells [][]supervisor.Cell
+				if u.SendInput != nil {
+					beforeCells = make([][]supervisor.Cell, len(before))
+					for i := range before {
+						beforeCells[i] = vt.Cells(i)
+					}
+				}
 				_, _ = vt.Write(item.data)
 				after := vt.Screen()
-				if !sameRows(before, after) {
+				cellsChanged := false
+				if u.SendInput != nil && sameRows(before, after) {
+					afterCells := make([][]supervisor.Cell, len(after))
+					for i := range after {
+						afterCells[i] = vt.Cells(i)
+					}
+					cellsChanged = !reflect.DeepEqual(beforeCells, afterCells)
+				}
+				if !sameRows(before, after) || cellsChanged {
 					lastChange = now().UTC()
+					screenUpdatedAt = lastChange
 				}
 			}
 			if item.err != nil && !errors.Is(item.err, io.EOF) && !exited {
@@ -137,6 +170,11 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 		current, err := u.Sessions.Load(initial.SessionID)
 		if err != nil {
 			return err
+		}
+		if !exited {
+			if err := u.resetStableRestartCount(initial.SessionID, current, now().UTC()); err != nil {
+				return err
+			}
 		}
 		result, err := u.Detect.Execute(ctx, current, vt, lastChange, exited, exitCode)
 		if err != nil {
@@ -164,6 +202,8 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 		stoppedByControl := u.Stop != nil && u.Stop.IsStopped(initial.SessionID)
 		wasStopped := current.State == supervisor.SessionStopped
 		var fromState supervisor.SupervisorSessionState
+		var confirmedExit *supervisor.PendingSend
+		var exitPending *supervisor.PendingSend
 		err = UpdateSession(u.Sessions, initial.SessionID, func(s *supervisor.ManagedSession) error {
 			fromState = s.State
 			if result.PermissionMode == detect.PermissionUnsafe && s.AutoContinueDisabledReason == "" {
@@ -171,6 +211,21 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 				unsafeSet = true
 			}
 			if exited {
+				if s.SendGate.Pending != nil {
+					pending := *s.SendGate.Pending
+					exitPending = &pending
+				}
+				if s.SendGate.Pending != nil && s.SendGate.Pending.Kind == supervisor.SendKindHandoffExit && u.SendInput != nil && !u.SendInput.CRWrittenAt(initial.SessionID, s.SendGate.Pending.SendID).IsZero() && exitedAt.After(u.SendInput.CRWrittenAt(initial.SessionID, s.SendGate.Pending.SendID)) {
+					pending := *s.SendGate.Pending
+					confirmedExit = &pending
+					confirmedAt := now().UTC()
+					s.SendGate.Pending = nil
+					s.SendGate.EverSent = true
+					s.SendGate.LastSendConfirmed = true
+					s.SendGate.LastConfirmedAt = &confirmedAt
+					s.SendGate.UnconfirmedDiscarded = false
+					s.LastSend = &supervisor.LastSendRecord{SendID: pending.SendID, Kind: pending.Kind, IssuedAt: pending.IssuedAt, Confirmed: true}
+				}
 				// Xe remains active while stopped; no exited child may retain a PID.
 				s.ChildPID = 0
 				s.ChildStartedAt = nil
@@ -179,7 +234,7 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 					event = supervisor.EventHandoffExit
 				}
 				previous := s.State
-				err := s.Apply(event, supervisor.TransitionContext{Generation: s.Generation, ChildPID: s.ChildPID, ExitCode: valueOrZero(exitCode), HasPendingSend: s.SendGate.Pending != nil, ClaudeSessionID: s.ClaudeSessionID != "", HasPreviousClaudeSessionID: s.PreviousClaudeSessionID != "", RestartCount: s.RestartCount, DailyRestartCount: restartCountSince(s.RestartTimes, now().Add(-24*time.Hour)), ObservedState: state}, now().UTC())
+				err := s.Apply(event, supervisor.TransitionContext{CLI: s.CLI, Generation: s.Generation, ChildPID: s.ChildPID, ExitCode: valueOrZero(exitCode), HasPendingSend: s.SendGate.Pending != nil, ClaudeSessionID: s.ClaudeSessionID != "", HasPreviousClaudeSessionID: s.PreviousClaudeSessionID != "", RestartCount: s.RestartCount, DailyRestartCount: supervisor.RestartCountInWindow(s.RestartTimes, now().UTC()), ObservedState: state}, now().UTC())
 				if err == nil && previous != s.State {
 					nextState = s.State
 				}
@@ -210,6 +265,54 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 		if err != nil {
 			return err
 		}
+		if confirmedExit != nil {
+			u.recordEvent(initial.SessionID, supervisor.EventKindSendConfirmed, store.Event{SendID: confirmedExit.SendID, SendKind: confirmedExit.Kind})
+		}
+		if u.SendInput != nil {
+			if exited {
+				if exitPending != nil {
+					u.SendInput.NotifyConfirmation(SendConfirmation{SessionID: initial.SessionID, SendID: exitPending.SendID, ProcessExited: true, ExitedAt: exitedAt})
+				}
+			} else {
+				rows := vt.Screen()
+				cells := make([][]supervisor.Cell, len(rows))
+				for i := range rows {
+					cells[i] = vt.Cells(i)
+				}
+				menu, selected := false, ""
+				if u.CompletionSelection != nil {
+					menu, selected = u.CompletionSelection(rows)
+				}
+				shot := ScreenSnapshot{Rows: rows, Cells: cells, State: result.State, Processing: result.State == detect.StateWorking && slices.Contains(result.Basis, supervisor.DetectionScreenPattern), CompletionMenu: menu, SelectedCompletion: selected, ObservedAt: now().UTC(), ChangedAt: lastChange}
+				if screens, ok := u.SendInput.Screens.(interface {
+					SetSnapshot(supervisor.SessionID, ScreenSnapshot)
+				}); ok {
+					screens.SetSnapshot(initial.SessionID, shot)
+				}
+				current, err = u.Sessions.Load(initial.SessionID)
+				if err != nil {
+					return err
+				}
+				if current.SendGate.Pending != nil && !screenUpdatedAt.IsZero() {
+					u.SendInput.NotifyConfirmation(SendConfirmation{SessionID: initial.SessionID, SendID: current.SendGate.Pending.SendID, Screen: shot})
+				}
+			}
+		}
+		if !exited && nextState != "" && u.InitialRemoteControl != nil && (fromState == supervisor.SessionStarting || nextState == supervisor.SessionIdle) {
+			current, err = u.Sessions.Load(initial.SessionID)
+			if err != nil {
+				return err
+			}
+			requestCtx := u.SupervisorContext
+			if requestCtx == nil {
+				requestCtx = context.WithoutCancel(ctx)
+			}
+			if nextState == supervisor.SessionIdle {
+				go func(s supervisor.ManagedSession) { _ = u.InitialRemoteControl.OnStateChange(requestCtx, fromState, s) }(current)
+			} else {
+				_ = u.InitialRemoteControl.OnStateChange(requestCtx, fromState, current)
+			}
+		}
 		if unsafeSet {
 			u.recordEvent(initial.SessionID, supervisor.EventKindPermissionModeUnsafe, store.Event{Code: "SUP_PERMISSION_MODE_UNSAFE"})
 		}
@@ -226,15 +329,24 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 			u.recordEvent(initial.SessionID, supervisor.EventKindStateChanged, store.Event{FromState: fromState, ToState: nextState})
 		}
 		if exited {
+			if u.SendInput != nil && u.SendInput.PTYs != nil {
+				writer := u.SendInput.PTYs.Get(initial.SessionID)
+				if writer != nil {
+					u.SendInput.PTYs.Remove(initial.SessionID, writer)
+				}
+			}
+			if u.SendInput != nil {
+				u.SendInput.EndSession(initial.SessionID)
+			}
+			if u.InitialRemoteControl != nil {
+				u.InitialRemoteControl.EndSession(initial.SessionID)
+			}
 			current, err = u.Sessions.Load(initial.SessionID)
 			if err != nil {
 				return err
 			}
-			if current.State == supervisor.SessionExited {
-				u.recordEvent(initial.SessionID, supervisor.EventKindSessionExited, store.Event{Reason: store.EventReason(current.ExitReason)})
-			} else if current.State == supervisor.SessionStopped && !wasStopped {
-				u.recordEvent(initial.SessionID, supervisor.EventKindSessionStopped, store.Event{Reason: store.EventReason(current.StopReason)})
-			}
+			u.recordExitOutcome(initial.SessionID, current, wasStopped)
+			u.startRecovery(initial.SessionID, current, nextState)
 		}
 		if result.State == detect.StateUndetermined {
 			if undeterminedSince.IsZero() {
@@ -280,6 +392,7 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 					<-waits
 				}
 				exited = true
+				ownedChildren.Remove(initial.SessionID, initial.ChildPID)
 				_ = pty.Close()
 				if err := UpdateSession(u.Sessions, initial.SessionID, func(s *supervisor.ManagedSession) error {
 					s.ChildPID = 0
@@ -303,14 +416,82 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 	}
 }
 
-func restartCountSince(times []time.Time, since time.Time) int {
-	count := 0
-	for _, at := range times {
-		if !at.Before(since) {
-			count++
+func (u ObserveSessionUseCase) resetStableRestartCount(id supervisor.SessionID, current supervisor.ManagedSession, now time.Time) error {
+	if current.Generation < 2 || current.RestartCount == 0 || current.ChildPID == 0 || current.ChildStartedAt == nil || !supervisor.RestartStable(*current.ChildStartedAt, now) {
+		return nil
+	}
+	return UpdateSession(u.Sessions, id, func(s *supervisor.ManagedSession) error {
+		if s.Generation == current.Generation && s.ChildPID == current.ChildPID && s.RestartCount > 0 && s.ChildStartedAt != nil && supervisor.RestartStable(*s.ChildStartedAt, now) {
+			s.RestartCount = 0
+		}
+		return nil
+	})
+}
+
+func (u ObserveSessionUseCase) recordExitOutcome(id supervisor.SessionID, current supervisor.ManagedSession, wasStopped bool) {
+	switch {
+	case current.State == supervisor.SessionExited:
+		u.recordEvent(id, supervisor.EventKindSessionExited, store.Event{Reason: store.EventReason(current.ExitReason)})
+	case current.State == supervisor.SessionStopped && !wasStopped:
+		if current.StopReason == supervisor.StopRestartLimitConsecutive || current.StopReason == supervisor.StopRestartLimitDaily {
+			u.recordEvent(id, supervisor.EventKindRestartLimitExceeded, store.Event{Reason: store.EventReason(current.StopReason), Code: "SUP_RESTART_LIMIT_EXCEEDED"})
+		} else {
+			u.recordEvent(id, supervisor.EventKindSessionStopped, store.Event{Reason: store.EventReason(current.StopReason)})
 		}
 	}
-	return count
+}
+
+type observedPTY struct {
+	ManagedPTY
+	io.Reader
+}
+
+// ObservedRespawn wires every child generation to the same observation loop.
+// Resume and automatic recovery must both use this function.
+func (u ObserveSessionUseCase) ObservedRespawn() func(context.Context, supervisor.SessionID, RespawnKind) error {
+	if u.Respawn == nil {
+		return nil
+	}
+	respawn := *u.Respawn
+	if u.SendInput != nil {
+		respawn.PTYs = u.SendInput.PTYs
+	}
+	respawn.Observe = func(_ context.Context, session supervisor.ManagedSession, pty ManagedPTY) {
+		reader, ok := pty.(io.Reader)
+		if !ok {
+			_ = pty.Close()
+			_, _ = pty.Wait()
+			return
+		}
+		lifetime := u.SupervisorContext
+		if lifetime == nil {
+			lifetime = context.Background()
+		}
+		_ = u.Run(lifetime, session, observedPTY{ManagedPTY: pty, Reader: reader}, supervisor.NewVirtualTerminal(int(respawn.Config.Columns), int(respawn.Config.Rows)))
+	}
+	return respawn.Execute
+}
+
+// ResumeRecovery is the continuation passed to StopControl after resume.
+func (u ObserveSessionUseCase) ResumeRecovery(ctx context.Context, session supervisor.ManagedSession) error {
+	respawn := u.ObservedRespawn()
+	if respawn == nil {
+		return errors.New("respawn is required")
+	}
+	return respawn(ctx, session.SessionID, RespawnResumeRecovery)
+}
+
+func (u ObserveSessionUseCase) startRecovery(id supervisor.SessionID, current supervisor.ManagedSession, next supervisor.SupervisorSessionState) {
+	if next == supervisor.SessionRecovering && current.State == supervisor.SessionRecovering && u.Recover != nil {
+		recovery := *u.Recover
+		if recovery.LifetimeContext == nil {
+			recovery.LifetimeContext = u.SupervisorContext
+		}
+		if respawn := u.ObservedRespawn(); respawn != nil {
+			recovery.Respawn = respawn
+		}
+		recovery.Start(id)
+	}
 }
 func (u ObserveSessionUseCase) recordEvent(id supervisor.SessionID, kind supervisor.SupervisorEventKind, event store.Event) {
 	if u.RecordStructured != nil {
