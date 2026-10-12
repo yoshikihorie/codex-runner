@@ -2,11 +2,11 @@
 
 OpenAI Codex CLI を長時間・非同期で安全に走らせる常駐プロセス `codexd` の Go 実装と設計資料を公開するリポジトリです。
 
-> **Status: 段階 -1〜3 は完了しました。** `codexd` を launchd で常駐させ、impl / review / plan / research / read / think を常駐プロセス経由で実行しています。旧経路への自動切り戻しは廃止し、接続できない場合は終了コード 3 で停止します。
+> **Status: 段階 -1〜3 は完了しました。** `codexd` を launchd で常駐させ、impl / review / plan / research / read / think を常駐プロセス経由で実行しています。旧経路への自動切り戻しは廃止し、接続できない場合は終了コード 3 で停止します。多プロジェクトの開発 CLI（Claude Code）を監視・対話制御する supervisor 機能は開発中です。`codexd supervise` などの起動コマンドにはまだ接続されておらず、起動できません。
 
-このプロジェクトは有志による非公式のツールです。OpenAI とは関係がなく、OpenAI が提供・保証するものでもありません。Codex は OpenAI の製品名です。
+このプロジェクトは MAGI が開発・公開する非公式のツールです。OpenAI とは関係がなく、OpenAI が提供・保証するものでもありません。Codex は OpenAI の製品名です。
 
-This is an unofficial, community-built project. It is not affiliated with, endorsed by, or supported by OpenAI. Codex is a product of OpenAI.
+This is an unofficial project developed and published by MAGI. It is not affiliated with, endorsed by, or supported by OpenAI. Codex is a product of OpenAI.
 
 ## English summary
 
@@ -18,8 +18,8 @@ It records task state and preserves the existing task-output format for callers.
 The implementation uses a separate session, file locks, and Codex JSON events, with optional pseudo-terminal support that is disabled by default.
 It is designed for a single local user and a Unix domain socket; it is never a network service.
 Stages -1 through 3 are complete. The daemon runs under launchd and handles impl, review, plan, research, read, and think requests through one daemon route. If the daemon cannot be reached, the caller exits with code 3 instead of switching to the former route.
+The supervisor feature for monitoring and controlling Claude Code sessions across multiple projects is in development. Its PTY, session state, detection, controlled input, recovery, and verified commit components exist, but the startup command is not wired up yet and the feature cannot be launched. Automatic continuation, allowed-remote push, context handoff, a dedicated socket, and real-PTY acceptance remain unfinished.
 The caller's thin Bash entry point is maintained in the user's local configuration and is not included in this repository.
-Feedback is welcome.
 
 ## 何を解決するのか
 
@@ -73,9 +73,15 @@ codexd
 codex exec --json
 ```
 
+## supervisor（開発中）
+
+複数プロジェクトの Claude Code セッションを管理下 PTY で起動し、仮想端末で再構築した画面を観測して状態を判定する機能を開発しています。`supervisor.toml` の読み込み、子環境、セッションの状態遷移と保存、STOP・イベント記録・通知、起動と観測ループ、定型文だけを通す送信関門、異常復旧と supervisor 再起動、検証済み変更の commit は実装済みです。
+
+推奨の自動継続、許可 remote への push、context の引き継ぎ、専用ソケットと `codexd supervise` などのモード起動、実 PTY での受入は未完了です。現時点ではコマンドに配線されていないため、supervisor は起動できません。起動前に API キーや従量課金の設定がないことを検査し、定型文以外を送らず、force push を許さない設計です。
+
 ## ロードマップ
 
-段階 -1〜3 はすべて完了し、2026-09-24 に旧経路を削除して常駐プロセス経由の入口に一本化しました。元の移行計画は [ロードマップ](docs/roadmap.md) を参照してください。
+段階 -1〜3 はすべて完了し、2026-09-24 に旧経路を削除して常駐プロセス経由の入口に一本化しました。段階 4 の supervisor は開発中です。進捗は [ロードマップ](docs/roadmap.md) を参照してください。
 
 ## 設計書
 
@@ -83,7 +89,7 @@ codex exec --json
 
 ## 動作環境
 
-macOS と Go 1.22 以降を対象とします。Codex CLI 0.156.1 で動作確認しています。設計前の調査では Codex CLI 0.144.5 を使用しました。
+macOS と Go 1.22 以降を対象とします。この文書の更新時に `codex --version` で確認した版は Codex CLI 0.159.3 です。設計前の調査では Codex CLI 0.144.5 を使用しました。
 
 ## ビルド・テスト
 
@@ -95,7 +101,7 @@ go vet ./...
 go test -race ./...
 ```
 
-実装は `cmd/codexd`（常駐プロセス）、`cmd/codex-cleanup`、`internal/` 配下の config / contract / domain / execution / metrics / proc / recovery / store / transport にあります。launchd への登録は利用者の環境に合わせて行ってください。呼び出し元の薄い Bash 入口はこのリポジトリに含まれません。
+実装は `cmd/codexd`（常駐プロセス）、`cmd/codex-cleanup`、`internal/` 配下の config / contract / domain / execution / metrics / proc / recovery / store / transport にあります。開発中の supervisor は `internal/supervisor` と、その配下の detect / gitops / launch / store / textpolicy / usecase にあります。launchd への登録は利用者の環境に合わせて行ってください。呼び出し元の薄い Bash 入口はこのリポジトリに含まれません。
 
 ## ライセンス
 
