@@ -33,7 +33,7 @@ func BuildSettingsJSON(codexdPath, sessionID, stateDir string) ([]byte, error) {
 	}
 	var doc settingsDocument
 	doc.StatusLine.Type = "command"
-	doc.StatusLine.Command = shellQuote(codexdPath) + " supervise-statusline --session " + shellQuote(sessionID)
+	doc.StatusLine.Command = shellQuote(codexdPath) + " supervise-statusline --state-dir " + shellQuote(stateDir) + " --session " + shellQuote(sessionID)
 	doc.Permissions.Deny = make([]string, len(supervisorDenyRules))
 	for i, rule := range supervisorDenyRules {
 		replacement := "/" + stateDir

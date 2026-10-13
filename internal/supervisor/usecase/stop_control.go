@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"sync"
@@ -53,7 +54,11 @@ func NewProcessResumeTransitionContext(isAlive func(int) bool, processStartedAt 
 		alive := false
 		orphan := false
 		if ownedChildren.Owns(s.SessionID, s.ChildPID) {
-			alive = true
+			if s.StopReason == supervisor.StopOrphanChildAlive {
+				orphan = isAlive(s.ChildPID)
+			} else {
+				alive = true
+			}
 		} else if s.ChildPID > 0 && isAlive(s.ChildPID) {
 			if s.ChildStartedAt == nil {
 				orphan = true
@@ -66,14 +71,28 @@ func NewProcessResumeTransitionContext(isAlive func(int) bool, processStartedAt 
 }
 
 type ResumeOutput struct {
-	Resumed      []supervisor.SessionID
-	StillStopped []StillStopped
+	Resumed      []supervisor.SessionID `json:"resumed"`
+	StillStopped []StillStopped         `json:"still_stopped"`
 }
+
+func (o ResumeOutput) MarshalJSON() ([]byte, error) {
+	if o.Resumed == nil {
+		o.Resumed = []supervisor.SessionID{}
+	}
+	if o.StillStopped == nil {
+		o.StillStopped = []StillStopped{}
+	}
+	type output ResumeOutput
+	return json.Marshal(output(o))
+}
+
 type StillStopped struct {
-	SessionID supervisor.SessionID
-	Reason    string
+	SessionID supervisor.SessionID `json:"session_id"`
+	Reason    string               `json:"reason"`
 }
-type StopOutput struct{ Stopped []supervisor.SessionID }
+type StopOutput struct {
+	Stopped []supervisor.SessionID `json:"stopped"`
+}
 type StopControlUseCase struct {
 	mu              sync.Mutex
 	stops           *StopState

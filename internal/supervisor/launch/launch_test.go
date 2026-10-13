@@ -72,7 +72,12 @@ func containsPair(a []string, x, y string) bool {
 }
 
 func TestSettingsJSONAndWrite(t *testing.T) {
-	home := t.TempDir()
+	home, err := os.MkdirTemp("/tmp", "ssettings-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
 	state := filepath.Join(home, "state")
 	bin := filepath.Join(home, "codexd")
 	data, err := BuildSettingsJSON(bin, "session-x", state)
@@ -91,7 +96,7 @@ func TestSettingsJSONAndWrite(t *testing.T) {
 	if err = json.Unmarshal(data, &got); err != nil {
 		t.Fatal(err)
 	}
-	if got.StatusLine.Type != "command" || got.StatusLine.Command != bin+" supervise-statusline --session session-x" {
+	if got.StatusLine.Type != "command" || got.StatusLine.Command != bin+" supervise-statusline --state-dir "+state+" --session session-x" {
 		t.Fatalf("statusline: %#v", got.StatusLine)
 	}
 	quoted, err := BuildSettingsJSON(bin+" path", "session 'quoted", state)
@@ -378,13 +383,18 @@ func TestLunaImplAllowed(t *testing.T) {
 	for _, tc := range []struct {
 		name, contents string
 		want           bool
+		reason         SupervisorLunaCheckReason
 	}{{"allowed", `model = "gpt-6-luna"
 [model_allowlist]
-gpt-6-luna=["impl"]`, true}, {"not allowed", `model = "gpt-6-luna"
+gpt-6-luna=["impl"]`, true, ""}, {"not allowed", `model = "gpt-6-luna"
 [model_allowlist]
-gpt-6-luna=["read"]`, false}, {"missing", "", false}, {"broken", "model_allowlist = [", false}} {
+gpt-6-luna=["read"]`, false, LunaNotAllowed}, {"missing", "", false, LunaConfigMissing}, {"broken", "model_allowlist = [", false, LunaConfigInvalid}} {
 		t.Run(tc.name, func(t *testing.T) {
-			home := t.TempDir()
+			home, err := os.MkdirTemp("/tmp", "sluna-old-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = os.RemoveAll(home) })
 			t.Setenv("HOME", home)
 			path := filepath.Join(home, ".claude", "codexd", "config.toml")
 			if tc.contents != "" {
@@ -401,7 +411,7 @@ gpt-6-luna=["read"]`, false}, {"missing", "", false}, {"broken", "model_allowlis
 			if tc.contents != "" && (beforeErr != nil || afterErr != nil || string(before) != string(after)) {
 				t.Fatalf("allowlist changed during read: before=%v after=%v", beforeErr, afterErr)
 			}
-			if got != tc.want {
+			if got != tc.want || reason != tc.reason {
 				t.Fatalf("got %v want %v, reason: %s", got, tc.want, reason)
 			}
 		})

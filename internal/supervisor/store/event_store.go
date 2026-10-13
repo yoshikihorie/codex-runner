@@ -367,6 +367,11 @@ const (
 	ReasonRemoteHeadNotLocal         EventReason = "remote_head_not_local"
 	ReasonVerifyBinaryChanged        EventReason = "verify_binary_changed"
 	ReasonStopSessionRequested       EventReason = "stop_session_requested"
+	// SupervisorLunaCheckReason, copied from specifications/10-shared/published-language/enums.md.
+	ReasonLunaHomeUnavailable EventReason = "home_unavailable"
+	ReasonLunaConfigMissing   EventReason = "config_missing"
+	ReasonLunaConfigInvalid   EventReason = "config_invalid"
+	ReasonLunaNotAllowed      EventReason = "not_allowed"
 )
 
 func validReasonForEvent(kind supervisor.SupervisorEventKind, value EventReason) bool {
@@ -397,6 +402,8 @@ func validReasonForEvent(kind supervisor.SupervisorEventKind, value EventReason)
 		return contains(ReasonRestartLimitConsecutive, ReasonRestartLimitDaily)
 	case supervisor.EventKindSessionExited:
 		return value == ReasonStopSessionRequested
+	case supervisor.EventKindLunaImplNotAllowed:
+		return contains(ReasonLunaHomeUnavailable, ReasonLunaConfigMissing, ReasonLunaConfigInvalid, ReasonLunaNotAllowed)
 	case supervisor.EventKindRotateFailed:
 		return contains(ReasonIdleWaitTimeout, ReasonSendNotConfirmed, ReasonMtimeNotUpdated, ReasonHeadGenerationUnchanged, ReasonNotIdleAfterHandoff, ReasonExitTimeout, ReasonSpawnFailed, ReasonStartupTimeout, ReasonStartNotSettled, ReasonChildAbsent, ReasonRestartLimit)
 	case supervisor.EventKindRotateIdleWaitTimeout:

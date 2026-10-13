@@ -93,6 +93,31 @@ func autoInput(body string) AutoContinueInput {
 }
 func ptrInt(v int) *int { return &v }
 
+func TestAutoContinueZeroValueStateWrites(t *testing.T) {
+	id := supervisor.SessionID("zero-value")
+	t.Run("ClearCandidate", func(t *testing.T) {
+		u := &AutoContinueUseCase{}
+		u.ClearCandidate(id)
+		if u.states != nil {
+			t.Fatal("ClearCandidate created state for an absent candidate")
+		}
+	})
+	t.Run("increment", func(t *testing.T) {
+		u := &AutoContinueUseCase{}
+		u.increment(id)
+		if got := u.Count(id); got != 1 {
+			t.Fatalf("count=%d; want 1", got)
+		}
+	})
+	t.Run("incrementIfGeneration", func(t *testing.T) {
+		u := &AutoContinueUseCase{}
+		u.incrementIfGeneration(id, 0)
+		if got := u.Count(id); got != 1 {
+			t.Fatalf("count=%d; want 1", got)
+		}
+	})
+}
+
 func TestAutoContinue_SCN09_SCN10_SCN11_SCN12_SafeAndFailClosed(t *testing.T) {
 	for _, tc := range []struct {
 		body     string

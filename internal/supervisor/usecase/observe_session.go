@@ -43,6 +43,7 @@ type ObserveSessionUseCase struct {
 	CompletionSelection     func([]string) (bool, string)
 	RecordStructured        func(store.Event) error
 	Observed                *ObservedStateStore
+	ContextPercent          *ObservedContextStore
 	Notify                  func(supervisor.SupervisorEventKind, string)
 	Interval                time.Duration
 	StartupTimeout          time.Duration
@@ -87,6 +88,10 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 }, vt *supervisor.VirtualTerminal) error {
 	if pty == nil || vt == nil || u.Sessions == nil {
 		return errors.New("observer dependencies are required")
+	}
+	if u.ContextPercent != nil {
+		u.ContextPercent.Delete(initial.SessionID)
+		defer u.ContextPercent.Delete(initial.SessionID)
 	}
 	gitPhaseDone := make(chan time.Time, 1)
 	var gitPhaseReported sync.Map
@@ -231,6 +236,42 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 		case waited := <-waits:
 			exited = true
 			exitedAt = now().UTC()
+			if u.SendInput != nil && u.SendInput.PTYs != nil {
+				registry := u.SendInput.PTYs
+				if registry.IsShuttingDown() {
+					return nil
+				}
+				if wrapped, ok := pty.(observedPTY); ok {
+					managed := wrapped.ManagedPTY
+					if registry.GetManaged(initial.SessionID) != managed {
+						ownedChildren.Remove(initial.SessionID, initial.ChildPID)
+						return nil
+					}
+					if registry.IsStopping(initial.SessionID, managed) {
+						changed := false
+						err := UpdateSession(u.Sessions, initial.SessionID, func(s *supervisor.ManagedSession) error {
+							if s.State == supervisor.SessionExited {
+								return nil
+							}
+							if err := s.Apply(supervisor.EventStopSession, supervisor.TransitionContext{ChildAlive: false}, now().UTC()); err != nil {
+								return err
+							}
+							s.ChildPID = 0
+							s.ChildStartedAt = nil
+							changed = true
+							return nil
+						})
+						if err != nil {
+							return err
+						}
+						ownedChildren.Remove(initial.SessionID, initial.ChildPID)
+						if changed {
+							u.recordEvent(initial.SessionID, supervisor.EventKindSessionExited, store.Event{Reason: store.ReasonStopSessionRequested})
+						}
+						return nil
+					}
+				}
+			}
 			ownedChildren.Remove(initial.SessionID, initial.ChildPID)
 			code := waited.code
 			if waited.err != nil {
@@ -408,6 +449,14 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 		current, err = u.Sessions.Load(initial.SessionID)
 		if err != nil {
 			return err
+		}
+		if u.ContextPercent != nil {
+			validated := result.ContextPercent
+			decision := u.PlanRotation.Evaluate(RotationPlanInput{Session: current, Detected: result, StatuslineObservedAt: u.rotationStatuslineAt(initial.SessionID), ObservedState: result.State, Now: now().UTC()})
+			if exited || decision.ContextUnknown || decision.NotApplicable {
+				validated = nil
+			}
+			u.ContextPercent.Set(initial.SessionID, validated)
 		}
 		if current.State != rotationDecisionState || !current.StateSince.Equal(rotationDecisionSince) {
 			rotationDecisionState = current.State
@@ -664,12 +713,18 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 				if u.Observed != nil {
 					u.Observed.Delete(initial.SessionID)
 				}
+				if u.ContextPercent != nil {
+					u.ContextPercent.Delete(initial.SessionID)
+				}
 				return nil
 			}
 		}
 		if exited {
 			if u.Observed != nil {
 				u.Observed.Delete(initial.SessionID)
+			}
+			if u.ContextPercent != nil {
+				u.ContextPercent.Delete(initial.SessionID)
 			}
 			return nil
 		}
@@ -706,6 +761,38 @@ type observedPTY struct {
 	io.Reader
 }
 
+// StartObserved owns ManagedPTY registration and starts one observation loop.
+func (u ObserveSessionUseCase) StartObserved(ctx context.Context, session supervisor.ManagedSession, pty ManagedPTY, columns, rows uint16) <-chan error {
+	done := make(chan error, 1)
+	reader, ok := pty.(io.Reader)
+	if !ok {
+		_ = pty.Close()
+		_, _ = pty.Wait()
+		done <- errors.New("PTY reader is required")
+		return done
+	}
+	var registry *PTYRegistry
+	if u.SendInput != nil {
+		registry = u.SendInput.PTYs
+	}
+	if registry != nil {
+		registry.RegisterManaged(session.SessionID, pty)
+		if registry.IsStopping(session.SessionID, pty) || registry.IsShuttingDown() {
+			_ = pty.Close()
+		}
+	}
+	go func() {
+		if registry != nil {
+			defer registry.RemoveManaged(session.SessionID, pty)
+			if writer, ok := pty.(PTYWriter); ok {
+				defer registry.Remove(session.SessionID, writer)
+			}
+		}
+		done <- u.Run(ctx, session, observedPTY{ManagedPTY: pty, Reader: reader}, supervisor.NewVirtualTerminal(int(columns), int(rows)))
+	}()
+	return done
+}
+
 // ObservedRespawn wires every child generation to the same observation loop.
 // Resume and automatic recovery must both use this function.
 func (u ObserveSessionUseCase) ObservedRespawn() func(context.Context, supervisor.SessionID, RespawnKind) error {
@@ -717,17 +804,11 @@ func (u ObserveSessionUseCase) ObservedRespawn() func(context.Context, superviso
 		respawn.PTYs = u.SendInput.PTYs
 	}
 	respawn.Observe = func(_ context.Context, session supervisor.ManagedSession, pty ManagedPTY) {
-		reader, ok := pty.(io.Reader)
-		if !ok {
-			_ = pty.Close()
-			_, _ = pty.Wait()
-			return
-		}
 		lifetime := u.SupervisorContext
 		if lifetime == nil {
 			lifetime = context.Background()
 		}
-		_ = u.Run(lifetime, session, observedPTY{ManagedPTY: pty, Reader: reader}, supervisor.NewVirtualTerminal(int(respawn.Config.Columns), int(respawn.Config.Rows)))
+		<-u.StartObserved(lifetime, session, pty, respawn.Config.Columns, respawn.Config.Rows)
 	}
 	return respawn.Execute
 }

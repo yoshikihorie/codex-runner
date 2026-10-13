@@ -26,20 +26,57 @@ type regressionSessionStore struct {
 	mu      sync.Mutex
 	session supervisor.ManagedSession
 	saves   int
+	saved   chan struct{}
 }
 
 func (s *regressionSessionStore) Load(supervisor.SessionID) (supervisor.ManagedSession, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.session, nil
+	return cloneRegressionSession(s.session), nil
 }
 
 func (s *regressionSessionStore) Save(v supervisor.ManagedSession) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.session = v
+	s.session = cloneRegressionSession(v)
 	s.saves++
+	if s.saved != nil {
+		select {
+		case s.saved <- struct{}{}:
+		default:
+		}
+	}
 	return nil
+}
+
+func cloneRegressionPointer[T any](value *T) *T {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func cloneRegressionSession(v supervisor.ManagedSession) supervisor.ManagedSession {
+	v.ChildStartedAt = cloneRegressionPointer(v.ChildStartedAt)
+	v.SendGate.LastConfirmedAt = cloneRegressionPointer(v.SendGate.LastConfirmedAt)
+	v.SendGate.Pending = cloneRegressionPointer(v.SendGate.Pending)
+	v.LastSend = cloneRegressionPointer(v.LastSend)
+	v.RestartTimes = append([]time.Time(nil), v.RestartTimes...)
+	if v.Rotation != nil {
+		rotation := *v.Rotation
+		rotation.StepStartedAt = cloneRegressionPointer(rotation.StepStartedAt)
+		rotation.EndIssuedAt = cloneRegressionPointer(rotation.EndIssuedAt)
+		rotation.RespawnWaitUntil = cloneRegressionPointer(rotation.RespawnWaitUntil)
+		if rotation.CheckpointSnapshot != nil {
+			snapshot := *rotation.CheckpointSnapshot
+			snapshot.Mtime = cloneRegressionPointer(snapshot.Mtime)
+			rotation.CheckpointSnapshot = &snapshot
+		}
+		v.Rotation = &rotation
+	}
+	v.PendingRemoteControlSince = cloneRegressionPointer(v.PendingRemoteControlSince)
+	return v
 }
 
 type constantDetector struct {

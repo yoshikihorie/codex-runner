@@ -14,6 +14,19 @@ type ownedChildRegistry struct {
 
 var ownedChildren = &ownedChildRegistry{pids: make(map[supervisor.SessionID]int)}
 
+// OwnedChildPIDs returns a detached snapshot for server-side peer checks.
+func OwnedChildPIDs() map[int]bool {
+	ownedChildren.mu.Lock()
+	defer ownedChildren.mu.Unlock()
+	result := make(map[int]bool, len(ownedChildren.pids))
+	for _, pid := range ownedChildren.pids {
+		if pid > 0 {
+			result[pid] = true
+		}
+	}
+	return result
+}
+
 func (r *ownedChildRegistry) Register(id supervisor.SessionID, pid int) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

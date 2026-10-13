@@ -72,9 +72,46 @@ func (s *SessionStore) sessionPath(id supervisor.SessionID) (string, error) {
 
 // Save validates and atomically persists a session record.
 func (s *SessionStore) Save(v supervisor.ManagedSession) error {
-	path, err := s.sessionPath(v.SessionID)
+	path, data, err := s.prepare(v)
 	if err != nil {
 		return err
+	}
+	return s.writeAtomic(path, data, 0600)
+}
+
+// Create publishes a complete new record without replacing an existing session.
+func (s *SessionStore) Create(v supervisor.ManagedSession) error {
+	path, data, err := s.prepare(v)
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".session-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	if _, err = tmp.Write(data); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err = tmp.Sync(); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err = tmp.Chmod(0600); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err = tmp.Close(); err != nil {
+		return err
+	}
+	return os.Link(tmp.Name(), path)
+}
+
+func (s *SessionStore) prepare(v supervisor.ManagedSession) (string, []byte, error) {
+	path, err := s.sessionPath(v.SessionID)
+	if err != nil {
+		return "", nil, err
 	}
 	if v.SchemaVersion == 0 {
 		v.SchemaVersion = 1
@@ -89,20 +126,20 @@ func (s *SessionStore) Save(v supervisor.ManagedSession) error {
 		v.StopScope = supervisor.StopScopeNone
 	}
 	if err = validateSession(v, v.SessionID); err != nil {
-		return fmt.Errorf("%w: %v", ErrStateFileCorrupt, err)
+		return "", nil, fmt.Errorf("%w: %v", ErrStateFileCorrupt, err)
 	}
 	dir := filepath.Dir(path)
 	if err = os.MkdirAll(dir, 0700); err != nil {
-		return err
+		return "", nil, err
 	}
 	if err = os.Chmod(dir, 0700); err != nil {
-		return err
+		return "", nil, err
 	}
 	data, err := json.Marshal(v)
 	if err != nil {
-		return err
+		return "", nil, err
 	}
-	return s.writeAtomic(path, append(data, '\n'), 0600)
+	return path, append(data, '\n'), nil
 }
 
 // Load reads a session record, quarantining corrupt records before returning an error.

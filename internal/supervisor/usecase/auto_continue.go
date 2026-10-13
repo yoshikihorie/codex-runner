@@ -89,6 +89,9 @@ func (u *AutoContinueUseCase) Count(id supervisor.SessionID) int { return u.stat
 func (u *AutoContinueUseCase) ClearCandidate(id supervisor.SessionID) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if u.states == nil {
+		return
+	}
 	s := u.states[id]
 	s.eligibleSince = time.Time{}
 	u.states[id] = s
@@ -138,6 +141,9 @@ func (u *AutoContinueUseCase) entered(id supervisor.SessionID, since time.Time) 
 func (u *AutoContinueUseCase) increment(id supervisor.SessionID) {
 	u.mu.Lock()
 	defer u.mu.Unlock()
+	if u.states == nil {
+		u.states = make(map[supervisor.SessionID]autoContinueState)
+	}
 	s := u.states[id]
 	s.count++
 	u.states[id] = s
@@ -148,6 +154,9 @@ func (u *AutoContinueUseCase) incrementIfGeneration(id supervisor.SessionID, gen
 	s := u.states[id]
 	if s.generation != generation {
 		return
+	}
+	if u.states == nil {
+		u.states = make(map[supervisor.SessionID]autoContinueState)
 	}
 	s.count++
 	u.states[id] = s

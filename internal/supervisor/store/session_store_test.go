@@ -13,6 +13,23 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/supervisor"
 )
 
+func TestSessionStoreCreateDoesNotReplaceExistingRecord(t *testing.T) {
+	st := NewSessionStore(t.TempDir())
+	id := mustID(t, "alpha-1")
+	v := supervisor.ManagedSession{SessionID: id, ProjectID: "alpha", CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionStarting, StateSince: time.Now().UTC(), RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 1}}
+	if err := st.Create(v); err != nil {
+		t.Fatal(err)
+	}
+	v.Generation = 2
+	if err := st.Create(v); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("duplicate create: %v", err)
+	}
+	got, err := st.Load(id)
+	if err != nil || got.Generation != 1 {
+		t.Fatalf("record=%+v err=%v", got, err)
+	}
+}
+
 func TestSetGitPhaseIfEligibleRejectsRotating(t *testing.T) {
 	st := NewSessionStore(t.TempDir())
 	id := mustID(t, "phase-rotation-1")

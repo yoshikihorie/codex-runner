@@ -37,6 +37,11 @@ func CreateSession(store interface {
 }, session supervisor.ManagedSession) error {
 	unlock := sessionLocker.Lock(session.SessionID)
 	defer unlock()
+	if creating, ok := store.(interface {
+		Create(supervisor.ManagedSession) error
+	}); ok {
+		return creating.Create(session)
+	}
 	return store.Save(session)
 }
 

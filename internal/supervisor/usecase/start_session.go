@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -49,20 +50,21 @@ func (defaultPTYStarter) Start(executable string, argv, env []string, cwd string
 }
 
 type StartSessionUseCase struct {
-	Config             StartSessionConfig
-	Projects           map[string]StartProject
-	Store              StartSessionStore
-	Stop               *StopState
-	Billing            launch.BillingGuard
-	Starter            PTYStarter
-	PTYs               *PTYRegistry
-	Lock               func() (func(), error)
-	Now                func() time.Time
-	RecordStructured   func(store.Event) error
-	RecordStartFailure func(string, store.SupervisorStartFailReason)
-	Notify             func(supervisor.SupervisorEventKind, string)
-	ParentEnv          func() []string
-	CleanupGrace       time.Duration
+	Config               StartSessionConfig
+	Projects             map[string]StartProject
+	Store                StartSessionStore
+	Stop                 *StopState
+	Billing              launch.BillingGuard
+	Starter              PTYStarter
+	PTYs                 *PTYRegistry
+	Lock                 func() (func(), error)
+	Now                  func() time.Time
+	RecordStructured     func(store.Event) error
+	RecordStartFailure   func(string, store.SupervisorStartFailReason)
+	Notify               func(supervisor.SupervisorEventKind, string)
+	ParentEnv            func() []string
+	CleanupGrace         time.Duration
+	GitConfigFingerprint func(projectID string) string
 }
 
 var startSessionMutex sync.Mutex
@@ -91,6 +93,31 @@ func (u StartSessionUseCase) Execute(projectID string, id supervisor.SessionID) 
 		return nil, err
 	}
 	return pty, startErr
+}
+
+// AbortUnobservedStart releases a child when dispatch cannot load its starting record.
+func (u StartSessionUseCase) AbortUnobservedStart(id supervisor.SessionID, pty ManagedPTY) {
+	if u.PTYs != nil {
+		if writer, ok := pty.(PTYWriter); ok {
+			u.PTYs.Remove(id, writer)
+		}
+	}
+	_ = pty.Close()
+	done := make(chan struct{})
+	go func() { _, _ = pty.Wait(); close(done) }()
+	grace := u.CleanupGrace
+	if grace <= 0 {
+		grace = timeoutKillGrace
+	}
+	select {
+	case <-done:
+	case <-time.After(grace):
+		_ = pty.Kill(syscall.SIGKILL)
+		<-done
+	}
+	ownedChildren.Remove(id, pty.Pid())
+	_ = DeleteSession(u.Store, id)
+	_ = os.Remove(filepath.Join(u.Config.StateDir, "statusline", id.String()+".settings.json"))
 }
 
 func (u StartSessionUseCase) executeLocked(projectID string, id supervisor.SessionID) (ManagedPTY, error) {
@@ -144,6 +171,9 @@ func (u StartSessionUseCase) executeLocked(projectID string, id supervisor.Sessi
 		now = u.Now().UTC()
 	}
 	session := supervisor.ManagedSession{SessionID: id, ProjectID: projectID, CLI: project.CLI, Generation: 1, State: supervisor.SessionStarting, StateSince: now, StopScope: supervisor.StopScopeNone, RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 1}}
+	if u.GitConfigFingerprint != nil {
+		session.GitConfigFingerprint = u.GitConfigFingerprint(projectID)
+	}
 	if err = CreateSession(u.Store, session); err != nil {
 		_ = os.Remove(settingsPath)
 		return nil, err
@@ -159,10 +189,21 @@ func (u StartSessionUseCase) executeLocked(projectID string, id supervisor.Sessi
 	if starter == nil {
 		starter = defaultPTYStarter{}
 	}
-	pty, err := starter.Start(project.BinaryPath, argv, env, project.CWD, cols, rows)
+	launchChild := func() (ManagedPTY, error) {
+		return starter.Start(project.BinaryPath, argv, env, project.CWD, cols, rows)
+	}
+	var pty ManagedPTY
+	if u.PTYs != nil {
+		pty, err = u.PTYs.StartChild(launchChild)
+	} else {
+		pty, err = launchChild()
+	}
 	if err != nil {
 		_ = DeleteSession(u.Store, id)
 		_ = os.Remove(settingsPath)
+		if errors.Is(err, ErrStopActive) {
+			return nil, ErrStopActive
+		}
 		u.startFailure(projectID, store.StartFailSpawnFailed)
 		return nil, fmt.Errorf("%w: %v", ErrSpawnFailed, err)
 	}

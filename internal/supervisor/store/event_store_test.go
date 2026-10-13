@@ -43,6 +43,24 @@ func TestEventStoreRestoresSequenceAndOmitsBody(t *testing.T) {
 	}
 }
 
+func TestEventStore_SCNsup0557_LunaReasonVocabulary(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "sup-home-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	st := NewEventStore(t.TempDir())
+	for _, reason := range []EventReason{"home_unavailable", "config_missing", "config_invalid", "not_allowed"} {
+		if _, err := st.Record(Event{Kind: supervisor.EventKindLunaImplNotAllowed, Reason: reason}); err != nil {
+			t.Fatalf("reason %q: %v", reason, err)
+		}
+	}
+	if _, err := st.Record(Event{Kind: supervisor.EventKindLunaImplNotAllowed, Reason: "configuration contents"}); err == nil {
+		t.Fatal("invalid reason accepted")
+	}
+}
+
 func TestEventStoreRecordsSessionStartFailureWithoutSessionID(t *testing.T) {
 	store := NewEventStore(t.TempDir())
 	for _, reason := range []string{"user_settings", "project_settings", "project_local_settings", "claude_json", "managed", "codex_auth", "child_env"} {

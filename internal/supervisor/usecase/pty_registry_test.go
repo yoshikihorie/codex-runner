@@ -2,11 +2,64 @@ package usecase
 
 import (
 	"context"
+	"errors"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/supervisor"
 )
+
+func TestPTYRegistryRejectsLaunchAfterShutdown(t *testing.T) {
+	r := &PTYRegistry{}
+	r.BeginShutdown()
+	called := false
+	_, err := r.StartChild(func() (ManagedPTY, error) { called = true; return &recoveryPTY{pid: 1}, nil })
+	if err == nil || called {
+		t.Fatalf("launch called=%v err=%v", called, err)
+	}
+	if !errors.Is(err, ErrStopActive) {
+		t.Fatalf("shutdown error=%v", err)
+	}
+}
+
+func TestPTYRegistry_SCNsup0535_ManagedAndStoppingIdentity(t *testing.T) {
+	home, err := os.MkdirTemp("/tmp", "sup-home-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(home) })
+	t.Setenv("HOME", home)
+	id, _ := supervisor.NewSessionID("alpha-1")
+	r := &PTYRegistry{}
+	old, next := &recoveryPTY{pid: 1}, &recoveryPTY{pid: 2}
+	r.RegisterManaged(id, old)
+	r.MarkStopping(id)
+	r.RegisterManaged(id, next)
+	if r.GetManaged(id) != next || r.IsStopping(id, next) {
+		t.Fatal("stale stop mark reached new child")
+	}
+	r.RemoveManaged(id, old)
+	if r.GetManaged(id) != next {
+		t.Fatal("old child removed replacement")
+	}
+	r.MarkStopping(id)
+	if !r.IsStopping(id, next) {
+		t.Fatal("stop mark missing")
+	}
+	r.ClearStopping(id, old)
+	if !r.IsStopping(id, next) {
+		t.Fatal("stale clear removed mark")
+	}
+	r.ClearStopping(id, next)
+	if r.IsStopping(id, next) {
+		t.Fatal("mark remained")
+	}
+	r.BeginShutdown()
+	if !r.IsShuttingDown() {
+		t.Fatal("shutdown mark missing")
+	}
+}
 
 func TestFix3PTYRegistryReplacesChildWithoutOldRemoval(t *testing.T) {
 	id, _ := supervisor.NewSessionID("alpha-1")

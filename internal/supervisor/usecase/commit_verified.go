@@ -248,6 +248,12 @@ func (u *CommitVerifiedChangesUseCase) configFingerprint(ctx context.Context) (s
 	}
 	return gitops.GitConfigFingerprintFromEntries(entries).SHA256, include, nil
 }
+
+// CurrentGitConfigFingerprint uses the same repository-specific check as commit evaluation.
+func (u *CommitVerifiedChangesUseCase) CurrentGitConfigFingerprint(ctx context.Context) (string, error) {
+	fingerprint, _, err := u.configFingerprint(ctx)
+	return fingerprint, err
+}
 func (u *CommitVerifiedChangesUseCase) failureFingerprint(ctx context.Context, root string, scope *gitops.PathScope) string {
 	snapshot, err := u.snapshot(ctx, root, scope)
 	if err != nil {

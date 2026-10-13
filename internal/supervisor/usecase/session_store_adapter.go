@@ -20,6 +20,9 @@ func (a SessionStoreAdapter) Load(id supervisor.SessionID) (supervisor.ManagedSe
 func (a SessionStoreAdapter) Save(session supervisor.ManagedSession) error {
 	return a.Store.Save(session)
 }
+func (a SessionStoreAdapter) Create(session supervisor.ManagedSession) error {
+	return a.Store.Create(session)
+}
 func (a SessionStoreAdapter) UpdateSession(id supervisor.SessionID, update func(*supervisor.ManagedSession) error) error {
 	return a.Store.UpdateSession(id, update)
 }

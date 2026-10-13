@@ -11,13 +11,29 @@ import (
 	"time"
 )
 
+type testDeadlineContext struct {
+	context.Context
+	done <-chan struct{}
+}
+
+func (c testDeadlineContext) Done() <-chan struct{} { return c.done }
+
+func (c testDeadlineContext) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
 func TestVerifyRunnerReasonsAndTimeoutRecheck(t *testing.T) {
 	r := VerifyRunner{StateDir: t.TempDir()}
 	if _, err := r.Run(context.Background(), nil, "", t.TempDir()); err == nil || err.Error() != "verify_exec_failed" {
 		t.Fatalf("invalid command reason: %v", err)
 	}
 	bin := filepath.Join(t.TempDir(), "verify")
-	content := []byte("#!/bin/sh\nprintf changed > \"$0.new\"\n/bin/mv \"$0.new\" \"$0\"\n/bin/sleep 5\n")
+	content := []byte("#!/bin/sh\nprintf changed > \"$0.new\"\n/bin/mv \"$0.new\" \"$0\"\nprintf ready > \"$0.ready\"\n/bin/sleep 30\n")
 	if err := os.WriteFile(bin, content, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -26,9 +42,35 @@ func TestVerifyRunnerReasonsAndTimeoutRecheck(t *testing.T) {
 	if _, err := r.Run(context.Background(), []string{bin}, hash, filepath.Join(t.TempDir(), "missing")); err == nil || err.Error() != "verify_cwd_invalid" {
 		t.Fatalf("missing cwd reason: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
-	defer cancel()
-	if _, err := r.Run(ctx, []string{bin}, hash, t.TempDir()); !errors.Is(err, ErrVerifyBinaryChanged) {
+	done := make(chan struct{})
+	defer func() {
+		select {
+		case <-done:
+		default:
+			close(done)
+		}
+	}()
+	result := make(chan error, 1)
+	cwd := t.TempDir()
+	go func() {
+		_, err := r.Run(testDeadlineContext{Context: context.Background(), done: done}, []string{bin}, hash, cwd)
+		result <- err
+	}()
+	deadline := time.After(10 * time.Second)
+	for {
+		if _, err := os.Stat(bin + ".ready"); err == nil {
+			break
+		}
+		select {
+		case err := <-result:
+			t.Fatalf("verify returned before binary changed: %v", err)
+		case <-deadline:
+			t.Fatal("verify binary did not change")
+		case <-time.After(time.Millisecond):
+		}
+	}
+	close(done)
+	if err := <-result; !errors.Is(err, ErrVerifyBinaryChanged) {
 		t.Fatalf("timeout missed changed binary: %v", err)
 	}
 }
