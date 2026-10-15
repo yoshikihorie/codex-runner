@@ -22,25 +22,26 @@ import (
 
 // Event contains only fields permitted by FD-sup-05 §16.1; it has no body field.
 type Event struct {
-	Seq       uint64                            `json:"seq"`
-	At        time.Time                         `json:"ts"`
-	Kind      supervisor.SupervisorEventKind    `json:"kind"`
-	SessionID string                            `json:"session_id,omitempty"`
-	ProjectID string                            `json:"project_id,omitempty"`
-	FromState supervisor.SupervisorSessionState `json:"from_state,omitempty"`
-	ToState   supervisor.SupervisorSessionState `json:"to_state,omitempty"`
-	SendID    string                            `json:"send_id,omitempty"`
-	SendKind  supervisor.SupervisorSendKind     `json:"send_kind,omitempty"`
-	Basis     []supervisor.DetectionBasis       `json:"basis,omitempty"`
-	Code      string                            `json:"code,omitempty"`
-	Step      string                            `json:"step,omitempty"`
-	Reason    EventReason                       `json:"reason,omitempty"`
-	Pattern   string                            `json:"pattern,omitempty"`
-	Count     int                               `json:"count,omitempty"`
-	RowCount  *int                              `json:"row_count,omitempty"`
-	CommitSHA string                            `json:"commit_sha,omitempty"`
-	Remote    string                            `json:"remote,omitempty"`
-	Branch    string                            `json:"branch,omitempty"`
+	Seq        uint64                            `json:"seq"`
+	At         time.Time                         `json:"ts"`
+	Kind       supervisor.SupervisorEventKind    `json:"kind"`
+	SessionID  string                            `json:"session_id,omitempty"`
+	ProjectID  string                            `json:"project_id,omitempty"`
+	FromState  supervisor.SupervisorSessionState `json:"from_state,omitempty"`
+	ToState    supervisor.SupervisorSessionState `json:"to_state,omitempty"`
+	SendID     string                            `json:"send_id,omitempty"`
+	SendKind   supervisor.SupervisorSendKind     `json:"send_kind,omitempty"`
+	TextLength *int                              `json:"text_length,omitempty"`
+	Basis      []supervisor.DetectionBasis       `json:"basis,omitempty"`
+	Code       string                            `json:"code,omitempty"`
+	Step       string                            `json:"step,omitempty"`
+	Reason     EventReason                       `json:"reason,omitempty"`
+	Pattern    string                            `json:"pattern,omitempty"`
+	Count      int                               `json:"count,omitempty"`
+	RowCount   *int                              `json:"row_count,omitempty"`
+	CommitSHA  string                            `json:"commit_sha,omitempty"`
+	Remote     string                            `json:"remote,omitempty"`
+	Branch     string                            `json:"branch,omitempty"`
 }
 
 // Rotation limits are copied from the canonical validation-rules specification.
@@ -161,6 +162,21 @@ func validateEvent(event Event) error {
 	if !supervisor.ValidSupervisorEventKind(event.Kind) {
 		return fmt.Errorf("invalid supervisor event kind: %q", event.Kind)
 	}
+	if event.TextLength != nil {
+		if event.SendKind != supervisor.SendKindOperatorInput || *event.TextLength < 1 || *event.TextLength > supervisor.SupervisorOperatorInputMaxLength || !operatorSendEvent(event.Kind) {
+			return errors.New("invalid operator input text length")
+		}
+	} else if event.SendKind == supervisor.SendKindOperatorInput && operatorSendEvent(event.Kind) {
+		return errors.New("missing operator input text length")
+	}
+	if event.Kind == supervisor.EventKindSendBlocked && event.Reason == ReasonRateLimited && event.SendKind != supervisor.SendKindOperatorInput {
+		return errors.New("rate limit is only valid for operator input")
+	}
+	if event.Kind == supervisor.EventKindOperatorInputRefused {
+		if event.SessionID == "" || event.Reason == "" || event.ProjectID != "" || event.FromState != "" || event.ToState != "" || event.SendID != "" || event.SendKind != "" || event.TextLength != nil || len(event.Basis) != 0 || event.Code != "" || event.Step != "" || event.Pattern != "" || event.Count != 0 || event.RowCount != nil || event.CommitSHA != "" || event.Remote != "" || event.Branch != "" {
+			return errors.New("invalid operator input refusal event")
+		}
+	}
 	if event.Kind == supervisor.EventKindScreenRead {
 		if event.SessionID == "" || event.RowCount == nil || *event.RowCount < 0 || event.ProjectID != "" || event.FromState != "" || event.ToState != "" || event.SendID != "" || event.SendKind != "" || len(event.Basis) != 0 || event.Code != "" || event.Step != "" || event.Reason != "" || event.Pattern != "" || event.Count != 0 || event.CommitSHA != "" || event.Remote != "" || event.Branch != "" {
 			return errors.New("invalid screen read event")
@@ -219,6 +235,14 @@ func validateEvent(event Event) error {
 		return errors.New("invalid git remote")
 	}
 	return nil
+}
+
+func operatorSendEvent(kind supervisor.SupervisorEventKind) bool {
+	switch kind {
+	case supervisor.EventKindSendIssued, supervisor.EventKindSendConfirmed, supervisor.EventKindSendAborted, supervisor.EventKindSendUnconfirmed, supervisor.EventKindSendBlocked:
+		return true
+	}
+	return false
 }
 
 func validStartFailureReason(reason EventReason) bool {
@@ -302,6 +326,9 @@ const (
 	ReasonPending                    EventReason = "pending"
 	ReasonUnconfirmed                EventReason = "unconfirmed"
 	ReasonNotFixedText               EventReason = "not_fixed_text"
+	ReasonRateLimited                EventReason = "rate_limited"
+	ReasonSupervisedCaller           EventReason = "supervised_caller"
+	ReasonForbiddenText              EventReason = "forbidden_text"
 	ReasonForcePush                  EventReason = "force_push"
 	ReasonPullRequest                EventReason = "pull_request"
 	ReasonDeploy                     EventReason = "deploy"
@@ -393,7 +420,9 @@ func validReasonForEvent(kind supervisor.SupervisorEventKind, value EventReason)
 	}
 	switch kind {
 	case supervisor.EventKindSendBlocked:
-		return contains(ReasonStop, ReasonState, ReasonPending, ReasonUnconfirmed, ReasonNotFixedText)
+		return contains(ReasonStop, ReasonState, ReasonPending, ReasonUnconfirmed, ReasonNotFixedText, ReasonRateLimited)
+	case supervisor.EventKindOperatorInputRefused:
+		return contains(ReasonSupervisedCaller, ReasonForbiddenText)
 	case supervisor.EventKindRecommendationBlocked:
 		return contains(ReasonForcePush, ReasonPullRequest, ReasonDeploy, ReasonDeletion, ReasonProduction, ReasonBilling, ReasonGitHistory, ReasonMigration, ReasonPrivilege, ReasonUndetermined, ReasonRepeated, ReasonConsecutiveLimit)
 	case supervisor.EventKindCommitFailed:
@@ -423,7 +452,7 @@ func validReasonForEvent(kind supervisor.SupervisorEventKind, value EventReason)
 
 func validEventCode(v string) bool {
 	switch v {
-	case "SUP_CONFIG_INVALID", "SUP_INSTANCE_LOCK_HELD", "SUP_PROJECT_NOT_FOUND", "SUP_SESSION_ALREADY_RUNNING", "SUP_SESSION_LIMIT_REACHED", "SUP_SESSION_NOT_FOUND", "SUP_SPAWN_FAILED", "SUP_ORPHAN_CHILD_ALIVE", "SUP_STATE_FILE_CORRUPT", "SUP_ILLEGAL_TRANSITION", "SUP_SEND_NOT_CONFIRMED", "SUP_SEND_BLOCKED", "SUP_RECOMMENDATION_FORBIDDEN", "SUP_RECOMMENDATION_UNDETERMINED", "SUP_PERMISSION_PENDING", "SUP_PERMISSION_MODE_UNSAFE", "SUP_CONFIG_PATH_CONFLICT", "SUP_BILLING_GUARD_FAILED", "SUP_SEND_ABORTED", "SUP_RECOMMENDATION_REPEATED", "SUP_AUTO_CONTINUE_LIMIT_REACHED", "SUP_RESUME_FORBIDDEN", "SUP_VERIFY_FAILED", "SUP_SENSITIVE_PATH_BLOCKED", "SUP_COMMIT_FAILED", "SUP_PUSH_REJECTED_POLICY", "SUP_PUSH_FAILED", "SUP_ROTATE_STEP_FAILED", "SUP_STOP_ACTIVE", "SUP_RESTART_LIMIT_EXCEEDED", "SUP_NOTIFY_FAILED", "SUP_CLIENT_UNAVAILABLE", "SUP_VERB_UNKNOWN", "SUP_REQUEST_MALFORMED", "SUP_PEER_REJECTED":
+	case "SUP_CONFIG_INVALID", "SUP_INSTANCE_LOCK_HELD", "SUP_PROJECT_NOT_FOUND", "SUP_SESSION_ALREADY_RUNNING", "SUP_SESSION_LIMIT_REACHED", "SUP_SESSION_NOT_FOUND", "SUP_SPAWN_FAILED", "SUP_ORPHAN_CHILD_ALIVE", "SUP_STATE_FILE_CORRUPT", "SUP_ILLEGAL_TRANSITION", "SUP_SEND_NOT_CONFIRMED", "SUP_SEND_BLOCKED", "SUP_RECOMMENDATION_FORBIDDEN", "SUP_RECOMMENDATION_UNDETERMINED", "SUP_PERMISSION_PENDING", "SUP_PERMISSION_MODE_UNSAFE", "SUP_CONFIG_PATH_CONFLICT", "SUP_BILLING_GUARD_FAILED", "SUP_SEND_ABORTED", "SUP_RECOMMENDATION_REPEATED", "SUP_AUTO_CONTINUE_LIMIT_REACHED", "SUP_RESUME_FORBIDDEN", "SUP_OPERATOR_INPUT_FORBIDDEN", "SUP_VERIFY_FAILED", "SUP_SENSITIVE_PATH_BLOCKED", "SUP_COMMIT_FAILED", "SUP_PUSH_REJECTED_POLICY", "SUP_PUSH_FAILED", "SUP_ROTATE_STEP_FAILED", "SUP_STOP_ACTIVE", "SUP_RESTART_LIMIT_EXCEEDED", "SUP_NOTIFY_FAILED", "SUP_CLIENT_UNAVAILABLE", "SUP_VERB_UNKNOWN", "SUP_REQUEST_MALFORMED", "SUP_PEER_REJECTED":
 		return true
 	}
 	return false

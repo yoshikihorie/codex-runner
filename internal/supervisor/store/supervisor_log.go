@@ -40,6 +40,7 @@ type SupervisorLogEntry struct {
 	Level     LogLevel                       `json:"level"`
 	Kind      supervisor.SupervisorEventKind `json:"kind"`
 	SessionID string                         `json:"session_id,omitempty"`
+	SendID    string                         `json:"send_id,omitempty"`
 	Reason    SupervisorLogReason            `json:"reason,omitempty"`
 }
 

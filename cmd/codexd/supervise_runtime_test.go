@@ -12,6 +12,7 @@ import (
 
 	"github.com/yoshikihorie/codex-runner/internal/config"
 	"github.com/yoshikihorie/codex-runner/internal/supervisor"
+	"github.com/yoshikihorie/codex-runner/internal/supervisor/detect"
 	"github.com/yoshikihorie/codex-runner/internal/supervisor/gitops"
 	supervisortransport "github.com/yoshikihorie/codex-runner/internal/supervisor/transport"
 	"github.com/yoshikihorie/codex-runner/internal/supervisor/usecase"
@@ -32,6 +33,57 @@ func TestSuperviseRuntimeScreenWiring(t *testing.T) {
 	response := r.newDispatch().Handle(context.Background(), supervisortransport.Request{SupervisorProtocolVersion: supervisortransport.SupervisorProtocolVersion, Verb: "screen", Params: json.RawMessage(`{"session_id":"alpha-1"}`)}, 0)
 	if !response.OK || !strings.Contains(string(response.Result), "wired screen") {
 		t.Fatalf("response=%+v", response)
+	}
+}
+
+type runtimeOperatorPTY struct {
+	r     *supervisorRuntime
+	id    supervisor.SessionID
+	text  string
+	calls int
+}
+
+func (p *runtimeOperatorPTY) WriteLine(_ context.Context, value string, _ time.Duration, before func() bool) error {
+	p.calls++
+	p.text = value
+	shot := p.r.screens.Snapshot(p.id)
+	shot.Rows[1] = "❯\u00a0" + value
+	shot.Cells[1] = []supervisor.Cell{{Text: "❯"}, {Text: "\u00a0"}}
+	for _, r := range value {
+		shot.Cells[1] = append(shot.Cells[1], supervisor.Cell{Text: string(r)})
+	}
+	p.r.screens.SetSnapshot(p.id, shot)
+	if !before() {
+		return usecase.ErrStopActive
+	}
+	shot.Rows[1] = "❯\u00a0"
+	shot.Cells[1] = []supervisor.Cell{{Text: "❯"}, {Text: "\u00a0"}}
+	shot.ChangedAt = time.Now().Add(time.Second)
+	p.r.screens.SetSnapshot(p.id, shot)
+	p.r.send.NotifyConfirmation(usecase.SendConfirmation{SessionID: p.id, SendID: "alpha-1-s1", Screen: shot})
+	return nil
+}
+
+func TestSuperviseRuntime_SCNSup0567_SendInputDispatchWiring(t *testing.T) {
+	r, err := newSupervisorRuntime(context.Background(), config.SupervisorConfig{StateDir: t.TempDir(), NotifyCommand: "none", MaxSessions: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(r.close)
+	id := supervisor.SessionID("alpha-1")
+	if err := r.sessions.Save(supervisor.ManagedSession{SessionID: id, ProjectID: "alpha", CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionIdle, StateSince: time.Now().UTC(), RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	r.screens.SetSnapshot(id, usecase.ScreenSnapshot{State: "idle", Rows: []string{"────", "❯\u00a0", "────"}, Cells: [][]supervisor.Cell{{}, {{Text: "❯"}, {Text: "\u00a0"}}, {}}, ObservedAt: time.Now()})
+	r.observed.Set(id, detect.StateIdle)
+	pty := &runtimeOperatorPTY{r: r, id: id}
+	r.ptys.Register(id, pty)
+	d := r.newDispatch()
+	d.PeerResume = func(int, map[int]bool) (bool, bool, error) { return false, false, nil }
+	const body = "日本語 ＡＢＣ"
+	response := d.Handle(context.Background(), supervisortransport.Request{SupervisorProtocolVersion: supervisortransport.SupervisorProtocolVersion, Verb: "send-input", Params: json.RawMessage(`{"session_id":"alpha-1","text":"` + body + `"}`)}, 0)
+	if !response.OK || pty.calls != 1 || pty.text != body || !strings.Contains(string(response.Result), `"confirmed":true`) {
+		t.Fatalf("response=%+v calls=%d text=%q", response, pty.calls, pty.text)
 	}
 }
 

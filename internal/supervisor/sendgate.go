@@ -23,10 +23,14 @@ const (
 	SendBlockedPending      SupervisorSendBlockedReason = "pending"
 	SendBlockedUnconfirmed  SupervisorSendBlockedReason = "unconfirmed"
 	SendBlockedNotFixedText SupervisorSendBlockedReason = "not_fixed_text"
+	SendBlockedRateLimited  SupervisorSendBlockedReason = "rate_limited"
 )
 
 // SendKindAllowed applies FD-sup-02 §5.1's state and kind matrix.
 func SendKindAllowed(state, observed SupervisorSessionState, kind SupervisorSendKind, origins ...SendOrigin) bool {
+	if kind == SendKindOperatorInput {
+		return state == SessionIdle && observed == SessionIdle
+	}
 	if state != SessionIdle && state != SessionAwaitingRecommendation && state != SessionRotating {
 		return false
 	}

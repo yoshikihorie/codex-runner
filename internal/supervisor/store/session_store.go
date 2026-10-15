@@ -393,7 +393,7 @@ func validExitReason(x supervisor.SupervisorExitReason) bool {
 }
 func validSendKind(x supervisor.SupervisorSendKind) bool {
 	switch x {
-	case supervisor.SendKindRecommendationContinue, supervisor.SendKindRemoteControl, supervisor.SendKindHandoffEnd, supervisor.SendKindSessionStart, supervisor.SendKindParallelInstruction, supervisor.SendKindHandoffExit:
+	case supervisor.SendKindRecommendationContinue, supervisor.SendKindRemoteControl, supervisor.SendKindHandoffEnd, supervisor.SendKindSessionStart, supervisor.SendKindParallelInstruction, supervisor.SendKindHandoffExit, supervisor.SendKindOperatorInput:
 		return true
 	}
 	return false

@@ -51,6 +51,7 @@ type supervisorRuntime struct {
 	screens        *usecase.ObservedScreenStore
 	pending        *usecase.PendingRemoteControlUseCase
 	send           *usecase.SendInputUseCase
+	operator       *usecase.SendOperatorInputUseCase
 	auto           *usecase.AutoContinueUseCase
 	control        *usecase.StopControlUseCase
 	recovery       *usecase.RecoverSessionUseCase
@@ -124,7 +125,8 @@ func newSupervisorRuntime(parent context.Context, cfg config.SupervisorConfig) (
 	for id, project := range r.projects {
 		instructions[id] = project.ParallelInstruction
 	}
-	r.send = &usecase.SendInputUseCase{Sessions: r.sessions, Screens: r.screens, PTYs: r.ptys, IsStopped: r.stops.IsStopped, StopState: r.stops, ProjectInstructions: instructions, OperationalLog: log, RecordStructured: record, Notify: notify}
+	r.send = &usecase.SendInputUseCase{Sessions: r.sessions, Screens: r.screens, Observed: r.observed, PTYs: r.ptys, IsStopped: r.stops.IsStopped, StopState: r.stops, ProjectInstructions: instructions, OperationalLog: log, RecordStructured: record, Notify: notify}
+	r.operator = &usecase.SendOperatorInputUseCase{Sessions: r.sessions, Send: r.send, RecordStructured: record}
 	r.pending = &usecase.PendingRemoteControlUseCase{Sessions: r.sessions, Send: r.send, RecordStructured: record, Now: time.Now}
 	r.auto = &usecase.AutoContinueUseCase{Extractor: supervisor.RecommendationExtractor{ObservedScreen: true}}
 	r.auto.Bind(r.sessions, r.send, r.stops.IsStopped, record, notify)
@@ -384,7 +386,7 @@ func runSupervise(parent context.Context, args []string, stderr io.Writer) int {
 }
 
 func (r *supervisorRuntime) newDispatch() *supervisortransport.Dispatch {
-	return &supervisortransport.Dispatch{Sessions: r.sessions, Control: r.control, StartSession: r.start, StopSession: r.stopSession, Events: r.events, ScreenRead: &usecase.ScreenReadUseCase{Sessions: r.sessions, Screens: r.screens, RecordStructured: r.recorder.RecordStructured}, ObserveFor: func(project string) *usecase.ObserveSessionUseCase {
+	return &supervisortransport.Dispatch{Sessions: r.sessions, Control: r.control, StartSession: r.start, StopSession: r.stopSession, Events: r.events, ScreenRead: &usecase.ScreenReadUseCase{Sessions: r.sessions, Screens: r.screens, RecordStructured: r.recorder.RecordStructured}, OperatorInput: r.operator, ObserveFor: func(project string) *usecase.ObserveSessionUseCase {
 		deps := r.projectDeps(project)
 		if deps == nil {
 			return nil

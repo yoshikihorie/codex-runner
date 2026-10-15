@@ -98,6 +98,7 @@ const (
 	SendKindSessionStart           SupervisorSendKind = "session_start"
 	SendKindParallelInstruction    SupervisorSendKind = "parallel_instruction"
 	SendKindHandoffExit            SupervisorSendKind = "handoff_exit"
+	SendKindOperatorInput          SupervisorSendKind = "operator_input"
 )
 
 type PendingSend struct {
@@ -641,11 +642,21 @@ const (
 	EventKindLunaImplNotAllowed              SupervisorEventKind = "luna_impl_not_allowed"
 	EventKindRotateIdleWaitTimeout           SupervisorEventKind = "rotate_idle_wait_timeout"
 	EventKindScreenRead                      SupervisorEventKind = "screen_read"
+	EventKindOperatorInputRefused            SupervisorEventKind = "operator_input_refused"
+)
+
+type OperatorInputRefuseReason string
+
+const (
+	OperatorInputRefuseSupervisedCaller OperatorInputRefuseReason = "supervised_caller"
+	OperatorInputRefuseForbiddenText    OperatorInputRefuseReason = "forbidden_text"
 )
 
 func ValidSupervisorEventKind(value SupervisorEventKind) bool {
 	switch value {
 	case EventKindScreenRead:
+		return true
+	case EventKindOperatorInputRefused:
 		return true
 	case EventKindSessionStarted:
 		return true

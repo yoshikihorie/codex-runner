@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/yoshikihorie/codex-runner/internal/proc"
 	"github.com/yoshikihorie/codex-runner/internal/supervisor"
@@ -41,6 +42,7 @@ type Dispatch struct {
 		ReadAll() ([]store.Event, int, error)
 	}
 	ScreenRead        *usecase.ScreenReadUseCase
+	OperatorInput     *usecase.SendOperatorInputUseCase
 	ObserveFor        func(string) *usecase.ObserveSessionUseCase
 	NewSessionID      func(string) (supervisor.SessionID, error)
 	SupervisorContext context.Context
@@ -55,6 +57,7 @@ type Dispatch struct {
 type dispatchParams struct {
 	SessionID string  `json:"session_id"`
 	ProjectID string  `json:"project_id"`
+	Text      *string `json:"text"`
 	SinceSeq  *uint64 `json:"since_seq"`
 	Limit     *int    `json:"limit"`
 }
@@ -65,11 +68,14 @@ func (d *Dispatch) Handle(ctx context.Context, request Request, peerPID int) Res
 	}
 	verb := request.Verb
 	switch verb {
-	case "status", "stop", "resume", "start-session", "stop-session", "events", "screen":
+	case "status", "stop", "resume", "start-session", "stop-session", "events", "screen", "send-input":
 	default:
 		return Response{Error: &ErrorBody{Code: "SUP_VERB_UNKNOWN", MessageKey: "error.supervisor.verbUnknown", Details: map[string]any{"verb": cleanVerb(verb)}}}
 	}
 	var p dispatchParams
+	if verb == "send-input" && !utf8.Valid(request.Params) {
+		return malformedResponse()
+	}
 	if len(request.Params) > 0 {
 		decoder := json.NewDecoder(bytes.NewReader(request.Params))
 		decoder.DisallowUnknownFields()
@@ -106,6 +112,26 @@ func (d *Dispatch) Handle(ctx context.Context, request Request, peerPID int) Res
 	if verb == "screen" && len(request.Params) > 0 {
 		var fields map[string]json.RawMessage
 		if err := json.Unmarshal(request.Params, &fields); err != nil || len(fields) != 1 || fields["session_id"] == nil {
+			return malformedResponse()
+		}
+	}
+	var operatorText supervisor.OperatorText
+	if verb == "send-input" {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(request.Params, &fields); err != nil || len(fields) != 2 || fields["session_id"] == nil || fields["text"] == nil || p.SessionID == "" || p.Text == nil || strings.ContainsRune(*p.Text, utf8.RuneError) {
+			return malformedResponse()
+		}
+		var err error
+		operatorText, err = supervisor.NewOperatorText(*p.Text)
+		if err != nil {
+			return malformedResponse()
+		}
+	} else if len(request.Params) != 0 {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(request.Params, &fields); err != nil {
+			return malformedResponse()
+		}
+		if _, hasText := fields["text"]; hasText {
 			return malformedResponse()
 		}
 	}
@@ -288,6 +314,37 @@ func (d *Dispatch) Handle(ctx context.Context, request Request, peerPID int) Res
 			return response
 		}
 		return success(result)
+	case "send-input":
+		if d.OperatorInput == nil {
+			return dispatchError(errors.New("SUP_CONFIG_INVALID"))
+		}
+		probe := d.PeerResume
+		if probe == nil {
+			probe = proc.PeerResumeConditions
+		}
+		_, supervised, probeErr := probe(peerPID, usecase.OwnedChildPIDs())
+		if probeErr != nil {
+			supervised = true
+		}
+		result, err := d.OperatorInput.Execute(ctx, *id, operatorText, supervised)
+		if result.Blocked != "" {
+			response := dispatchError(errors.New("SUP_SEND_BLOCKED"))
+			response.Error.Details = map[string]any{"session_id": p.SessionID, "reason": string(result.Blocked)}
+			return response
+		}
+		if err != nil {
+			response := dispatchError(err)
+			var operatorErr *usecase.OperatorInputError
+			if errors.As(err, &operatorErr) {
+				if operatorErr.Reason != "" {
+					response.Error.Details = map[string]any{"session_id": p.SessionID, "reason": string(operatorErr.Reason)}
+				} else if operatorErr.SendID != "" {
+					response.Error.Details = map[string]any{"session_id": p.SessionID, "send_id": operatorErr.SendID}
+				}
+			}
+			return response
+		}
+		return success(map[string]any{"session_id": p.SessionID, "send_id": result.SendID, "confirmed": true})
 	}
 	return malformedResponse()
 }
@@ -322,43 +379,44 @@ func dispatchError(err error) Response {
 		code = strings.TrimSuffix(strings.Fields(err.Error())[0], ":")
 	}
 	keys := map[string]string{
-		"SUP_CONFIG_INVALID":              "error.supervisor.configInvalid",
-		"SUP_CONFIG_PATH_CONFLICT":        "error.supervisor.configPathConflict",
-		"SUP_PROJECT_NOT_FOUND":           "error.supervisor.projectNotFound",
-		"SUP_PROJECT_CWD_UNAVAILABLE":     "error.supervisor.projectCwdUnavailable",
-		"SUP_SESSION_ALREADY_RUNNING":     "error.supervisor.sessionAlreadyRunning",
-		"SUP_SESSION_LIMIT_REACHED":       "error.supervisor.sessionLimitReached",
-		"SUP_SESSION_NOT_FOUND":           "error.supervisor.sessionNotFound",
-		"SUP_SCREEN_UNAVAILABLE":          "error.supervisor.screenUnavailable",
-		"SUP_SPAWN_FAILED":                "error.supervisor.spawnFailed",
-		"SUP_ORPHAN_CHILD_ALIVE":          "error.supervisor.orphanChildAlive",
-		"SUP_STATE_FILE_CORRUPT":          "error.supervisor.stateFileCorrupt",
-		"SUP_ILLEGAL_TRANSITION":          "error.supervisor.illegalTransition",
-		"SUP_BILLING_GUARD_FAILED":        "error.supervisor.billingGuardFailed",
-		"SUP_RESUME_FORBIDDEN":            "error.supervisor.resumeForbidden",
-		"SUP_STOP_ACTIVE":                 "error.supervisor.stopActive",
-		"SUP_REQUEST_MALFORMED":           "error.supervisor.requestMalformed",
-		"SUP_INSTANCE_LOCK_HELD":          "error.supervisor.instanceLockHeld",
-		"SUP_SEND_NOT_CONFIRMED":          "error.supervisor.sendNotConfirmed",
-		"SUP_SEND_BLOCKED":                "error.supervisor.sendBlocked",
-		"SUP_RECOMMENDATION_FORBIDDEN":    "error.supervisor.recommendationForbidden",
-		"SUP_RECOMMENDATION_UNDETERMINED": "error.supervisor.recommendationUndetermined",
-		"SUP_PERMISSION_PENDING":          "info.supervisor.permissionPending",
-		"SUP_PERMISSION_MODE_UNSAFE":      "info.supervisor.permissionModeUnsafe",
-		"SUP_SEND_ABORTED":                "error.supervisor.sendAborted",
-		"SUP_RECOMMENDATION_REPEATED":     "error.supervisor.recommendationRepeated",
-		"SUP_AUTO_CONTINUE_LIMIT_REACHED": "error.supervisor.autoContinueLimitReached",
-		"SUP_VERIFY_FAILED":               "error.supervisor.verifyFailed",
-		"SUP_SENSITIVE_PATH_BLOCKED":      "error.supervisor.sensitivePathBlocked",
-		"SUP_COMMIT_FAILED":               "error.supervisor.commitFailed",
-		"SUP_PUSH_REJECTED_POLICY":        "error.supervisor.pushRejectedPolicy",
-		"SUP_PUSH_FAILED":                 "error.supervisor.pushFailed",
-		"SUP_ROTATE_STEP_FAILED":          "error.supervisor.rotateStepFailed",
-		"SUP_RESTART_LIMIT_EXCEEDED":      "error.supervisor.restartLimitExceeded",
-		"SUP_NOTIFY_FAILED":               "error.supervisor.notifyFailed",
-		"SUP_CLIENT_UNAVAILABLE":          "error.supervisor.clientUnavailable",
-		"SUP_VERB_UNKNOWN":                "error.supervisor.verbUnknown",
-		"SUP_PEER_REJECTED":               "error.supervisor.peerRejected",
+		"SUP_CONFIG_INVALID":                       "error.supervisor.configInvalid",
+		"SUP_CONFIG_PATH_CONFLICT":                 "error.supervisor.configPathConflict",
+		"SUP_PROJECT_NOT_FOUND":                    "error.supervisor.projectNotFound",
+		"SUP_PROJECT_CWD_UNAVAILABLE":              "error.supervisor.projectCwdUnavailable",
+		"SUP_SESSION_ALREADY_RUNNING":              "error.supervisor.sessionAlreadyRunning",
+		"SUP_SESSION_LIMIT_REACHED":                "error.supervisor.sessionLimitReached",
+		"SUP_SESSION_NOT_FOUND":                    "error.supervisor.sessionNotFound",
+		"SUP_SCREEN_UNAVAILABLE":                   "error.supervisor.screenUnavailable",
+		"SUP_SPAWN_FAILED":                         "error.supervisor.spawnFailed",
+		"SUP_ORPHAN_CHILD_ALIVE":                   "error.supervisor.orphanChildAlive",
+		"SUP_STATE_FILE_CORRUPT":                   "error.supervisor.stateFileCorrupt",
+		"SUP_ILLEGAL_TRANSITION":                   "error.supervisor.illegalTransition",
+		"SUP_BILLING_GUARD_FAILED":                 "error.supervisor.billingGuardFailed",
+		"SUP_RESUME_FORBIDDEN":                     "error.supervisor.resumeForbidden",
+		supervisor.ErrorCodeOperatorInputForbidden: supervisor.MessageKeyOperatorInputForbidden,
+		"SUP_STOP_ACTIVE":                          "error.supervisor.stopActive",
+		"SUP_REQUEST_MALFORMED":                    "error.supervisor.requestMalformed",
+		"SUP_INSTANCE_LOCK_HELD":                   "error.supervisor.instanceLockHeld",
+		"SUP_SEND_NOT_CONFIRMED":                   "error.supervisor.sendNotConfirmed",
+		"SUP_SEND_BLOCKED":                         "error.supervisor.sendBlocked",
+		"SUP_RECOMMENDATION_FORBIDDEN":             "error.supervisor.recommendationForbidden",
+		"SUP_RECOMMENDATION_UNDETERMINED":          "error.supervisor.recommendationUndetermined",
+		"SUP_PERMISSION_PENDING":                   "info.supervisor.permissionPending",
+		"SUP_PERMISSION_MODE_UNSAFE":               "info.supervisor.permissionModeUnsafe",
+		"SUP_SEND_ABORTED":                         "error.supervisor.sendAborted",
+		"SUP_RECOMMENDATION_REPEATED":              "error.supervisor.recommendationRepeated",
+		"SUP_AUTO_CONTINUE_LIMIT_REACHED":          "error.supervisor.autoContinueLimitReached",
+		"SUP_VERIFY_FAILED":                        "error.supervisor.verifyFailed",
+		"SUP_SENSITIVE_PATH_BLOCKED":               "error.supervisor.sensitivePathBlocked",
+		"SUP_COMMIT_FAILED":                        "error.supervisor.commitFailed",
+		"SUP_PUSH_REJECTED_POLICY":                 "error.supervisor.pushRejectedPolicy",
+		"SUP_PUSH_FAILED":                          "error.supervisor.pushFailed",
+		"SUP_ROTATE_STEP_FAILED":                   "error.supervisor.rotateStepFailed",
+		"SUP_RESTART_LIMIT_EXCEEDED":               "error.supervisor.restartLimitExceeded",
+		"SUP_NOTIFY_FAILED":                        "error.supervisor.notifyFailed",
+		"SUP_CLIENT_UNAVAILABLE":                   "error.supervisor.clientUnavailable",
+		"SUP_VERB_UNKNOWN":                         "error.supervisor.verbUnknown",
+		"SUP_PEER_REJECTED":                        "error.supervisor.peerRejected",
 	}
 	key := keys[code]
 	if key == "" {

@@ -333,6 +333,48 @@ func TestSendEchoWithRealDetectorCanReachEnter(t *testing.T) {
 	}
 }
 
+func TestOperatorEchoFromCapturedScreenAllowsIdleAndWorking(t *testing.T) {
+	_, source, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("source path unavailable")
+	}
+	data, err := os.ReadFile(filepath.Join(filepath.Dir(source), "..", "testdata", "claude-default-screen.txt"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows := strings.Split(string(data), "\n")
+	const text = "hello from operator"
+	found := false
+	for i, row := range rows {
+		if strings.HasPrefix(row, "❯\u00a0") {
+			// The capture contains an extra blank spacer; active input has the border adjacent.
+			if i > 0 && strings.TrimSpace(rows[i-1]) == "" {
+				rows = append(rows[:i-1], rows[i:]...)
+				i--
+			}
+			rows[i] = "❯\u00a0" + text
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatal("captured screen has no input row")
+	}
+	now := time.Now()
+	for _, tc := range []struct {
+		name    string
+		changed time.Time
+		want    detect.DetectedState
+	}{{"quiet", now.Add(-detect.QuietPeriod), detect.StateIdle}, {"fresh echo", now, detect.StateWorking}} {
+		t.Run(tc.name, func(t *testing.T) {
+			result, err := detect.NewCompositeDetector(detect.DefaultPatternSet()).Detect(context.Background(), detect.DetectInput{CLI: supervisor.CLIClaude, ScreenRows: rows, Now: now, LastScreenChangeAt: tc.changed})
+			if err != nil || result.State != tc.want || !screenReadyForEnter(ScreenSnapshot{Rows: rows, State: result.State}, text, true) {
+				t.Fatalf("state=%s want=%s err=%v", result.State, tc.want, err)
+			}
+		})
+	}
+}
+
 func TestSendRealDetectorEchoDoesNotAbort(t *testing.T) {
 	id, _ := supervisor.NewSessionID("alpha-1")
 	s := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, State: supervisor.SessionIdle, SendGate: supervisor.SendGateRecord{NextSeq: 1}}}
@@ -1191,9 +1233,9 @@ func TestSCNsup0222AmbiguousPTYErrorKeepsPending(t *testing.T) {
 	}
 }
 
-func TestSCNsup0219SendInputRejectsArbitraryKindAndHasNoTextField(t *testing.T) {
+func TestSCNsup0219SendInputRejectsArbitraryKindAndOnlyOperatorHasText(t *testing.T) {
 	typ := reflect.TypeOf(SendInput{})
-	if typ.NumField() != 4 || typ.Field(0).Type != reflect.TypeOf(supervisor.SessionID("")) || typ.Field(1).Type != reflect.TypeOf(supervisor.SupervisorSendKind("")) || typ.Field(2).Type != reflect.TypeOf(supervisor.SendOriginNormal) || typ.Field(3).Type != reflect.TypeOf(time.Duration(0)) {
+	if typ.NumField() != 5 || typ.Field(0).Type != reflect.TypeOf(supervisor.SessionID("")) || typ.Field(1).Type != reflect.TypeOf(supervisor.SupervisorSendKind("")) || typ.Field(2).Type != reflect.TypeOf(supervisor.OperatorText{}) || typ.Field(3).Type != reflect.TypeOf(supervisor.SendOriginNormal) || typ.Field(4).Type != reflect.TypeOf(time.Duration(0)) {
 		t.Fatalf("unexpected input type: %v", typ)
 	}
 	id, _ := supervisor.NewSessionID("alpha-1")

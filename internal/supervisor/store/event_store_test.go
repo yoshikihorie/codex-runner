@@ -11,6 +11,39 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/supervisor"
 )
 
+func TestEventStore_SCNSup0578_OperatorFieldsAreRestricted(t *testing.T) {
+	st := NewEventStore(t.TempDir())
+	length := 5
+	for _, kind := range []supervisor.SupervisorEventKind{supervisor.EventKindSendIssued, supervisor.EventKindSendConfirmed, supervisor.EventKindSendAborted, supervisor.EventKindSendUnconfirmed, supervisor.EventKindSendBlocked} {
+		event := Event{Kind: kind, SessionID: "alpha-1", SendKind: supervisor.SendKindOperatorInput, TextLength: &length}
+		if kind == supervisor.EventKindSendBlocked {
+			event.Reason = ReasonState
+		}
+		if _, err := st.Record(event); err != nil {
+			t.Fatalf("valid %s event rejected: %v", kind, err)
+		}
+	}
+	for _, event := range []Event{
+		{Kind: supervisor.EventKindSendIssued, SessionID: "alpha-1", SendKind: supervisor.SendKindOperatorInput},
+		{Kind: supervisor.EventKindSendIssued, SessionID: "alpha-1", SendKind: supervisor.SendKindRemoteControl, TextLength: &length},
+		{Kind: supervisor.EventKindSendBlocked, SessionID: "alpha-1", SendKind: supervisor.SendKindRemoteControl, Reason: ReasonRateLimited},
+		{Kind: supervisor.EventKindScreenRead, SessionID: "alpha-1", RowCount: &length, TextLength: &length},
+		{Kind: supervisor.EventKindOperatorInputRefused, SessionID: "alpha-1", Reason: ReasonForbiddenText, TextLength: &length},
+		{Kind: supervisor.EventKindOperatorInputRefused, SessionID: "alpha-1", Reason: ReasonForbiddenText, SendKind: supervisor.SendKindOperatorInput},
+		{Kind: supervisor.EventKindOperatorInputRefused, SessionID: "alpha-1", Reason: ReasonForbiddenText, Code: "SUP_OPERATOR_INPUT_FORBIDDEN"},
+		{Kind: supervisor.EventKindOperatorInputRefused, SessionID: "alpha-1", Reason: "free text"},
+	} {
+		if _, err := st.Record(event); err == nil {
+			t.Fatalf("invalid event accepted: %+v", event)
+		}
+	}
+	for _, reason := range []EventReason{ReasonSupervisedCaller, ReasonForbiddenText} {
+		if _, err := st.Record(Event{Kind: supervisor.EventKindOperatorInputRefused, SessionID: "alpha-1", Reason: reason}); err != nil {
+			t.Fatalf("reason %s rejected: %v", reason, err)
+		}
+	}
+}
+
 func TestEventStoreRestoresSequenceAndOmitsBody(t *testing.T) {
 	root := t.TempDir()
 	store := NewEventStore(root)

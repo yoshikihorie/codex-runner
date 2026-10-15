@@ -17,6 +17,7 @@ import (
 type SendInput struct {
 	SessionID      supervisor.SessionID
 	Kind           supervisor.SupervisorSendKind
+	OperatorText   supervisor.OperatorText
 	Origin         supervisor.SendOrigin
 	ConfirmTimeout time.Duration
 }
@@ -109,6 +110,7 @@ type SendConfirmation struct {
 type SendInputUseCase struct {
 	Sessions             SessionRecordStore
 	Screens              ScreenReader
+	Observed             *ObservedStateStore
 	PTY                  PTYWriter
 	PTYs                 *PTYRegistry
 	IsStopped            func(supervisor.SessionID) bool
@@ -201,7 +203,7 @@ func (u *SendInputUseCase) record(e store.Event) error {
 	}
 	return nil
 }
-func (u *SendInputUseCase) blocked(id supervisor.SessionID, reason supervisor.SupervisorSendBlockedReason) (SendResult, error) {
+func (u *SendInputUseCase) blocked(id supervisor.SessionID, reason supervisor.SupervisorSendBlockedReason, inputs ...SendInput) (SendResult, error) {
 	var logErr error
 	if reason == supervisor.SendBlockedNotFixedText && u.OperationalLog != nil {
 		logErr = u.OperationalLog.Record(store.SupervisorLogEntry{Level: store.LogLevelError, Kind: supervisor.EventKindSendBlocked, SessionID: id.String()})
@@ -209,7 +211,13 @@ func (u *SendInputUseCase) blocked(id supervisor.SessionID, reason supervisor.Su
 	if reason == supervisor.SendBlockedNotFixedText && u.LogBlocked != nil {
 		u.LogBlocked(id, reason)
 	}
-	err := u.record(store.Event{Kind: supervisor.EventKindSendBlocked, SessionID: id.String(), Reason: store.EventReason(reason), Code: "SUP_SEND_BLOCKED"})
+	event := store.Event{Kind: supervisor.EventKindSendBlocked, SessionID: id.String(), Reason: store.EventReason(reason), Code: "SUP_SEND_BLOCKED"}
+	if len(inputs) != 0 && inputs[0].Kind == supervisor.SendKindOperatorInput {
+		event.SendKind = supervisor.SendKindOperatorInput
+		length := inputs[0].OperatorText.Len()
+		event.TextLength = &length
+	}
+	err := u.record(event)
 	return SendResult{Blocked: reason}, errors.Join(logErr, err)
 }
 func (u *SendInputUseCase) stopped(id supervisor.SessionID) bool {
@@ -312,7 +320,7 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 	}
 	lock := u.sessionLock(in.SessionID)
 	if !lock.TryLock() {
-		return u.blocked(in.SessionID, supervisor.SendBlockedPending)
+		return u.blocked(in.SessionID, supervisor.SendBlockedPending, in)
 	}
 	defer lock.Unlock()
 	s, err := u.Sessions.Load(in.SessionID)
@@ -321,25 +329,33 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 	}
 	parallel := u.parallelInstructionFor(s)
 	message, fixed := supervisor.FixedText(in.Kind, parallel)
+	if in.Kind == supervisor.SendKindOperatorInput {
+		message, fixed = in.OperatorText.PTYText(), in.OperatorText.Len() > 0
+	} else if in.OperatorText.Len() != 0 {
+		fixed = false
+	}
 	shot := u.Screens.Snapshot(in.SessionID)
 	fresh := !s.SendGate.UnconfirmedDiscarded || shot.State == detect.StateIdle && snapshotObservedAt(shot).After(s.StateSince) && !snapshotChangedAt(shot).IsZero() && u.now().Sub(snapshotChangedAt(shot)) >= detect.QuietPeriod && screenReadyForWrite(shot)
 	reason := supervisor.CheckSendGate(s, supervisor.SupervisorSessionState(shot.State), in.Kind, u.stopped(in.SessionID), fixed, fresh, in.Origin)
 	if reason != "" {
-		return u.blocked(in.SessionID, reason)
+		return u.blocked(in.SessionID, reason, in)
+	}
+	if in.Kind == supervisor.SendKindOperatorInput && !operatorScreenReadyForWrite(shot) {
+		return u.blocked(in.SessionID, supervisor.SendBlockedState, in)
 	}
 	second := u.Screens.Snapshot(in.SessionID)
 	if u.stopped(in.SessionID) {
-		return u.blocked(in.SessionID, supervisor.SendBlockedStop)
+		return u.blocked(in.SessionID, supervisor.SendBlockedStop, in)
 	}
-	if !supervisor.SendKindAllowed(s.State, supervisor.SupervisorSessionState(second.State), in.Kind, in.Origin) || !screenReadyForWrite(second) {
-		return u.blocked(in.SessionID, supervisor.SendBlockedState)
+	if !supervisor.SendKindAllowed(s.State, supervisor.SupervisorSessionState(second.State), in.Kind, in.Origin) || !screenReadyForWrite(second) || in.Kind == supervisor.SendKindOperatorInput && !operatorScreenReadyForWrite(second) {
+		return u.blocked(in.SessionID, supervisor.SendBlockedState, in)
 	}
 	pty := u.PTY
 	if u.PTYs != nil {
 		pty = u.PTYs.Get(in.SessionID)
 	}
 	if pty == nil {
-		return u.blocked(in.SessionID, supervisor.SendBlockedState)
+		return u.blocked(in.SessionID, supervisor.SendBlockedState, in)
 	}
 	prev := s.SendGate.LastSendConfirmed
 	prevEver := s.SendGate.EverSent
@@ -369,16 +385,16 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 	})
 	if err != nil {
 		if errors.Is(err, errSendStateChanged) {
-			return u.blocked(in.SessionID, supervisor.SendBlockedState)
+			return u.blocked(in.SessionID, supervisor.SendBlockedState, in)
 		}
 		if errors.Is(err, errSendPendingAppeared) {
-			return u.blocked(in.SessionID, supervisor.SendBlockedPending)
+			return u.blocked(in.SessionID, supervisor.SendBlockedPending, in)
 		}
 		return SendResult{}, err
 	}
 	result := SendResult{SendID: pending.SendID}
-	if err = u.record(store.Event{Kind: supervisor.EventKindSendIssued, SessionID: in.SessionID.String(), SendID: pending.SendID, SendKind: in.Kind}); err != nil {
-		return result, errors.Join(err, u.blockBeforeText(in.SessionID, pending, prevEver, prev, supervisor.SendBlockedState))
+	if err = u.record(sendEvent(supervisor.EventKindSendIssued, in, pending, "")); err != nil {
+		return result, errors.Join(err, u.blockBeforeText(in, pending, prevEver, prev, supervisor.SendBlockedState))
 	}
 	if in.Kind == supervisor.SendKindRecommendationContinue && u.RecommendationIssued != nil {
 		if hash, ok := ctx.Value(recommendationHashContextKey{}).([32]byte); ok {
@@ -387,14 +403,31 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 	}
 	if u.stopped(in.SessionID) {
 		result.Blocked = supervisor.SendBlockedStop
-		return result, u.blockBeforeText(in.SessionID, pending, prevEver, prev, supervisor.SendBlockedStop)
+		return result, u.blockBeforeText(in, pending, prevEver, prev, supervisor.SendBlockedStop)
+	}
+	if in.Kind == supervisor.SendKindOperatorInput && !operatorScreenReadyForWrite(u.Screens.Snapshot(in.SessionID)) {
+		result.Blocked = supervisor.SendBlockedState
+		return result, u.blockBeforeText(in, pending, prevEver, prev, supervisor.SendBlockedState)
 	}
 	var crAt time.Time
 	var beforeCalled, beforeAllowed bool
 	before := func() bool {
 		beforeCalled = true
-		if u.stopped(in.SessionID) || !screenReadyForEnter(u.Screens.Snapshot(in.SessionID), message) {
+		shot := u.Screens.Snapshot(in.SessionID)
+		if u.stopped(in.SessionID) || in.Kind == supervisor.SendKindOperatorInput && (shot.State != detect.StateIdle && shot.State != detect.StateWorking || shot.CompletionMenu) || !screenReadyForEnter(shot, message, in.Kind == supervisor.SendKindOperatorInput) {
 			return false
+		}
+		if in.Kind == supervisor.SendKindOperatorInput {
+			current, err := u.Sessions.Load(in.SessionID)
+			if err != nil || current.State != supervisor.SessionIdle && current.State != supervisor.SessionWorking {
+				return false
+			}
+			if u.Observed != nil {
+				state, ok := u.Observed.Get(in.SessionID)
+				if !ok || state != detect.StateIdle && state != detect.StateWorking {
+					return false
+				}
+			}
 		}
 		crAt = u.now()
 		u.markCR(in.SessionID, pending.SendID)
@@ -403,13 +436,22 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 	}
 	err = pty.WriteLine(ctx, message, supervisor.SupervisorSendEnterDelay, before)
 	if err != nil {
+		if in.Kind == supervisor.SendKindOperatorInput && u.OperationalLog != nil {
+			kind := supervisor.EventKindSendAborted
+			if beforeAllowed {
+				kind = supervisor.EventKindSendUnconfirmed
+			}
+			if logErr := u.logOperatorSendOutcome(in, pending, kind); logErr != nil {
+				err = errors.Join(err, logErr)
+			}
+		}
 		if beforeAllowed {
-			return result, errors.Join(err, u.unconfirmed(in.SessionID, pending, in.Origin))
+			return result, errors.Join(err, u.unconfirmed(in, pending))
 		}
 		if !beforeCalled && (strings.ContainsAny(message, "\r\n") || supervisor.SupervisorSendEnterDelay < 0 || err.Error() == "line text must not contain CR or LF" || err.Error() == "delay must not be negative") {
-			return result, errors.Join(err, u.blockBeforeText(in.SessionID, pending, prevEver, prev, supervisor.SendBlockedState))
+			return result, errors.Join(err, u.blockBeforeText(in, pending, prevEver, prev, supervisor.SendBlockedState))
 		}
-		return result, errors.Join(err, u.abortBeforeCR(in.SessionID, pending, prevEver, prev, in.Origin))
+		return result, errors.Join(err, u.abortBeforeCR(in, pending, prevEver, prev))
 	}
 	timeout := in.ConfirmTimeout
 	if timeout <= 0 && in.Kind == supervisor.SendKindHandoffExit && in.Origin == supervisor.SendOriginHandoff {
@@ -445,7 +487,7 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 					if !u.CRWritten(in.SessionID, pending.SendID) {
 						continue
 					}
-					return u.confirmSend(in.SessionID, pending)
+					return u.confirmSend(in, pending)
 				}
 				current, err := u.Sessions.Load(in.SessionID)
 				if err != nil {
@@ -479,16 +521,20 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 			if !blank && (in.Kind == supervisor.SendKindRemoteControl || !c.Screen.Processing) {
 				continue
 			}
-			return u.confirmSend(in.SessionID, pending)
+			return u.confirmSend(in, pending)
 		case <-timer.C:
-			if err := u.unconfirmed(in.SessionID, pending, in.Origin); err != nil {
-				return result, err
-			}
-			return result, errors.New("SUP_SEND_NOT_CONFIRMED")
+			return result, errors.Join(errors.New("SUP_SEND_NOT_CONFIRMED"), u.unconfirmed(in, pending), u.logOperatorSendOutcome(in, pending, supervisor.EventKindSendUnconfirmed))
 		case <-ctx.Done():
-			return result, errors.Join(ctx.Err(), u.unconfirmed(in.SessionID, pending, in.Origin))
+			return result, errors.Join(ctx.Err(), u.unconfirmed(in, pending), u.logOperatorSendOutcome(in, pending, supervisor.EventKindSendUnconfirmed))
 		}
 	}
+}
+
+func (u *SendInputUseCase) logOperatorSendOutcome(in SendInput, p supervisor.PendingSend, kind supervisor.SupervisorEventKind) error {
+	if in.Kind != supervisor.SendKindOperatorInput || u.OperationalLog == nil {
+		return nil
+	}
+	return u.OperationalLog.Record(store.SupervisorLogEntry{Level: store.LogLevelWarn, Kind: kind, SessionID: in.SessionID.String(), SendID: p.SendID})
 }
 
 func (u *SendInputUseCase) parallelInstructionFor(s supervisor.ManagedSession) string {
@@ -501,7 +547,8 @@ func (u *SendInputUseCase) parallelInstructionFor(s supervisor.ManagedSession) s
 	return defaultParallelInstruction
 }
 
-func (u *SendInputUseCase) abortBeforeCR(id supervisor.SessionID, p supervisor.PendingSend, ever, confirmed bool, origin supervisor.SendOrigin) error {
+func (u *SendInputUseCase) abortBeforeCR(in SendInput, p supervisor.PendingSend, ever, confirmed bool) error {
+	id, origin := in.SessionID, in.Origin
 	if err := UpdateSession(u.Sessions, id, func(v *supervisor.ManagedSession) error {
 		v.SendGate.Pending = nil
 		v.SendGate.EverSent = ever
@@ -514,7 +561,7 @@ func (u *SendInputUseCase) abortBeforeCR(id supervisor.SessionID, p supervisor.P
 	}); err != nil {
 		return err
 	}
-	if err := u.record(store.Event{Kind: supervisor.EventKindSendAborted, SessionID: id.String(), SendID: p.SendID, SendKind: p.Kind, Code: "SUP_SEND_ABORTED"}); err != nil {
+	if err := u.record(sendEvent(supervisor.EventKindSendAborted, in, p, "SUP_SEND_ABORTED")); err != nil {
 		return err
 	}
 	if origin != supervisor.SendOriginHandoff && u.Notify != nil {
@@ -523,7 +570,8 @@ func (u *SendInputUseCase) abortBeforeCR(id supervisor.SessionID, p supervisor.P
 	return nil
 }
 
-func (u *SendInputUseCase) blockBeforeText(id supervisor.SessionID, p supervisor.PendingSend, ever, confirmed bool, reason supervisor.SupervisorSendBlockedReason) error {
+func (u *SendInputUseCase) blockBeforeText(in SendInput, p supervisor.PendingSend, ever, confirmed bool, reason supervisor.SupervisorSendBlockedReason) error {
+	id := in.SessionID
 	if err := UpdateSession(u.Sessions, id, func(v *supervisor.ManagedSession) error {
 		v.SendGate.Pending = nil
 		v.SendGate.EverSent = ever
@@ -532,11 +580,12 @@ func (u *SendInputUseCase) blockBeforeText(id supervisor.SessionID, p supervisor
 	}); err != nil {
 		return err
 	}
-	_, err := u.blocked(id, reason)
+	_, err := u.blocked(id, reason, in)
 	return err
 }
 
-func (u *SendInputUseCase) unconfirmed(id supervisor.SessionID, p supervisor.PendingSend, origin supervisor.SendOrigin) error {
+func (u *SendInputUseCase) unconfirmed(in SendInput, p supervisor.PendingSend) error {
+	id, origin := in.SessionID, in.Origin
 	if err := UpdateSession(u.Sessions, id, func(v *supervisor.ManagedSession) error {
 		if origin != supervisor.SendOriginHandoff && v.State != supervisor.SessionStopped {
 			v.State = supervisor.SessionStopped
@@ -546,7 +595,7 @@ func (u *SendInputUseCase) unconfirmed(id supervisor.SessionID, p supervisor.Pen
 	}); err != nil {
 		return err
 	}
-	if err := u.record(store.Event{Kind: supervisor.EventKindSendUnconfirmed, SessionID: id.String(), SendID: p.SendID, SendKind: p.Kind, Code: "SUP_SEND_NOT_CONFIRMED"}); err != nil {
+	if err := u.record(sendEvent(supervisor.EventKindSendUnconfirmed, in, p, "SUP_SEND_NOT_CONFIRMED")); err != nil {
 		return err
 	}
 	if origin != supervisor.SendOriginHandoff && u.Notify != nil {
@@ -554,7 +603,8 @@ func (u *SendInputUseCase) unconfirmed(id supervisor.SessionID, p supervisor.Pen
 	}
 	return nil
 }
-func (u *SendInputUseCase) confirmSend(id supervisor.SessionID, p supervisor.PendingSend) (SendResult, error) {
+func (u *SendInputUseCase) confirmSend(in SendInput, p supervisor.PendingSend) (SendResult, error) {
+	id := in.SessionID
 	now := u.now()
 	err := UpdateSession(u.Sessions, id, func(v *supervisor.ManagedSession) error {
 		v.SendGate.Pending = nil
@@ -568,8 +618,17 @@ func (u *SendInputUseCase) confirmSend(id supervisor.SessionID, p supervisor.Pen
 	if err != nil {
 		return SendResult{SendID: p.SendID}, err
 	}
-	err = u.record(store.Event{Kind: supervisor.EventKindSendConfirmed, SessionID: id.String(), SendID: p.SendID, SendKind: p.Kind})
+	err = u.record(sendEvent(supervisor.EventKindSendConfirmed, in, p, ""))
 	return SendResult{SendID: p.SendID, Confirmed: true}, err
+}
+
+func sendEvent(kind supervisor.SupervisorEventKind, in SendInput, p supervisor.PendingSend, code string) store.Event {
+	event := store.Event{Kind: kind, SessionID: in.SessionID.String(), SendID: p.SendID, SendKind: p.Kind, Code: code}
+	if in.Kind == supervisor.SendKindOperatorInput {
+		length := in.OperatorText.Len()
+		event.TextLength = &length
+	}
+	return event
 }
 func screenReadyForWrite(s ScreenSnapshot) bool {
 	if s.Processing || s.State != detect.StateIdle && s.State != detect.StateAwaitingRecommendation {
@@ -580,7 +639,10 @@ func screenReadyForWrite(s ScreenSnapshot) bool {
 	}
 	return !hasSelectionMenu(s.Rows)
 }
-func screenReadyForEnter(s ScreenSnapshot, want string) bool {
+func operatorScreenReadyForWrite(s ScreenSnapshot) bool {
+	return s.State == detect.StateIdle && !s.CompletionMenu && screenReadyForWrite(s)
+}
+func screenReadyForEnter(s ScreenSnapshot, want string, operatorInput ...bool) bool {
 	if s.Processing || s.State == detect.StateAwaitingPermission || s.State == detect.StateExited {
 		return false
 	}
@@ -590,7 +652,12 @@ func screenReadyForEnter(s ScreenSnapshot, want string) bool {
 	for i := len(s.Rows) - 1; i >= 0; i-- {
 		row := s.Rows[i]
 		if strings.HasPrefix(row, "❯\u00a0") {
-			return strings.TrimSpace(strings.TrimPrefix(row, "❯\u00a0")) == want
+			if len(operatorInput) != 0 && operatorInput[0] {
+				// A lost leading space means the UI changed the operator's text; do not send CR.
+				return strings.TrimRight(strings.TrimPrefix(row, "❯\u00a0"), " ") == strings.TrimRight(want, " ")
+			}
+			body := strings.TrimSpace(strings.TrimPrefix(row, "❯\u00a0"))
+			return body == want
 		}
 	}
 	return false
