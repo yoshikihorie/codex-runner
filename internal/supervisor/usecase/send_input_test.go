@@ -887,7 +887,7 @@ func TestSCNsup0233UnknownCompletionMenuAborts(t *testing.T) {
 	id, _ := supervisor.NewSessionID("alpha-1")
 	s := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, State: supervisor.SessionIdle, SendGate: supervisor.SendGateRecord{NextSeq: 1}}}
 	screen := &sendTestScreen{shot: blankScreen()}
-	p := &sendTestPTY{onWrite: func() { echoScreen(screen, "/rc"); screen.shot.Rows = append(screen.shot.Rows, "❯ /other") }}
+	p := &sendTestPTY{onWrite: func() { echoScreen(screen, "/rc"); screen.shot.Rows = append(screen.shot.Rows, "  ❯ /other") }}
 	u := SendInputUseCase{Sessions: s, Screens: screen, PTY: p, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir())}
 	_, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindRemoteControl})
 	if err == nil || s.session.StopReason != supervisor.StopSendAborted || s.session.SendGate.Pending != nil {
@@ -901,7 +901,7 @@ func TestSCNsup0232ExactSelectedCompletionAllowsSlashCommand(t *testing.T) {
 			shot := blankScreen()
 			screen := &sendTestScreen{shot: shot}
 			echoScreen(screen, command)
-			screen.shot.Rows = append(screen.shot.Rows, "❯ "+command)
+			screen.shot.Rows = append(screen.shot.Rows, "  ❯ "+command)
 			screen.shot.CompletionMenu = true
 			screen.shot.SelectedCompletion = command
 			if !screenReadyForEnter(screen.shot, command) {
@@ -911,12 +911,134 @@ func TestSCNsup0232ExactSelectedCompletionAllowsSlashCommand(t *testing.T) {
 	}
 }
 
+func TestSCNsup0232CompletionCandidateMatching(t *testing.T) {
+	for _, tc := range []struct {
+		name, candidate, command string
+		want                     bool
+	}{
+		{"alias", "/remote-control (rc) Example", "/rc", true},
+		{"name", "/exit Example", "/exit", true},
+		{"other", "/resume (continue) Example", "/rc", false},
+		{"partial name", "/rcfoo Example", "/rc", false},
+		{"description", "/other Example /rc", "/rc", false},
+		{"unclosed alias", "/remote-control (rc Example", "/rc", false},
+		{"invalid name", "remote-control (rc) Example", "/rc", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := completionCandidateMatches(tc.candidate, tc.command); got != tc.want {
+				t.Fatalf("candidate=%q command=%q got=%v want=%v", tc.candidate, tc.command, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestSCNsup0232CompletionMenuSelection(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		rows     []string
+		menu     bool
+		selected string
+	}{
+		{"candidate", []string{"  ❯ /remote-control (rc) Example", "    /other Example", "────", "❯\u00a0/rc", "────"}, true, "/remote-control (rc) Example"},
+		{"history only", []string{"❯ /rc", "────", "❯\u00a0/rc", "────"}, false, ""},
+		{"no input frame", []string{"  ❯ /rc Example", "❯\u00a0/rc"}, false, ""},
+		{"permission", []string{"  ❯ /rc Example", "Enter to confirm", "────", "❯\u00a0/rc", "────"}, false, ""},
+		{"trust", []string{"  ❯ Yes, I trust this project", "────", "❯\u00a0/rc", "────"}, false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			menu, selected := CompletionSelection(tc.rows)
+			if menu != tc.menu || selected != tc.selected {
+				t.Fatalf("menu=%v selected=%q", menu, selected)
+			}
+		})
+	}
+}
+
+func TestSCNsup0232AliasSelectionAllowsEnter(t *testing.T) {
+	screen := &sendTestScreen{shot: blankScreen()}
+	echoScreen(screen, "/rc")
+	screen.shot.Rows = append([]string{"  ❯ /remote-control (rc) Example"}, screen.shot.Rows...)
+	screen.shot.CompletionMenu, screen.shot.SelectedCompletion = CompletionSelection(screen.shot.Rows)
+	if !screenReadyForEnter(screen.shot, "/rc") {
+		t.Fatal("matching alias was rejected")
+	}
+}
+
+func TestSCNsup0232AliasSelectionSendsCR(t *testing.T) {
+	id, _ := supervisor.NewSessionID("alpha-1")
+	sessions := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, State: supervisor.SessionIdle, SendGate: supervisor.SendGateRecord{NextSeq: 1}}}
+	screen := &sendTestScreen{shot: blankScreen()}
+	p := &sendTestPTY{onWrite: func() {
+		echoScreen(screen, "/rc")
+		screen.shot.Rows = append([]string{"  ❯ /remote-control (rc) Example"}, screen.shot.Rows...)
+		screen.shot.CompletionMenu, screen.shot.SelectedCompletion = CompletionSelection(screen.shot.Rows)
+	}}
+	u := &SendInputUseCase{Sessions: sessions, Screens: screen, PTY: p, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir()), ConfirmTimeout: time.Second}
+	p.afterEnter = func() {
+		shot := blankScreen()
+		shot.ChangedAt = time.Now().Add(time.Second)
+		u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
+	}
+	result, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindRemoteControl})
+	if err != nil || !result.Confirmed || len(p.writes) != 2 || string(p.writes[1]) != "\r" {
+		t.Fatalf("result=%+v err=%v writes=%q", result, err, p.writes)
+	}
+}
+
+func TestSCNsup0232HistoryEchoDoesNotBlockEnter(t *testing.T) {
+	screen := &sendTestScreen{shot: blankScreen()}
+	echoScreen(screen, "/rc")
+	screen.shot.Rows = append([]string{"❯ /rc"}, screen.shot.Rows...)
+	screen.shot.CompletionMenu, screen.shot.SelectedCompletion = CompletionSelection(screen.shot.Rows)
+	if !screenReadyForEnter(screen.shot, "/rc") {
+		t.Fatal("history echo was treated as a selection menu")
+	}
+}
+
+func TestSelectionMenuIndentAndColumnZero(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		row  string
+		menu bool
+	}{
+		{"one space", " ❯ 1. Yes", true},
+		{"two spaces", "  ❯ 1. Yes", true},
+		{"three spaces", "   ❯ 1. Yes", true},
+		{"history echo", "❯ 1. Yes", false},
+		{"input row", "❯\u00a0/rc", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := hasSelectionMenu([]string{tc.row}); got != tc.menu {
+				t.Fatalf("hasSelectionMenu(%q)=%v, want %v", tc.row, got, tc.menu)
+			}
+			screen := &sendTestScreen{shot: blankScreen()}
+			echoScreen(screen, "/rc")
+			screen.shot.Rows = append([]string{tc.row}, screen.shot.Rows...)
+			if got := screenReadyForEnter(screen.shot, "/rc"); got == tc.menu {
+				t.Fatalf("screenReadyForEnter(%q)=%v", tc.row, got)
+			}
+		})
+	}
+}
+
+func TestSCNsup0233CompletionExceptionOnlyForSlashCommands(t *testing.T) {
+	for _, command := range []string{"#end", "#start", "continue with the recommendation", "parallel task"} {
+		screen := &sendTestScreen{shot: blankScreen()}
+		echoScreen(screen, command)
+		screen.shot.Rows = append([]string{"  ❯ /exit Example"}, screen.shot.Rows...)
+		screen.shot.CompletionMenu, screen.shot.SelectedCompletion = CompletionSelection(screen.shot.Rows)
+		if screenReadyForEnter(screen.shot, command) {
+			t.Fatalf("non-slash command %q accepted a selection menu", command)
+		}
+	}
+}
+
 func TestSCNsup0233WrongOrUnreadableCompletionAborts(t *testing.T) {
 	for _, candidate := range []string{"/other", ""} {
 		shot := blankScreen()
 		screen := &sendTestScreen{shot: shot}
 		echoScreen(screen, "/rc")
-		screen.shot.Rows = append(screen.shot.Rows, "❯ /other")
+		screen.shot.Rows = append(screen.shot.Rows, "  ❯ /other")
 		screen.shot.CompletionMenu = true
 		screen.shot.SelectedCompletion = candidate
 		if screenReadyForEnter(screen.shot, "/rc") {

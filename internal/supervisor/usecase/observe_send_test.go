@@ -31,7 +31,7 @@ func TestObserveSuppliesCompletionSelectionToEnterGate(t *testing.T) {
 	}, Interval: time.Millisecond}
 	done := make(chan error, 1)
 	go func() { done <- u.Run(ctx, s, p, supervisor.NewVirtualTerminal(80, 24)) }()
-	p.reads <- []byte("❯\u00a0/rc\r\n❯ /rc")
+	p.reads <- []byte("❯\u00a0/rc\r\n  ❯ /rc")
 	deadline := time.After(time.Second)
 	for {
 		shot := screens.Snapshot(s.SessionID)

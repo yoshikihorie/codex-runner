@@ -864,10 +864,15 @@ func TestObserve_SCN37_StaleCompletionDoesNotEvaluateNewStay(t *testing.T) {
 	auto.entered(s.SessionID, current.StateSince)
 	select {
 	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("second commit did not start")
+		t.Fatal("second commit started before the first completed")
+	case <-time.After(30 * time.Millisecond):
 	}
 	releaseFirst()
+	select {
+	case <-started:
+	case <-time.After(time.Second):
+		t.Fatal("second commit did not start after the first completed")
+	}
 	select {
 	case <-events:
 		t.Fatal("stale completion evaluated new stay")

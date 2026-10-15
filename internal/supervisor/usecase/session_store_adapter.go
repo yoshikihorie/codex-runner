@@ -26,6 +26,12 @@ func (a SessionStoreAdapter) Create(session supervisor.ManagedSession) error {
 func (a SessionStoreAdapter) UpdateSession(id supervisor.SessionID, update func(*supervisor.ManagedSession) error) error {
 	return a.Store.UpdateSession(id, update)
 }
+func (a SessionStoreAdapter) SetGitPhase(id supervisor.SessionID, phase supervisor.GitPhase) {
+	a.Store.SetGitPhase(id, phase)
+}
+func (a SessionStoreAdapter) SetGitPhaseIfEligible(id supervisor.SessionID, phase supervisor.GitPhase) (bool, error) {
+	return a.Store.SetGitPhaseIfEligible(id, phase)
+}
 func (a SessionStoreAdapter) Delete(id supervisor.SessionID) error { return a.Store.Delete(id) }
 func (a SessionStoreAdapter) List() ([]supervisor.ManagedSession, error) {
 	sessions, _, err := a.ListWithCorrupt()

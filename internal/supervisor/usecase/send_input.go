@@ -550,7 +550,7 @@ func screenReadyForEnter(s ScreenSnapshot, want string) bool {
 	if s.Processing || s.State == detect.StateAwaitingPermission || s.State == detect.StateExited {
 		return false
 	}
-	if hasSelectionMenu(s.Rows) && !(strings.HasPrefix(want, "/") && s.CompletionMenu && s.SelectedCompletion == want && !hasPermissionDialog(s.Rows)) {
+	if hasSelectionMenu(s.Rows) && !(strings.HasPrefix(want, "/") && s.CompletionMenu && completionCandidateMatches(s.SelectedCompletion, want) && !hasPermissionDialog(s.Rows)) {
 		return false
 	}
 	for i := len(s.Rows) - 1; i >= 0; i-- {
@@ -574,7 +574,7 @@ func hasSelectionMenu(rows []string) bool {
 		return true
 	}
 	for _, row := range rows {
-		if strings.HasPrefix(strings.TrimSpace(row), "❯ ") {
+		if strings.HasPrefix(row, " ") && strings.HasPrefix(strings.TrimSpace(row), "❯ ") {
 			return true
 		}
 	}

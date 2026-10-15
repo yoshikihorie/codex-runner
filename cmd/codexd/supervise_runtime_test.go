@@ -67,6 +67,16 @@ func TestSuperviseProjectDeps_SCNSup0548(t *testing.T) {
 	}
 	t.Cleanup(r.close)
 	a, b := r.projectDeps("alpha"), r.projectDeps("beta")
+	if a == nil || b == nil {
+		t.Fatal("project dependencies missing")
+	}
+	if a.ObserveSession.CompletionSelection == nil || b.ObserveSession.CompletionSelection == nil {
+		t.Fatal("completion selection not wired")
+	}
+	menu, selected := a.ObserveSession.CompletionSelection([]string{"  ❯ /remote-control (rc) Example", "────", "❯\u00a0/rc", "────"})
+	if !menu || selected != "/remote-control (rc) Example" {
+		t.Fatalf("completion selection: menu=%v selected=%q", menu, selected)
+	}
 	if a == nil || b == nil || a == b || a.CommitVerified == b.CommitVerified || a.Push == b.Push || a.ObserveSession == b.ObserveSession || a.CommitVerified.Locker != b.CommitVerified.Locker || a.CommitVerified.CWD != cfg.Projects[0].CWD || b.CommitVerified.CWD != cfg.Projects[1].CWD {
 		t.Fatal("project dependencies were shared incorrectly")
 	}

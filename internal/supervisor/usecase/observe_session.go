@@ -94,6 +94,7 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 		defer u.ContextPercent.Delete(initial.SessionID)
 	}
 	gitPhaseDone := make(chan time.Time, 1)
+	commitEvaluationDone := make(chan struct{}, 1)
 	var gitPhaseReported sync.Map
 	if u.CommitVerified != nil {
 		unregister := u.CommitVerified.RegisterGitPhase(initial.SessionID, func(since time.Time) {
@@ -217,8 +218,10 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 	rotationNotApplicableRecorded := false
 	pendingDone := make(chan struct{}, 1)
 	pendingInFlight := false
+	var commitSince time.Time
 	var recommendationSince time.Time
 	commitStarted := false
+	commitInFlight := false
 	autoAttempted := false
 	contextWasKnown := false
 	var permissionWarnedSince time.Time
@@ -233,6 +236,8 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 		var gitPhaseCompleted time.Time
 		select {
 		case gitPhaseCompleted = <-gitPhaseDone:
+		case <-commitEvaluationDone:
+			commitInFlight = false
 		case waited := <-waits:
 			exited = true
 			exitedAt = now().UTC()
@@ -422,7 +427,7 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 					u.SendInput.NotifyConfirmation(SendConfirmation{SessionID: initial.SessionID, SendID: exitPending.SendID, ProcessExited: true, ExitedAt: exitedAt})
 				}
 			} else {
-				rows := vt.Screen()
+				rows := vt.TextRows()
 				cells := make([][]supervisor.Cell, len(rows))
 				for i := range rows {
 					cells[i] = vt.Cells(i)
@@ -531,11 +536,40 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 				}
 			}
 		}
+		if !exited && (current.State == supervisor.SessionIdle || current.State == supervisor.SessionAwaitingRecommendation) {
+			if !current.StateSince.Equal(commitSince) {
+				commitSince = current.StateSince
+				commitStarted = false
+			}
+			settled := now().Sub(current.StateSince) >= commitSettle
+			if settled && u.EvaluateCommit != nil && !commitStarted && !commitInFlight {
+				commitStarted = true
+				commitInFlight = true
+				staySince := current.StateSince
+				go func() {
+					if err := u.EvaluateCommit(ctx, initial.SessionID); err != nil {
+						slog.Warn("commit evaluation failed", "error", err)
+					}
+					if _, reported := gitPhaseReported.Load(staySince); !reported {
+						current, err := u.Sessions.Load(initial.SessionID)
+						if err == nil && current.StateSince.Equal(staySince) {
+							select {
+							case gitPhaseDone <- staySince:
+							default:
+							}
+						}
+					}
+					select {
+					case commitEvaluationDone <- struct{}{}:
+					case <-ctx.Done():
+					}
+				}()
+			}
+		}
 		if u.AutoContinue != nil && !exited && current.State == supervisor.SessionAwaitingRecommendation {
 			enteredFromWorking := nextState == supervisor.SessionAwaitingRecommendation && fromState == supervisor.SessionWorking
 			if !current.StateSince.Equal(recommendationSince) {
 				recommendationSince = current.StateSince
-				commitStarted = false
 				autoAttempted = false
 				contextWasKnown = false
 			}
@@ -554,24 +588,6 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 				contextPercent = nil
 			}
 			contextKnown := contextPercent != nil
-			if settled && u.EvaluateCommit != nil && !commitStarted {
-				commitStarted = true
-				staySince := current.StateSince
-				go func() {
-					if err := u.EvaluateCommit(ctx, initial.SessionID); err != nil {
-						slog.Warn("commit evaluation failed", "error", err)
-					}
-					if _, reported := gitPhaseReported.Load(staySince); !reported {
-						current, err := u.Sessions.Load(initial.SessionID)
-						if err == nil && current.StateSince.Equal(staySince) {
-							select {
-							case gitPhaseDone <- staySince:
-							default:
-							}
-						}
-					}
-				}()
-			}
 			if settled && (gitPhaseCompleted.Equal(current.StateSince) || contextKnown && !contextWasKnown && autoAttempted || !autoAttempted && u.EvaluateCommit == nil) {
 				u.AutoContinue.EvaluateAsync(ctx, AutoContinueInput{
 					SessionID: initial.SessionID, Rows: vt.TextRows(), ContextPercent: contextPercent,
