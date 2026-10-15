@@ -209,7 +209,7 @@ func (r *supervisorRuntime) projectDeps(projectID string) *supervisorProjectDeps
 	push := &usecase.PushToAllowedRemoteUseCase{Git: git, Sessions: r.sessions, Projects: supervisorstore.NewProjectRecordStore(r.config.StateDir), Stop: r.stops, Allowlist: allow, ProtectedBranches: r.config.ProtectedBranches, Record: record, Notify: notifyID}
 	commit := &usecase.CommitVerifiedChangesUseCase{Git: git, Verify: gitops.VerifyRunner{StateDir: r.config.StateDir}, Sessions: r.sessions, Projects: supervisorstore.NewProjectRecordStore(r.config.StateDir), Stop: r.stops, Locker: r.locker, CWD: p.CWD, OwnedPaths: p.OwnedPaths, VerifyCommand: p.VerifyCommand, VerifyCommandSHA256: p.VerifySHA256, Record: record, Notify: notifyID, AfterCommit: push.Run, Now: time.Now}
 	respawn := &usecase.RespawnSessionUseCase{Config: r.start.Config, Projects: r.startProjects, Store: r.sessions, Stop: r.stops, Billing: launch.BillingGuard{}, PTYs: r.ptys, Lock: r.start.Lock, Now: time.Now, RecordStructured: record, RecordStartFailure: r.start.RecordStartFailure, Notify: notify}
-	initial := &usecase.InitialRemoteControl{Request: func(ctx context.Context, input usecase.SendInput) error {
+	initial := &usecase.InitialRemoteControl{RecordStructured: record, OperationalLog: r.recorder.Log, Request: func(ctx context.Context, input usecase.SendInput) error {
 		_, err := r.send.Execute(ctx, input)
 		return err
 	}}

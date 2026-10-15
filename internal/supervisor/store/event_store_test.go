@@ -11,6 +11,42 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/supervisor"
 )
 
+func TestEventStore_SCN0159RemoteControlSkippedFields(t *testing.T) {
+	st := NewEventStore(t.TempDir())
+	valid := Event{Kind: supervisor.EventKindRemoteControlSkipped, SessionID: "alpha-1", Reason: EventReason(supervisor.RemoteControlSkipResumedAfterConfirmed)}
+	if _, err := st.Record(valid); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(filepath.Join(st.root, "events.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(bytesFirstLine(data), &fields); err != nil {
+		t.Fatal(err)
+	}
+	for key := range fields {
+		if key != "seq" && key != "ts" && key != "kind" && key != "session_id" && key != "reason" {
+			t.Fatalf("unexpected event field %q", key)
+		}
+	}
+	for _, mutate := range []func(*Event){
+		func(e *Event) { e.SessionID = "" },
+		func(e *Event) { e.Reason = "" },
+		func(e *Event) { e.Reason = "other" },
+		func(e *Event) { e.SendID = "alpha-1-s1" },
+		func(e *Event) { e.SendKind = supervisor.SendKindRemoteControl },
+		func(e *Event) { e.Code = "SUP_SEND_NOT_CONFIRMED" },
+		func(e *Event) { e.ProjectID = "alpha" },
+	} {
+		v := valid
+		mutate(&v)
+		if _, err := st.Record(v); err == nil {
+			t.Fatalf("invalid event accepted: %+v", v)
+		}
+	}
+}
+
 func TestEventStore_SCNSup0578_OperatorFieldsAreRestricted(t *testing.T) {
 	st := NewEventStore(t.TempDir())
 	length := 5

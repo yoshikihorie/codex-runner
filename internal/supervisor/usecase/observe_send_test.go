@@ -2,6 +2,7 @@ package usecase
 
 import (
 	"context"
+	"errors"
 	"io"
 	"strings"
 	"sync"
@@ -174,6 +175,57 @@ func observeSendFixture(t *testing.T, state supervisor.SupervisorSessionState) (
 }
 func observeSendRecord(events *store.EventStore) func(store.Event) error {
 	return func(e store.Event) error { _, err := events.Record(e); return err }
+}
+
+type channelOperationalLog struct{ entries chan store.SupervisorLogEntry }
+
+func (l channelOperationalLog) Record(entry store.SupervisorLogEntry) error {
+	l.entries <- entry
+	return nil
+}
+
+func TestObserveInitialRemoteControlEventFailureWritesWarn(t *testing.T) {
+	s, sessions, events := observeSendFixture(t, supervisor.SessionStarting)
+	s.Generation = 2
+	s.RemoteControlConfirmed = true
+	if err := sessions.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	logs := make(chan store.SupervisorLogEntry, 1)
+	requested := make(chan struct{}, 1)
+	remote := &InitialRemoteControl{
+		Request:          func(context.Context, SendInput) error { requested <- struct{}{}; return nil },
+		RecordStructured: func(store.Event) error { return errors.New("event write failed") },
+		OperationalLog:   channelOperationalLog{entries: logs},
+	}
+	p := newObserveSendPTY()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateIdle}}}, Sessions: sessions, InitialRemoteControl: remote, RecordStructured: observeSendRecord(events), Interval: time.Millisecond}
+	go func() { done <- u.Run(ctx, s, p, supervisor.NewVirtualTerminal(80, 24)) }()
+	select {
+	case entry := <-logs:
+		if entry.Level != store.LogLevelWarn || entry.Kind != supervisor.EventKindRemoteControlSkipped || entry.SessionID != s.SessionID.String() || entry.Reason != store.LogReasonEventWriteFailed {
+			t.Fatalf("unexpected warning: %+v", entry)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("observer did not log event failure")
+	}
+	select {
+	case <-requested:
+		t.Fatal("remote control requested after failed skip event")
+	default:
+	}
+	cancel()
+	_ = p.Close()
+	select {
+	case err := <-done:
+		if err != nil && err != context.Canceled {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("observer did not stop")
+	}
 }
 
 func TestSCNsup0135SCNsup0239ObserveRequestsInitialRemoteControl(t *testing.T) {

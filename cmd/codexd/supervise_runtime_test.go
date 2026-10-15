@@ -47,7 +47,7 @@ func TestSuperviseRuntimeRecoveryObservationReachesIdle(t *testing.T) {
 	deps.ObserveSession.Interval = time.Millisecond
 	id := supervisor.SessionID("alpha-1")
 	now := time.Now().UTC()
-	s := supervisor.ManagedSession{SessionID: id, ProjectID: "alpha", CLI: supervisor.CLIClaude, Generation: 2, State: supervisor.SessionStarting, StateSince: now, ChildStartedAt: &now, RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 1}}
+	s := supervisor.ManagedSession{SessionID: id, ProjectID: "alpha", CLI: supervisor.CLIClaude, Generation: 2, State: supervisor.SessionStarting, StateSince: now, ChildStartedAt: &now, RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 1}, RemoteControlConfirmed: true}
 	if err := r.sessions.Save(s); err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +75,22 @@ func TestSuperviseRuntimeRecoveryObservationReachesIdle(t *testing.T) {
 		}
 		observed, _ := r.observed.Get(id)
 		if current.State == supervisor.SessionIdle && observed == detect.StateIdle {
-			return
+			events, _, err := r.events.ReadAll()
+			if err != nil {
+				t.Fatal(err)
+			}
+			skipped := 0
+			for _, event := range events {
+				if event.Kind == supervisor.EventKindRemoteControlSkipped {
+					skipped++
+				}
+				if event.Kind == supervisor.EventKindSendIssued || event.Kind == supervisor.EventKindSendUnconfirmed {
+					t.Fatalf("unexpected send event: %+v", event)
+				}
+			}
+			if skipped == 1 && current.SendGate.Pending == nil {
+				return
+			}
 		}
 		select {
 		case <-deadline:

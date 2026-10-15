@@ -167,6 +167,9 @@ func (u RespawnSessionUseCase) executeLocked(ctx context.Context, id supervisor.
 			return ErrStopActive
 		}
 		s.Generation++
+		if kind == RespawnHandoffStage5 {
+			s.RemoteControlConfirmed = false
+		}
 		if kind != RespawnResumeRecovery && kind != RespawnHandoffResume {
 			s.RestartCount++
 			cutoff := u.now().Add(-supervisor.RestartWindow)

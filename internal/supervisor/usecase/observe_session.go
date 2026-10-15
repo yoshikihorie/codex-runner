@@ -641,9 +641,15 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 				requestCtx = context.WithoutCancel(ctx)
 			}
 			if nextState == supervisor.SessionIdle {
-				go func(s supervisor.ManagedSession) { _ = u.InitialRemoteControl.OnStateChange(requestCtx, fromState, s) }(current)
+				go func(s supervisor.ManagedSession) {
+					if err := u.InitialRemoteControl.OnStateChange(requestCtx, fromState, s); err != nil {
+						u.InitialRemoteControl.warnFailure(s)
+					}
+				}(current)
 			} else {
-				_ = u.InitialRemoteControl.OnStateChange(requestCtx, fromState, current)
+				if err := u.InitialRemoteControl.OnStateChange(requestCtx, fromState, current); err != nil {
+					u.InitialRemoteControl.warnFailure(current)
+				}
 			}
 		}
 		if unsafeSet {

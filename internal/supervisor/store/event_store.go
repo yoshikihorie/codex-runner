@@ -184,6 +184,11 @@ func validateEvent(event Event) error {
 	} else if event.RowCount != nil {
 		return errors.New("row count is only valid for screen read")
 	}
+	if event.Kind == supervisor.EventKindRemoteControlSkipped {
+		if event.SessionID == "" || event.Reason != EventReason(supervisor.RemoteControlSkipResumedAfterConfirmed) || event.ProjectID != "" || event.FromState != "" || event.ToState != "" || event.SendID != "" || event.SendKind != "" || event.TextLength != nil || len(event.Basis) != 0 || event.Code != "" || event.Step != "" || event.Pattern != "" || event.Count != 0 || event.RowCount != nil || event.CommitSHA != "" || event.Remote != "" || event.Branch != "" {
+			return errors.New("invalid remote control skipped event")
+		}
+	}
 	if event.Reason != "" && !validReasonForEvent(event.Kind, event.Reason) && !(event.Kind == supervisor.EventKindSessionStartFailed && validStartFailureReason(event.Reason)) {
 		return fmt.Errorf("invalid reason %q for event %q", event.Reason, event.Kind)
 	}
@@ -419,6 +424,8 @@ func validReasonForEvent(kind supervisor.SupervisorEventKind, value EventReason)
 		return false
 	}
 	switch kind {
+	case supervisor.EventKindRemoteControlSkipped:
+		return value == EventReason(supervisor.RemoteControlSkipResumedAfterConfirmed)
 	case supervisor.EventKindSendBlocked:
 		return contains(ReasonStop, ReasonState, ReasonPending, ReasonUnconfirmed, ReasonNotFixedText, ReasonRateLimited)
 	case supervisor.EventKindOperatorInputRefused:

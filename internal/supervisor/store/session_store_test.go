@@ -13,6 +13,30 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/supervisor"
 )
 
+func TestSessionStore_SCN0163And64RemoteControlConfirmed(t *testing.T) {
+	st := NewSessionStore(t.TempDir())
+	id := mustID(t, "confirmed-1")
+	s := supervisor.ManagedSession{SessionID: id, ProjectID: "alpha", CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionIdle, StateSince: time.Now().UTC(), RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 1}}
+	if err := st.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := st.Load(id)
+	if err != nil || loaded.RemoteControlConfirmed {
+		t.Fatalf("old record: confirmed=%v err=%v", loaded.RemoteControlConfirmed, err)
+	}
+	if err := st.UpdateSession(id, func(v *supervisor.ManagedSession) error {
+		v.RemoteControlConfirmed = true
+		v.SendGate.LastSendConfirmed = true
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = NewSessionStore(st.root).Load(id)
+	if err != nil || !loaded.RemoteControlConfirmed || !loaded.SendGate.LastSendConfirmed {
+		t.Fatalf("reloaded record: %+v err=%v", loaded, err)
+	}
+}
+
 func TestSessionStoreCreateDoesNotReplaceExistingRecord(t *testing.T) {
 	st := NewSessionStore(t.TempDir())
 	id := mustID(t, "alpha-1")

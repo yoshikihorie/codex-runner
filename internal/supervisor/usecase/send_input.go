@@ -612,6 +612,9 @@ func (u *SendInputUseCase) confirmSend(in SendInput, p supervisor.PendingSend) (
 		v.SendGate.LastSendConfirmed = true
 		v.SendGate.LastConfirmedAt = &now
 		v.SendGate.UnconfirmedDiscarded = false
+		if p.Kind == supervisor.SendKindRemoteControl {
+			v.RemoteControlConfirmed = true
+		}
 		v.LastSend = &supervisor.LastSendRecord{SendID: p.SendID, Kind: p.Kind, IssuedAt: p.IssuedAt, Confirmed: true}
 		return nil
 	})

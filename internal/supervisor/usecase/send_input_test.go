@@ -22,6 +22,34 @@ import (
 
 type sendTestStore struct{ session supervisor.ManagedSession }
 
+type remoteConfirmStore struct {
+	*sendTestStore
+	confirmedWrites int
+	incompleteWrite bool
+}
+
+func (s *remoteConfirmStore) Save(v supervisor.ManagedSession) error {
+	if v.SendGate.LastSendConfirmed {
+		s.confirmedWrites++
+		if !v.RemoteControlConfirmed {
+			s.incompleteWrite = true
+		}
+	}
+	return s.sendTestStore.Save(v)
+}
+
+func TestSendInput_SCN0163ConfirmationIsOneUpdate(t *testing.T) {
+	id, _ := supervisor.NewSessionID("confirmed-1")
+	now := time.Now().UTC()
+	pending := supervisor.PendingSend{SendID: "confirmed-1-s1", Kind: supervisor.SendKindRemoteControl, IssuedAt: now}
+	s := &remoteConfirmStore{sendTestStore: &sendTestStore{session: supervisor.ManagedSession{SessionID: id, State: supervisor.SessionIdle, SendGate: supervisor.SendGateRecord{NextSeq: 2, Pending: &pending}}}}
+	u := &SendInputUseCase{Sessions: s}
+	result, err := u.confirmSend(SendInput{SessionID: id, Kind: supervisor.SendKindRemoteControl}, pending)
+	if err != nil || !result.Confirmed || s.confirmedWrites != 1 || s.incompleteWrite || !s.session.RemoteControlConfirmed {
+		t.Fatalf("result=%+v err=%v writes=%d incomplete=%v", result, err, s.confirmedWrites, s.incompleteWrite)
+	}
+}
+
 func TestSendInput_SCN23_ParallelInstructionFromProjectOrDefault(t *testing.T) {
 	id := supervisor.SessionID("parallel-23")
 	s := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, ProjectID: "project-a"}}
@@ -454,7 +482,7 @@ func TestSendPreCRErrorsRestoreGate(t *testing.T) {
 			s := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, State: supervisor.SessionIdle, SendGate: supervisor.SendGateRecord{NextSeq: 1}}}
 			u := SendInputUseCase{Sessions: s, Screens: &sendTestScreen{shot: blankScreen()}, PTY: failingBeforeCRPTY{writeErr}, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir())}
 			_, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindRemoteControl})
-			if !errors.Is(err, writeErr) || s.session.SendGate.Pending != nil || s.session.SendGate.EverSent || s.session.SendGate.LastSendConfirmed || s.session.SendGate.NextSeq != 2 || s.session.StopReason != supervisor.StopSendAborted {
+			if !errors.Is(err, writeErr) || s.session.SendGate.Pending != nil || s.session.SendGate.EverSent || s.session.SendGate.LastSendConfirmed || s.session.RemoteControlConfirmed || s.session.SendGate.NextSeq != 2 || s.session.StopReason != supervisor.StopSendAborted {
 				t.Fatalf("err=%v session=%+v", err, s.session)
 			}
 		})
@@ -758,7 +786,7 @@ func TestSCNsup0204TimeoutLeavesPendingAndDoesNotResend(t *testing.T) {
 	var notified supervisor.SupervisorEventKind
 	u := SendInputUseCase{Sessions: s, Screens: screen, PTY: p, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir()), ConfirmTimeout: time.Millisecond, RecordStructured: func(e store.Event) error { events = append(events, e); return nil }, Notify: func(kind supervisor.SupervisorEventKind, _ string) { notified = kind }}
 	_, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindRemoteControl})
-	if err == nil || p.calls != 1 || s.session.State != supervisor.SessionStopped || s.session.StopReason != supervisor.StopSendNotConfirmed || s.session.SendGate.Pending == nil || s.session.SendGate.LastSendConfirmed || len(events) != 2 || events[1].Kind != supervisor.EventKindSendUnconfirmed || notified != supervisor.EventKindSendUnconfirmed {
+	if err == nil || p.calls != 1 || s.session.State != supervisor.SessionStopped || s.session.StopReason != supervisor.StopSendNotConfirmed || s.session.SendGate.Pending == nil || s.session.SendGate.LastSendConfirmed || s.session.RemoteControlConfirmed || len(events) != 2 || events[1].Kind != supervisor.EventKindSendUnconfirmed || notified != supervisor.EventKindSendUnconfirmed {
 		t.Fatalf("err=%v calls=%d session=%+v events=%v", err, p.calls, s.session, events)
 	}
 }
@@ -907,7 +935,7 @@ func TestSCNsup0223SCNsup0224ConfirmationRequiresPostCRScreen(t *testing.T) {
 		}()
 	}
 	result, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindRemoteControl})
-	if err != nil || !result.Confirmed || s.session.SendGate.Pending != nil || !s.session.SendGate.LastSendConfirmed {
+	if err != nil || !result.Confirmed || s.session.SendGate.Pending != nil || !s.session.SendGate.LastSendConfirmed || !s.session.RemoteControlConfirmed {
 		t.Fatalf("result=%+v err=%v gate=%+v", result, err, s.session.SendGate)
 	}
 }

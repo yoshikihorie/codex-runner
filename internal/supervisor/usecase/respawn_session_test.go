@@ -234,6 +234,54 @@ func TestRespawnSession_SCN0439_HandoffResume(t *testing.T) {
 	}
 }
 
+func TestRespawnSession_SCN0162ConfirmedFlagAcrossKinds(t *testing.T) {
+	for _, kind := range []RespawnKind{RespawnRecovery, RespawnResumeRecovery, RespawnHandoffResume, RespawnHandoffStage5} {
+		t.Run(string(kind), func(t *testing.T) {
+			u, sessions, _, id := respawnFixture(t)
+			sessions.session.RemoteControlConfirmed = true
+			if kind == RespawnHandoffResume || kind == RespawnHandoffStage5 {
+				sessions.session.State = supervisor.SessionRotating
+			}
+			if err := u.Execute(context.Background(), id, kind); err != nil {
+				t.Fatal(err)
+			}
+			want := kind != RespawnHandoffStage5
+			if sessions.session.RemoteControlConfirmed != want {
+				t.Fatalf("kind=%s confirmed=%v want=%v", kind, sessions.session.RemoteControlConfirmed, want)
+			}
+		})
+	}
+}
+
+func TestRespawnSession_SCN0162HandoffStage5RecoveryRequestsFirstRemoteControl(t *testing.T) {
+	u, sessions, _, id := respawnFixture(t)
+	sessions.session.State = supervisor.SessionRotating
+	sessions.session.RemoteControlConfirmed = true
+	if err := u.Execute(context.Background(), id, RespawnHandoffStage5); err != nil {
+		t.Fatal(err)
+	}
+	if sessions.session.RemoteControlConfirmed {
+		t.Fatal("handoff_stage5 retained old confirmation")
+	}
+	sessions.session.State = supervisor.SessionStarting
+	if err := u.Execute(context.Background(), id, RespawnRecovery); err != nil {
+		t.Fatal(err)
+	}
+	requests, skips := 0, 0
+	r := &InitialRemoteControl{
+		Request:          func(context.Context, SendInput) error { requests++; return nil },
+		RecordStructured: func(store.Event) error { skips++; return nil },
+	}
+	s := sessions.session
+	s.State = supervisor.SessionIdle
+	if err := r.OnStateChange(context.Background(), supervisor.SessionStarting, s); err != nil {
+		t.Fatal(err)
+	}
+	if requests != 1 || skips != 0 {
+		t.Fatalf("recovery before pending /rc confirmation: requests=%d skips=%d", requests, skips)
+	}
+}
+
 func TestRespawnSession_SCN0412_RotatingSpawnFailureReturned(t *testing.T) {
 	u, sessions, spy, id := respawnFixture(t)
 	sessions.session.State = supervisor.SessionRotating

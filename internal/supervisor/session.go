@@ -222,6 +222,7 @@ type ManagedSession struct {
 	Rotation                   *RotationRecord            `json:"rotation,omitempty"`
 	AutoContinueDisabledReason AutoContinueDisabledReason `json:"auto_continue_disabled_reason,omitempty"`
 	PendingRemoteControl       bool                       `json:"pending_remote_control,omitempty"`
+	RemoteControlConfirmed     bool                       `json:"remote_control_confirmed,omitempty"`
 	PendingRemoteControlSince  *time.Time                 `json:"pending_remote_control_since,omitempty"`
 	PreviousState              SupervisorSessionState     `json:"previous_state,omitempty"`
 	LastVerifiedFingerprint    string                     `json:"last_verified_fingerprint,omitempty"`
@@ -643,7 +644,13 @@ const (
 	EventKindRotateIdleWaitTimeout           SupervisorEventKind = "rotate_idle_wait_timeout"
 	EventKindScreenRead                      SupervisorEventKind = "screen_read"
 	EventKindOperatorInputRefused            SupervisorEventKind = "operator_input_refused"
+	EventKindRemoteControlSkipped            SupervisorEventKind = "remote_control_skipped"
 )
+
+// SupervisorRemoteControlSkipReason follows the published language enum.
+type SupervisorRemoteControlSkipReason string
+
+const RemoteControlSkipResumedAfterConfirmed SupervisorRemoteControlSkipReason = "resumed_after_confirmed"
 
 type OperatorInputRefuseReason string
 
@@ -654,6 +661,8 @@ const (
 
 func ValidSupervisorEventKind(value SupervisorEventKind) bool {
 	switch value {
+	case EventKindRemoteControlSkipped:
+		return true
 	case EventKindScreenRead:
 		return true
 	case EventKindOperatorInputRefused:
