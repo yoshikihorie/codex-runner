@@ -22,7 +22,8 @@ type changingDetector struct{ state atomic.Value }
 
 func (d *changingDetector) set(state detect.DetectedState) { d.state.Store(state) }
 func (d *changingDetector) Detect(context.Context, detect.DetectInput) (detect.DetectResult, error) {
-	return detect.DetectResult{State: d.state.Load().(detect.DetectedState), ContextPercent: ptrInt(20)}, nil
+	state := d.state.Load().(detect.DetectedState)
+	return detect.DetectResult{State: state, ProcessingIndicator: state == detect.StateWorking, ContextPercent: ptrInt(20)}, nil
 }
 
 type observeStopRepository struct {
@@ -289,9 +290,12 @@ func TestAutoContinue_SCN37_ContextUnknownSharedWithRotation(t *testing.T) {
 	s, sessions, _ := observeSendFixture(t, supervisor.SessionWorking)
 	records := make(chan supervisor.SupervisorEventKind, 4)
 	auto := &AutoContinueUseCase{}
+	observed := &ObservedStateStore{}
+	detector := &switchableRecoveryDetector{}
+	detector.set(detect.StateWorking, true)
 	u := ObserveSessionUseCase{
-		Detect:   DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateAwaitingRecommendation}}},
-		Sessions: sessions, AutoContinue: auto,
+		Detect:   DetectSessionStateUseCase{Detector: detector},
+		Sessions: sessions, Observed: observed, AutoContinue: auto,
 		Rotation: &RotateSessionUseCase{Wake: rotationWakeChannel, PendingRemoteControl: &PendingRemoteControlUseCase{}, ResumeReady: func(supervisor.SessionID, time.Time) bool { return true }},
 		RecordStructured: func(e store.Event) error {
 			if e.Kind == supervisor.EventKindContextUnknown {
@@ -312,10 +316,18 @@ func TestAutoContinue_SCN37_ContextUnknownSharedWithRotation(t *testing.T) {
 			t.Error(err)
 		}
 	}()
+	waitObservedState(t, observed, s.SessionID, detect.StateWorking)
 	select {
 	case <-records:
 	case <-time.After(time.Second):
 		t.Fatal("context_unknown missing")
+	}
+	detector.set(detect.StateAwaitingRecommendation, false)
+	waitObservedState(t, observed, s.SessionID, detect.StateAwaitingRecommendation)
+	select {
+	case <-records:
+	case <-time.After(time.Second):
+		t.Fatal("context_unknown missing after recommendation")
 	}
 	select {
 	case <-records:
@@ -503,7 +515,7 @@ func TestObserve_SCN37_CommitEvaluatedOncePerStay(t *testing.T) {
 	}
 	called := make(chan struct{}, 8)
 	u := ObserveSessionUseCase{
-		Detect:   DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateAwaitingRecommendation}}},
+		Detect:   DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateAwaitingRecommendation, ProcessingIndicator: true}}},
 		Sessions: sessions, AutoContinue: &AutoContinueUseCase{}, Interval: time.Millisecond,
 		EvaluateCommit: func(context.Context, supervisor.SessionID) error { called <- struct{}{}; return nil },
 	}
@@ -579,20 +591,18 @@ func TestObserve_SCN13_PermissionRecordErrorKeepsObserving(t *testing.T) {
 }
 
 func TestObserve_SCN37_CommitCompletesBeforeAutoContinue(t *testing.T) {
-	s, sessions, _ := observeSendFixture(t, supervisor.SessionAwaitingRecommendation)
-	s.StateSince = time.Now().Add(-2 * commitSettle)
-	if err := sessions.Save(s); err != nil {
-		t.Fatal(err)
-	}
+	s, sessions, _ := observeSendFixture(t, supervisor.SessionWorking)
 	events := make(chan string, 4)
 	auto := &AutoContinueUseCase{
 		Extractor: supervisor.RecommendationExtractor{PreviousInput: "previous", RecommendationStart: "recommendation:", InputTop: "top"},
 		Send:      observeAutoSender{events: events},
 	}
-	auto.entered(s.SessionID, s.StateSince)
+	observed := &ObservedStateStore{}
+	detector := &switchableRecoveryDetector{}
+	detector.result.Store(detect.DetectResult{State: detect.StateWorking, ProcessingIndicator: true, ContextPercent: ptrInt(20)})
 	u := ObserveSessionUseCase{
-		Detect:   DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateAwaitingRecommendation, ContextPercent: ptrInt(20)}}},
-		Sessions: sessions, AutoContinue: auto, Interval: time.Millisecond,
+		Detect:   DetectSessionStateUseCase{Detector: detector},
+		Sessions: sessions, Observed: observed, AutoContinue: auto, Interval: time.Millisecond,
 		RotationStatuslineAt: func(supervisor.SessionID) *time.Time { at := time.Now(); return &at },
 		EvaluateCommit:       func(context.Context, supervisor.SessionID) error { events <- "commit"; return nil },
 	}
@@ -603,6 +613,30 @@ func TestObserve_SCN37_CommitCompletesBeforeAutoContinue(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- u.Run(ctx, s, pty, vt) }()
 	defer func() { cancel(); _ = pty.Close(); <-done }()
+	waitObservedState(t, observed, s.SessionID, detect.StateWorking)
+	detector.result.Store(detect.DetectResult{State: detect.StateAwaitingRecommendation, ContextPercent: ptrInt(20)})
+	waitObservedState(t, observed, s.SessionID, detect.StateAwaitingRecommendation)
+	deadline := time.After(time.Second)
+	var current supervisor.ManagedSession
+	for {
+		var err error
+		current, err = sessions.Load(s.SessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if current.State == supervisor.SessionAwaitingRecommendation {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("session did not reach recommendation: %s", current.State)
+		case <-time.After(time.Millisecond):
+		}
+	}
+	current.StateSince = time.Now().Add(-2 * commitSettle)
+	if err := sessions.Save(current); err != nil {
+		t.Fatal(err)
+	}
 	for _, want := range []string{"commit", "send"} {
 		select {
 		case got := <-events:
@@ -692,7 +726,7 @@ func TestObserve_SCN36_StopWorkingRecommendationResume(t *testing.T) {
 			t.Error(err)
 		}
 	}()
-	waitObservedState(t, observed, s.SessionID, detect.StateAwaitingRecommendation)
+	waitObservedState(t, observed, s.SessionID, detect.StateIdle)
 	clock = clock.Add(time.Second)
 	if _, err := control.Resume(context.Background(), &s.SessionID, true, false); err != nil {
 		t.Fatal(err)
@@ -738,7 +772,7 @@ func TestObserve_SCN37_CommitVerifiedCompletionBeforeAutoContinue(t *testing.T) 
 	}
 	auto := &AutoContinueUseCase{Extractor: supervisor.RecommendationExtractor{PreviousInput: "previous", RecommendationStart: "recommendation:", InputTop: "top"}, Send: observeAutoSender{events: events}}
 	auto.entered(s.SessionID, s.StateSince)
-	u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateAwaitingRecommendation, ContextPercent: ptrInt(20)}}},
+	u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateAwaitingRecommendation, ProcessingIndicator: true, ContextPercent: ptrInt(20)}}},
 		Sessions: sessions, CommitVerified: commit, AutoContinue: auto, Interval: time.Millisecond,
 		RotationStatuslineAt: func(supervisor.SessionID) *time.Time { at := time.Now(); return &at },
 	}
@@ -780,7 +814,7 @@ func TestObserve_SCN37_CommitSkippedStillCompletesEvaluation(t *testing.T) {
 	events := make(chan string, 1)
 	auto := &AutoContinueUseCase{Extractor: supervisor.RecommendationExtractor{PreviousInput: "previous", RecommendationStart: "recommendation:", InputTop: "top"}, Send: observeAutoSender{events: events}}
 	auto.entered(s.SessionID, s.StateSince)
-	u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateAwaitingRecommendation, ContextPercent: ptrInt(20)}}},
+	u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateAwaitingRecommendation, ProcessingIndicator: true, ContextPercent: ptrInt(20)}}},
 		Sessions: sessions, CommitVerified: commit, AutoContinue: auto, Interval: time.Millisecond,
 		RotationStatuslineAt: func(supervisor.SessionID) *time.Time { at := time.Now(); return &at },
 	}
@@ -820,7 +854,7 @@ func TestObserve_SCN37_StaleCompletionDoesNotEvaluateNewStay(t *testing.T) {
 	releaseFirst := func() { firstOnce.Do(func() { close(first) }) }
 	releaseSecond := func() { secondOnce.Do(func() { close(second) }) }
 	var calls atomic.Int32
-	u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateAwaitingRecommendation, ContextPercent: ptrInt(20)}}}, Sessions: sessions, AutoContinue: auto, Interval: time.Millisecond,
+	u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateAwaitingRecommendation, ProcessingIndicator: true, ContextPercent: ptrInt(20)}}}, Sessions: sessions, AutoContinue: auto, Interval: time.Millisecond,
 		RotationStatuslineAt: func(supervisor.SessionID) *time.Time { at := time.Now(); return &at },
 		EvaluateCommit: func(context.Context, supervisor.SessionID) error {
 			call := int(calls.Add(1))

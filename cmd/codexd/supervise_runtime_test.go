@@ -3,9 +3,11 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -17,6 +19,71 @@ import (
 	supervisortransport "github.com/yoshikihorie/codex-runner/internal/supervisor/transport"
 	"github.com/yoshikihorie/codex-runner/internal/supervisor/usecase"
 )
+
+type runtimeObservationPTY struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func (p *runtimeObservationPTY) Read([]byte) (int, error) { <-p.closed; return 0, io.EOF }
+func (p *runtimeObservationPTY) Wait() (int, error)       { <-p.closed; return 0, nil }
+func (p *runtimeObservationPTY) Close() error {
+	p.once.Do(func() { close(p.closed) })
+	return nil
+}
+
+func TestSuperviseRuntimeRecoveryObservationReachesIdle(t *testing.T) {
+	root := t.TempDir()
+	r, err := newSupervisorRuntime(context.Background(), config.SupervisorConfig{StateDir: root, NotifyCommand: "none", MaxSessions: 1, Projects: []config.SupervisorProject{{ID: "alpha", CWD: root, CLI: "claude", VerifySHA256: strings.Repeat("a", 64)}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(r.close)
+	deps := r.projectDeps("alpha")
+	if deps == nil || deps.ObserveSession == nil {
+		t.Fatal("observer not wired")
+	}
+	deps.ObserveSession.Detect.Now = func() time.Time { return time.Now().Add(detect.QuietPeriod) }
+	deps.ObserveSession.Interval = time.Millisecond
+	id := supervisor.SessionID("alpha-1")
+	now := time.Now().UTC()
+	s := supervisor.ManagedSession{SessionID: id, ProjectID: "alpha", CLI: supervisor.CLIClaude, Generation: 2, State: supervisor.SessionStarting, StateSince: now, ChildStartedAt: &now, RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 1}}
+	if err := r.sessions.Save(s); err != nil {
+		t.Fatal(err)
+	}
+	vt := supervisor.NewVirtualTerminal(120, 24)
+	border := strings.Repeat("─", 24)
+	if _, err := vt.Write([]byte(strings.Join([]string{"❯ previous request", "⏺ Completed answer.", "✻ Cooked for 2s · done 10:00", border, "❯\u00a0", border}, "\r\n"))); err != nil {
+		t.Fatal(err)
+	}
+	pty := &runtimeObservationPTY{closed: make(chan struct{})}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- deps.ObserveSession.Run(ctx, s, pty, vt) }()
+	defer func() {
+		cancel()
+		_ = pty.Close()
+		if err := <-done; err != nil && err != context.Canceled {
+			t.Error(err)
+		}
+	}()
+	deadline := time.After(time.Second)
+	for {
+		current, err := r.sessions.Load(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		observed, _ := r.observed.Get(id)
+		if current.State == supervisor.SessionIdle && observed == detect.StateIdle {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("runtime recovery state=%s observed=%s", current.State, observed)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
 
 func TestSuperviseRuntimeScreenWiring(t *testing.T) {
 	root := t.TempDir()

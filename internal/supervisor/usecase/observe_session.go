@@ -238,6 +238,7 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 	contextWasKnown := false
 	var permissionWarnedSince time.Time
 	var lastDetected detect.DetectedState
+	armed := false
 	for {
 		select {
 		case <-pendingDone:
@@ -340,6 +341,12 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 		result, err := u.Detect.Execute(ctx, current, vt, lastChange, exited, exitCode)
 		if err != nil {
 			return err
+		}
+		if result.ProcessingIndicator {
+			armed = true
+		}
+		if !armed && result.State == detect.StateAwaitingRecommendation {
+			result.State = detect.StateIdle
 		}
 		if u.AutoContinue != nil && current.State == supervisor.SessionStopped && lastDetected == detect.StateWorking && result.State == detect.StateAwaitingRecommendation {
 			u.AutoContinue.entered(initial.SessionID, now().UTC())
@@ -552,7 +559,7 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 				}
 			}
 		}
-		if !exited && (current.State == supervisor.SessionIdle || current.State == supervisor.SessionAwaitingRecommendation) {
+		if !exited && armed && (current.State == supervisor.SessionIdle || current.State == supervisor.SessionAwaitingRecommendation) {
 			if !current.StateSince.Equal(commitSince) {
 				commitSince = current.StateSince
 				commitStarted = false

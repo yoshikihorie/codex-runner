@@ -64,11 +64,12 @@ type DetectInput struct {
 
 // DetectResult contains a state and only the evidence used by its winning rule.
 type DetectResult struct {
-	State          DetectedState
-	Basis          []DetectionBasis
-	ContextPercent *int
-	SessionID      string
-	PermissionMode PermissionMode
+	State               DetectedState
+	Basis               []DetectionBasis
+	ProcessingIndicator bool
+	ContextPercent      *int
+	SessionID           string
+	PermissionMode      PermissionMode
 }
 
 // Detector classifies one session observation.

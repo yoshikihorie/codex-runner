@@ -85,6 +85,9 @@ func TestCompositeRulesAndWinningBasis(t *testing.T) {
 			if got.State != tt.want {
 				t.Fatalf("state=%q want %q", got.State, tt.want)
 			}
+			if got.ProcessingIndicator != (tt.name == "rule2 pattern beats permission") {
+				t.Fatalf("processing indicator=%v", got.ProcessingIndicator)
+			}
 			if strings.Join(basisStrings(got.Basis), ",") != strings.Join(basisStrings(tt.basis), ",") {
 				t.Fatalf("basis=%v want %v", got.Basis, tt.basis)
 			}

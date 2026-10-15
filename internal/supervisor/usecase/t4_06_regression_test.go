@@ -904,7 +904,15 @@ func TestSCNsup01033IllegalTransitionIsLoggedOncePerStatePair(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	count := 0
-	u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateAwaitingRecommendation}}}, Sessions: &regressionSessionStore{session: s}, Interval: time.Millisecond, RecordStructured: func(event testEvent) error {
+	var calls int
+	detector := detectorFunc(func() detect.DetectResult {
+		calls++
+		if calls == 1 {
+			return detect.DetectResult{State: detect.StateWorking, ProcessingIndicator: true}
+		}
+		return detect.DetectResult{State: detect.StateAwaitingRecommendation}
+	})
+	u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: detector}, Sessions: &regressionSessionStore{session: s}, Interval: time.Millisecond, RecordStructured: func(event testEvent) error {
 		k := event.Kind
 		if k == supervisor.EventKindIllegalTransition {
 			count++

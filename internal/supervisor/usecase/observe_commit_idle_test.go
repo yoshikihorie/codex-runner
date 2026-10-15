@@ -10,14 +10,45 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/supervisor/detect"
 )
 
-func TestObserveCommitEvaluatesEachSettledIdleStay(t *testing.T) {
-	s, sessions, _ := observeSendFixture(t, supervisor.SessionIdle)
-	s.StateSince = time.Now().Add(-2 * commitSettle)
-	if err := sessions.Save(s); err != nil {
+func waitCommitState(t *testing.T, sessions SessionRecordStore, id supervisor.SessionID, want supervisor.SupervisorSessionState) {
+	t.Helper()
+	deadline := time.After(time.Second)
+	for {
+		current, err := sessions.Load(id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if current.State == want {
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("session did not reach %s", want)
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func armAndSettleIdle(t *testing.T, sessions SessionRecordStore, id supervisor.SessionID, detector *changingDetector) time.Time {
+	t.Helper()
+	waitCommitState(t, sessions, id, supervisor.SessionWorking)
+	detector.set(detect.StateIdle)
+	waitCommitState(t, sessions, id, supervisor.SessionIdle)
+	current, err := sessions.Load(id)
+	if err != nil {
 		t.Fatal(err)
 	}
+	current.StateSince = time.Now().Add(-2 * commitSettle)
+	if err := sessions.Save(current); err != nil {
+		t.Fatal(err)
+	}
+	return current.StateSince
+}
+
+func TestObserveCommitEvaluatesEachSettledIdleStay(t *testing.T) {
+	s, sessions, _ := observeSendFixture(t, supervisor.SessionIdle)
 	detector := &changingDetector{}
-	detector.set(detect.StateIdle)
+	detector.set(detect.StateWorking)
 	commits := make(chan struct{}, 3)
 	autoSends := make(chan string, 1)
 	auto := &AutoContinueUseCase{Send: observeAutoSender{events: autoSends}}
@@ -49,25 +80,7 @@ func TestObserveCommitEvaluatesEachSettledIdleStay(t *testing.T) {
 			t.Fatal("settled idle stay did not evaluate commit")
 		}
 	}
-	waitState := func(want supervisor.SupervisorSessionState) {
-		t.Helper()
-		deadline := time.After(time.Second)
-		for {
-			current, err := sessions.Load(s.SessionID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if current.State == want {
-				return
-			}
-			select {
-			case <-deadline:
-				t.Fatalf("session did not reach %s", want)
-			default:
-				time.Sleep(time.Millisecond)
-			}
-		}
-	}
+	armAndSettleIdle(t, sessions, s.SessionID, detector)
 	waitCommit()
 	// Give the observer multiple ticks to expose a duplicate evaluation.
 	time.Sleep(20 * time.Millisecond)
@@ -77,9 +90,9 @@ func TestObserveCommitEvaluatesEachSettledIdleStay(t *testing.T) {
 	default:
 	}
 	detector.set(detect.StateWorking)
-	waitState(supervisor.SessionWorking)
+	waitCommitState(t, sessions, s.SessionID, supervisor.SessionWorking)
 	detector.set(detect.StateIdle)
-	waitState(supervisor.SessionIdle)
+	waitCommitState(t, sessions, s.SessionID, supervisor.SessionIdle)
 	current, err := sessions.Load(s.SessionID)
 	if err != nil {
 		t.Fatal(err)
@@ -110,14 +123,12 @@ func TestObserveCommitEvaluatesEachSettledIdleStay(t *testing.T) {
 
 func TestObserveIdleWithoutAutoContinueEvaluatesCommit(t *testing.T) {
 	s, sessions, _ := observeSendFixture(t, supervisor.SessionIdle)
-	s.StateSince = time.Now().Add(-2 * commitSettle)
-	if err := sessions.Save(s); err != nil {
-		t.Fatal(err)
-	}
+	detector := &changingDetector{}
+	detector.set(detect.StateWorking)
 	var calls atomic.Int32
 	called := make(chan struct{}, 1)
 	u := ObserveSessionUseCase{
-		Detect:   DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateIdle}}},
+		Detect:   DetectSessionStateUseCase{Detector: detector},
 		Sessions: sessions, Interval: time.Millisecond,
 		EvaluateCommit: func(context.Context, supervisor.SessionID) error {
 			calls.Add(1)
@@ -130,6 +141,7 @@ func TestObserveIdleWithoutAutoContinueEvaluatesCommit(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- u.Run(ctx, s, pty, supervisor.NewVirtualTerminal(80, 24)) }()
 	defer func() { cancel(); _ = pty.Close(); <-done }()
+	armAndSettleIdle(t, sessions, s.SessionID, detector)
 	select {
 	case <-called:
 	case <-time.After(time.Second):
@@ -142,12 +154,8 @@ func TestObserveIdleWithoutAutoContinueEvaluatesCommit(t *testing.T) {
 
 func TestObserveCommitWaitsForIdleEvaluationBeforeRecommendationEvaluation(t *testing.T) {
 	s, sessions, _ := observeSendFixture(t, supervisor.SessionIdle)
-	s.StateSince = time.Now().Add(-2 * commitSettle)
-	if err := sessions.Save(s); err != nil {
-		t.Fatal(err)
-	}
 	detector := &changingDetector{}
-	detector.set(detect.StateIdle)
+	detector.set(detect.StateWorking)
 	firstStarted := make(chan struct{})
 	releaseFirst := make(chan struct{})
 	t.Cleanup(func() {
@@ -180,34 +188,16 @@ func TestObserveCommitWaitsForIdleEvaluationBeforeRecommendationEvaluation(t *te
 	done := make(chan error, 1)
 	go func() { done <- u.Run(ctx, s, pty, supervisor.NewVirtualTerminal(80, 24)) }()
 	defer func() { cancel(); _ = pty.Close(); <-done }()
+	armAndSettleIdle(t, sessions, s.SessionID, detector)
 	select {
 	case <-firstStarted:
 	case <-time.After(time.Second):
 		t.Fatal("idle commit evaluation did not start")
 	}
-	waitState := func(want supervisor.SupervisorSessionState) {
-		t.Helper()
-		deadline := time.After(time.Second)
-		for {
-			current, err := sessions.Load(s.SessionID)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if current.State == want {
-				return
-			}
-			select {
-			case <-deadline:
-				t.Fatalf("session did not reach %s", want)
-			default:
-				time.Sleep(time.Millisecond)
-			}
-		}
-	}
 	detector.set(detect.StateWorking)
-	waitState(supervisor.SessionWorking)
+	waitCommitState(t, sessions, s.SessionID, supervisor.SessionWorking)
 	detector.set(detect.StateAwaitingRecommendation)
-	waitState(supervisor.SessionAwaitingRecommendation)
+	waitCommitState(t, sessions, s.SessionID, supervisor.SessionAwaitingRecommendation)
 	current, err := sessions.Load(s.SessionID)
 	if err != nil {
 		t.Fatal(err)
@@ -232,12 +222,13 @@ func TestObserveCommitWaitsForIdleEvaluationBeforeRecommendationEvaluation(t *te
 func TestObserveIdleCommitVerifiedClosesGitPhase(t *testing.T) {
 	commit, fixture, _, _, _ := commitTestFixture(t)
 	s, sessions, _ := observeSendFixture(t, supervisor.SessionIdle)
-	s.StateSince = time.Now().Add(-2 * commitSettle)
 	s.GitConfigFingerprint = fixture.value.GitConfigFingerprint
 	if err := sessions.Save(s); err != nil {
 		t.Fatal(err)
 	}
 	commit.Sessions = sessions
+	detector := &changingDetector{}
+	detector.set(detect.StateWorking)
 	completed := make(chan time.Time, 1)
 	commit.AfterGitPhase = func(id supervisor.SessionID, since time.Time) {
 		if id != s.SessionID {
@@ -246,7 +237,7 @@ func TestObserveIdleCommitVerifiedClosesGitPhase(t *testing.T) {
 		completed <- since
 	}
 	u := ObserveSessionUseCase{
-		Detect:   DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateIdle}}},
+		Detect:   DetectSessionStateUseCase{Detector: detector},
 		Sessions: sessions, CommitVerified: commit, Interval: time.Millisecond,
 	}
 	ctx, cancel := context.WithCancel(context.Background())
@@ -254,10 +245,11 @@ func TestObserveIdleCommitVerifiedClosesGitPhase(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- u.Run(ctx, s, pty, supervisor.NewVirtualTerminal(80, 24)) }()
 	defer func() { cancel(); _ = pty.Close(); <-done }()
+	idleSince := armAndSettleIdle(t, sessions, s.SessionID, detector)
 	select {
 	case since := <-completed:
-		if !since.Equal(s.StateSince) {
-			t.Fatalf("completion stay=%v, want %v", since, s.StateSince)
+		if !since.Equal(idleSince) {
+			t.Fatalf("completion stay=%v, want %v", since, idleSince)
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("idle commit evaluation did not close git phase")

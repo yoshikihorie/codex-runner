@@ -66,6 +66,7 @@ func (d *CompositeDetector) Detect(_ context.Context, in DetectInput) (DetectRes
 	case working:
 		result.State = StateWorking
 		result.Basis = []DetectionBasis{BasisScreenPattern}
+		result.ProcessingIndicator = true
 	case permission && recommendation:
 		result.State = StateUndetermined
 		result.Basis = []DetectionBasis{BasisScreenPattern}
