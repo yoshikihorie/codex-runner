@@ -37,6 +37,7 @@ type Event struct {
 	Reason    EventReason                       `json:"reason,omitempty"`
 	Pattern   string                            `json:"pattern,omitempty"`
 	Count     int                               `json:"count,omitempty"`
+	RowCount  *int                              `json:"row_count,omitempty"`
 	CommitSHA string                            `json:"commit_sha,omitempty"`
 	Remote    string                            `json:"remote,omitempty"`
 	Branch    string                            `json:"branch,omitempty"`
@@ -159,6 +160,13 @@ func (s *EventStore) Record(event Event) (Event, error) {
 func validateEvent(event Event) error {
 	if !supervisor.ValidSupervisorEventKind(event.Kind) {
 		return fmt.Errorf("invalid supervisor event kind: %q", event.Kind)
+	}
+	if event.Kind == supervisor.EventKindScreenRead {
+		if event.SessionID == "" || event.RowCount == nil || *event.RowCount < 0 || event.ProjectID != "" || event.FromState != "" || event.ToState != "" || event.SendID != "" || event.SendKind != "" || len(event.Basis) != 0 || event.Code != "" || event.Step != "" || event.Reason != "" || event.Pattern != "" || event.Count != 0 || event.CommitSHA != "" || event.Remote != "" || event.Branch != "" {
+			return errors.New("invalid screen read event")
+		}
+	} else if event.RowCount != nil {
+		return errors.New("row count is only valid for screen read")
 	}
 	if event.Reason != "" && !validReasonForEvent(event.Kind, event.Reason) && !(event.Kind == supervisor.EventKindSessionStartFailed && validStartFailureReason(event.Reason)) {
 		return fmt.Errorf("invalid reason %q for event %q", event.Reason, event.Kind)

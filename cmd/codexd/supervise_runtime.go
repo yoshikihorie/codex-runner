@@ -384,7 +384,7 @@ func runSupervise(parent context.Context, args []string, stderr io.Writer) int {
 }
 
 func (r *supervisorRuntime) newDispatch() *supervisortransport.Dispatch {
-	return &supervisortransport.Dispatch{Sessions: r.sessions, Control: r.control, StartSession: r.start, StopSession: r.stopSession, Events: r.events, ObserveFor: func(project string) *usecase.ObserveSessionUseCase {
+	return &supervisortransport.Dispatch{Sessions: r.sessions, Control: r.control, StartSession: r.start, StopSession: r.stopSession, Events: r.events, ScreenRead: &usecase.ScreenReadUseCase{Sessions: r.sessions, Screens: r.screens, RecordStructured: r.recorder.RecordStructured}, ObserveFor: func(project string) *usecase.ObserveSessionUseCase {
 		deps := r.projectDeps(project)
 		if deps == nil {
 			return nil

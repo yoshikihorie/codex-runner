@@ -640,10 +640,13 @@ const (
 	EventKindSupervisorStarted               SupervisorEventKind = "supervisor_started"
 	EventKindLunaImplNotAllowed              SupervisorEventKind = "luna_impl_not_allowed"
 	EventKindRotateIdleWaitTimeout           SupervisorEventKind = "rotate_idle_wait_timeout"
+	EventKindScreenRead                      SupervisorEventKind = "screen_read"
 )
 
 func ValidSupervisorEventKind(value SupervisorEventKind) bool {
 	switch value {
+	case EventKindScreenRead:
+		return true
 	case EventKindSessionStarted:
 		return true
 	case EventKindSessionStartFailed:

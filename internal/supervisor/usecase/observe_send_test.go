@@ -58,6 +58,78 @@ func TestObserveSuppliesCompletionSelectionToEnterGate(t *testing.T) {
 	if err := <-done; err != nil && err != context.Canceled {
 		t.Fatal(err)
 	}
+	if !screens.Snapshot(s.SessionID).ObservedAt.IsZero() {
+		t.Fatal("observer retained a stale screen after exit")
+	}
+}
+
+func TestObservedScreenStoreOldOwnerCannotDeleteNewSnapshot(t *testing.T) {
+	id := supervisor.SessionID("alpha-1")
+	screens := &ObservedScreenStore{}
+	oldOwner, newOwner := uint64(1), uint64(2)
+	screens.SetSnapshotOwned(id, ScreenSnapshot{Rows: []string{"old"}, ObservedAt: time.Now()}, oldOwner)
+	screens.SetSnapshotOwned(id, ScreenSnapshot{Rows: []string{"new"}, ObservedAt: time.Now()}, newOwner)
+	screens.DeleteOwned(id, oldOwner)
+	if shot := screens.Snapshot(id); len(shot.Rows) != 1 || shot.Rows[0] != "new" {
+		t.Fatalf("old owner deleted new snapshot: %+v", shot)
+	}
+	screens.SetSnapshotOwned(id, ScreenSnapshot{Rows: []string{"late old"}, ObservedAt: time.Now()}, oldOwner)
+	if shot := screens.Snapshot(id); shot.Rows[0] != "new" {
+		t.Fatalf("old owner replaced new snapshot: %+v", shot)
+	}
+	screens.DeleteOwned(id, newOwner)
+	if shot := screens.Snapshot(id); !shot.ObservedAt.IsZero() {
+		t.Fatalf("new owner failed to clear snapshot: %+v", shot)
+	}
+}
+
+func TestSendInputEndSessionKeepsNewOwnerSnapshot(t *testing.T) {
+	id := supervisor.SessionID("alpha-1")
+	screens := &ObservedScreenStore{}
+	screens.SetSnapshotOwned(id, ScreenSnapshot{Rows: []string{"new"}, ObservedAt: time.Now()}, 2)
+	u := &SendInputUseCase{Screens: screens}
+	u.EndSession(id, 1)
+	if shot := screens.Snapshot(id); len(shot.Rows) != 1 || shot.Rows[0] != "new" {
+		t.Fatalf("old session deleted new screen: %+v", shot)
+	}
+}
+
+func TestObserveOldLoopExitKeepsNewLoopScreen(t *testing.T) {
+	session, sessions, events := observeSendFixture(t, supervisor.SessionIdle)
+	screens := &ObservedScreenStore{}
+	start := func(content string) (context.CancelFunc, *observeSendPTY, <-chan error) {
+		u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateIdle}}}, Sessions: sessions, SendInput: &SendInputUseCase{Screens: screens}, RecordStructured: observeSendRecord(events), Interval: time.Millisecond}
+		ctx, cancel := context.WithCancel(context.Background())
+		pty := newObserveSendPTY()
+		done := make(chan error, 1)
+		go func() { done <- u.Run(ctx, session, pty, supervisor.NewVirtualTerminal(80, 24)) }()
+		pty.reads <- []byte(content)
+		deadline := time.After(time.Second)
+		for {
+			shot := screens.Snapshot(session.SessionID)
+			if len(shot.Rows) != 0 && strings.Contains(shot.Rows[0], content) {
+				return cancel, pty, done
+			}
+			select {
+			case <-deadline:
+				cancel()
+				t.Fatal("screen not observed")
+			default:
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}
+	cancelOld, oldPTY, oldDone := start("old screen")
+	cancelNew, newPTY, newDone := start("new screen")
+	defer func() { cancelNew(); _ = newPTY.Close(); <-newDone }()
+	cancelOld()
+	_ = oldPTY.Close()
+	if err := <-oldDone; err != nil && err != context.Canceled {
+		t.Fatal(err)
+	}
+	if shot := screens.Snapshot(session.SessionID); len(shot.Rows) == 0 || !strings.Contains(shot.Rows[0], "new screen") {
+		t.Fatalf("old observer removed new screen: %+v", shot)
+	}
 }
 
 type observeSendPTY struct {

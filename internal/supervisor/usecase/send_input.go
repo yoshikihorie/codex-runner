@@ -45,8 +45,9 @@ type ScreenReader interface {
 	Snapshot(supervisor.SessionID) ScreenSnapshot
 }
 type ObservedScreenStore struct {
-	mu    sync.RWMutex
-	shots map[supervisor.SessionID]ScreenSnapshot
+	mu     sync.RWMutex
+	shots  map[supervisor.SessionID]ScreenSnapshot
+	owners map[supervisor.SessionID]uint64
 }
 
 func (s *ObservedScreenStore) Snapshot(id supervisor.SessionID) ScreenSnapshot {
@@ -62,10 +63,35 @@ func (s *ObservedScreenStore) SetSnapshot(id supervisor.SessionID, shot ScreenSn
 	}
 	s.shots[id] = shot
 }
+
+// SetSnapshotOwned rejects updates from an observation loop superseded by a newer loop.
+func (s *ObservedScreenStore) SetSnapshotOwned(id supervisor.SessionID, shot ScreenSnapshot, owner uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.owners == nil {
+		s.owners = make(map[supervisor.SessionID]uint64)
+	}
+	if owner < s.owners[id] {
+		return
+	}
+	if s.shots == nil {
+		s.shots = make(map[supervisor.SessionID]ScreenSnapshot)
+	}
+	s.owners[id] = owner
+	s.shots[id] = shot
+}
 func (s *ObservedScreenStore) Delete(id supervisor.SessionID) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.shots, id)
+}
+
+func (s *ObservedScreenStore) DeleteOwned(id supervisor.SessionID, owner uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.owners[id] == owner {
+		delete(s.shots, id)
+	}
 }
 
 type PTYWriter interface {
@@ -245,7 +271,7 @@ func (u *SendInputUseCase) CRWrittenAt(id supervisor.SessionID, sendID string) t
 	return u.crAt[id]
 }
 
-func (u *SendInputUseCase) EndSession(id supervisor.SessionID) {
+func (u *SendInputUseCase) EndSession(id supervisor.SessionID, owner ...uint64) {
 	u.mu.Lock()
 	if u.ended == nil {
 		u.ended = make(map[supervisor.SessionID]bool)
@@ -256,7 +282,15 @@ func (u *SendInputUseCase) EndSession(id supervisor.SessionID) {
 	delete(u.crAt, id)
 	delete(u.locks, id)
 	u.mu.Unlock()
-	if screens, ok := u.Screens.(interface{ Delete(supervisor.SessionID) }); ok {
+	if len(owner) != 0 {
+		if screens, ok := u.Screens.(interface {
+			DeleteOwned(supervisor.SessionID, uint64)
+		}); ok {
+			screens.DeleteOwned(id, owner[0])
+		} else if screens, ok := u.Screens.(interface{ Delete(supervisor.SessionID) }); ok {
+			screens.Delete(id)
+		}
+	} else if screens, ok := u.Screens.(interface{ Delete(supervisor.SessionID) }); ok {
 		screens.Delete(id)
 	}
 }

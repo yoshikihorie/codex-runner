@@ -25,7 +25,7 @@ func runSupervisorClient(ctx context.Context, args []string, stdin io.Reader, st
 	}
 	verb := args[0]
 	switch verb {
-	case "status", "stop", "resume", "start-session", "stop-session", "events":
+	case "status", "stop", "resume", "start-session", "stop-session", "events", "screen":
 	default:
 		return supervisorClientUsage(stderr)
 	}
@@ -45,7 +45,7 @@ func runSupervisorClient(ctx context.Context, args []string, stdin io.Reader, st
 			return supervisorClientUsage(stderr)
 		}
 	}
-	if (verb == "stop-session" && !seen["session"]) || (verb == "start-session" && *project == "") || (verb != "start-session" && seen["project"]) || (verb != "events" && (seen["since-seq"] || seen["limit"])) || (verb == "events" && seen["limit"] && *limit < 1) || (verb == "start-session" && seen["session"]) {
+	if ((verb == "stop-session" || verb == "screen") && !seen["session"]) || (verb == "start-session" && *project == "") || (verb != "start-session" && seen["project"]) || (verb != "events" && (seen["since-seq"] || seen["limit"])) || (verb == "events" && seen["limit"] && *limit < 1) || (verb == "start-session" && seen["session"]) {
 		return supervisorClientUsage(stderr)
 	}
 	if *socketPath == "" {

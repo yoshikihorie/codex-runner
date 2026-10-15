@@ -40,6 +40,7 @@ type Dispatch struct {
 	Events       interface {
 		ReadAll() ([]store.Event, int, error)
 	}
+	ScreenRead        *usecase.ScreenReadUseCase
 	ObserveFor        func(string) *usecase.ObserveSessionUseCase
 	NewSessionID      func(string) (supervisor.SessionID, error)
 	SupervisorContext context.Context
@@ -64,7 +65,7 @@ func (d *Dispatch) Handle(ctx context.Context, request Request, peerPID int) Res
 	}
 	verb := request.Verb
 	switch verb {
-	case "status", "stop", "resume", "start-session", "stop-session", "events":
+	case "status", "stop", "resume", "start-session", "stop-session", "events", "screen":
 	default:
 		return Response{Error: &ErrorBody{Code: "SUP_VERB_UNKNOWN", MessageKey: "error.supervisor.verbUnknown", Details: map[string]any{"verb": cleanVerb(verb)}}}
 	}
@@ -99,8 +100,14 @@ func (d *Dispatch) Handle(ctx context.Context, request Request, peerPID int) Res
 	if verb == "start-session" && (p.ProjectID == "" || p.SessionID != "") {
 		return malformedResponse()
 	}
-	if verb == "stop-session" && p.SessionID == "" {
+	if (verb == "stop-session" || verb == "screen") && p.SessionID == "" {
 		return malformedResponse()
+	}
+	if verb == "screen" && len(request.Params) > 0 {
+		var fields map[string]json.RawMessage
+		if err := json.Unmarshal(request.Params, &fields); err != nil || len(fields) != 1 || fields["session_id"] == nil {
+			return malformedResponse()
+		}
 	}
 	if verb == "events" && p.ProjectID != "" {
 		return malformedResponse()
@@ -268,6 +275,19 @@ func (d *Dispatch) Handle(ctx context.Context, request Request, peerPID int) Res
 			}
 		}
 		return success(map[string]any{"events": page, "next_seq": next})
+	case "screen":
+		if d.ScreenRead == nil {
+			return dispatchError(errors.New("SUP_CONFIG_INVALID"))
+		}
+		result, err := d.ScreenRead.Execute(*id)
+		if err != nil {
+			response := dispatchError(err)
+			if errors.Is(err, usecase.ErrSessionNotFound) || errors.Is(err, usecase.ErrScreenUnavailable) {
+				response.Error.Details = map[string]any{"session_id": p.SessionID}
+			}
+			return response
+		}
+		return success(result)
 	}
 	return malformedResponse()
 }
@@ -309,6 +329,7 @@ func dispatchError(err error) Response {
 		"SUP_SESSION_ALREADY_RUNNING":     "error.supervisor.sessionAlreadyRunning",
 		"SUP_SESSION_LIMIT_REACHED":       "error.supervisor.sessionLimitReached",
 		"SUP_SESSION_NOT_FOUND":           "error.supervisor.sessionNotFound",
+		"SUP_SCREEN_UNAVAILABLE":          "error.supervisor.screenUnavailable",
 		"SUP_SPAWN_FAILED":                "error.supervisor.spawnFailed",
 		"SUP_ORPHAN_CHILD_ALIVE":          "error.supervisor.orphanChildAlive",
 		"SUP_STATE_FILE_CORRUPT":          "error.supervisor.stateFileCorrupt",

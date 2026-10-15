@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -52,6 +53,7 @@ type ObserveSessionUseCase struct {
 }
 
 var rotationObservationWakes sync.Map
+var nextScreenOwner atomic.Uint64
 
 func rotationWakeChannel(id supervisor.SessionID) <-chan struct{} {
 	value, _ := rotationObservationWakes.LoadOrStore(id, make(chan struct{}, 1))
@@ -89,6 +91,7 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 	if pty == nil || vt == nil || u.Sessions == nil {
 		return errors.New("observer dependencies are required")
 	}
+	screenOwner := nextScreenOwner.Add(1)
 	if u.ContextPercent != nil {
 		u.ContextPercent.Delete(initial.SessionID)
 		defer u.ContextPercent.Delete(initial.SessionID)
@@ -189,6 +192,15 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 	var exitedAt time.Time
 	defer func() {
 		stopReader()
+		if u.SendInput != nil {
+			if screens, ok := u.SendInput.Screens.(interface {
+				DeleteOwned(supervisor.SessionID, uint64)
+			}); ok {
+				screens.DeleteOwned(initial.SessionID, screenOwner)
+			} else if screens, ok := u.SendInput.Screens.(interface{ Delete(supervisor.SessionID) }); ok {
+				screens.Delete(initial.SessionID)
+			}
+		}
 		if current, err := u.Sessions.Load(initial.SessionID); err == nil && terminal(current.State) {
 			rotationObservationWakes.Delete(initial.SessionID)
 			if u.Rotation != nil {
@@ -438,6 +450,10 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 				}
 				shot := ScreenSnapshot{Rows: rows, Cells: cells, State: result.State, Processing: result.State == detect.StateWorking && slices.Contains(result.Basis, supervisor.DetectionScreenPattern), CompletionMenu: menu, SelectedCompletion: selected, ObservedAt: now().UTC(), ChangedAt: lastChange}
 				if screens, ok := u.SendInput.Screens.(interface {
+					SetSnapshotOwned(supervisor.SessionID, ScreenSnapshot, uint64)
+				}); ok {
+					screens.SetSnapshotOwned(initial.SessionID, shot, screenOwner)
+				} else if screens, ok := u.SendInput.Screens.(interface {
 					SetSnapshot(supervisor.SessionID, ScreenSnapshot)
 				}); ok {
 					screens.SetSnapshot(initial.SessionID, shot)
@@ -646,7 +662,7 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 				}
 			}
 			if u.SendInput != nil {
-				u.SendInput.EndSession(initial.SessionID)
+				u.SendInput.EndSession(initial.SessionID, screenOwner)
 			}
 			if u.InitialRemoteControl != nil {
 				u.InitialRemoteControl.EndSession(initial.SessionID)

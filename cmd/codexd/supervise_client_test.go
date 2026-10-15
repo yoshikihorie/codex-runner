@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
@@ -10,6 +11,33 @@ import (
 
 	supervisortransport "github.com/yoshikihorie/codex-runner/internal/supervisor/transport"
 )
+
+func TestSupervisorClient_SCNSup0560_ScreenFlags(t *testing.T) {
+	socket := filepath.Join(t.TempDir(), "screen.sock")
+	old := supervisorClientCall
+	defer func() { supervisorClientCall = old }()
+	called := 0
+	supervisorClientCall = func(_ context.Context, c supervisortransport.Client, r supervisortransport.Request) (supervisortransport.Response, error) {
+		called++
+		if c.SocketPath != socket || r.Verb != "screen" || string(r.Params) != `{"session_id":"alpha-1"}` {
+			t.Fatalf("client=%+v request=%+v", c, r)
+		}
+		return supervisortransport.Response{OK: true, Result: json.RawMessage(`{}`)}, nil
+	}
+	for _, args := range [][]string{{"screen", "--socket-path=" + socket}, {"screen", "--socket-path=relative", "--session=alpha-1"}, {"screen", "--socket-path=" + socket, "--session=alpha-1", "--project=alpha"}, {"screen", "--socket-path=" + socket, "--session=alpha-1", "--limit=1"}} {
+		var out, stderr bytes.Buffer
+		if code := runSupervisorClient(context.Background(), args, strings.NewReader(""), &out, &stderr); code != 2 {
+			t.Fatalf("args=%v code=%d", args, code)
+		}
+	}
+	if called != 0 {
+		t.Fatalf("unexpected calls=%d", called)
+	}
+	var out, stderr bytes.Buffer
+	if code := runSupervisorClient(context.Background(), []string{"screen", "--socket-path=" + socket, "--session=alpha-1"}, strings.NewReader(""), &out, &stderr); code != 0 || called != 1 {
+		t.Fatalf("code=%d calls=%d", code, called)
+	}
+}
 
 func TestSupervisorClient_SCNSup0530And0544(t *testing.T) {
 	home, err := os.MkdirTemp("/tmp", "sclient-")

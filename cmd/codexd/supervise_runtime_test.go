@@ -2,16 +2,38 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/yoshikihorie/codex-runner/internal/config"
 	"github.com/yoshikihorie/codex-runner/internal/supervisor"
 	"github.com/yoshikihorie/codex-runner/internal/supervisor/gitops"
+	supervisortransport "github.com/yoshikihorie/codex-runner/internal/supervisor/transport"
+	"github.com/yoshikihorie/codex-runner/internal/supervisor/usecase"
 )
+
+func TestSuperviseRuntimeScreenWiring(t *testing.T) {
+	root := t.TempDir()
+	r, err := newSupervisorRuntime(context.Background(), config.SupervisorConfig{StateDir: root, NotifyCommand: "none", MaxSessions: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(r.close)
+	id := supervisor.SessionID("alpha-1")
+	if err := r.sessions.Save(supervisor.ManagedSession{SessionID: id, ProjectID: "alpha", CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionStarting, StateSince: time.Now().UTC(), RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 1}}); err != nil {
+		t.Fatal(err)
+	}
+	r.screens.SetSnapshot(id, usecase.ScreenSnapshot{Rows: []string{"wired screen"}, ObservedAt: time.Now().UTC()})
+	response := r.newDispatch().Handle(context.Background(), supervisortransport.Request{SupervisorProtocolVersion: supervisortransport.SupervisorProtocolVersion, Verb: "screen", Params: json.RawMessage(`{"session_id":"alpha-1"}`)}, 0)
+	if !response.OK || !strings.Contains(string(response.Result), "wired screen") {
+		t.Fatalf("response=%+v", response)
+	}
+}
 
 type shutdownPTY struct {
 	close  func()

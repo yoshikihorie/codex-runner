@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -412,5 +413,47 @@ func TestDispatch_SCNsup0532_StatusOmitsPrivateContent(t *testing.T) {
 	}
 	if strings.Contains(string(r.Result), "private-sentinel") {
 		t.Fatalf("private field leaked: %s", r.Result)
+	}
+}
+
+func TestDispatch_SCNsup0561_62_ScreenErrors(t *testing.T) {
+	id := supervisor.SessionID("alpha-1")
+	recorded := 0
+	d := &Dispatch{ScreenRead: &usecase.ScreenReadUseCase{
+		Sessions:         dispatchTestSessions{values: []supervisor.ManagedSession{{SessionID: id, State: supervisor.SessionStarting}}},
+		Screens:          &usecase.ObservedScreenStore{},
+		RecordStructured: func(store.Event) error { recorded++; return nil },
+	}}
+	for _, tc := range []struct{ params, code, key, id string }{
+		{`{"session_id":"ghost-9"}`, "SUP_SESSION_NOT_FOUND", "error.supervisor.sessionNotFound", "ghost-9"},
+		{`{"session_id":"alpha-1"}`, "SUP_SCREEN_UNAVAILABLE", "error.supervisor.screenUnavailable", "alpha-1"},
+	} {
+		r := d.Handle(context.Background(), Request{SupervisorProtocolVersion: SupervisorProtocolVersion, Verb: "screen", Params: json.RawMessage(tc.params)}, 0)
+		if r.Error == nil || r.Error.Code != tc.code || r.Error.MessageKey != tc.key || r.Error.Details["session_id"] != tc.id || len(r.Error.Details) != 1 || recorded != 0 {
+			t.Fatalf("response=%+v recorded=%d", r, recorded)
+		}
+	}
+}
+
+func TestDispatchScreenFailedSessionIsUnavailable(t *testing.T) {
+	id := supervisor.SessionID("alpha-1")
+	screens := &usecase.ObservedScreenStore{}
+	screens.SetSnapshot(id, usecase.ScreenSnapshot{Rows: []string{"stale private"}, ObservedAt: time.Now()})
+	recorded := 0
+	d := &Dispatch{ScreenRead: &usecase.ScreenReadUseCase{Sessions: dispatchTestSessions{values: []supervisor.ManagedSession{{SessionID: id, State: supervisor.SessionFailed}}}, Screens: screens, RecordStructured: func(store.Event) error { recorded++; return nil }}}
+	r := d.Handle(context.Background(), Request{SupervisorProtocolVersion: SupervisorProtocolVersion, Verb: "screen", Params: json.RawMessage(`{"session_id":"alpha-1"}`)}, 0)
+	if r.Error == nil || r.Error.Code != "SUP_SCREEN_UNAVAILABLE" || r.Error.MessageKey != "error.supervisor.screenUnavailable" || len(r.Error.Details) != 1 || r.Error.Details["session_id"] != string(id) || recorded != 0 {
+		t.Fatalf("response=%+v recorded=%d", r, recorded)
+	}
+}
+
+func TestDispatchScreenAuditFailureOmitsBody(t *testing.T) {
+	id := supervisor.SessionID("alpha-1")
+	screens := &usecase.ObservedScreenStore{}
+	screens.SetSnapshot(id, usecase.ScreenSnapshot{Rows: []string{"private screen"}, ObservedAt: time.Now()})
+	d := &Dispatch{ScreenRead: &usecase.ScreenReadUseCase{Sessions: dispatchTestSessions{values: []supervisor.ManagedSession{{SessionID: id, State: supervisor.SessionIdle}}}, Screens: screens, RecordStructured: func(store.Event) error { return errors.New("audit unavailable") }}}
+	r := d.Handle(context.Background(), Request{SupervisorProtocolVersion: SupervisorProtocolVersion, Verb: "screen", Params: json.RawMessage(`{"session_id":"alpha-1"}`)}, 0)
+	if r.OK || r.Error == nil || len(r.Result) != 0 || strings.Contains(fmt.Sprint(r), "private screen") {
+		t.Fatalf("response=%+v", r)
 	}
 }

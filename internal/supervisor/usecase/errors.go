@@ -5,6 +5,7 @@ import "errors"
 var (
 	ErrProjectNotFound          = errors.New("SUP_PROJECT_NOT_FOUND")
 	ErrSessionNotFound          = errors.New("SUP_SESSION_NOT_FOUND")
+	ErrScreenUnavailable        = errors.New("SUP_SCREEN_UNAVAILABLE")
 	ErrSessionAlreadyRunning    = errors.New("SUP_SESSION_ALREADY_RUNNING")
 	ErrSessionAlreadyExists     = ErrSessionAlreadyRunning
 	ErrSessionLimitReached      = errors.New("SUP_SESSION_LIMIT_REACHED")
