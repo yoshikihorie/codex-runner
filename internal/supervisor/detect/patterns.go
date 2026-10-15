@@ -2,14 +2,16 @@ package detect
 
 import (
 	supervisor "github.com/yoshikihorie/codex-runner/internal/supervisor"
+	"regexp"
 	"strings"
 )
 
 // DetectorPatternSet holds CLI-specific patterns. Each inner slice is an AND group; groups are ORed.
 type DetectorPatternSet struct {
-	IdleTop, IdleBottom, Prompt           string
-	Working, Recommendation, UnsafeFooter [][]string
-	Permission                            [][]LinePattern
+	IdleTop, IdleBottom, Prompt             string
+	Working, Recommendation, UnsafeFooter   [][]string
+	Permission                              [][]LinePattern
+	ObservedWorking, ObservedRecommendation bool
 }
 
 // LineMatchMode defines how a pattern is matched against a trimmed screen row.
@@ -18,6 +20,7 @@ type LineMatchMode uint8
 const (
 	LinePrefix LineMatchMode = iota + 1
 	LineExact
+	LineRegex
 )
 
 // LinePattern makes the distinction between a row prefix and a complete row explicit.
@@ -28,7 +31,7 @@ type LinePattern struct {
 
 // DefaultPatternSet returns the supported Claude screen patterns.
 func DefaultPatternSet() DetectorPatternSet {
-	return DetectorPatternSet{IdleTop: "─", IdleBottom: "─", Prompt: "❯\u00a0", Permission: [][]LinePattern{{{Text: "Quick safety check: Is this a project you created or one you trust?", Mode: LinePrefix}, {Text: "Enter to confirm · Esc to cancel", Mode: LineExact}}}, UnsafeFooter: [][]string{{"auto mode on"}, {"bypass permissions on"}}}
+	return DetectorPatternSet{IdleTop: "─", IdleBottom: "─", Prompt: "❯\u00a0", ObservedWorking: true, ObservedRecommendation: true, Permission: [][]LinePattern{{{Text: "Quick safety check: Is this a project you created or one you trust?", Mode: LinePrefix}, {Text: "Enter to confirm · Esc to cancel", Mode: LineExact}}, {{Text: "Do you want to proceed?", Mode: LineExact}, {Text: `^❯?\s*1\. Yes(\s|$)`, Mode: LineRegex}}}, UnsafeFooter: [][]string{{"auto mode on"}, {"bypass permissions on"}}}
 }
 func containsAny(rows []string, groups [][]string) bool {
 	for _, g := range groups {
@@ -99,9 +102,23 @@ func linePatternMatches(row string, pattern LinePattern) bool {
 		return strings.HasPrefix(row, pattern.Text)
 	case LineExact:
 		return row == pattern.Text
+	case LineRegex:
+		matched, err := regexp.MatchString(pattern.Text, row)
+		return err == nil && matched
 	default:
 		return false
 	}
+}
+
+var observedWorkingLine = regexp.MustCompile(`^[^\pL\pN\s] [A-Za-z]+…(\s|$)`)
+
+func hasObservedWorking(rows []string) bool {
+	for _, row := range rows {
+		if observedWorkingLine.MatchString(row) {
+			return true
+		}
+	}
+	return false
 }
 func hasIdle(rows []string, p DetectorPatternSet) bool {
 	if p.Prompt == "" || p.IdleTop == "" || p.IdleBottom == "" {

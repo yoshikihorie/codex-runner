@@ -126,7 +126,7 @@ func newSupervisorRuntime(parent context.Context, cfg config.SupervisorConfig) (
 	}
 	r.send = &usecase.SendInputUseCase{Sessions: r.sessions, Screens: r.screens, PTYs: r.ptys, IsStopped: r.stops.IsStopped, StopState: r.stops, ProjectInstructions: instructions, OperationalLog: log, RecordStructured: record, Notify: notify}
 	r.pending = &usecase.PendingRemoteControlUseCase{Sessions: r.sessions, Send: r.send, RecordStructured: record, Now: time.Now}
-	r.auto = &usecase.AutoContinueUseCase{}
+	r.auto = &usecase.AutoContinueUseCase{Extractor: supervisor.RecommendationExtractor{ObservedScreen: true}}
 	r.auto.Bind(r.sessions, r.send, r.stops.IsStopped, record, notify)
 	r.control = usecase.NewStopControlUseCase(r.stops, supervisorSessionRepository{r.sessions}, r.recorder, r.notifier)
 	r.control.SetAutoContinue(r.auto)

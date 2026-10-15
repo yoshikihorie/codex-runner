@@ -175,7 +175,7 @@ func TestSuperviseWiringStartSessionSequence(t *testing.T) {
 		var err error
 		for attempt := 0; attempt < 100; attempt++ {
 			response, err = client.Call(context.Background(), request)
-			if err == nil || !errors.Is(err, os.ErrNotExist) {
+			if err == nil || !errors.Is(err, os.ErrNotExist) && !errors.Is(err, syscall.ECONNREFUSED) {
 				break
 			}
 			time.Sleep(time.Millisecond)

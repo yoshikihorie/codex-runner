@@ -79,6 +79,9 @@ func TestSuperviseProjectDeps_SCNSup0548(t *testing.T) {
 	if a.ObserveSession.SupervisorContext != r.ctx || b.ObserveSession.SupervisorContext != r.ctx || a.ObserveSession.AutoContinue != r.auto || b.ObserveSession.AutoContinue != r.auto {
 		t.Fatal("lifetime or auto-continue wiring wrong")
 	}
+	if !r.auto.Extractor.ObservedScreen {
+		t.Fatal("observed recommendation extractor not wired")
+	}
 	if r.rotation.PendingRemoteControl == nil || r.rotation.ResumeReady == nil || r.rotation.ChildAlive == nil || r.rotation.Wake == nil {
 		t.Fatal("rotation not wired")
 	}

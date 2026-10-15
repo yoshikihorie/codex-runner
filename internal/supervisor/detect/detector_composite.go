@@ -2,6 +2,7 @@ package detect
 
 import "context"
 import "time"
+import "github.com/yoshikihorie/codex-runner/internal/supervisor"
 
 // CompositeDetector applies the canonical rules in priority order.
 type CompositeDetector struct {
@@ -43,7 +44,7 @@ func (d *CompositeDetector) Detect(_ context.Context, in DetectInput) (DetectRes
 	}
 	screen := d.Screen.Detect(in)
 	quiet := d.Quiet.IsQuiet(in)
-	working := containsAny(in.ScreenRows, p.Working)
+	working := containsAny(in.ScreenRows, p.Working) || p.ObservedWorking && hasObservedWorking(in.ScreenRows)
 	permission := false
 	for _, group := range p.Permission {
 		if orderedLinePatternFound(in.ScreenRows, group) {
@@ -51,8 +52,12 @@ func (d *CompositeDetector) Detect(_ context.Context, in DetectInput) (DetectRes
 			break
 		}
 	}
-	recommendation := containsAny(in.ScreenRows, p.Recommendation)
 	idle := hasIdle(in.ScreenRows, p)
+	recommendation := containsAny(in.ScreenRows, p.Recommendation)
+	if p.ObservedRecommendation && idle && quiet {
+		_, _, observed := supervisor.ObservedRecommendationBounds(in.ScreenRows)
+		recommendation = recommendation || observed
+	}
 	result := DetectResult{State: StateUndetermined, PermissionMode: screen.PermissionMode}
 	switch {
 	case in.ProcessExited:

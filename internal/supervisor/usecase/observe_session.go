@@ -574,7 +574,7 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 			}
 			if settled && (gitPhaseCompleted.Equal(current.StateSince) || contextKnown && !contextWasKnown && autoAttempted || !autoAttempted && u.EvaluateCommit == nil) {
 				u.AutoContinue.EvaluateAsync(ctx, AutoContinueInput{
-					SessionID: initial.SessionID, Rows: vt.Screen(), ContextPercent: contextPercent,
+					SessionID: initial.SessionID, Rows: vt.TextRows(), ContextPercent: contextPercent,
 					RequireSettle: true, Settled: true, StaySince: current.StateSince,
 				}, nil)
 				autoAttempted = true

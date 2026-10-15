@@ -657,6 +657,18 @@ func (v *VirtualTerminal) repairWideRow(s *terminalScreen, row int) {
 func (v *VirtualTerminal) Screen() []string {
 	v.mu.Lock()
 	defer v.mu.Unlock()
+	return v.screenRows(false)
+}
+
+// TextRows returns visible rows without wide-character continuation cells.
+// Screen retains those cells as spaces to preserve terminal column positions.
+func (v *VirtualTerminal) TextRows() []string {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	return v.screenRows(true)
+}
+
+func (v *VirtualTerminal) screenRows(omitContinuation bool) []string {
 	s := v.current()
 	out := make([]string, v.rows)
 	for r := range s.cells {
@@ -668,10 +680,14 @@ func (v *VirtualTerminal) Screen() []string {
 		for c := 0; c <= last; c++ {
 			cell := s.cells[r][c]
 			if cell.continuation {
-				b.WriteByte(' ')
-			} else if cell.text != "" {
+				if !omitContinuation {
+					b.WriteByte(' ')
+				}
+				continue
+			}
+			if cell.text != "" {
 				b.WriteString(cell.text)
-			} else if !cell.continuation {
+			} else {
 				b.WriteByte(' ')
 			}
 		}

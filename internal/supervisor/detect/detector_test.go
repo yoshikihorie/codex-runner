@@ -16,6 +16,39 @@ func testPatterns() DetectorPatternSet {
 	p.Recommendation = [][]string{{"recommendation"}}
 	return p
 }
+
+func TestDefaultPatternsObservedScreens(t *testing.T) {
+	now := time.Now()
+	border := strings.Repeat("─", 24)
+	idle := []string{"❯ please answer", "⏺ The answer is two.", "✻ Cooked for 2s · done 10:00", border, "❯\u00a0Try a prompt", border, "  ⏸ manual mode on"}
+	quiet := func(rows []string) DetectResult {
+		return detect(t, NewCompositeDetector(DefaultPatternSet()), DetectInput{ScreenRows: rows, Now: now, LastScreenChangeAt: now.Add(-QuietPeriod)})
+	}
+	for _, tc := range []struct {
+		name string
+		rows []string
+		want DetectedState
+	}{
+		{"recommendation", idle, StateAwaitingRecommendation},
+		{"working", append([]string{"✳ Effecting…"}, idle...), StateWorking},
+		{"startup idle", []string{border, "❯\u00a0", border, "  ⏸ manual mode on"}, StateIdle},
+		{"missing completion", []string{"❯ please answer", "⏺ The answer is two.", border, "❯\u00a0", border}, StateIdle},
+		{"last echo has no completion", append([]string{"❯ older", "⏺ older response", "✻ Cooked for 2s · done 10:00", "❯ newer", "⏺ newer response"}, border, "❯\u00a0", border), StateIdle},
+		{"tool permission", []string{" Bash command", " Do you want to proceed?", " ❯ 1. Yes", "   2. Yes, and switch to auto mode", "   3. No"}, StateAwaitingPermission},
+		{"permission and recommendation", append(append([]string{}, idle...), " Do you want to proceed?", " ❯ 1. Yes"), StateUndetermined},
+		{"teach auto mode", []string{"  Teach auto mode about your environment?", "  ❯ 1. Yes", "    2. Not now", "  Enter to confirm · Esc to cancel"}, StateUndetermined},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := quiet(tc.rows)
+			if got.State != tc.want {
+				t.Fatalf("state=%s want %s", got.State, tc.want)
+			}
+			if tc.name == "recommendation" && got.PermissionMode != PermissionDefaultOrUnknown {
+				t.Fatalf("manual footer mode=%s", got.PermissionMode)
+			}
+		})
+	}
+}
 func detect(t *testing.T, d *CompositeDetector, in DetectInput) DetectResult {
 	t.Helper()
 	r, e := d.Detect(context.Background(), in)

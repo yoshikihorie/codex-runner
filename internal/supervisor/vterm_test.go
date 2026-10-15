@@ -253,6 +253,19 @@ func TestVirtualTerminalConcurrentWriteAndScreen(t *testing.T) {
 	wg.Wait()
 }
 
+func TestVirtualTerminalTextRowsOmitWideContinuation(t *testing.T) {
+	v := NewVirtualTerminal(40, 2)
+	if _, err := v.Write([]byte("⏺ 本番にデプロイ\r\nforce push")); err != nil {
+		t.Fatal(err)
+	}
+	if got := v.TextRows(); got[0] != "⏺ 本番にデプロイ" || got[1] != "force push" {
+		t.Fatalf("text rows=%q", got)
+	}
+	if v.Screen()[0] == v.TextRows()[0] {
+		t.Fatal("column-preserving screen unexpectedly changed")
+	}
+}
+
 func TestVirtualTerminalOSCInterruptAndEscapeSequenceLimit(t *testing.T) {
 	v := NewVirtualTerminal(20, 4)
 	v.Write([]byte("\x1b]title\x1b\x1b[2;1HX\x1b]unterminated"))

@@ -15,6 +15,7 @@ import (
 	"github.com/yoshikihorie/codex-runner/internal/supervisor"
 	"github.com/yoshikihorie/codex-runner/internal/supervisor/detect"
 	"github.com/yoshikihorie/codex-runner/internal/supervisor/store"
+	"github.com/yoshikihorie/codex-runner/internal/supervisor/textpolicy"
 )
 
 type changingDetector struct{ state atomic.Value }
@@ -87,6 +88,26 @@ func autoFixture() (*AutoContinueUseCase, *autoSessions, *autoSender, *[]store.E
 	sender := &autoSender{u: u}
 	u.Send = sender
 	return u, s, sender, events
+}
+
+func TestObservedWideTextIsClassifiedBeforeAutoContinue(t *testing.T) {
+	for _, forbidden := range []string{"本番にデプロイ", "force push"} {
+		t.Run(forbidden, func(t *testing.T) {
+			vt := supervisor.NewVirtualTerminal(80, 12)
+			lines := []string{"❯ synthetic input", "⏺ " + forbidden, "✻ Cooked for 2s · done 10:00", "────────", "❯\u00a0", "────────"}
+			for i, line := range lines {
+				_, _ = vt.Write([]byte(fmt.Sprintf("\x1b[%d;1H%s", i+1, line)))
+			}
+			body, ok := (supervisor.RecommendationExtractor{ObservedScreen: true}).Extract(vt.TextRows())
+			if !ok || !strings.Contains(body, forbidden) {
+				t.Fatalf("body=%q ok=%v", body, ok)
+			}
+			categories, unknown := textpolicy.Classify(body)
+			if unknown || len(categories) == 0 {
+				t.Fatalf("categories=%v unknown=%v", categories, unknown)
+			}
+		})
+	}
 }
 func autoInput(body string) AutoContinueInput {
 	return AutoContinueInput{SessionID: supervisor.SessionID("auto-test-1"), Rows: []string{"❯ 前の入力", "推奨:", body, "────", "❯\u00a0"}, ContextPercent: ptrInt(20), EnteredFromWorking: true}
