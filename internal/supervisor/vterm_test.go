@@ -3,10 +3,10 @@ package supervisor
 import (
 	_ "embed"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
-	"time"
 )
 
 //go:embed testdata/claude-default-startup.txt
@@ -214,11 +214,51 @@ func TestVirtualTerminalKittyCSIAndC1Ignored(t *testing.T) {
 }
 
 func TestVirtualTerminalHugeScrollingIsBounded(t *testing.T) {
-	v := NewVirtualTerminal(30, 20)
-	start := time.Now()
-	v.Write([]byte("\x1b[20000000S\x1b[20000000L"))
-	if time.Since(start) > 10*time.Millisecond {
-		t.Fatalf("large scroll took %s", time.Since(start))
+	const hugeScrollTestAllocationLimit = 1000
+	initialRows := []string{"AAAAA", "BBBBB", "CCCCC", "DDDDD", "EEEEE"}
+	var initial strings.Builder
+	for row, content := range initialRows {
+		fmt.Fprintf(&initial, "\x1b[%d;1H%s", row+1, content)
+	}
+	// Clear pending wrap after writing the last column.
+	initial.WriteString("\x1b[1;1H")
+	for _, tt := range []struct {
+		name, position, operation string
+		want                      []string
+		cursor                    CursorPosition
+	}{
+		{"full screen S", "\x1b[3;2H", "\x1b[20000000S", []string{"", "", "", "", ""}, CursorPosition{Row: 2, Col: 1}},
+		{"region S", "\x1b[2;4r\x1b[3;2H", "\x1b[20000000S", []string{"AAAAA", "", "", "", "EEEEE"}, CursorPosition{Row: 2, Col: 1}},
+		{"region L", "\x1b[2;4r\x1b[3;1H", "\x1b[20000000L", []string{"AAAAA", "BBBBB", "", "", "EEEEE"}, CursorPosition{Row: 2, Col: 0}},
+		{"outside region L", "\x1b[2;4r\x1b[1;1H", "\x1b[20000000L", initialRows, CursorPosition{Row: 0, Col: 0}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			setup := []byte(initial.String() + tt.position)
+			operation := []byte(tt.operation)
+			v := NewVirtualTerminal(5, 5)
+			v.Write(setup)
+			before := v.CursorPos()
+			if before != tt.cursor {
+				t.Fatalf("cursor before scroll = %+v, want %+v", before, tt.cursor)
+			}
+			v.Write(operation)
+			got := v.Screen()
+			if len(got) != 5 || !slices.Equal(got, tt.want) {
+				t.Fatalf("screen = %#v, want %#v (5 rows)", got, tt.want)
+			}
+			if after := v.CursorPos(); after != before {
+				t.Fatalf("cursor after scroll = %+v, want unchanged %+v", after, before)
+			}
+			allocs := testing.AllocsPerRun(10, func() {
+				terminal := NewVirtualTerminal(5, 5)
+				terminal.Write(setup)
+				terminal.Write(operation)
+			})
+			t.Logf("%s: allocations = %.1f, limit < %d", tt.name, allocs, hugeScrollTestAllocationLimit)
+			if allocs >= hugeScrollTestAllocationLimit {
+				t.Fatalf("%s: allocations = %.1f, want < %d", tt.name, allocs, hugeScrollTestAllocationLimit)
+			}
+		})
 	}
 }
 

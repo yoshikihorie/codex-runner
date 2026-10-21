@@ -494,56 +494,146 @@ func waitForHandlers(t *testing.T, wg *sync.WaitGroup) {
 	}
 }
 
-func TestServeSocketPermissionsAndCancellation(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "t1-03-sock-*")
+// These lifecycle helpers are only for the two Serve cancellation tests.
+const serveCancellationTestWaitLimit = 10 * time.Second
+
+type serveCancellationTestServer struct {
+	dir, path                               string
+	conn                                    net.Conn
+	cancel                                  context.CancelFunc
+	wg                                      sync.WaitGroup
+	registry                                *tailConnRegistry
+	serveDone                               chan struct{}
+	serveErr                                error // Published by closing serveDone.
+	handlersDone                            chan struct{}
+	serveWaitTimedOut, handlersWaitTimedOut bool
+}
+
+func startServeCancellationTestServer(t *testing.T, prefix string, dispatch func(Request) Response, handler TailHandler) *serveCancellationTestServer {
+	t.Helper()
+	dir, err := os.MkdirTemp("/tmp", prefix)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer os.RemoveAll(dir)
-	path := filepath.Join(dir, "codexd.sock")
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	var wg sync.WaitGroup
-	done := make(chan error, 1)
+	s := &serveCancellationTestServer{
+		dir: dir, path: filepath.Join(dir, "codexd.sock"), cancel: cancel,
+		registry: NewTailConnRegistry(), serveDone: make(chan struct{}),
+	}
+	// Register before starting Serve so all fatal paths use the same shutdown order.
+	t.Cleanup(func() {
+		if s.conn != nil {
+			_ = s.conn.Close()
+		}
+		s.cancel()
+		if !s.waitServe(t) {
+			t.Errorf("Serve termination unconfirmed; retained directory: %s", s.dir)
+			return
+		}
+		if !s.shutdownHandlers(t) {
+			t.Errorf("handler termination unconfirmed; retained directory: %s", s.dir)
+			return
+		}
+		if err := os.RemoveAll(s.dir); err != nil {
+			t.Errorf("remove directory %s: %v", s.dir, err)
+		}
+	})
 	ready := make(chan error, 1)
 	go func() {
-		_, err := Serve(ctx, path, func(req Request) Response {
-			return Response{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, OK: true, Result: json.RawMessage(`{}`)}
-		}, noOpTailHandler, &wg, &tailConnRegistry{}, make(chan struct{}), ready)
-		done <- err
+		_, s.serveErr = Serve(ctx, s.path, dispatch, handler, &s.wg, s.registry, make(chan struct{}), ready)
+		close(s.serveDone)
 	}()
-	if err := <-ready; err != nil {
-		t.Fatal(err)
-	}
-	var conn net.Conn
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		var err error
-		conn, err = net.Dial("unix", path)
-		if err == nil {
-			break
+	select {
+	case err := <-ready:
+		if err != nil {
+			t.Fatalf("ready %s: %v", s.path, err)
 		}
-		time.Sleep(time.Millisecond)
+	case <-time.After(serveCancellationTestWaitLimit):
+		t.Fatalf("ready %s: timed out after %s", s.path, serveCancellationTestWaitLimit)
 	}
-	if conn == nil {
-		t.Fatal("server did not start")
+	s.conn, err = net.DialTimeout("unix", s.path, serveCancellationTestWaitLimit)
+	if err != nil {
+		t.Fatalf("Dial after ready %s: %v", s.path, err)
 	}
-	info, err := os.Stat(path)
+	return s
+}
+
+func (s *serveCancellationTestServer) waitSignal(t *testing.T, done <-chan struct{}, stage string) bool {
+	t.Helper()
+	select {
+	case <-done:
+		return true
+	case <-time.After(serveCancellationTestWaitLimit):
+		t.Errorf("%s %s: timed out after %s", stage, s.path, serveCancellationTestWaitLimit)
+		return false
+	}
+}
+
+func (s *serveCancellationTestServer) waitServe(t *testing.T) bool {
+	t.Helper()
+	if s.serveWaitTimedOut {
+		return false
+	}
+	if !s.waitSignal(t, s.serveDone, "Serve termination") {
+		s.serveWaitTimedOut = true
+		return false
+	}
+	if s.serveErr != nil {
+		t.Errorf("Serve termination %s: %v", s.path, s.serveErr)
+	}
+	return true
+}
+
+func (s *serveCancellationTestServer) shutdownHandlers(t *testing.T) bool {
+	t.Helper()
+	// A closed serveDone ensures Serve cannot add any more handlers.
+	select {
+	case <-s.serveDone:
+	default:
+		t.Errorf("handler shutdown before Serve termination %s", s.path)
+		return false
+	}
+	if s.handlersDone == nil {
+		s.registry.closeAll()
+		s.handlersDone = make(chan struct{})
+		go func() {
+			s.wg.Wait()
+			close(s.handlersDone)
+		}()
+	}
+	if s.handlersWaitTimedOut {
+		return false
+	}
+	if !s.waitSignal(t, s.handlersDone, "handler termination") {
+		s.handlersWaitTimedOut = true
+		return false
+	}
+	return true
+}
+
+func TestServeSocketPermissionsAndCancellation(t *testing.T) {
+	s := startServeCancellationTestServer(t, "t1-03-sock-*", func(req Request) Response {
+		return Response{ProtocolVersion: ProtocolVersion, RequestID: req.RequestID, OK: true, Result: json.RawMessage(`{}`)}
+	}, noOpTailHandler)
+	info, err := os.Stat(s.path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("mode = %o", info.Mode().Perm())
 	}
-	conn.Close()
-	cancel()
-	if err := <-done; err != nil {
-		t.Fatal(err)
+	_ = s.conn.Close()
+	s.cancel()
+	if !s.waitServe(t) || s.serveErr != nil {
+		t.FailNow()
 	}
-	if _, err := net.Dial("unix", path); err == nil {
-		t.Fatal("dial succeeded after cancellation")
+	if conn, err := net.DialTimeout("unix", s.path, serveCancellationTestWaitLimit); err == nil {
+		_ = conn.Close()
+		t.Fatalf("Dial after cancellation %s: unexpectedly succeeded", s.path)
 	}
-	wg.Wait()
+	if !s.shutdownHandlers(t) {
+		t.FailNow()
+	}
 }
 
 func TestServeRejectsPreexistingSocketPathWithoutRemovingIt(t *testing.T) {
@@ -1018,14 +1108,6 @@ func TestHandleConnUnblocksReadWhenShutdownBegins(t *testing.T) {
 }
 
 func TestServeKeepsTailContextAliveUntilRegistryShutdown(t *testing.T) {
-	dir, err := os.MkdirTemp("/tmp", "t1-23-batch4-sock-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer os.RemoveAll(dir)
-	path := filepath.Join(dir, "codexd.sock")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	started := make(chan struct{})
 	observed := make(chan error, 1)
 	tailHandler := func(handlerCtx context.Context, _ Request, _ io.Writer) error {
@@ -1034,62 +1116,40 @@ func TestServeKeepsTailContextAliveUntilRegistryShutdown(t *testing.T) {
 		observed <- handlerCtx.Err()
 		return nil
 	}
-	registry := NewTailConnRegistry()
-	var wg sync.WaitGroup
-	acceptLoopDone := make(chan struct{})
-	serveDone := make(chan error, 1)
-	ready := make(chan error, 1)
-	go func() {
-		_, err := Serve(ctx, path, func(Request) Response { return Response{} }, tailHandler, &wg, registry, acceptLoopDone, ready)
-		serveDone <- err
-	}()
-	if err := <-ready; err != nil {
-		t.Fatal(err)
+	s := startServeCancellationTestServer(t, "t1-23-batch4-sock-*", func(Request) Response { return Response{} }, tailHandler)
+	if err := s.conn.SetWriteDeadline(time.Now().Add(serveCancellationTestWaitLimit)); err != nil {
+		t.Fatalf("tail write deadline %s: %v", s.path, err)
 	}
-
-	var client net.Conn
-	deadline := time.Now().Add(time.Second)
-	for time.Now().Before(deadline) {
-		client, _ = net.Dial("unix", path)
-		if client != nil {
-			break
-		}
-		time.Sleep(time.Millisecond)
+	if _, err := s.conn.Write([]byte(`{"verb":"tail","request_id":"tail-1"}` + "\n")); err != nil {
+		t.Fatalf("tail request write %s: %v", s.path, err)
 	}
-	if client == nil {
-		t.Fatal("server did not start")
+	if !s.waitSignal(t, started, "tail handler start") {
+		t.FailNow()
 	}
-	defer client.Close()
-	if _, err := client.Write([]byte(`{"verb":"tail","request_id":"tail-1"}` + "\n")); err != nil {
-		t.Fatal(err)
+	s.cancel()
+	if !s.waitServe(t) || s.serveErr != nil {
+		t.FailNow()
 	}
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("tail handler did not start")
-	}
-	cancel()
 	select {
 	case err := <-observed:
 		t.Fatalf("tail handler context cancelled before registry shutdown: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
-	if err := <-serveDone; err != nil {
-		t.Fatal(err)
+	// Shutdown and WaitGroup waiting happen once, shared with cleanup.
+	if !s.shutdownHandlers(t) {
+		t.FailNow()
 	}
-	registry.closeAll()
 	select {
 	case err := <-observed:
 		if !errors.Is(err, context.Canceled) {
 			t.Fatalf("handler context error = %v", err)
 		}
-	case <-time.After(time.Second):
-		t.Fatal("tail handler did not receive registry cancellation")
+	case <-time.After(serveCancellationTestWaitLimit):
+		t.Fatalf("registry shutdown notification %s: timed out after %s", s.path, serveCancellationTestWaitLimit)
 	}
-	wg.Wait()
-	registry.mu.Lock()
-	remaining := len(registry.conns)
-	registry.mu.Unlock()
+	s.registry.mu.Lock()
+	remaining := len(s.registry.conns)
+	s.registry.mu.Unlock()
 	if remaining != 0 {
 		t.Fatalf("tail connection registry entries = %d", remaining)
 	}

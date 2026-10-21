@@ -283,6 +283,7 @@ func TestBuildLaunchArgsTerminatesOptionsBeforePrompt(t *testing.T) {
 }
 
 func TestDetectSkipGitRepoCheck(t *testing.T) {
+	const normalGitCheckTestTimeout = time.Hour
 	originalFind, originalRun, originalTimeout := findGitBinary, runGitRepositoryCheck, gitRepositoryCheckTimeout
 	t.Cleanup(func() {
 		findGitBinary, runGitRepositoryCheck, gitRepositoryCheckTimeout = originalFind, originalRun, originalTimeout
@@ -291,32 +292,40 @@ func TestDetectSkipGitRepoCheck(t *testing.T) {
 
 	for _, tt := range []struct {
 		name       string
-		findErr    error
+		timeout    time.Duration
 		run        func(context.Context, string, []string, io.Writer, io.Writer, ...string) error
 		wantReason gitRepoCheckReason
 		wantSkip   bool
 	}{
-		{name: "success", run: func(context.Context, string, []string, io.Writer, io.Writer, ...string) error { return nil }},
-		{name: "non-zero", run: func(context.Context, string, []string, io.Writer, io.Writer, ...string) error {
+		{name: "success", timeout: normalGitCheckTestTimeout, run: func(context.Context, string, []string, io.Writer, io.Writer, ...string) error { return nil }},
+		{name: "non-zero", timeout: normalGitCheckTestTimeout, run: func(context.Context, string, []string, io.Writer, io.Writer, ...string) error {
 			return &exec.ExitError{}
 		}, wantSkip: true, wantReason: gitRepoCheckReasonNotConfirmed},
-		{name: "runner failure", run: func(context.Context, string, []string, io.Writer, io.Writer, ...string) error {
+		{name: "runner failure", timeout: normalGitCheckTestTimeout, run: func(context.Context, string, []string, io.Writer, io.Writer, ...string) error {
 			return errors.New("runner failure")
 		}, wantSkip: true, wantReason: gitRepoCheckReasonFailed},
-		{name: "timeout", run: func(ctx context.Context, _ string, _ []string, _ io.Writer, _ io.Writer, _ ...string) error {
+		{name: "timeout", timeout: 0, run: func(ctx context.Context, _ string, _ []string, _ io.Writer, _ io.Writer, _ ...string) error {
 			<-ctx.Done()
 			return ctx.Err()
 		}, wantSkip: true, wantReason: gitRepoCheckReasonTimeout},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
-			gitRepositoryCheckTimeout = time.Millisecond
-			findGitBinary = func() (string, error) { return "/usr/bin/git", tt.findErr }
-			runGitRepositoryCheck = tt.run
+			previousTimeout := gitRepositoryCheckTimeout
+			t.Cleanup(func() { gitRepositoryCheckTimeout = previousTimeout })
+			gitRepositoryCheckTimeout = tt.timeout
+			findGitBinary = func() (string, error) { return "/usr/bin/git", nil }
+			runGitRepositoryCheck = func(ctx context.Context, binary string, env []string, stdout, stderr io.Writer, args ...string) error {
+				if tt.timeout != 0 && ctx.Err() != nil {
+					t.Fatalf("normal git check context expired: %v", ctx.Err())
+				}
+				return tt.run(ctx, binary, env, stdout, stderr, args...)
+			}
 			if skip, reason := detectSkipGitRepoCheck("/safe/workdir"); skip != tt.wantSkip || reason != tt.wantReason {
 				t.Fatalf("skip, reason = %t, %q; want %t, %q", skip, reason, tt.wantSkip, tt.wantReason)
 			}
 		})
 	}
+	gitRepositoryCheckTimeout = normalGitCheckTestTimeout
 	findGitBinary = func() (string, error) { return "", errors.New("not found") }
 	if skip, reason := detectSkipGitRepoCheck("/safe/workdir"); !skip || reason != gitRepoCheckReasonBinaryUnavailable {
 		t.Fatalf("binary failure = %t, %q", skip, reason)
