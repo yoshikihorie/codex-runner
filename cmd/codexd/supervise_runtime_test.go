@@ -142,7 +142,11 @@ func (p *runtimeOperatorPTY) WriteLine(_ context.Context, value string, _ time.D
 	shot.Cells[1] = []supervisor.Cell{{Text: "❯"}, {Text: "\u00a0"}}
 	shot.ChangedAt = time.Now().Add(time.Second)
 	p.r.screens.SetSnapshot(p.id, shot)
-	p.r.send.NotifyConfirmation(usecase.SendConfirmation{SessionID: p.id, SendID: "alpha-1-s1", Screen: shot})
+	// Model two consecutive post-CR snapshots, as required by SCN-sup-02-41.
+	for observation := uint64(1); observation <= 2; observation++ {
+		shot.Observation = observation
+		p.r.send.NotifyConfirmation(usecase.SendConfirmation{SessionID: p.id, SendID: "alpha-1-s1", Screen: shot})
+	}
 	return nil
 }
 

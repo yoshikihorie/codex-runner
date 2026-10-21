@@ -384,3 +384,55 @@ func TestSCNsup0222SCNsup0235ObserveExitWithPending(t *testing.T) {
 		})
 	}
 }
+
+func TestObserveC1ObservationAdvancesOnlyOnOutput(t *testing.T) {
+	s, sessions, events := observeSendFixture(t, supervisor.SessionIdle)
+	screens := &ObservedScreenStore{}
+	send := &SendInputUseCase{Screens: screens}
+	p := newObserveSendPTY()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateWorking}}}, Sessions: sessions, SendInput: send, RecordStructured: observeSendRecord(events), Interval: time.Millisecond}
+	done := make(chan error, 1)
+	go func() { done <- u.Run(ctx, s, p, supervisor.NewVirtualTerminal(80, 24)) }()
+	defer func() {
+		cancel()
+		_ = p.Close()
+		if err := <-done; err != nil && !errors.Is(err, context.Canceled) {
+			t.Error(err)
+		}
+	}()
+	wait := func(want uint64) ScreenSnapshot {
+		t.Helper()
+		deadline := time.After(time.Second)
+		for {
+			shot := screens.Snapshot(s.SessionID)
+			if shot.Observation == want {
+				return shot
+			}
+			select {
+			case <-deadline:
+				t.Fatalf("observation=%d want=%d", shot.Observation, want)
+			default:
+				time.Sleep(time.Millisecond)
+			}
+		}
+	}
+	p.reads <- []byte("❯\u00a0")
+	first := wait(1)
+	time.Sleep(5 * time.Millisecond)
+	if got := screens.Snapshot(s.SessionID).Observation; got != 1 {
+		t.Fatalf("timer advanced observation: %d", got)
+	}
+	// Output that leaves all cells unchanged is still a distinct observation.
+	p.reads <- []byte("\r")
+	second := wait(2)
+	if !second.ChangedAt.Equal(first.ChangedAt) {
+		t.Fatalf("unchanged cells advanced ChangedAt: %v -> %v", first.ChangedAt, second.ChangedAt)
+	}
+	p.reads <- []byte("different")
+	third := wait(3)
+	if !third.ChangedAt.After(second.ChangedAt) {
+		t.Fatal("changed output did not advance ChangedAt")
+	}
+}

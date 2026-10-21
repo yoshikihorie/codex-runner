@@ -23,7 +23,7 @@ func pendingRemoteControlFixture(t *testing.T) (*PendingRemoteControlUseCase, *s
 	pty.afterEnter = func() {
 		shot := blankScreen()
 		shot.ChangedAt = time.Now().Add(time.Second)
-		send.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: sessions.session.SendGate.Pending.SendID, Screen: shot})
+		notifySendTestPair(send, SendConfirmation{SessionID: id, SendID: sessions.session.SendGate.Pending.SendID, Screen: shot})
 		screen.shot = blankScreen()
 	}
 	events := &[]store.Event{}

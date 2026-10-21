@@ -6,6 +6,8 @@ import "time"
 const SupervisorSendConfirmTimeout = 60 * time.Second
 const SupervisorExitGrace = 60 * time.Second // SUPERVISOR_EXIT_GRACE_SECONDS, validation-rules.md §3.
 const SupervisorSendEnterDelay = 200 * time.Millisecond
+const SupervisorSendEchoWait = 2000 * time.Millisecond    // SUPERVISOR_SEND_ECHO_WAIT_MS, validation-rules.md §3.1.
+const SupervisorStopPollInterval = 500 * time.Millisecond // SUPERVISOR_STOP_POLL_INTERVAL_MS, validation-rules.md §3.1.
 
 // Canonical values: specifications/10-shared/published-language/enums.md SupervisorSendBlockedReason.
 type SupervisorSendBlockedReason string

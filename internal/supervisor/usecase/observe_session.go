@@ -156,6 +156,7 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 		started = *initial.ChildStartedAt
 	}
 	lastChange := now().UTC()
+	var observation uint64
 	readerCtx, stopReader := context.WithCancel(ctx)
 	type readResult struct {
 		data []byte
@@ -299,6 +300,8 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 			_ = pty.Close()
 		case item := <-reads:
 			if len(item.data) > 0 {
+				observation++
+				screenUpdatedAt = now().UTC()
 				before := vt.Screen()
 				var beforeCells [][]supervisor.Cell
 				if u.SendInput != nil {
@@ -455,7 +458,7 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 				if u.CompletionSelection != nil {
 					menu, selected = u.CompletionSelection(rows)
 				}
-				shot := ScreenSnapshot{Rows: rows, Cells: cells, State: result.State, Processing: result.State == detect.StateWorking && slices.Contains(result.Basis, supervisor.DetectionScreenPattern), CompletionMenu: menu, SelectedCompletion: selected, ObservedAt: now().UTC(), ChangedAt: lastChange}
+				shot := ScreenSnapshot{Observation: observation, Rows: rows, Cells: cells, State: result.State, Processing: result.State == detect.StateWorking && slices.Contains(result.Basis, supervisor.DetectionScreenPattern), CompletionMenu: menu, SelectedCompletion: selected, ObservedAt: now().UTC(), ChangedAt: lastChange}
 				if screens, ok := u.SendInput.Screens.(interface {
 					SetSnapshotOwned(supervisor.SessionID, ScreenSnapshot, uint64)
 				}); ok {

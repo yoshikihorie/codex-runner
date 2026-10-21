@@ -34,6 +34,8 @@ var errSendPendingAppeared = errors.New("pending send appeared before issue")
 const defaultParallelInstruction = "自動作業計画モード 並列で作業して。実装は ~/.claude/scripts/codex.sh impl --model gpt-6-luna を明示して委譲する"
 
 type ScreenSnapshot struct {
+	// Observation advances once per output chunk processed by the observer.
+	Observation           uint64
 	Rows                  []string
 	Cells                 [][]supervisor.Cell
 	State                 detect.DetectedState
@@ -99,6 +101,8 @@ type PTYWriter interface {
 	WriteLine(context.Context, string, time.Duration, func() bool) error
 }
 type SendConfirmation struct {
+	// earlier preserves intervening screens when the notification channel is full.
+	earlier       []SendConfirmation
 	SessionID     supervisor.SessionID
 	SendID        string
 	Screen        ScreenSnapshot
@@ -124,6 +128,7 @@ type SendInputUseCase struct {
 	RecommendationIssued func(supervisor.SessionID, [32]byte, time.Time)
 	Now                  func() time.Time
 	ConfirmTimeout       time.Duration
+	EchoWait             time.Duration
 	issuedBindOnce       sync.Once
 	mu                   sync.Mutex
 	locks                map[supervisor.SessionID]*sync.Mutex
@@ -157,12 +162,11 @@ func (u *SendInputUseCase) confirmationChannel(id supervisor.SessionID) chan Sen
 }
 func (u *SendInputUseCase) NotifyConfirmation(c SendConfirmation) {
 	u.mu.Lock()
+	defer u.mu.Unlock()
 	if u.ended[c.SessionID] {
-		u.mu.Unlock()
 		return
 	}
 	ch := u.confirm[c.SessionID]
-	u.mu.Unlock()
 	if ch == nil {
 		return
 	}
@@ -170,13 +174,22 @@ func (u *SendInputUseCase) NotifyConfirmation(c SendConfirmation) {
 	case ch <- c:
 	default:
 		select {
-		case <-ch:
+		case previous := <-ch:
+			c.earlier = previous.earlier
+			previous.earlier = nil
+			c.earlier = append(c.earlier, previous)
 		default:
 		}
-		select {
-		case ch <- c:
-		default:
-		}
+		ch <- c
+	}
+}
+
+// Stop retaining observations when no sender is waiting (including after timeout).
+func (u *SendInputUseCase) releaseConfirmation(id supervisor.SessionID, ch chan SendConfirmation) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.confirm[id] == ch {
+		delete(u.confirm, id)
 	}
 }
 func (u *SendInputUseCase) now() time.Time {
@@ -361,6 +374,7 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 	prevEver := s.SendGate.EverSent
 	var pending supervisor.PendingSend
 	ch := u.resetConfirmation(in.SessionID)
+	defer u.releaseConfirmation(in.SessionID, ch)
 	err = UpdateSession(u.Sessions, in.SessionID, func(v *supervisor.ManagedSession) error {
 		if !supervisor.SendKindAllowed(v.State, supervisor.SupervisorSessionState(second.State), in.Kind, in.Origin) {
 			return errSendStateChanged
@@ -413,24 +427,9 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 	var beforeCalled, beforeAllowed bool
 	before := func() bool {
 		beforeCalled = true
-		shot := u.Screens.Snapshot(in.SessionID)
-		if u.stopped(in.SessionID) || in.Kind == supervisor.SendKindOperatorInput && (shot.State != detect.StateIdle && shot.State != detect.StateWorking || shot.CompletionMenu) || !screenReadyForEnter(shot, message, in.Kind == supervisor.SendKindOperatorInput) {
+		if !u.waitForEnter(ctx, in, message, pending.SendID, ch) {
 			return false
 		}
-		if in.Kind == supervisor.SendKindOperatorInput {
-			current, err := u.Sessions.Load(in.SessionID)
-			if err != nil || current.State != supervisor.SessionIdle && current.State != supervisor.SessionWorking {
-				return false
-			}
-			if u.Observed != nil {
-				state, ok := u.Observed.Get(in.SessionID)
-				if !ok || state != detect.StateIdle && state != detect.StateWorking {
-					return false
-				}
-			}
-		}
-		crAt = u.now()
-		u.markCR(in.SessionID, pending.SendID)
 		beforeAllowed = true
 		return true
 	}
@@ -453,6 +452,9 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 		}
 		return result, errors.Join(err, u.abortBeforeCR(in, pending, prevEver, prev))
 	}
+	// WriteLine returns only after the separate CR write completes.
+	u.markCR(in.SessionID, pending.SendID)
+	crAt = u.CRWrittenAt(in.SessionID, pending.SendID)
 	timeout := in.ConfirmTimeout
 	if timeout <= 0 && in.Kind == supervisor.SendKindHandoffExit && in.Origin == supervisor.SendOriginHandoff {
 		timeout = supervisor.SupervisorExitGrace
@@ -465,63 +467,82 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 	}
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
+	var lastObservation uint64
+	consecutive := 0
 	for {
 		select {
-		case c := <-ch:
-			if c.SendID != pending.SendID {
-				continue
-			}
-			if c.ProcessExited {
-				if in.Kind == supervisor.SendKindHandoffExit {
-					if !c.ExitedAt.After(crAt) {
-						continue
+		case notification := <-ch:
+			for _, c := range append(notification.earlier, notification) {
+				if c.SendID != pending.SendID {
+					continue
+				}
+				if c.ProcessExited {
+					if in.Kind == supervisor.SendKindHandoffExit {
+						if !c.ExitedAt.After(crAt) {
+							continue
+						}
+						// The observer confirms handoff_exit in the same write as the exit transition.
+						current, err := u.Sessions.Load(in.SessionID)
+						if err != nil {
+							return result, err
+						}
+						if current.SendGate.Pending == nil && current.LastSend != nil && current.LastSend.SendID == pending.SendID && current.LastSend.Confirmed {
+							return SendResult{SendID: pending.SendID, Confirmed: true}, nil
+						}
+						if !u.CRWritten(in.SessionID, pending.SendID) {
+							continue
+						}
+						return u.confirmSend(in, pending)
 					}
-					// The observer confirms handoff_exit in the same write as the exit transition.
 					current, err := u.Sessions.Load(in.SessionID)
 					if err != nil {
 						return result, err
 					}
-					if current.SendGate.Pending == nil && current.LastSend != nil && current.LastSend.SendID == pending.SendID && current.LastSend.Confirmed {
-						return SendResult{SendID: pending.SendID, Confirmed: true}, nil
+					if current.State == supervisor.SessionStopped && current.StopReason == supervisor.StopProcessExitWithPending {
+						return result, errors.New("process exited with pending send")
 					}
-					if !u.CRWritten(in.SessionID, pending.SendID) {
-						continue
+					if in.Origin == supervisor.SendOriginHandoff {
+						return result, errors.New("process exited with pending send")
 					}
+					if err := UpdateSession(u.Sessions, in.SessionID, func(v *supervisor.ManagedSession) error {
+						v.State = supervisor.SessionStopped
+						v.StopReason = supervisor.StopProcessExitWithPending
+						return nil
+					}); err != nil {
+						return result, err
+					}
+					if u.Notify != nil {
+						u.Notify(supervisor.EventKindSessionStopped, in.SessionID.String())
+					}
+					return result, errors.New("process exited with pending send")
+				}
+				if in.Kind == supervisor.SendKindHandoffExit {
+					continue
+				}
+				if c.Screen.Observation == 0 {
+					consecutive = 0
+					continue
+				}
+				if c.Screen.Observation <= lastObservation {
+					continue
+				}
+				adjacent := lastObservation != 0 && c.Screen.Observation-lastObservation == 1
+				lastObservation = c.Screen.Observation
+				blank := detect.IsInputBlank(detect.DefaultPatternSet(), c.Screen.Rows, c.Screen.Cells)
+				if !snapshotChangedAt(c.Screen).After(crAt) || !blank && (in.Kind == supervisor.SendKindRemoteControl || !c.Screen.Processing) {
+					consecutive = 0
+					continue
+				}
+				if !adjacent {
+					consecutive = 0
+				}
+				consecutive++
+				// FD-sup-02 §5.2 requires two consecutive, distinct observations.
+				if consecutive >= 2 {
 					return u.confirmSend(in, pending)
 				}
-				current, err := u.Sessions.Load(in.SessionID)
-				if err != nil {
-					return result, err
-				}
-				if current.State == supervisor.SessionStopped && current.StopReason == supervisor.StopProcessExitWithPending {
-					return result, errors.New("process exited with pending send")
-				}
-				if in.Origin == supervisor.SendOriginHandoff {
-					return result, errors.New("process exited with pending send")
-				}
-				if err := UpdateSession(u.Sessions, in.SessionID, func(v *supervisor.ManagedSession) error {
-					v.State = supervisor.SessionStopped
-					v.StopReason = supervisor.StopProcessExitWithPending
-					return nil
-				}); err != nil {
-					return result, err
-				}
-				if u.Notify != nil {
-					u.Notify(supervisor.EventKindSessionStopped, in.SessionID.String())
-				}
-				return result, errors.New("process exited with pending send")
 			}
-			if !snapshotChangedAt(c.Screen).After(crAt) {
-				continue
-			}
-			if in.Kind == supervisor.SendKindHandoffExit {
-				continue
-			}
-			blank := detect.IsInputBlank(detect.DefaultPatternSet(), c.Screen.Rows, c.Screen.Cells)
-			if !blank && (in.Kind == supervisor.SendKindRemoteControl || !c.Screen.Processing) {
-				continue
-			}
-			return u.confirmSend(in, pending)
+
 		case <-timer.C:
 			return result, errors.Join(errors.New("SUP_SEND_NOT_CONFIRMED"), u.unconfirmed(in, pending), u.logOperatorSendOutcome(in, pending, supervisor.EventKindSendUnconfirmed))
 		case <-ctx.Done():
@@ -645,26 +666,125 @@ func screenReadyForWrite(s ScreenSnapshot) bool {
 func operatorScreenReadyForWrite(s ScreenSnapshot) bool {
 	return s.State == detect.StateIdle && !s.CompletionMenu && screenReadyForWrite(s)
 }
-func screenReadyForEnter(s ScreenSnapshot, want string, operatorInput ...bool) bool {
+
+// waitForEnter only waits for a readable prefix. The first snapshot is taken after
+// WriteLine's text write and fixed delay; using its observation as the baseline
+// also excludes all observations from before the text write completed.
+func (u *SendInputUseCase) waitForEnter(ctx context.Context, in SendInput, message, sendID string, ch <-chan SendConfirmation) bool {
+	shot := u.Screens.Snapshot(in.SessionID)
+	operator := in.Kind == supervisor.SendKindOperatorInput
+	check := func(shot ScreenSnapshot) (match, prefix bool) {
+		if ctx.Err() != nil || u.stopped(in.SessionID) || !screenSafeForEnter(shot, message) {
+			return false, false
+		}
+		current, err := u.Sessions.Load(in.SessionID)
+		if err != nil || current.State == supervisor.SessionStopped {
+			return false, false
+		}
+		if operator {
+			if shot.State != detect.StateIdle && shot.State != detect.StateWorking || shot.CompletionMenu || current.State != supervisor.SessionIdle && current.State != supervisor.SessionWorking {
+				return false, false
+			}
+			if u.Observed != nil {
+				state, ok := u.Observed.Get(in.SessionID)
+				if !ok || state != detect.StateIdle && state != detect.StateWorking {
+					return false, false
+				}
+			}
+		}
+		body, want, ok := enterInputText(shot, message, operator)
+		return ok && body == want, ok && strings.HasPrefix(want, body)
+	}
+	match, prefix := check(shot)
+	if match || !prefix {
+		return match
+	}
+	limit := u.EchoWait
+	if limit <= 0 {
+		limit = supervisor.SupervisorSendEchoWait
+	}
+	deadline := time.Now().Add(limit)
+	timer := time.NewTimer(limit)
+	defer timer.Stop()
+	poll := time.NewTicker(supervisor.SupervisorStopPollInterval)
+	defer poll.Stop()
+	baseline, last := shot.Observation, shot.Observation
+	for {
+		expired := false
+		select {
+		case <-ctx.Done():
+			return false
+		case <-poll.C:
+		case <-timer.C:
+			expired = true
+		case notification := <-ch:
+			for _, c := range append(notification.earlier, notification) {
+				if c.SessionID != in.SessionID || c.SendID != sendID {
+					continue
+				}
+				if c.ProcessExited {
+					return false
+				}
+				if c.Screen.Observation <= last {
+					continue
+				}
+				_, prefix = check(c.Screen)
+				if !prefix {
+					return false
+				}
+				shot, last = c.Screen, c.Screen.Observation
+			}
+		}
+		// A stream of notifications must not postpone the deadline.
+		expired = expired || !time.Now().Before(deadline)
+		// Recheck STOP and session state even with no output. At the deadline,
+		// read the latest screen once more, including updates not yet notified.
+		latest := u.Screens.Snapshot(in.SessionID)
+		if latest.Observation >= last {
+			shot, last = latest, latest.Observation
+		}
+		match, prefix = check(shot)
+		if !prefix {
+			return false
+		}
+		if match && shot.Observation > baseline {
+			return true
+		}
+		if expired {
+			return false
+		}
+	}
+}
+
+func screenSafeForEnter(s ScreenSnapshot, want string) bool {
 	if s.Processing || s.State == detect.StateAwaitingPermission || s.State == detect.StateExited {
 		return false
 	}
-	if hasSelectionMenu(s.Rows) && !(strings.HasPrefix(want, "/") && s.CompletionMenu && completionCandidateMatches(s.SelectedCompletion, want) && !hasPermissionDialog(s.Rows)) {
-		return false
-	}
+	return !hasSelectionMenu(s.Rows) || strings.HasPrefix(want, "/") && s.CompletionMenu && completionCandidateMatches(s.SelectedCompletion, want) && !hasPermissionDialog(s.Rows)
+}
+
+func enterInputText(s ScreenSnapshot, want string, operator bool) (string, string, bool) {
 	for i := len(s.Rows) - 1; i >= 0; i-- {
-		row := s.Rows[i]
-		if strings.HasPrefix(row, "❯\u00a0") {
-			if len(operatorInput) != 0 && operatorInput[0] {
-				// A lost leading space means the UI changed the operator's text; do not send CR.
-				return strings.TrimRight(strings.TrimPrefix(row, "❯\u00a0"), " ") == strings.TrimRight(want, " ")
+		if strings.HasPrefix(s.Rows[i], "❯\u00a0") {
+			body := strings.TrimPrefix(s.Rows[i], "❯\u00a0")
+			if operator {
+				// Preserve leading spaces: a changed operator text must abort.
+				return strings.TrimRight(body, " "), strings.TrimRight(want, " "), true
 			}
-			body := strings.TrimSpace(strings.TrimPrefix(row, "❯\u00a0"))
-			return body == want
+			return strings.TrimSpace(body), want, true
 		}
 	}
-	return false
+	return "", want, false
 }
+
+func screenReadyForEnter(s ScreenSnapshot, want string, operatorInput ...bool) bool {
+	if !screenSafeForEnter(s, want) {
+		return false
+	}
+	body, expected, ok := enterInputText(s, want, len(operatorInput) != 0 && operatorInput[0])
+	return ok && body == expected
+}
+
 func hasPermissionDialog(rows []string) bool {
 	for _, row := range rows {
 		if strings.Contains(row, "Enter to confirm") || strings.Contains(row, "Esc to cancel") {

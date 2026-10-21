@@ -421,7 +421,7 @@ func TestSendRealDetectorEchoDoesNotAbort(t *testing.T) {
 	p.afterEnter = func() {
 		shot := blankScreen()
 		shot.ChangedAt = time.Now().Add(time.Second)
-		u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
+		notifySendTestPair(u, SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
 	}
 	got, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindRemoteControl})
 	if err != nil || !got.Confirmed || s.session.StopReason == supervisor.StopSendAborted {
@@ -593,7 +593,7 @@ func TestSendObservedAtCannotConfirmWithoutChangedAt(t *testing.T) {
 		shot := blankScreen()
 		shot.ObservedAt = time.Now().Add(time.Hour)
 		shot.ChangedAt = time.Now().Add(-time.Hour)
-		u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
+		notifySendTestPair(u, SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
 	}
 	result, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindRemoteControl})
 	if err == nil || result.Confirmed || s.session.SendGate.Pending == nil {
@@ -610,7 +610,7 @@ func TestSCNsup0216ConsecutiveSendsHaveUniqueIDs(t *testing.T) {
 	p.afterEnter = func() {
 		shot := blankScreen()
 		shot.ChangedAt = time.Now().Add(time.Second)
-		u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: s.session.SendGate.Pending.SendID, Screen: shot})
+		notifySendTestPair(u, SendConfirmation{SessionID: id, SendID: s.session.SendGate.Pending.SendID, Screen: shot})
 		screen.shot = blankScreen()
 	}
 	for n, want := range []string{"alpha-1-s1", "alpha-1-s2", "alpha-1-s3"} {
@@ -931,7 +931,7 @@ func TestSCNsup0223SCNsup0224ConfirmationRequiresPostCRScreen(t *testing.T) {
 			time.Sleep(time.Millisecond)
 			shot := blankScreen()
 			shot.ChangedAt = time.Now().Add(time.Second)
-			u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
+			notifySendTestPair(u, SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
 		}()
 	}
 	result, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindRemoteControl})
@@ -1047,7 +1047,7 @@ func TestSCNsup0232AliasSelectionSendsCR(t *testing.T) {
 	p.afterEnter = func() {
 		shot := blankScreen()
 		shot.ChangedAt = time.Now().Add(time.Second)
-		u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
+		notifySendTestPair(u, SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
 	}
 	result, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindRemoteControl})
 	if err != nil || !result.Confirmed || len(p.writes) != 2 || string(p.writes[1]) != "\r" {
@@ -1128,7 +1128,7 @@ func TestSCNsup0223WorkingStateAloneDoesNotConfirm(t *testing.T) {
 		shot := screen.shot
 		shot.State = detect.StateWorking
 		shot.ChangedAt = time.Now().Add(time.Second)
-		u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
+		notifySendTestPair(u, SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
 	}
 	result, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindHandoffEnd})
 	if err == nil || result.Confirmed || s.session.StopReason != supervisor.StopSendNotConfirmed {
@@ -1146,7 +1146,7 @@ func TestSCNsup0224HandoffExitRequiresProcessExit(t *testing.T) {
 	p.afterEnter = func() {
 		shot := blankScreen()
 		shot.ObservedAt = time.Now().Add(time.Second)
-		u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
+		notifySendTestPair(u, SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
 	}
 	result, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindHandoffExit})
 	if err == nil || result.Confirmed || s.session.StopReason != supervisor.StopSendNotConfirmed {
@@ -1228,7 +1228,7 @@ func TestSCNsup0231ProcessingPatternConfirmsSend(t *testing.T) {
 		shot.State = detect.StateWorking
 		shot.Processing = true
 		shot.ChangedAt = time.Now().Add(time.Second)
-		u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
+		notifySendTestPair(u, SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
 	}
 	result, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindHandoffEnd})
 	if err != nil || !result.Confirmed || !s.session.SendGate.LastSendConfirmed || s.session.SendGate.Pending != nil {
@@ -1330,5 +1330,331 @@ func TestSCNsup0219OnlySendInputUseCaseWritesPTY(t *testing.T) {
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Existing confirmation fixtures model two separate post-CR output observations.
+func notifySendTestPair(u *SendInputUseCase, c SendConfirmation) {
+	for observation := uint64(1); observation <= 2; observation++ {
+		c.Screen.Observation = observation
+		u.NotifyConfirmation(c)
+	}
+}
+
+// SCN-sup-02-40: the beforeEnter callback must not record CR completion.
+func TestSendInputC1CRCompletionTime(t *testing.T) {
+	id := supervisor.SessionID("alpha-1")
+	sessions := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, State: supervisor.SessionIdle, SendGate: supervisor.SendGateRecord{NextSeq: 1}}}
+	screen := &sendTestScreen{shot: blankScreen()}
+	start := time.Now().UTC()
+	now := start
+	pty := &sendTestPTY{onWrite: func() { echoScreen(screen, "/rc") }}
+	u := &SendInputUseCase{Sessions: sessions, Screens: screen, PTY: pty, Now: func() time.Time { return now }, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir()), ConfirmTimeout: time.Millisecond}
+	pty.afterEnter = func() {
+		if u.CRWritten(id, "alpha-1-s1") {
+			t.Error("CR recorded before WriteLine completed")
+		}
+		now = start.Add(time.Second)
+		shot := blankScreen()
+		shot.ChangedAt = start.Add(time.Millisecond)
+		shot.Observation = 1
+		u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
+		shot.Observation = 2
+		u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
+	}
+	result, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindRemoteControl})
+	if err == nil || result.Confirmed {
+		t.Fatalf("pre-completion output confirmed: result=%+v err=%v", result, err)
+	}
+	if got := u.CRWrittenAt(id, "alpha-1-s1"); !got.Equal(now) {
+		t.Fatalf("crAt=%v want completion=%v", got, now)
+	}
+}
+
+func TestSendInputC1SingleSnapshotDoesNotConfirm(t *testing.T) {
+	id := supervisor.SessionID("alpha-1")
+	sessions := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, State: supervisor.SessionIdle, SendGate: supervisor.SendGateRecord{NextSeq: 1}}}
+	screen := &sendTestScreen{shot: blankScreen()}
+	pty := &sendTestPTY{onWrite: func() { echoScreen(screen, "/rc") }}
+	u := &SendInputUseCase{Sessions: sessions, Screens: screen, PTY: pty, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir()), ConfirmTimeout: time.Millisecond}
+	pty.afterEnter = func() {
+		shot := blankScreen()
+		shot.ChangedAt = time.Now().Add(time.Second)
+		shot.Observation = 1
+		u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
+	}
+	result, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindRemoteControl})
+	if err == nil || result.Confirmed {
+		t.Fatalf("one snapshot confirmed: result=%+v err=%v", result, err)
+	}
+}
+
+// SCN-sup-02-41: each character describes a separately processed output chunk.
+func TestSendInputC1ConsecutiveObservations(t *testing.T) {
+	for _, tc := range []struct {
+		name, frames string
+		kind         supervisor.SupervisorSendKind
+		confirmed    bool
+	}{
+		{"two blank", "bb", supervisor.SendKindHandoffEnd, true},
+		{"two processing", "pp", supervisor.SendKindHandoffEnd, true},
+		{"mixed", "bp", supervisor.SendKindHandoffEnd, true},
+		{"remote processing is insufficient", "pp", supervisor.SendKindRemoteControl, false},
+		{"remote mixed is insufficient", "bp", supervisor.SendKindRemoteControl, false},
+		{"remote blank", "bb", supervisor.SendKindRemoteControl, true},
+		{"partial redraw then text", "bt", supervisor.SendKindHandoffEnd, false},
+		{"reset after text", "btb", supervisor.SendKindHandoffEnd, false},
+		{"restart after text", "btbb", supervisor.SendKindHandoffEnd, true},
+		{"same observation", "bd", supervisor.SendKindHandoffEnd, false},
+		{"unobserved gap", "bg", supervisor.SendKindHandoffEnd, false},
+		{"pre CR", "ss", supervisor.SendKindHandoffEnd, false},
+		{"pre CR then blank", "sb", supervisor.SendKindHandoffEnd, false},
+		{"no observation number", "zz", supervisor.SendKindHandoffEnd, false},
+		{"unknown observation breaks sequence", "bzd", supervisor.SendKindHandoffEnd, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id := supervisor.SessionID("alpha-1")
+			sessions := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, State: supervisor.SessionIdle, SendGate: supervisor.SendGateRecord{NextSeq: 1}}}
+			screen := &sendTestScreen{shot: blankScreen()}
+			text, _ := supervisor.FixedText(tc.kind, "")
+			pty := &sendTestPTY{onWrite: func() { echoScreen(screen, text) }}
+			var events []store.Event
+			u := &SendInputUseCase{Sessions: sessions, Screens: screen, PTY: pty, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir()), ConfirmTimeout: time.Millisecond, RecordStructured: func(e store.Event) error { events = append(events, e); return nil }}
+			pty.afterEnter = func() {
+				for n, frame := range tc.frames {
+					shot := blankScreen()
+					shot.ChangedAt = time.Now().Add(time.Second)
+					shot.Observation = uint64(n + 1)
+					switch frame {
+					case 'p', 't':
+						echo := &sendTestScreen{shot: shot}
+						echoScreen(echo, text)
+						shot = echo.shot
+						shot.Processing = frame == 'p'
+					case 'd':
+						shot.Observation--
+					case 'g':
+						shot.Observation++
+					case 's':
+						shot.ChangedAt = time.Now().Add(-time.Second)
+					case 'z':
+						shot.Observation = 0
+					}
+					// Delivered before Execute starts receiving: intermediate screens must survive coalescing.
+					u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
+				}
+			}
+			result, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: tc.kind})
+			if result.Confirmed != tc.confirmed || (err == nil) != tc.confirmed {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			if !tc.confirmed && (err == nil || !strings.Contains(err.Error(), "SUP_SEND_NOT_CONFIRMED") || sessions.session.StopReason != supervisor.StopSendNotConfirmed || sessions.session.SendGate.Pending == nil) {
+				t.Fatalf("timeout contract: session=%+v err=%v", sessions.session, err)
+			}
+			want := supervisor.EventKindSendUnconfirmed
+			if tc.confirmed {
+				want = supervisor.EventKindSendConfirmed
+			}
+			if len(events) != 2 || events[1].Kind != want {
+				t.Fatalf("events=%+v", events)
+			}
+		})
+	}
+}
+
+// SCN-sup-02-42: use the production enter delay and asynchronously observed echoes.
+func TestSendInputE1DelayedEcho(t *testing.T) {
+	for _, kind := range []supervisor.SupervisorSendKind{supervisor.SendKindOperatorInput, supervisor.SendKindRemoteControl, supervisor.SendKindHandoffEnd, supervisor.SendKindSessionStart, supervisor.SendKindHandoffExit, supervisor.SendKindParallelInstruction, supervisor.SendKindRecommendationContinue} {
+		for _, delay := range []time.Duration{20 * time.Millisecond, 280 * time.Millisecond} {
+			t.Run(fmt.Sprintf("%s/%s", kind, delay), func(t *testing.T) {
+				id := supervisor.SessionID("alpha-1")
+				sessions := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, State: supervisor.SessionIdle}}
+				screens := &ObservedScreenStore{}
+				shot := blankScreen()
+				shot.Observation = 1
+				screens.SetSnapshot(id, shot)
+				pty := &sendTestPTY{}
+				u := &SendInputUseCase{Sessions: sessions, Screens: screens, PTY: pty, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir()), ConfirmTimeout: time.Millisecond}
+				message, _ := supervisor.FixedText(kind, defaultParallelInstruction)
+				input := SendInput{SessionID: id, Kind: kind}
+				if kind == supervisor.SendKindOperatorInput {
+					message = "hello world"
+					input.OperatorText = operatorText(t, message)
+				}
+				done := make(chan struct{})
+				pty.onWrite = func() {
+					go func() {
+						defer close(done)
+						time.Sleep(delay)
+						echo := &sendTestScreen{shot: blankScreen()}
+						echoScreen(echo, message)
+						echo.shot.Observation = 2
+						screens.SetSnapshot(id, echo.shot)
+						u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: echo.shot})
+					}()
+					time.Sleep(supervisor.SupervisorSendEnterDelay)
+				}
+				pty.afterEnter = func() {
+					if kind == supervisor.SendKindHandoffExit {
+						u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", ProcessExited: true, ExitedAt: time.Now().Add(time.Second)})
+						return
+					}
+					shot := blankScreen()
+					shot.ChangedAt = time.Now().Add(time.Second)
+					// Post-CR observations follow the echo's observation number.
+					for observation := uint64(3); observation <= 4; observation++ {
+						shot.Observation = observation
+						u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
+					}
+				}
+				result, err := u.Execute(context.Background(), input)
+				<-done
+				if err != nil || !result.Confirmed || len(pty.writes) != 2 {
+					t.Fatalf("delayed echo aborted: err=%v writes=%d", err, len(pty.writes))
+				}
+			})
+		}
+	}
+}
+
+// SCN-sup-02-43/44: safety changes must abort, including without fresh output.
+func TestSendInputE1AbortAndDeadline(t *testing.T) {
+	for _, mode := range []string{"timeout", "stop", "cancel", "mismatch", "fullwidth", "leading-space", "extra", "unreadable", "processing", "permission", "exit", "menu", "completion", "state", "stopped", "observed", "observed-store", "late-permission", "late-mismatch", "duplicate", "deadline-latest", "partial"} {
+		t.Run(mode, func(t *testing.T) {
+			id := supervisor.SessionID("alpha-1")
+			sessions := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, State: supervisor.SessionIdle, SendGate: supervisor.SendGateRecord{EverSent: true, LastSendConfirmed: true}}}
+			screens := &ObservedScreenStore{}
+			shot := blankScreen()
+			shot.Observation = 1
+			screens.SetSnapshot(id, shot)
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			pty := &sendTestPTY{}
+			var events []store.Event
+			u := &SendInputUseCase{Sessions: sessions, Screens: screens, PTY: pty, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir()), ConfirmTimeout: time.Millisecond, RecordStructured: func(e store.Event) error { events = append(events, e); return nil }}
+			u.EchoWait = time.Second
+			if mode == "timeout" || mode == "duplicate" || mode == "deadline-latest" {
+				u.EchoWait = 200 * time.Millisecond
+			}
+			firstEnter := make(chan struct{})
+			enterSeen := false
+			u.Screens = screenReaderFunc(func(id supervisor.SessionID) ScreenSnapshot {
+				shot := screens.Snapshot(id)
+				if pty.calls > 0 && !enterSeen {
+					enterSeen = true
+					close(firstEnter)
+				}
+				return shot
+			})
+			if mode == "stop" {
+				u.EchoWait = 2 * time.Second
+			}
+			done := make(chan struct{})
+			message := "hello world"
+			if mode == "leading-space" {
+				message = " hello world"
+			}
+			pty.onWrite = func() {
+				s := &sendTestScreen{shot: blankScreen()}
+				s.shot.Observation = 2
+				switch mode {
+				case "mismatch":
+					echoScreen(s, "other")
+				case "fullwidth":
+					echoScreen(s, "hello　world")
+				case "leading-space":
+					echoScreen(s, "hello world")
+				case "extra":
+					echoScreen(s, message+"x")
+				case "unreadable":
+					s.shot.Rows = []string{"no input row"}
+				case "processing":
+					s.shot.Processing = true
+				case "permission":
+					s.shot.State = detect.StateAwaitingPermission
+				case "exit":
+					s.shot.State = detect.StateExited
+				case "menu":
+					s.shot.Rows = append(s.shot.Rows, " ❯ choice")
+				case "completion":
+					s.shot.CompletionMenu = true
+				case "state":
+					sessions.session.State = supervisor.SessionAwaitingPermission
+				case "stopped":
+					sessions.session.State = supervisor.SessionStopped
+					sessions.session.StopReason = supervisor.StopGlobal
+				case "observed-store":
+					u.Observed = &ObservedStateStore{}
+					u.Observed.Set(id, detect.StateAwaitingPermission)
+				case "observed":
+					s.shot.State = detect.StateAwaitingRecommendation
+				}
+				screens.SetSnapshot(id, s.shot)
+				go func() {
+					defer close(done)
+					<-firstEnter
+					time.Sleep(20 * time.Millisecond)
+					switch mode {
+					case "stop":
+						if err := os.WriteFile(u.StopState.filePath(""), nil, 0600); err != nil {
+							t.Error(err)
+						}
+					case "cancel":
+						cancel()
+					case "late-permission", "late-mismatch", "duplicate", "deadline-latest", "partial":
+						s := &sendTestScreen{shot: blankScreen()}
+						s.shot.Observation = 3
+						switch mode {
+						case "late-permission":
+							s.shot.State = detect.StateAwaitingPermission
+						case "late-mismatch":
+							echoScreen(s, "other")
+						case "duplicate":
+							echoScreen(s, message)
+							s.shot.Observation = 2
+						case "deadline-latest":
+							echoScreen(s, message)
+						case "partial":
+							echoScreen(s, "hello")
+						}
+						screens.SetSnapshot(id, s.shot)
+						if mode != "deadline-latest" {
+							u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: s.shot})
+						}
+						if mode == "partial" {
+							time.Sleep(20 * time.Millisecond)
+							s = &sendTestScreen{shot: blankScreen()}
+							echoScreen(s, message)
+							s.shot.Observation = 4
+							screens.SetSnapshot(id, s.shot)
+							u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: s.shot})
+						}
+					}
+				}()
+			}
+			start := time.Now()
+			_, err := u.Execute(ctx, SendInput{SessionID: id, Kind: supervisor.SendKindOperatorInput, OperatorText: operatorText(t, message)})
+			elapsed := time.Since(start)
+			<-done
+			if mode == "deadline-latest" || mode == "partial" {
+				if len(pty.writes) != 2 || errors.Is(err, proc.ErrBeforeEnter) {
+					t.Fatalf("expected CR: %v writes=%d", err, len(pty.writes))
+				}
+				return
+			}
+			if !errors.Is(err, proc.ErrBeforeEnter) || len(pty.writes) != 1 || sessions.session.SendGate.Pending != nil || !sessions.session.SendGate.EverSent || !sessions.session.SendGate.LastSendConfirmed || sessions.session.SendGate.NextSeq != 2 || len(events) != 2 || events[1].Kind != supervisor.EventKindSendAborted || events[1].Code != "SUP_SEND_ABORTED" {
+				t.Fatalf("abort contract: err=%v writes=%d events=%v", err, len(pty.writes), events)
+			}
+			if mode == "timeout" || mode == "duplicate" {
+				if elapsed < u.EchoWait {
+					t.Fatalf("did not wait for deadline: %s", elapsed)
+				}
+			} else if elapsed >= u.EchoWait {
+				t.Fatalf("unsafe condition waited until deadline: %s", elapsed)
+			}
+			if mode == "stopped" && sessions.session.StopReason != supervisor.StopGlobal {
+				t.Fatal("overwrote stop reason")
+			}
+		})
 	}
 }

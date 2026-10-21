@@ -1,6 +1,9 @@
 package supervisor
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestSendGateStopPrecedesObservedState(t *testing.T) {
 	s := ManagedSession{State: SessionIdle}
@@ -78,5 +81,14 @@ func TestSCNsup0219SCNsup0238SCNsup0143SendGateReasons(t *testing.T) {
 	s.SendGate.LastSendConfirmed = false
 	if got := CheckSendGate(s, SessionIdle, SendKindRemoteControl, false, true, true); got != "" {
 		t.Fatalf("fresh idle after discarded pending was blocked: %q", got)
+	}
+}
+
+func TestSendEchoWaitCanonicalValue(t *testing.T) {
+	if SupervisorSendEchoWait != 2000*time.Millisecond {
+		t.Fatalf("echo wait=%s", SupervisorSendEchoWait)
+	}
+	if SupervisorStopPollInterval != 500*time.Millisecond {
+		t.Fatalf("stop poll=%s", SupervisorStopPollInterval)
 	}
 }
