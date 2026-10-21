@@ -39,9 +39,10 @@ func (l *ExecutionLogs) Close() error {
 }
 
 type fileContractWriter struct {
-	root   string
-	clock  domain.Clock
-	events eventState
+	root    string
+	clock   domain.Clock
+	events  eventState
+	syncDir func(string) error
 }
 
 func NewFileContractWriter(root string, clock domain.Clock) (*fileContractWriter, error) {
@@ -49,7 +50,7 @@ func NewFileContractWriter(root string, clock domain.Clock) (*fileContractWriter
 	if err != nil {
 		return nil, err
 	}
-	return &fileContractWriter{root: path.String(), clock: clock}, nil
+	return &fileContractWriter{root: path.String(), clock: clock, syncDir: store.SyncDir}, nil
 }
 func (w *fileContractWriter) dir(id domain.TaskID) (string, error) {
 	p, e := store.EventsJSONLPath(w.root, id)
@@ -109,6 +110,8 @@ func (w *fileContractWriter) once(id domain.TaskID, path func(string, domain.Tas
 	if e != nil {
 		return contractWriteError(e)
 	}
+	// Publication succeeded; directory sync failure must not report a failed write.
+	_ = w.syncDir(filepath.Dir(p))
 	return nil
 }
 func (w *fileContractWriter) WritePrompt(id domain.TaskID, b []byte) error {

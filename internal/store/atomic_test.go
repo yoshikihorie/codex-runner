@@ -215,3 +215,37 @@ func TestWriteAtomicReturnsErrorForMissingParent(t *testing.T) {
 type partialWriteError struct{ data []byte }
 
 func (e *partialWriteError) Error() string { return "observed partial atomic write" }
+
+func TestSyncDirExistingAndMissingDirectories(t *testing.T) {
+	dir := t.TempDir()
+	if err := SyncDir(dir); err != nil {
+		t.Fatalf("SyncDir existing directory: %v", err)
+	}
+	if err := SyncDir(filepath.Join(dir, "missing")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("SyncDir missing directory: %v", err)
+	}
+}
+
+func TestSyncDirSharesWriteAtomicSyncHook(t *testing.T) {
+	original := syncDir
+	t.Cleanup(func() { syncDir = original })
+	dir := t.TempDir()
+	wantErr := errors.New("directory sync failed")
+	calls := 0
+	syncDir = func(got string) error {
+		calls++
+		if got != dir {
+			t.Errorf("directory = %q, want %q", got, dir)
+		}
+		return wantErr
+	}
+	if err := SyncDir(dir); !errors.Is(err, wantErr) {
+		t.Fatalf("SyncDir error = %v, want %v", err, wantErr)
+	}
+	if err := WriteAtomic(filepath.Join(dir, "task.json"), []byte("new"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Fatalf("shared syncDir calls = %d, want 2", calls)
+	}
+}

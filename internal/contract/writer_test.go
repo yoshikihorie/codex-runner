@@ -208,3 +208,44 @@ func TestExecutionLogsCloseNil(t *testing.T) {
 		t.Fatal("unexpected error")
 	}
 }
+
+func TestContractWriterOnceSyncsParentAfterLink(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		syncErr error
+	}{
+		{name: "success"},
+		{name: "sync error ignored", syncErr: errors.New("directory sync failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root, id := writerRoot(t)
+			w := newWriter(t, root, nil)
+			path, err := store.PromptMDPath(root, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			calls := 0
+			w.syncDir = func(dir string) error {
+				calls++
+				if dir != filepath.Dir(path) {
+					t.Errorf("sync directory = %q, want %q", dir, filepath.Dir(path))
+				}
+				readWriterFile(t, path, []byte("prompt"))
+				return tc.syncErr
+			}
+			if err := w.WritePrompt(id, []byte("prompt")); err != nil {
+				t.Fatalf("WritePrompt: %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("sync calls = %d, want 1", calls)
+			}
+			if err := w.WritePrompt(id, []byte("replacement")); !errors.Is(err, domain.ErrContractWriteFailed) {
+				t.Fatalf("duplicate WritePrompt: %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("sync calls after failed link = %d, want 1", calls)
+			}
+			readWriterFile(t, path, []byte("prompt"))
+		})
+	}
+}

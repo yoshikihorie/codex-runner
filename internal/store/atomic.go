@@ -37,6 +37,12 @@ func WriteAtomic(path string, data []byte, perm os.FileMode) error {
 	return nil
 }
 
+// SyncDir syncs a directory after publishing a file. Callers should ignore errors
+// when publication has already succeeded, since directory sync is best effort.
+func SyncDir(dir string) error {
+	return syncDir(dir)
+}
+
 // syncDir opens and syncs dir to help preserve rename across power loss.
 var syncDir = func(dir string) error {
 	d, err := os.Open(dir)

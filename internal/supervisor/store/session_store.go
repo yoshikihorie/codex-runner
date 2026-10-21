@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	atom "github.com/yoshikihorie/codex-runner/internal/store"
+	corestore "github.com/yoshikihorie/codex-runner/internal/store"
 	"github.com/yoshikihorie/codex-runner/internal/supervisor"
 	"io"
 	"os"
@@ -32,6 +32,7 @@ type SessionStore struct {
 	phaseMu      sync.Mutex
 	phases       map[supervisor.SessionID]supervisor.GitPhase
 	writeAtomic  func(string, []byte, os.FileMode) error
+	syncDir      func(string) error
 	quarantineMu sync.Mutex
 	onQuarantine func(supervisor.SessionID)
 }
@@ -45,7 +46,7 @@ func (s *SessionStore) SetQuarantineHandler(report func(supervisor.SessionID)) {
 
 // NewSessionStore creates a store rooted at stateDir.
 func NewSessionStore(stateDir string) *SessionStore {
-	return &SessionStore{root: stateDir, writeAtomic: atom.WriteAtomic}
+	return &SessionStore{root: stateDir, writeAtomic: corestore.WriteAtomic, syncDir: corestore.SyncDir}
 }
 func (s *SessionStore) path(id supervisor.SessionID) string {
 	path, _ := s.sessionPath(id)
@@ -105,7 +106,12 @@ func (s *SessionStore) Create(v supervisor.ManagedSession) error {
 	if err = tmp.Close(); err != nil {
 		return err
 	}
-	return os.Link(tmp.Name(), path)
+	if err := os.Link(tmp.Name(), path); err != nil {
+		return err
+	}
+	// Publication succeeded; directory sync failure must not report a failed create.
+	_ = s.syncDir(filepath.Dir(path))
+	return nil
 }
 
 func (s *SessionStore) prepare(v supervisor.ManagedSession) (string, []byte, error) {

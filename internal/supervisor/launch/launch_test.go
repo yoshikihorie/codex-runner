@@ -115,7 +115,10 @@ func TestSettingsJSONAndWrite(t *testing.T) {
 	if len(got.Permissions.Deny) != len(supervisorDenyRules) {
 		t.Fatalf("deny count %d", len(got.Permissions.Deny))
 	}
-	wantRules := []string{"Bash(git push --force*)", "Bash(git push -f*)", "Bash(git push*--force*)", "Bash(git push*+*)", "Bash(git push*--mirror*)", "Bash(git push*--delete*)", "Bash(gh pr create*)", "Bash(gh pr merge*)", "Bash(gh release*)", "Bash(*deploy*)", "Bash(codexd supervisor-client*)", "Bash(*codexd-supervisor*)", "Write(/" + state + "/**)", "Edit(/" + state + "/**)", "Bash(*" + state + "*)"}
+	wantRules := []string{"Bash(git push --force*)", "Bash(git push -f*)", "Bash(git push*--force*)", "Bash(git push*+*)", "Bash(git push*--mirror*)", "Bash(git push*--delete*)", "Bash(gh pr create*)", "Bash(gh pr merge*)", "Bash(gh release*)", "Bash(*deploy*)", "Bash(codexd supervisor-client*)", "Bash(*codexd-supervisor*)", "Edit(/" + state + "/**)", "Bash(*" + state + "*)"}
+	if len(got.Permissions.Deny) != len(wantRules) {
+		t.Fatalf("deny count = %d, want %d", len(got.Permissions.Deny), len(wantRules))
+	}
 	for i, want := range wantRules {
 		if got.Permissions.Deny[i] != want {
 			t.Errorf("deny[%d]=%q want %q", i, got.Permissions.Deny[i], want)

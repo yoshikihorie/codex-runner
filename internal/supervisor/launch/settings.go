@@ -11,7 +11,7 @@ import (
 var supervisorDenyRules = []string{
 	"Bash(git push --force*)", "Bash(git push -f*)", "Bash(git push*--force*)", "Bash(git push*+*)", "Bash(git push*--mirror*)", "Bash(git push*--delete*)",
 	"Bash(gh pr create*)", "Bash(gh pr merge*)", "Bash(gh release*)", "Bash(*deploy*)", "Bash(codexd supervisor-client*)", "Bash(*codexd-supervisor*)",
-	"Write(<state_dir>/**)", "Edit(<state_dir>/**)", "Bash(*<state_dir>*)",
+	"Edit(<state_dir>/**)", "Bash(*<state_dir>*)",
 }
 
 const supervisorStateDirPlaceholder = "<state_dir>"

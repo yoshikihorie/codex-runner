@@ -652,3 +652,49 @@ func TestSessionStoreGitPhaseIsMemoryOnly(t *testing.T) {
 		t.Fatalf("got=%+v err=%v", got, err)
 	}
 }
+
+func TestSessionStoreCreateSyncsParentAfterLink(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		syncErr error
+	}{
+		{name: "success"},
+		{name: "sync error ignored", syncErr: errors.New("directory sync failed")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := NewSessionStore(t.TempDir())
+			id := mustID(t, "alpha-1")
+			v := supervisor.ManagedSession{SessionID: id, ProjectID: "alpha", CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionStarting, StateSince: time.Now().UTC(), RestartTimes: []time.Time{}, SendGate: supervisor.SendGateRecord{NextSeq: 1}}
+			path := st.path(id)
+			calls := 0
+			st.syncDir = func(dir string) error {
+				calls++
+				if dir != filepath.Dir(path) {
+					t.Errorf("sync directory = %q, want %q", dir, filepath.Dir(path))
+				}
+				got, err := st.Load(id)
+				if err != nil || got.Generation != 1 {
+					t.Fatalf("record at sync = %+v, error = %v", got, err)
+				}
+				return tc.syncErr
+			}
+			if err := st.Create(v); err != nil {
+				t.Fatalf("Create: %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("sync calls = %d, want 1", calls)
+			}
+			v.Generation = 2
+			if err := st.Create(v); !errors.Is(err, os.ErrExist) {
+				t.Fatalf("duplicate Create: %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("sync calls after failed link = %d, want 1", calls)
+			}
+			got, err := st.Load(id)
+			if err != nil || got.Generation != 1 {
+				t.Fatalf("record after failed link = %+v, error = %v", got, err)
+			}
+		})
+	}
+}
