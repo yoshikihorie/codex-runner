@@ -1,12 +1,75 @@
 package store
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
+
+// SCN-sup-03-62: unknown fields do not invalidate project records.
+func TestProjectRecordStoreLoadIgnoresUnknownFields(t *testing.T) {
+	root := t.TempDir()
+	s := NewProjectRecordStore(root)
+	want := []string{strings.Repeat("a", 40), strings.Repeat("b", 40)}
+	path := filepath.Join(root, "projects", "project.json")
+	if err := os.Mkdir(filepath.Dir(path), 0700); err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`{"supervisor_commit_shas":[%q,%q],"future_field":1}`, want[0], want[1])
+	if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+		t.Fatal(err)
+	}
+	record, err := s.Load("project")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(record.SupervisorCommitSHAs, want) {
+		t.Fatalf("commit SHAs: got %v, want %v", record.SupervisorCommitSHAs, want)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != body {
+		t.Fatalf("load changed record: %q %v", data, err)
+	}
+}
+
+func TestProjectRecordStoreLoadRejectsCorruptRecords(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	valid := fmt.Sprintf(`{"supervisor_commit_shas":[%q]}`, sha)
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"invalid JSON", "{"},
+		{"extra JSON value", valid + " {}"},
+		{"trailing garbage", valid + " garbage"},
+		{"wrong field type", `{"supervisor_commit_shas":1}`},
+		{"wrong element type", `{"supervisor_commit_shas":[1]}`},
+		{"missing field", `{}`},
+		{"null field", `{"supervisor_commit_shas":null}`},
+		{"over history limit", `{"supervisor_commit_shas":[` + strings.Repeat(fmt.Sprintf("%q,", sha), supervisorCommitSHAHistoryMax) + fmt.Sprintf("%q]}", sha)},
+		{"short SHA", `{"supervisor_commit_shas":["abc"]}`},
+		{"uppercase SHA", fmt.Sprintf(`{"supervisor_commit_shas":[%q]}`, strings.Repeat("A", 40))},
+		{"nonhex SHA", fmt.Sprintf(`{"supervisor_commit_shas":[%q]}`, strings.Repeat("g", 40))},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			path := filepath.Join(root, "projects", "project.json")
+			if err := os.Mkdir(filepath.Dir(path), 0700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, []byte(tc.body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := NewProjectRecordStore(root).Load("project"); !errors.Is(err, ErrStateFileCorrupt) {
+				t.Fatalf("got %v, want ErrStateFileCorrupt", err)
+			}
+		})
+	}
+}
 
 func TestProjectRecordStoreValidatesAndPersistsAtomically(t *testing.T) {
 	root := t.TempDir()

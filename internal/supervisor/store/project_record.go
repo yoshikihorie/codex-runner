@@ -62,7 +62,6 @@ func (s *ProjectRecordStore) Load(projectID string) (ProjectRecord, error) {
 	}
 	var record ProjectRecord
 	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
 	if err := dec.Decode(&record); err != nil {
 		return ProjectRecord{}, fmt.Errorf("%w: %v", ErrStateFileCorrupt, err)
 	}
