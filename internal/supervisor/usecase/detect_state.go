@@ -18,7 +18,7 @@ import (
 type statuslineRecord struct {
 	SchemaVersion   int       `json:"schema_version"`
 	ObservedAt      time.Time `json:"observed_at"`
-	UsedPercentage  int       `json:"used_percentage"`
+	UsedPercentage  *int      `json:"used_percentage"`
 	ClaudeSessionID string    `json:"claude_session_id"`
 }
 
@@ -62,10 +62,11 @@ func (u DetectSessionStateUseCase) Execute(ctx context.Context, session supervis
 			input.ScreenDim[i][j] = cell.Faint
 		}
 	}
+	var unknownUsageSessionID string
 	if u.StateDir != "" {
 		path := filepath.Join(u.StateDir, "statusline", session.SessionID.String()+".json")
-		if rec, err := readStatusline(path); err == nil && rec.UsedPercentage >= 0 && rec.UsedPercentage <= 100 {
-			info := &detect.StructuredInfo{ObservedAt: rec.ObservedAt, UsedPercentage: rec.UsedPercentage, SessionID: rec.ClaudeSessionID}
+		if rec, err := readStatusline(path); err == nil && (rec.UsedPercentage == nil || *rec.UsedPercentage >= 0 && *rec.UsedPercentage <= 100) {
+			info := &detect.StructuredInfo{ObservedAt: rec.ObservedAt, SessionID: rec.ClaudeSessionID}
 			if !claudeSessionUUID.MatchString(info.SessionID) {
 				info.SessionID = ""
 			}
@@ -74,13 +75,22 @@ func (u DetectSessionStateUseCase) Execute(ctx context.Context, session supervis
 				startedAt = *session.ChildStartedAt
 			}
 			if !info.ObservedAt.Before(startedAt) && !info.ObservedAt.After(now.Add(5*time.Second)) && statuslineIsFresh(input, info) {
-				input.Structured = info
+				if rec.UsedPercentage != nil {
+					info.UsedPercentage = *rec.UsedPercentage
+					input.Structured = info
+				} else {
+					// FD-sup-01 §5.3b: retain the ID without presenting missing usage as 0%.
+					unknownUsageSessionID = info.SessionID
+				}
 			}
 		}
 	}
 	result, err := u.Detector.Detect(ctx, input)
 	if err != nil {
 		return result, err
+	}
+	if unknownUsageSessionID != "" {
+		result.SessionID = unknownUsageSessionID
 	}
 	if result.SessionID != "" && result.SessionID != session.ClaudeSessionID {
 		if u.Sessions != nil {
