@@ -164,6 +164,41 @@ func TestSessionStoreRoundTripAndOmitsScreenText(t *testing.T) {
 	if info.Mode().Perm() != 0600 {
 		t.Fatalf("permissions=%o", info.Mode().Perm())
 	}
+	t.Run("unknown field is ignored", func(t *testing.T) {
+		body := strings.TrimSuffix(strings.TrimSpace(string(data)), "}") + `,"future_field":1}`
+		if err := os.WriteFile(path, []byte(body), 0600); err != nil {
+			t.Fatal(err)
+		}
+		got, err := st.Load(s.SessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !reflect.DeepEqual(got, s) {
+			t.Fatalf("known fields changed:\n got %#v\nwant %#v", got, s)
+		}
+		if _, err := os.Stat(path); err != nil {
+			t.Fatalf("session record missing: %v", err)
+		}
+		matches, err := filepath.Glob(path + ".corrupt-*")
+		if err != nil || len(matches) != 0 {
+			t.Fatalf("quarantine paths=%v err=%v", matches, err)
+		}
+	})
+	t.Run("trailing data is quarantined", func(t *testing.T) {
+		for _, suffix := range []string{`{}`, `garbage`} {
+			t.Run(suffix, func(t *testing.T) {
+				if err := os.WriteFile(path, append(append([]byte(nil), data...), suffix...), 0600); err != nil {
+					t.Fatal(err)
+				}
+				if _, err := st.Load(s.SessionID); !errors.Is(err, ErrStateFileCorrupt) {
+					t.Fatalf("Load error=%v", err)
+				}
+				if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
+					t.Fatalf("session record was not quarantined: %v", err)
+				}
+			})
+		}
+	})
 }
 
 func TestSessionStoreRotationCheckpointHeadHashSHA256(t *testing.T) {
@@ -309,7 +344,7 @@ func TestSessionStoreAtomicFailureKeepsPreviousRecord(t *testing.T) {
 	}
 }
 
-func TestSessionStoreRejectsUnknownFieldAndWrongType(t *testing.T) {
+func TestSessionStoreRejectsMissingRequiredFieldsAndWrongType(t *testing.T) {
 	for _, body := range []string{`{"unknown":true}`, `{"schema_version":"wrong"}`} {
 		root := t.TempDir()
 		dir := filepath.Join(root, "sessions")

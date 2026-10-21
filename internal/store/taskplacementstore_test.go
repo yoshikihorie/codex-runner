@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -615,8 +616,18 @@ func TestTaskPlacementDeletesAtMaximumSupportedDepth(t *testing.T) { // N26
 
 func TestTaskPlacementConcurrentExecuteUsesOneDeathLease(t *testing.T) { // N17
 	s, root := placementStore(t)
-	name, _ := placementDir(t, root, "concurrent", true)
+	name, dir := placementDir(t, root, "concurrent", true)
 	plan := placementPlan(t, s)
+	var removals atomic.Int32
+	originalUnlinkAt := taskPlacementUnlinkAt
+	taskPlacementUnlinkAt = func(fd int, entry string, flags int) error {
+		err := originalUnlinkAt(fd, entry, flags)
+		if err == nil && entry == name && flags == atRemoveDir {
+			removals.Add(1)
+		}
+		return err
+	}
+	t.Cleanup(func() { taskPlacementUnlinkAt = originalUnlinkAt })
 	results := make(chan []domain.TaskID, 2)
 	errs := make(chan error, 2)
 	var start sync.WaitGroup
@@ -633,17 +644,24 @@ func TestTaskPlacementConcurrentExecuteUsesOneDeathLease(t *testing.T) { // N17
 	deleted := 0
 	for i := 0; i < 2; i++ {
 		if err := <-errs; err != nil {
-			t.Fatal(err)
+			t.Error(err)
 		}
 		for _, id := range <-results {
 			if id.String() != name {
-				t.Fatalf("unexpected task id %s", id)
+				t.Errorf("unexpected task id %s", id)
 			}
 			deleted++
 		}
 	}
-	if deleted != 1 {
-		t.Fatalf("N17 deleted=%d, want one death-lease holder", deleted)
+	// Execute also reports an already absent placement as deleted (N29).
+	if deleted < 1 || deleted > 2 {
+		t.Errorf("N17 deleted=%d, want one or two reported IDs", deleted)
+	}
+	if got := removals.Load(); got != 1 {
+		t.Errorf("N17 directory removals=%d, want one death-lease holder", got)
+	}
+	if _, err := os.Lstat(dir); !os.IsNotExist(err) {
+		t.Fatalf("N17 placement remains after deletion: %v", err)
 	}
 }
 
