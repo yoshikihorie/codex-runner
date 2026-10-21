@@ -381,7 +381,6 @@ func (v *VirtualTerminal) executeCSI(final rune, raw string) {
 		return
 	}
 	params := parseTerminalParams(raw)
-	hasSubparameters := strings.Contains(raw, ":")
 	param := func(i, def int) int {
 		if i >= len(params) || params[i] == 0 {
 			return def
@@ -396,6 +395,14 @@ func (v *VirtualTerminal) executeCSI(final rune, raw string) {
 	}
 	switch final {
 	case 'm':
+		// Colon subparameters belong to one SGR field; only semicolons
+		// separate attributes. Keep that boundary when ignoring colors.
+		fields := strings.Split(raw, ";")
+		params := make([]int, len(fields))
+		for i, field := range fields {
+			value, _, _ := strings.Cut(field, ":")
+			params[i] = parseTerminalParams(value)[0]
+		}
 		for i := 0; i < len(params); i++ {
 			p := params[i]
 			switch p {
@@ -406,15 +413,14 @@ func (v *VirtualTerminal) executeCSI(final rune, raw string) {
 			case 22:
 				s.faint = false
 			case 38, 48, 58:
+				if strings.Contains(fields[i], ":") {
+					continue
+				}
 				if i+1 < len(params) {
 					if params[i+1] == 5 {
 						i += 2
 					} else if params[i+1] == 2 {
-						if hasSubparameters && i+5 < len(params) && params[i+2] == 0 {
-							i += 5
-						} else {
-							i += 4
-						}
+						i += 4
 					}
 				}
 			}
@@ -470,6 +476,7 @@ func (v *VirtualTerminal) executeCSI(final rune, raw string) {
 			return
 		}
 		s.savedRow, s.savedCol = s.row, s.col
+		s.savedFaint = s.faint
 	case 'u':
 		if raw != "" {
 			return

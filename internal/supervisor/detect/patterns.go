@@ -4,6 +4,7 @@ import (
 	supervisor "github.com/yoshikihorie/codex-runner/internal/supervisor"
 	"regexp"
 	"strings"
+	"unicode"
 )
 
 // DetectorPatternSet holds CLI-specific patterns. Each inner slice is an AND group; groups are ORed.
@@ -112,24 +113,53 @@ func linePatternMatches(row string, pattern LinePattern) bool {
 
 var observedWorkingLine = regexp.MustCompile(`^[^\pL\pN\s] [A-Za-z]+…(\s|$)`)
 
-func hasObservedWorking(rows []string) bool {
-	for _, row := range rows {
-		if observedWorkingLine.MatchString(row) {
-			return true
+// hasObservedWorking inspects the status row above the lowest input's top border.
+// FD-sup-01 §5.3a-2 places working and completion lines at the same position.
+// Skip blank and auxiliary rows, then match only the first remaining row.
+func hasObservedWorking(rows []string, p DetectorPatternSet) bool {
+	input := lastInputRow(rows, p)
+	for i := input - 2; i >= 0; i-- {
+		if strings.TrimSpace(rows[i]) == "" {
+			continue
 		}
+		if start := auxiliaryRowStart(rows, i); start >= 0 {
+			i = start
+			continue
+		}
+		return observedWorkingLine.MatchString(rows[i])
 	}
 	return false
 }
-func hasIdle(rows []string, p DetectorPatternSet) bool {
-	if p.Prompt == "" || p.IdleTop == "" || p.IdleBottom == "" {
-		return false
-	}
-	for i := 1; i < len(rows)-1; i++ {
-		if strings.HasPrefix(rows[i], p.Prompt) && allBorder(rows[i-1], p.IdleTop) && allBorder(rows[i+1], p.IdleBottom) {
-			return true
+
+// auxiliaryRowStart finds the ⎿ row that starts an auxiliary continuation chain.
+// FD-sup-01 §5.3a-2 requires each continuation to be indented and immediately
+// follow an auxiliary row or continuation; unrelated indented body rows do not qualify.
+func auxiliaryRowStart(rows []string, end int) int {
+	for i := end; i >= 0; i-- {
+		if strings.HasPrefix(strings.TrimSpace(rows[i]), "⎿") {
+			return i
+		}
+		if strings.TrimLeftFunc(rows[i], unicode.IsSpace) == rows[i] {
+			break
 		}
 	}
-	return false
+	return -1
+}
+
+// lastInputRow identifies the active input rather than an older bordered prompt.
+func lastInputRow(rows []string, p DetectorPatternSet) int {
+	if p.Prompt == "" || p.IdleTop == "" || p.IdleBottom == "" {
+		return -1
+	}
+	for i := len(rows) - 2; i >= 1; i-- {
+		if strings.HasPrefix(rows[i], p.Prompt) && allBorder(rows[i-1], p.IdleTop) && allBorder(rows[i+1], p.IdleBottom) {
+			return i
+		}
+	}
+	return -1
+}
+func hasIdle(rows []string, p DetectorPatternSet) bool {
+	return lastInputRow(rows, p) >= 0
 }
 func allBorder(row, border string) bool {
 	if row == "" || border == "" {
@@ -148,13 +178,7 @@ func IsInputBlank(patterns DetectorPatternSet, rows []string, cells [][]supervis
 	if cells == nil || len(cells) != len(rows) {
 		return false
 	}
-	row := -1
-	for i := 1; i < len(rows)-1; i++ {
-		if strings.HasPrefix(rows[i], patterns.Prompt) && allBorder(rows[i-1], patterns.IdleTop) && allBorder(rows[i+1], patterns.IdleBottom) {
-			row = i
-			break
-		}
-	}
+	row := lastInputRow(rows, patterns)
 	if row < 0 {
 		return false
 	}
