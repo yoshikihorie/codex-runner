@@ -44,7 +44,7 @@ func (d *CompositeDetector) Detect(_ context.Context, in DetectInput) (DetectRes
 	}
 	screen := d.Screen.Detect(in)
 	quiet := d.Quiet.IsQuiet(in)
-	working := containsAny(in.ScreenRows, p.Working) || p.ObservedWorking && hasObservedWorking(in.ScreenRows)
+	working := containsAny(in.ScreenRows, p.Working) || p.ObservedWorking && hasObservedWorking(in.ScreenRows, p)
 	permission := false
 	for _, group := range p.Permission {
 		if orderedLinePatternFound(in.ScreenRows, group) {

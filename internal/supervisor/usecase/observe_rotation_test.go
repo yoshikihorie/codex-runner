@@ -275,7 +275,7 @@ func TestObserveSession_SCN17_PendingRemoteControlSentOnIdle(t *testing.T) {
 		}
 		shot := blankScreen()
 		shot.ChangedAt = time.Now().Add(time.Second)
-		send.NotifyConfirmation(SendConfirmation{SessionID: s.SessionID, SendID: current.SendGate.Pending.SendID, Screen: shot})
+		notifySendTestPair(send, SendConfirmation{SessionID: s.SessionID, SendID: current.SendGate.Pending.SendID, Screen: shot})
 	}
 	pending := &PendingRemoteControlUseCase{Sessions: sessions, Send: send}
 	u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateIdle}}}, Sessions: sessions, PendingRemoteControl: pending, Interval: time.Millisecond}
@@ -338,7 +338,7 @@ func TestObserveSession_SCN01_17_RotationCompletesThenSendsPendingRemoteControl(
 		}
 		shot := blankScreen()
 		shot.ChangedAt = time.Now().Add(time.Second)
-		send.NotifyConfirmation(SendConfirmation{SessionID: s.SessionID, SendID: current.SendGate.Pending.SendID, Screen: shot})
+		notifySendTestPair(send, SendConfirmation{SessionID: s.SessionID, SendID: current.SendGate.Pending.SendID, Screen: shot})
 	}
 	pending := &PendingRemoteControlUseCase{Sessions: sessions, Send: send}
 	completed := make(chan struct{}, 1)

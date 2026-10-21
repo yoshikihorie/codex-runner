@@ -45,7 +45,7 @@ func TestSendOperatorInput_SCNSup0567_SendsExactTextAndAuditsLength(t *testing.T
 		screen.shot.ChangedAt = time.Now().Add(time.Second)
 		screen.shot.Rows[1] = "❯\u00a0"
 		screen.shot.Cells[1] = []supervisor.Cell{{Text: "❯"}, {Text: "\u00a0"}}
-		u.Send.NotifyConfirmation(SendConfirmation{SessionID: "alpha-1", SendID: "alpha-1-s1", Screen: screen.shot})
+		notifySendTestPair(u.Send, SendConfirmation{SessionID: "alpha-1", SendID: "alpha-1-s1", Screen: screen.shot})
 	}
 	result, err := u.Execute(context.Background(), "alpha-1", operatorText(t, value), false)
 	if err != nil || !result.Confirmed || result.SendID != "alpha-1-s1" || pty.wrote != value || pty.calls != 1 || len(pty.writes) != 2 || string(pty.writes[1]) != "\r" {

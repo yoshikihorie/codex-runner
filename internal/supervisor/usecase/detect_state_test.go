@@ -161,3 +161,58 @@ func (d *statuslineCaptureDetector) Detect(_ context.Context, in detect.DetectIn
 	}
 	return detect.DetectResult{}, nil
 }
+
+func TestSCNsup01066MissingUsagePreservesSessionID(t *testing.T) {
+	const uuid = "123e4567-e89b-12d3-a456-426614174000"
+	for _, tc := range []struct {
+		name, percentage, claudeID string
+		offset                     time.Duration
+		wantID                     string
+		wantUsage                  bool
+	}{
+		{name: "missing", claudeID: uuid, wantID: uuid},
+		{name: "null", percentage: `,"used_percentage":null`, claudeID: uuid, wantID: uuid},
+		{name: "invalid_id", claudeID: "invalid"},
+		{name: "before_generation", claudeID: uuid, offset: -time.Second},
+		{name: "future", claudeID: uuid, offset: 6 * time.Second},
+		{name: "out_of_range", percentage: `,"used_percentage":150`, claudeID: uuid},
+		{name: "zero", percentage: `,"used_percentage":0`, claudeID: uuid, wantID: uuid, wantUsage: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			session, sessions, _ := observeSendFixture(t, supervisor.SessionIdle)
+			now := *session.ChildStartedAt
+			root := t.TempDir()
+			if err := os.Mkdir(filepath.Join(root, "statusline"), 0700); err != nil {
+				t.Fatal(err)
+			}
+			body := `{"schema_version":1,"observed_at":"` + now.Add(tc.offset).Format(time.RFC3339Nano) + `","claude_session_id":"` + tc.claudeID + `"` + tc.percentage + `}`
+			if err := os.WriteFile(filepath.Join(root, "statusline", session.SessionID.String()+".json"), []byte(body), 0600); err != nil {
+				t.Fatal(err)
+			}
+			detector := statuslineStructuredDetector{}
+			result, err := (DetectSessionStateUseCase{StateDir: root, Sessions: sessions, Detector: detector, Now: func() time.Time { return now }}).Execute(context.Background(), session, supervisor.NewVirtualTerminal(80, 24), now, false, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if result.SessionID != tc.wantID || (result.ContextPercent != nil) != tc.wantUsage {
+				t.Fatalf("result=%+v", result)
+			}
+			if result.ContextPercent != nil && *result.ContextPercent != 0 {
+				t.Fatalf("percentage=%d", *result.ContextPercent)
+			}
+			saved, err := sessions.Load(session.SessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if saved.ClaudeSessionID != tc.wantID {
+				t.Fatalf("persisted ID=%q want=%q", saved.ClaudeSessionID, tc.wantID)
+			}
+		})
+	}
+}
+
+type statuslineStructuredDetector struct{}
+
+func (statuslineStructuredDetector) Detect(_ context.Context, in detect.DetectInput) (detect.DetectResult, error) {
+	return detect.NewStructuredInfoDetector().Detect(in), nil
+}

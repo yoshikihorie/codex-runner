@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"flag"
 	"io"
@@ -15,13 +16,16 @@ import (
 
 var superviseClaudeUUID = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 
+// FD-sup-01 §5.3b and validation-rules.yaml: decimal/exponent notation is not an integer literal.
+var superviseStatuslineInteger = regexp.MustCompile(`^-?[0-9]+$`)
+
 const superviseStatuslineSchemaVersion = 1 // FD-sup-01 §5.3b statusline record.
 
 type superviseStatuslineInput struct {
 	SessionID     string `json:"session_id"`
 	ContextWindow struct {
-		UsedPercentage    *int `json:"used_percentage"`
-		ContextWindowSize int  `json:"context_window_size"`
+		UsedPercentage    json.RawMessage `json:"used_percentage"`
+		ContextWindowSize int             `json:"context_window_size"`
 		CurrentUsage      *struct {
 			InputTokens              int `json:"input_tokens"`
 			OutputTokens             int `json:"output_tokens"`
@@ -55,25 +59,42 @@ func runSuperviseStatusline(args []string, stdin io.Reader, stdout io.Writer) in
 	if err := decoder.Decode(new(any)); err != io.EOF {
 		return 0
 	}
-	used := input.ContextWindow.UsedPercentage
-	if used == nil && input.ContextWindow.ContextWindowSize > 0 && input.ContextWindow.CurrentUsage != nil {
+	rawUsed := bytes.TrimSpace(input.ContextWindow.UsedPercentage)
+	var used *int
+	if superviseStatuslineInteger.Match(rawUsed) {
+		var value int
+		// An integer too large for int is also out of range: preserve the no-write rule.
+		if json.Unmarshal(rawUsed, &value) != nil {
+			return 0
+		}
+		used = &value
+	}
+	if len(rawUsed) == 0 || bytes.Equal(rawUsed, []byte("null")) {
+		// FD-sup-01 §5.3b: missing usage without a fallback must not refresh the record.
+		if input.ContextWindow.ContextWindowSize <= 0 || input.ContextWindow.CurrentUsage == nil {
+			return 0
+		}
 		current := input.ContextWindow.CurrentUsage
 		value := 100 * (current.InputTokens + current.OutputTokens + current.CacheCreationInputTokens + current.CacheReadInputTokens) / input.ContextWindow.ContextWindowSize
 		used = &value
 	}
-	if used == nil || *used < 0 || *used > 100 {
+	if used != nil && (*used < 0 || *used > 100) {
 		return 0
 	}
 	claudeID := input.SessionID
 	if !superviseClaudeUUID.MatchString(claudeID) {
 		claudeID = ""
 	}
+	if used == nil && claudeID == "" {
+		return 0
+	}
+
 	record := struct {
 		SchemaVersion   int       `json:"schema_version"`
 		ObservedAt      time.Time `json:"observed_at"`
-		UsedPercentage  int       `json:"used_percentage"`
+		UsedPercentage  *int      `json:"used_percentage,omitempty"`
 		ClaudeSessionID string    `json:"claude_session_id"`
-	}{superviseStatuslineSchemaVersion, time.Now().UTC(), *used, claudeID}
+	}{superviseStatuslineSchemaVersion, time.Now().UTC(), used, claudeID}
 	data, err := json.Marshal(record)
 	if err != nil {
 		return 0

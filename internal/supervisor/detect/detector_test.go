@@ -30,7 +30,7 @@ func TestDefaultPatternsObservedScreens(t *testing.T) {
 		want DetectedState
 	}{
 		{"recommendation", idle, StateAwaitingRecommendation},
-		{"working", append([]string{"✳ Effecting…"}, idle...), StateWorking},
+		{"working", append([]string{"✳ Effecting…"}, idle[3:]...), StateWorking},
 		{"startup idle", []string{border, "❯\u00a0", border, "  ⏸ manual mode on"}, StateIdle},
 		{"missing completion", []string{"❯ please answer", "⏺ The answer is two.", border, "❯\u00a0", border}, StateIdle},
 		{"last echo has no completion", append([]string{"❯ older", "⏺ older response", "✻ Cooked for 2s · done 10:00", "❯ newer", "⏺ newer response"}, border, "❯\u00a0", border), StateIdle},
@@ -217,6 +217,52 @@ func TestReconstructedStartupFixtures(t *testing.T) {
 			if got.State != tc.want {
 				t.Fatalf("state=%q want=%q rows=%q", got.State, tc.want, strings.Join(rows, "\n"))
 			}
+			if got.ProcessingIndicator {
+				t.Fatal("startup fixture must not indicate processing")
+			}
+			if tc.want != StateIdle {
+				return
+			}
+			// The fixture is a sanitized capture. Add only synthetic status/body rows.
+			input := -1
+			for i, row := range rows {
+				if strings.HasPrefix(row, DefaultPatternSet().Prompt) {
+					input = i
+				}
+			}
+			if input < 4 {
+				t.Fatal("fixture has no room above its input")
+			}
+			cells := make([][]supervisor.Cell, len(rows))
+			for i := range rows {
+				cells[i] = vt.Cells(i)
+			}
+			if !IsInputBlank(DefaultPatternSet(), rows, cells) {
+				t.Fatal("fixture's dim placeholder must be blank")
+			}
+			for _, variant := range []struct {
+				name    string
+				above   []string
+				working bool
+			}{
+				{"working adjacent", []string{"✳ Reviewing…"}, true},
+				{"working with blank", []string{"✳ Reviewing…", ""}, true},
+				{"history", []string{"✳ Reviewing…", "⏺ Synthetic answer."}, false},
+				{"completed", []string{"✳ Reviewing…", "✻ Cooked for 2s · done 10:00"}, false},
+			} {
+				t.Run(variant.name, func(t *testing.T) {
+					screen := append([]string{}, rows...)
+					copy(screen[input-1-len(variant.above):input-1], variant.above)
+					got := detect(t, NewCompositeDetector(DefaultPatternSet()), DetectInput{ScreenRows: screen, Now: now, LastScreenChangeAt: now.Add(-QuietPeriod)})
+					want := StateIdle
+					if variant.working {
+						want = StateWorking
+					}
+					if got.ProcessingIndicator != variant.working || got.State != want {
+						t.Fatalf("processing=%v state=%s want (%v,%s)", got.ProcessingIndicator, got.State, variant.working, want)
+					}
+				})
+			}
 		})
 	}
 }
@@ -238,5 +284,117 @@ func TestCLIPatternSelectionAndOROfANDGroups(t *testing.T) {
 	in.ScreenRows = []string{"processing"}
 	if got := detect(t, d, in); got.State != StateWorking {
 		t.Fatalf("alternate OR group state=%q", got.State)
+	}
+}
+
+func TestInputBlankUsesLowestBorderedPrompt(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		upper, lower string
+		want         bool
+	}{
+		{"lower retains text", "", "pending", false},
+		{"lower is blank", "old text", "", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := []string{"────", "❯\u00a0" + tc.upper, "────", "history", "────", "❯\u00a0" + tc.lower, "────"}
+			cells := make([][]supervisor.Cell, len(rows))
+			for i, row := range rows {
+				for _, r := range row {
+					cells[i] = append(cells[i], supervisor.Cell{Text: string(r)})
+				}
+			}
+			if got := IsInputBlank(DefaultPatternSet(), rows, cells); got != tc.want {
+				t.Fatalf("IsInputBlank=%v want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestObservedWorkingOnlyAboveLowestInput(t *testing.T) {
+	prompt := []string{"────", "❯\u00a0", "────"}
+	for _, tc := range []struct {
+		name string
+		rows []string
+		want bool
+	}{
+		{"history", append([]string{"✳ Reviewing…", "⏺ Finished response."}, prompt...), false},
+		{"completed", append([]string{"✳ Reviewing…", "✻ Cooked for 2s · done 10:00"}, prompt...), false},
+		{"adjacent", append([]string{"✳ Reviewing…"}, prompt...), true},
+		{"blank separator", append([]string{"✳ Reviewing…", "", "   "}, prompt...), true},
+		{"body after blank", append([]string{"✳ Reviewing…", "", "⏺ Finished response.", ""}, prompt...), false},
+		{"above old input", append(append([]string{"✳ Reviewing…"}, prompt...), append([]string{"response"}, prompt...)...), false},
+		{"footer", append(append([]string{}, prompt...), "✳ Reviewing…"), false},
+		{"missing input", []string{"✳ Reviewing…"}, false},
+		{"missing borders", []string{"✳ Reviewing…", "❯\u00a0"}, false},
+		{"completion", append([]string{"✻ Cooked for 2s · done 10:00"}, prompt...), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			got := detect(t, NewCompositeDetector(DefaultPatternSet()), DetectInput{ScreenRows: tc.rows, Now: now, LastScreenChangeAt: now.Add(-QuietPeriod)})
+			if got.ProcessingIndicator != tc.want {
+				t.Fatalf("ProcessingIndicator=%v want %v (state=%s)", got.ProcessingIndicator, tc.want, got.State)
+			}
+		})
+	}
+}
+
+// SCN-sup-01-67/68: use synthetic rows only.
+func TestObservedWorkingSkipsAuxiliaryRows(t *testing.T) {
+	prompt := []string{"────", "❯\u00a0", "────"}
+	for _, tc := range []struct {
+		name  string
+		above []string
+		want  bool
+	}{
+		{"task", []string{"✳ Effecting…", "⎿ ☐ Synthetic task"}, true},
+		{"tip", []string{"✳ Effecting…", "  ⎿ Tip: Synthetic tip"}, true},
+		{"continuations", []string{"✳ Effecting…", "⎿ Tip: Synthetic tip", "  wrapped text", "\tmore text"}, true},
+		{"unicode indentation", []string{"✳ Effecting…", "\u00a0⎿ Tip: Synthetic tip", "\u00a0wrapped text"}, true},
+		{"mixed blanks", []string{"✳ Effecting…", "", "⎿ ☐ First", "  continuation", "", "   ", "  ⎿ ☐ Second", ""}, true},
+		{"history", []string{"- Reviewing…", "Synthetic response", "⎿ Tip: Synthetic tip", "  continuation", ""}, false},
+		{"completion", []string{"✳ Effecting…", "✻ Cooked for 2s · done 10:00", "⎿ ☐ Synthetic task"}, false},
+		{"indented body", []string{"✳ Effecting…", "  Synthetic body", "⎿ Tip: Synthetic tip"}, false},
+		{"unindented breaks continuation", []string{"✳ Effecting…", "⎿ Tip: Synthetic tip", "Synthetic body", "  continuation"}, false},
+		{"empty row breaks continuation", []string{"✳ Effecting…", "⎿ Tip: Synthetic tip", "", "  Synthetic body"}, false},
+		{"embedded marker", []string{"✳ Effecting…", "Synthetic body ⎿ Tip: text"}, false},
+		{"only auxiliary", []string{"⎿ Tip: Synthetic tip", "  continuation"}, false},
+		{"english word only", []string{"✳ Sautéing…", "⎿ Tip: Synthetic tip"}, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			rows := append(append([]string{}, tc.above...), prompt...)
+			now := time.Now()
+			got := detect(t, NewCompositeDetector(DefaultPatternSet()), DetectInput{ScreenRows: rows, Now: now, LastScreenChangeAt: now.Add(-QuietPeriod)})
+			wantState := StateIdle
+			if tc.want {
+				wantState = StateWorking
+			}
+			if got.ProcessingIndicator != tc.want || got.State != wantState {
+				t.Fatalf("processing=%v state=%s want (%v,%s)", got.ProcessingIndicator, got.State, tc.want, wantState)
+			}
+		})
+	}
+}
+
+func TestLowestInputWorkingAndUnsafeFooter(t *testing.T) {
+	prompt := []string{"────", "❯\u00a0", "────"}
+	for _, tc := range []struct {
+		name    string
+		rows    []string
+		working bool
+		mode    PermissionMode
+	}{
+		{"old unsafe footer", append(append([]string{}, prompt...), append([]string{"auto mode on", "✳ Effecting…", "⎿ ☐ Synthetic task"}, prompt...)...), true, PermissionDefaultOrUnknown},
+		{"active unsafe footer", append(append(append([]string{}, prompt...), prompt...), "bypass permissions on"), false, PermissionUnsafe},
+		{"above old input", append(append([]string{"✳ Effecting…", "⎿ ☐ Synthetic task"}, prompt...), append([]string{"Synthetic response"}, prompt...)...), false, PermissionDefaultOrUnknown},
+		{"missing input", []string{"✳ Effecting…", "⎿ Tip: Synthetic tip", "  continuation", "auto mode on"}, false, PermissionDefaultOrUnknown},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			now := time.Now()
+			got := detect(t, NewCompositeDetector(DefaultPatternSet()), DetectInput{ScreenRows: tc.rows, Now: now, LastScreenChangeAt: now.Add(-QuietPeriod)})
+			if got.ProcessingIndicator != tc.working || got.PermissionMode != tc.mode {
+				t.Fatalf("processing=%v mode=%s want (%v,%s)", got.ProcessingIndicator, got.PermissionMode, tc.working, tc.mode)
+			}
+		})
 	}
 }

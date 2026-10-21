@@ -375,6 +375,77 @@ func TestVirtualTerminalSGRColorsDoNotBecomeAttributes(t *testing.T) {
 	}
 }
 
+func TestVirtualTerminalSGRColorParameterBoundaries(t *testing.T) {
+	for _, color := range []string{"38", "48", "58"} {
+		for _, format := range []string{
+			";2;0;2;22", ":2:0:2:22", ":2::0:2:22", ":2:0:0:2:22", ":2:1:0:2:22",
+			";5;2", ":5:2", ":5:0",
+		} {
+			for _, tc := range []struct {
+				name, before, after string
+				wantFaint           bool
+			}{
+				{"clear", "2", "22", false},
+				{"set", "22", "2", true},
+				{"preserve_faint", "2", "", true},
+				{"preserve_normal", "22", "", false},
+			} {
+				t.Run(color+format+"/"+tc.name, func(t *testing.T) {
+					v := NewVirtualTerminal(8, 1)
+					sequence := tc.before + ";" + color + format
+					if tc.after != "" {
+						sequence += ";" + tc.after
+					}
+					v.Write([]byte("\x1b[" + sequence + "mX"))
+					if cell := v.Cells(0)[0]; cell.Text != "X" || cell.Faint != tc.wantFaint {
+						t.Fatalf("SGR %q: cell=%+v want faint=%t", sequence, cell, tc.wantFaint)
+					}
+				})
+			}
+		}
+	}
+	for _, sequence := range []string{
+		"2;38:2:0:2:22;48;2;0;2;22;58:2:1:0:2:22;22",
+		"2;38;2;0;2;22;48:2::0:2:22;58;5;2;22",
+		"2;38:2:0:2:22;48:5:2;58;2;0;2;22;22",
+	} {
+		t.Run("mixed/"+sequence, func(t *testing.T) {
+			v := NewVirtualTerminal(8, 1)
+			for _, b := range []byte("\x1b[" + sequence + "mX") {
+				v.Write([]byte{b})
+			}
+			if cell := v.Cells(0)[0]; cell.Text != "X" || cell.Faint {
+				t.Fatalf("mixed SGR %q: cell=%+v want normal X", sequence, cell)
+			}
+		})
+	}
+}
+
+func TestVirtualTerminalSavedCursorFaintCombinations(t *testing.T) {
+	for _, save := range []string{"\x1b7", "\x1b[s"} {
+		for _, restore := range []string{"\x1b8", "\x1b[u"} {
+			for _, faint := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%q/%q/faint=%t", save, restore, faint), func(t *testing.T) {
+					v := NewVirtualTerminal(8, 3)
+					before, after := "22", "2"
+					if faint {
+						before, after = after, before
+					}
+					// Seed an older DECSC attribute opposite to the new saved state.
+					v.Write([]byte("\x1b[" + after + "m\x1b7\x1b[" + before + "m\x1b[2;3H" + save))
+					v.Write([]byte("\x1b[" + after + "m\x1b[1;1H" + restore + "X"))
+					if cell := v.Cells(1)[2]; cell.Text != "X" || cell.Faint != faint {
+						t.Fatalf("restored cell=%+v want faint=%t", cell, faint)
+					}
+					if got := v.CursorPos(); got != (CursorPosition{Row: 1, Col: 3}) {
+						t.Fatalf("restored cursor after X=%+v", got)
+					}
+				})
+			}
+		}
+	}
+}
+
 func TestVirtualTerminalCSIEmptyParametersAndPendingWrap(t *testing.T) {
 	v := NewVirtualTerminal(3, 3)
 	v.Write([]byte("abc\x1b[2m"))

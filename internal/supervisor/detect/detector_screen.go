@@ -15,11 +15,8 @@ func (d *ScreenPatternDetector) Detect(in DetectInput) DetectResult {
 	}
 	mode := PermissionDefaultOrUnknown
 	footerStart := len(in.ScreenRows)
-	for i := 1; i < len(in.ScreenRows)-1; i++ {
-		if strings.HasPrefix(in.ScreenRows[i], p.Prompt) && allBorder(in.ScreenRows[i-1], p.IdleTop) && allBorder(in.ScreenRows[i+1], p.IdleBottom) {
-			footerStart = i + 2
-			break
-		}
+	if input := lastInputRow(in.ScreenRows, p); input >= 0 {
+		footerStart = input + 2
 	}
 	for _, row := range in.ScreenRows[footerStart:] {
 		for _, g := range p.UnsafeFooter {
