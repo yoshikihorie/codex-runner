@@ -157,7 +157,6 @@ func (s *SessionStore) Load(id supervisor.SessionID) (supervisor.ManagedSession,
 	}
 	var v supervisor.ManagedSession
 	dec := json.NewDecoder(bytes.NewReader(data))
-	dec.DisallowUnknownFields()
 	err = dec.Decode(&v)
 	if err == nil {
 		var extra any
