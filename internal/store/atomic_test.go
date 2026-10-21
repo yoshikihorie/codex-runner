@@ -2,6 +2,7 @@ package store
 
 import (
 	"bytes"
+	"errors"
 	"os"
 	"path/filepath"
 	"sync"
@@ -29,6 +30,53 @@ func TestWriteAtomicWritesAndReplacesWithRequestedPermissions(t *testing.T) {
 	}
 	if info.Mode().Perm() != 0o600 {
 		t.Fatalf("permissions = %o", info.Mode().Perm())
+	}
+}
+
+func TestWriteAtomicSyncsParentAfterRename(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		syncErr error
+	}{
+		{name: "success"},
+		{name: "sync error is ignored", syncErr: errors.New("directory sync failed")},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "task.json")
+			if err := os.WriteFile(path, []byte("old"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			originalSyncDir := syncDir
+			t.Cleanup(func() { syncDir = originalSyncDir })
+			calls := 0
+			syncDir = func(dir string) error {
+				calls++
+				if dir != filepath.Dir(path) {
+					t.Errorf("syncDir directory = %q, want %q", dir, filepath.Dir(path))
+				}
+				got, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if string(got) != "new" {
+					t.Errorf("content at syncDir = %q, want new", got)
+				}
+				return test.syncErr
+			}
+			if err := WriteAtomic(path, []byte("new"), 0o600); err != nil {
+				t.Fatalf("WriteAtomic returned error: %v", err)
+			}
+			if calls != 1 {
+				t.Errorf("syncDir calls = %d, want 1", calls)
+			}
+			got, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != "new" {
+				t.Errorf("content = %q, want new", got)
+			}
+		})
 	}
 }
 

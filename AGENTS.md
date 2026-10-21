@@ -9,10 +9,10 @@ existing `README.md` / `CONTRIBUTING.md` convention.
 
 ## English summary
 
-- **Status: Stage 1 implementation in progress.** Core components (e.g. task store, contract
-  writer, execution monitoring) exist under `internal/`, but the `codexd` daemon as a whole is not
-  yet complete. Do not assume every package, type, or function mentioned below is already
-  implemented — check the actual source under `internal/` for current status.
+- **Status: Stages -1 through 3 are complete; the supervisor feature is in development.** The
+  daemon runs under launchd. Supervisor components exist under `internal/supervisor/`, but their
+  startup command is not connected yet and the feature cannot be launched. Check the actual source
+  before assuming a component is usable.
 - The canonical source for values (enums, thresholds, error codes, message text) and for the API
   contract (socket protocol verbs, CLI subcommands, on-disk output format) lives outside this
   repository, in a local specifications directory that is **not part of the public repository**.
@@ -21,7 +21,7 @@ existing `README.md` / `CONTRIBUTING.md` convention.
 - Do not hardcode enum values or thresholds you find written out in design docs; treat any such
   value as a copy of a canonical definition, not the definition itself.
 - Do not change the on-disk task-output format under `/tmp/codex-tasks/<task-id>/` without an
-  explicit instruction — nine external check scripts currently read it directly (see
+  explicit instruction — eight external check scripts currently read it directly (see
   `02-domain/output-contract.md` §5 in the specifications directory for the current count), and it
   is treated as a frozen contract.
 - Do not write absolute, machine-specific filesystem paths into source code or tests.
@@ -30,12 +30,9 @@ existing `README.md` / `CONTRIBUTING.md` convention.
 
 ## このリポジトリが何か
 
-`codexd`（OpenAI Codex CLI を長時間・非同期で安全に走らせる常駐プロセス）の**設計リポジトリ**である。
-`README.md` が明記するとおり、現時点は**Stage 1（常駐プロセス基盤）の実装が進行中**である。
-`go.mod` と `internal/` 配下に主要コンポーネント（TaskStore・ContractWriter・実行監視の一部等）は
-実装済みだが、`codexd` 常駐プロセス全体としてはまだ完成していない。以下で触れる型名・パッケージ名・
-関数シグネチャは正典が定める名前を基準としており、実装済みかどうかは `internal/` 配下の実ソースで
-都度確認すること。
+`codexd`（OpenAI Codex CLI を長時間・非同期で安全に走らせる常駐プロセス）の実装と設計資料を公開するリポジトリである。
+段階 -1〜3 は完了し、常駐プロセスを運用している。`internal/supervisor/` 配下では、複数プロジェクトの
+開発 CLI を監視・対話制御する機能を開発中である。起動コマンドへの接続は未実装で、まだ起動できない。
 
 実装を始める前に、まず `README.md`（何を解決するか）と `docs/roadmap.md`（段階移行の計画）を読むこと。
 
@@ -77,7 +74,7 @@ existing `README.md` / `CONTRIBUTING.md` convention.
   思えた場合は、まず Issue で論点を共有すること（`CONTRIBUTING.md` の手順に従う）。
 - **出力契約を変えない。** `/tmp/codex-tasks/<task-id>/` 配下のファイル（`task.json` / `prompt.md` /
   `exit-code` / `last-message.md` / `stdout.log` / `stderr.log` 等）の形式・書き込みタイミングは、
-  外部検査スクリプト（異なり 15 種類のうち現存 9 本。内訳は `02-domain/output-contract.md` §5 参照）が
+  外部検査スクリプト（異なり 15 種類のうち現存 8 本。内訳は `02-domain/output-contract.md` §5 参照）が
   直接読む後方互換契約であり、明示的な指示なしに変更しない。
 - **絶対パスを書かない。** ソースコード・テスト・設定に、特定のマシン環境に固有の絶対パス
   （`/Users/...` や `/Volumes/...` など）を書き込まない。

@@ -238,6 +238,15 @@ func main() {
 }
 
 func runEntrypoint(ctx context.Context, args []string, stdin io.Reader, stdout, stderr io.Writer) int {
+	if len(args) > 0 && args[0] == "supervise-statusline" {
+		return runSuperviseStatusline(args[1:], stdin, stdout)
+	}
+	if len(args) > 0 && args[0] == "supervisor-client" {
+		return runSupervisorClient(ctx, args[1:], stdin, stdout, stderr)
+	}
+	if len(args) > 0 && args[0] == "supervise" {
+		return runSupervise(ctx, args[1:], stderr)
+	}
 	if len(args) > 0 && args[0] == "client" {
 		return runClient(ctx, args[1:], stdin, stdout, stderr)
 	}

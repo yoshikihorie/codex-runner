@@ -29,5 +29,23 @@ func WriteAtomic(path string, data []byte, perm os.FileMode) error {
 	if err := tmp.Close(); err != nil {
 		return err
 	}
-	return os.Rename(tmpPath, path)
+	if err := os.Rename(tmpPath, path); err != nil {
+		return err
+	}
+	// Sync the directory entry after rename; failure is best effort because replacement succeeded.
+	_ = syncDir(dir)
+	return nil
+}
+
+// syncDir opens and syncs dir to help preserve rename across power loss.
+var syncDir = func(dir string) error {
+	d, err := os.Open(dir)
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return err
+	}
+	return d.Close()
 }
