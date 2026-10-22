@@ -12,6 +12,7 @@ import (
 	"regexp"
 	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1439,6 +1440,10 @@ func TestSendInputC1ConsecutiveObservations(t *testing.T) {
 			pty := &sendTestPTY{onWrite: func() { echoScreen(screen, text) }}
 			var events []store.Event
 			u := &SendInputUseCase{Sessions: sessions, Screens: screen, PTY: pty, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir()), ConfirmTimeout: time.Millisecond, RecordStructured: func(e store.Event) error { events = append(events, e); return nil }}
+			if tc.confirmed {
+				u.ConfirmTimeout = timingBatchConfirmationDeadline
+			}
+			ctx := timingBatchContext(t)
 			pty.afterEnter = func() {
 				for n, frame := range tc.frames {
 					shot := blankScreen()
@@ -1463,7 +1468,11 @@ func TestSendInputC1ConsecutiveObservations(t *testing.T) {
 					u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
 				}
 			}
-			result, err := u.Execute(context.Background(), SendInput{SessionID: id, Kind: tc.kind})
+			result, err := u.Execute(ctx, SendInput{SessionID: id, Kind: tc.kind})
+			timingBatchHealthy(t, ctx)
+			if pty.wrote != text || len(pty.writes) != 2 || string(pty.writes[1]) != "\r" {
+				t.Fatalf("text/CR: writes=%q", pty.writes)
+			}
 			if result.Confirmed != tc.confirmed || (err == nil) != tc.confirmed {
 				t.Fatalf("result=%+v err=%v", result, err)
 			}
@@ -1484,8 +1493,8 @@ func TestSendInputC1ConsecutiveObservations(t *testing.T) {
 // SCN-sup-02-42: use the production enter delay and asynchronously observed echoes.
 func TestSendInputE1DelayedEcho(t *testing.T) {
 	for _, kind := range []supervisor.SupervisorSendKind{supervisor.SendKindOperatorInput, supervisor.SendKindRemoteControl, supervisor.SendKindHandoffEnd, supervisor.SendKindSessionStart, supervisor.SendKindHandoffExit, supervisor.SendKindParallelInstruction, supervisor.SendKindRecommendationContinue} {
-		for _, delay := range []time.Duration{20 * time.Millisecond, 280 * time.Millisecond} {
-			t.Run(fmt.Sprintf("%s/%s", kind, delay), func(t *testing.T) {
+		for _, phase := range []string{"before guard", "after partial"} {
+			t.Run(fmt.Sprintf("%s/%s", kind, phase), func(t *testing.T) {
 				id := supervisor.SessionID("alpha-1")
 				sessions := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, State: supervisor.SessionIdle}}
 				screens := &ObservedScreenStore{}
@@ -1493,25 +1502,60 @@ func TestSendInputE1DelayedEcho(t *testing.T) {
 				shot.Observation = 1
 				screens.SetSnapshot(id, shot)
 				pty := &sendTestPTY{}
-				u := &SendInputUseCase{Sessions: sessions, Screens: screens, PTY: pty, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir()), ConfirmTimeout: time.Millisecond}
+				u := &SendInputUseCase{Sessions: sessions, Screens: screens, PTY: pty, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir()), ConfirmTimeout: timingBatchConfirmationDeadline, EchoWait: timingBatchConfirmationDeadline}
 				message, _ := supervisor.FixedText(kind, defaultParallelInstruction)
 				input := SendInput{SessionID: id, Kind: kind}
 				if kind == supervisor.SendKindOperatorInput {
 					message = "hello world"
 					input.OperatorText = operatorText(t, message)
 				}
+				ctx, cancel := context.WithCancel(timingBatchContext(t))
+				t.Cleanup(cancel)
+				var events []store.Event
+				u.RecordStructured = func(e store.Event) error { events = append(events, e); return nil }
+				partialProcessed := make(chan struct{})
 				done := make(chan struct{})
+				postWriteSnapshots := 0
+				u.Screens = screenReaderFunc(func(id supervisor.SessionID) ScreenSnapshot {
+					if pty.calls > 0 && phase == "after partial" {
+						postWriteSnapshots++
+						if postWriteSnapshots == 2 {
+							// waitForEnter has checked the initial partial prefix
+							// before requesting its next snapshot.
+							close(partialProcessed)
+							timingBatchAwait(t, done)
+						}
+					}
+					return screens.Snapshot(id)
+				})
 				pty.onWrite = func() {
+					if phase == "after partial" {
+						partial := &sendTestScreen{shot: blankScreen()}
+						echoScreen(partial, string([]rune(message)[:1]))
+						partial.shot.Observation = 2
+						screens.SetSnapshot(id, partial.shot)
+						partial.shot.Observation = 3
+						u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: partial.shot})
+					}
 					go func() {
 						defer close(done)
-						time.Sleep(delay)
+						if phase == "after partial" {
+							select {
+							case <-partialProcessed:
+							case <-ctx.Done():
+								return
+							}
+						}
 						echo := &sendTestScreen{shot: blankScreen()}
 						echoScreen(echo, message)
-						echo.shot.Observation = 2
+						echo.shot.Observation = 4
 						screens.SetSnapshot(id, echo.shot)
 						u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: echo.shot})
 					}()
-					time.Sleep(supervisor.SupervisorSendEnterDelay)
+					t.Cleanup(func() { cancel(); timingBatchAwait(t, done) })
+					if phase == "before guard" {
+						timingBatchAwait(t, done)
+					}
 				}
 				pty.afterEnter = func() {
 					if kind == supervisor.SendKindHandoffExit {
@@ -1524,15 +1568,25 @@ func TestSendInputE1DelayedEcho(t *testing.T) {
 					shot := blankScreen()
 					shot.ChangedAt = time.Now().Add(time.Second)
 					// Post-CR observations follow the echo's observation number.
-					for observation := uint64(3); observation <= 4; observation++ {
+					for observation := uint64(5); observation <= 6; observation++ {
 						shot.Observation = observation
 						u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
 					}
 				}
-				result, err := u.Execute(context.Background(), input)
-				<-done
-				if err != nil || !result.Confirmed || len(pty.writes) != 2 {
+				result, err := u.Execute(ctx, input)
+				timingBatchHealthy(t, ctx)
+				timingBatchAwait(t, done)
+				if err != nil || !result.Confirmed || len(pty.writes) != 2 || pty.wrote != message || string(pty.writes[1]) != "\r" || pty.delay != supervisor.SupervisorSendEnterDelay {
 					t.Fatalf("delayed echo aborted: err=%v writes=%d", err, len(pty.writes))
+				}
+				confirmed := 0
+				for _, event := range events {
+					if event.Kind == supervisor.EventKindSendConfirmed {
+						confirmed++
+					}
+				}
+				if confirmed != 1 {
+					t.Fatalf("confirmation events=%d: %+v", confirmed, events)
 				}
 			})
 		}
@@ -1549,29 +1603,35 @@ func TestSendInputE1AbortAndDeadline(t *testing.T) {
 			shot := blankScreen()
 			shot.Observation = 1
 			screens.SetSnapshot(id, shot)
-			ctx, cancel := context.WithCancel(context.Background())
-			defer cancel()
+			watchdog := timingBatchContext(t)
+			ctx, cancel := context.WithCancelCause(watchdog)
+			intentionalCancel := errors.New("cancel after entering echo wait")
+			defer cancel(nil)
 			pty := &sendTestPTY{}
 			var events []store.Event
 			u := &SendInputUseCase{Sessions: sessions, Screens: screens, PTY: pty, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir()), ConfirmTimeout: time.Millisecond, RecordStructured: func(e store.Event) error { events = append(events, e); return nil }}
-			u.EchoWait = time.Second
+			u.EchoWait = timingBatchConfirmationDeadline
 			if mode == "timeout" || mode == "duplicate" || mode == "deadline-latest" {
 				u.EchoWait = 200 * time.Millisecond
 			}
-			firstEnter := make(chan struct{})
 			enterSeen := false
+			latestReads := 0
+			var echoWaitStarted time.Time
+			waiting := &timingBatchDoneContext{Context: ctx}
 			u.Screens = screenReaderFunc(func(id supervisor.SessionID) ScreenSnapshot {
-				shot := screens.Snapshot(id)
-				if pty.calls > 0 && !enterSeen {
-					enterSeen = true
-					close(firstEnter)
+				if pty.calls > 0 {
+					if !enterSeen {
+						enterSeen = true
+						echoWaitStarted = time.Now()
+					} else {
+						latestReads++
+						if mode == "deadline-latest" && time.Since(echoWaitStarted) < u.EchoWait {
+							t.Fatal("latest screen read before the real echo deadline")
+						}
+					}
 				}
-				return shot
+				return screens.Snapshot(id)
 			})
-			if mode == "stop" {
-				u.EchoWait = 2 * time.Second
-			}
-			done := make(chan struct{})
 			message := "hello world"
 			if mode == "leading-space" {
 				message = " hello world"
@@ -1612,54 +1672,80 @@ func TestSendInputE1AbortAndDeadline(t *testing.T) {
 					s.shot.State = detect.StateAwaitingRecommendation
 				}
 				screens.SetSnapshot(id, s.shot)
-				go func() {
-					defer close(done)
-					<-firstEnter
-					time.Sleep(20 * time.Millisecond)
-					switch mode {
-					case "stop":
-						if err := os.WriteFile(u.StopState.filePath(""), nil, 0600); err != nil {
-							t.Error(err)
-						}
-					case "cancel":
-						cancel()
-					case "late-permission", "late-mismatch", "duplicate", "deadline-latest", "partial":
-						s := &sendTestScreen{shot: blankScreen()}
-						s.shot.Observation = 3
-						switch mode {
-						case "late-permission":
-							s.shot.State = detect.StateAwaitingPermission
-						case "late-mismatch":
-							echoScreen(s, "other")
-						case "duplicate":
-							echoScreen(s, message)
-							s.shot.Observation = 2
-						case "deadline-latest":
-							echoScreen(s, message)
-						case "partial":
-							echoScreen(s, "hello")
-						}
-						screens.SetSnapshot(id, s.shot)
-						if mode != "deadline-latest" {
-							u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: s.shot})
-						}
-						if mode == "partial" {
-							time.Sleep(20 * time.Millisecond)
-							s = &sendTestScreen{shot: blankScreen()}
-							echoScreen(s, message)
-							s.shot.Observation = 4
-							screens.SetSnapshot(id, s.shot)
-							u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: s.shot})
-						}
-					}
-				}()
+				if mode == "partial" || mode == "deadline-latest" {
+					echoScreen(s, "hello")
+					screens.SetSnapshot(id, s.shot)
+				}
 			}
+			waitArrival := make(chan error, 1)
+			waiting.onDone = func() {
+				// Verify the direct Done caller before changing the waiting fixture.
+				arrivalErr := timingBatchDoneCaller(".(*SendInputUseCase).waitForEnter")
+				waitArrival <- arrivalErr
+				if arrivalErr != nil {
+					cancel(arrivalErr)
+					return
+				}
+				switch mode {
+				case "duplicate":
+					d := &sendTestScreen{shot: blankScreen()}
+					echoScreen(d, message)
+					d.shot.Observation = 2
+					screens.SetSnapshot(id, d.shot)
+					u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: d.shot})
+				case "stop":
+					u.StopState.SetGlobal(true) // No notification: retain default STOP polling.
+				case "cancel":
+					cancel(intentionalCancel)
+				case "late-permission", "late-mismatch", "deadline-latest", "partial":
+					s := &sendTestScreen{shot: blankScreen()}
+					s.shot.Observation = 3
+					switch mode {
+					case "late-permission":
+						s.shot.State = detect.StateAwaitingPermission
+					case "late-mismatch":
+						echoScreen(s, "other")
+					default:
+						echoScreen(s, message)
+					}
+					screens.SetSnapshot(id, s.shot)
+					if mode != "deadline-latest" {
+						u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: s.shot})
+					}
+				}
+			}
+			if mode == "partial" || mode == "deadline-latest" {
+				u.ConfirmTimeout = timingBatchConfirmationDeadline
+				pty.afterEnter = func() {
+					shot := blankScreen()
+					shot.ChangedAt = time.Now().Add(time.Second)
+					for observation := uint64(4); observation <= 5; observation++ {
+						shot.Observation = observation
+						u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", Screen: shot})
+					}
+				}
+			}
+
 			start := time.Now()
-			_, err := u.Execute(ctx, SendInput{SessionID: id, Kind: supervisor.SendKindOperatorInput, OperatorText: operatorText(t, message)})
+			result, err := u.Execute(waiting, SendInput{SessionID: id, Kind: supervisor.SendKindOperatorInput, OperatorText: operatorText(t, message)})
 			elapsed := time.Since(start)
-			<-done
+			select {
+			case arrivalErr := <-waitArrival:
+				if arrivalErr != nil {
+					t.Fatal(arrivalErr)
+				}
+			default: // Unsafe initial screens can abort before the waiting select.
+			}
+			timingBatchHealthy(t, watchdog)
+			if mode == "cancel" {
+				if !enterSeen || !errors.Is(context.Cause(ctx), intentionalCancel) || ctx.Err() != context.Canceled {
+					t.Fatalf("intentional cancellation stage/cause: entered=%v cause=%v", enterSeen, context.Cause(ctx))
+				}
+			} else {
+				timingBatchHealthy(t, ctx)
+			}
 			if mode == "deadline-latest" || mode == "partial" {
-				if len(pty.writes) != 2 || errors.Is(err, proc.ErrBeforeEnter) {
+				if err != nil || !result.Confirmed || latestReads == 0 || len(pty.writes) != 2 || pty.wrote != message || string(pty.writes[1]) != "\r" || len(events) != 2 || events[1].Kind != supervisor.EventKindSendConfirmed {
 					t.Fatalf("expected CR: %v writes=%d", err, len(pty.writes))
 				}
 				return
@@ -1671,12 +1757,79 @@ func TestSendInputE1AbortAndDeadline(t *testing.T) {
 				if elapsed < u.EchoWait {
 					t.Fatalf("did not wait for deadline: %s", elapsed)
 				}
-			} else if elapsed >= u.EchoWait {
-				t.Fatalf("unsafe condition waited until deadline: %s", elapsed)
 			}
-			if mode == "stopped" && sessions.session.StopReason != supervisor.StopGlobal {
+			if sessions.session.State != supervisor.SessionStopped || mode != "stopped" && sessions.session.StopReason != supervisor.StopSendAborted || mode == "stopped" && sessions.session.StopReason != supervisor.StopGlobal {
 				t.Fatal("overwrote stop reason")
 			}
 		})
+	}
+}
+
+// Budgets from the timing-test work plan; these do not change production limits.
+const (
+	timingBatchWatchdog             = 10 * time.Second
+	timingBatchConfirmationDeadline = time.Hour
+)
+
+func timingBatchContext(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), timingBatchWatchdog)
+	t.Cleanup(cancel)
+	return ctx
+}
+
+func timingBatchHealthy(t *testing.T, ctx context.Context) {
+	t.Helper()
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("watchdog/context expired: %v", err)
+	}
+}
+
+func timingBatchAwait[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	timer := time.NewTimer(timingBatchWatchdog)
+	defer timer.Stop()
+	select {
+	case value := <-ch:
+		return value
+	case <-timer.C:
+		t.Fatal("watchdog: synchronization point not reached")
+		var zero T
+		return zero
+	}
+}
+
+// onDone runs at select evaluation, after the preceding safety check. Context
+// cancellation remains independent of this test-only arrival signal.
+type timingBatchDoneContext struct {
+	context.Context
+	once   sync.Once
+	onDone func()
+}
+
+func (c *timingBatchDoneContext) Done() <-chan struct{} {
+	c.once.Do(c.onDone)
+	return c.Context.Done()
+}
+
+// Inspect the frame immediately outside Done, rather than accepting a waiting
+// function anywhere in the stack: context.WithCancel can call Done from inside it.
+func timingBatchDoneCaller(want string) error {
+	var pcs [32]uintptr
+	n := runtime.Callers(2, pcs[:])
+	frames := runtime.CallersFrames(pcs[:n])
+	foundDone := false
+	for {
+		frame, more := frames.Next()
+		if foundDone {
+			if frame.Function == "github.com/yoshikihorie/codex-runner/internal/supervisor/usecase"+want {
+				return nil
+			}
+			return fmt.Errorf("waiting synchronization: Done caller=%s, want %s", frame.Function, want)
+		}
+		foundDone = strings.HasSuffix(frame.Function, ".(*timingBatchDoneContext).Done")
+		if !more {
+			return fmt.Errorf("waiting synchronization: Done caller frame not found, want %s", want)
+		}
 	}
 }

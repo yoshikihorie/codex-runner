@@ -56,15 +56,39 @@ func TestSCNsup0522StopDuringWaitPreventsSpawn(t *testing.T) {
 func TestSCNsup0522DefaultWaitObservesStopBeforeBackoffEnds(t *testing.T) {
 	u, sessions, spy, id := respawnFixture(t)
 	sessions.session.State = supervisor.SessionRecovering
+	sessions.session.RestartCount = supervisor.RestartMaxCount - 1
+	if delay := supervisor.RestartBackoff(sessions.session.RestartCount); delay <= timingBatchWatchdog {
+		t.Fatalf("fixture backoff %s must outlast watchdog", delay)
+	}
 	stops := NewStopState(t.TempDir())
 	recovery := RecoverSessionUseCase{Store: sessions, Stop: stops, Respawn: u.Execute, Now: u.Now}
-	ctx, cancel := context.WithTimeout(context.Background(), 2*defaultObserveInterval)
-	defer cancel()
-	go func() { time.Sleep(defaultObserveInterval / 4); stops.SetGlobal(true) }()
-	if err := recovery.Execute(ctx, id); err != nil {
+	watchdog := timingBatchContext(t)
+	ctx, cancel := context.WithCancel(watchdog)
+	waiting := make(chan error, 1)
+	observed := &timingBatchDoneContext{Context: ctx, onDone: func() {
+		waiting <- timingBatchDoneCaller(".waitRecoveryDelay")
+	}}
+	done := make(chan error, 1)
+	go func() { done <- recovery.Execute(observed, id) }()
+	joined := false
+	defer func() {
+		cancel()
+		if !joined {
+			timingBatchAwait(t, done)
+		}
+	}()
+	// Check the direct Done caller before setting STOP from the test goroutine.
+	if arrivalErr := timingBatchAwait(t, waiting); arrivalErr != nil {
+		t.Fatal(arrivalErr)
+	}
+	stops.SetGlobal(true)
+	err := timingBatchAwait(t, done)
+	joined = true
+	timingBatchHealthy(t, ctx)
+	if err != nil {
 		t.Fatal(err)
 	}
-	if sessions.session.State != supervisor.SessionStopped || spy.calls != 0 {
+	if recovery.Wait != nil || sessions.session.State != supervisor.SessionStopped || sessions.session.StopReason != supervisor.StopGlobal || spy.calls != 0 {
 		t.Fatalf("session=%+v calls=%d", sessions.session, spy.calls)
 	}
 }

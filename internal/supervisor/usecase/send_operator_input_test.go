@@ -39,6 +39,8 @@ func operatorText(t *testing.T, value string) supervisor.OperatorText {
 
 func TestSendOperatorInput_SCNSup0567_SendsExactTextAndAuditsLength(t *testing.T) {
 	u, _, screen, pty, events := operatorFixture(t)
+	u.Send.ConfirmTimeout = timingBatchConfirmationDeadline
+	ctx := timingBatchContext(t)
 	const value = "全角 ＡＢＣ"
 	pty.onWrite = func() { echoScreen(screen, value) }
 	pty.afterEnter = func() {
@@ -47,7 +49,8 @@ func TestSendOperatorInput_SCNSup0567_SendsExactTextAndAuditsLength(t *testing.T
 		screen.shot.Cells[1] = []supervisor.Cell{{Text: "❯"}, {Text: "\u00a0"}}
 		notifySendTestPair(u.Send, SendConfirmation{SessionID: "alpha-1", SendID: "alpha-1-s1", Screen: screen.shot})
 	}
-	result, err := u.Execute(context.Background(), "alpha-1", operatorText(t, value), false)
+	result, err := u.Execute(ctx, "alpha-1", operatorText(t, value), false)
+	timingBatchHealthy(t, ctx)
 	if err != nil || !result.Confirmed || result.SendID != "alpha-1-s1" || pty.wrote != value || pty.calls != 1 || len(pty.writes) != 2 || string(pty.writes[1]) != "\r" {
 		t.Fatalf("result=%+v err=%v writes=%v", result, err, pty.writes)
 	}
