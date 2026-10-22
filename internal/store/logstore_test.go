@@ -19,18 +19,21 @@ func TestFileLogStoreRotateNowAndLastRotationAt(t *testing.T) {
 		t.Fatal(err)
 	}
 	store := NewFileLogStore(nil)
+	fixed := time.Date(2020, 2, 3, 4, 5, 6, 0, time.UTC)
+	store.now = func() time.Time { return fixed }
 	rotated, err := store.RotateNow(path)
 	if err != nil {
 		t.Fatalf("RotateNow() error = %v", err)
 	}
-	if _, err := os.Stat(rotated); err != nil {
+	info, err := os.Stat(rotated)
+	if err != nil {
 		t.Fatalf("rotated file missing: %v", err)
 	}
 	if info, err := os.Stat(path); err != nil || info.Size() != 0 {
 		t.Fatalf("active file = %#v, %v; want empty file", info, err)
 	}
 	got, err := store.LastRotationAt(path)
-	if err != nil || got.IsZero() || time.Since(got) > time.Minute {
+	if err != nil || !got.Equal(info.ModTime()) || !got.Truncate(time.Second).Equal(fixed) {
 		t.Fatalf("LastRotationAt() = %v, %v", got, err)
 	}
 }

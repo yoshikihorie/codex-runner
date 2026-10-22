@@ -1,15 +1,21 @@
 package gitops
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
+
+	"github.com/yoshikihorie/codex-runner/internal/proc"
 )
 
 func TestGitRunner_NoForbiddenOperationMethods(t *testing.T) {
@@ -213,21 +219,224 @@ func runGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
-func TestGitRunnerTimeoutKillsProcessGroup(t *testing.T) {
-	dir := t.TempDir()
-	fake := filepath.Join(dir, "slow-git")
-	marker := filepath.Join(dir, "survived")
-	if err := os.WriteFile(fake, []byte("#!/bin/sh\n/bin/sh -c 'sleep 1; touch \""+marker+"\"' &\nwait\n"), 0700); err != nil {
+const gitTimingTimeout = 500 * time.Millisecond
+const gitTimingWatchdog = 15 * time.Second
+
+func awaitGitTiming[T any](t *testing.T, ch <-chan T, operation string) T {
+	t.Helper()
+	select {
+	case result := <-ch:
+		return result
+	case <-time.After(gitTimingWatchdog):
+		t.Fatalf("watchdog waiting for %s", operation)
+		var zero T
+		return zero
+	}
+}
+
+func holdGitTimingFIFO(t *testing.T, path string) *os.File {
+	t.Helper()
+	if err := syscall.Mkfifo(path, 0600); err != nil {
 		t.Fatal(err)
 	}
-	r := newGitRunnerWithBinary(t, fake, dir, "", "")
-	_, err := r.run(context.Background(), "git_local", 20_000_000, false, "status")
+	held, err := os.OpenFile(path, os.O_RDWR|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = held.Close() })
+	return held
+}
+
+// EOF cannot release cat while the holding descriptor is open. exec keeps
+// Output/Wait responsible for exactly one directly owned child.
+func hangingGitTimingBinary(t *testing.T, dir string) string {
+	t.Helper()
+	fifo := filepath.Join(dir, "release")
+	holdGitTimingFIFO(t, fifo)
+	binary := filepath.Join(dir, "git-slow")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec /bin/cat < '"+fifo+"'\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	return binary
+}
+
+func TestGitRunnerTimeoutClassification(t *testing.T) {
+	dir := t.TempDir()
+	r := newGitRunnerWithBinary(t, hangingGitTimingBinary(t, dir), dir, "", "")
+	ctx, cancel := context.WithTimeout(context.Background(), gitTimingWatchdog)
+	defer cancel()
+	_, err := r.run(ctx, proc.GitEnvLocal, gitTimingTimeout, false, "status")
+	if ctx.Err() != nil {
+		t.Fatalf("watchdog ended: %v", ctx.Err())
+	}
 	if !errors.Is(err, ErrGitTimeout) {
 		t.Fatalf("want git_timeout, got %v", err)
 	}
-	time.Sleep(1200 * time.Millisecond)
-	if _, statErr := os.Stat(marker); !os.IsNotExist(statErr) {
-		t.Fatal("grandchild survived timeout")
+}
+
+// The helper is selected only in subprocesses. It reports kernel PID/PGID and
+// stays alive behind a FIFO gate, with no finite lifetime or external clock.
+func TestGitRunnerTimeoutFixture(t *testing.T) {
+	args := os.Args
+	if len(args) < 5 || args[len(args)-5] != "timing-process-group" {
+		return
+	}
+	fifo, gate, role := args[len(args)-4], args[len(args)-3], args[len(args)-2]
+	// The trailing argument protects this protocol from go test's own flags.
+	if args[len(args)-1] != "fixture" {
+		return
+	}
+	var child *exec.Cmd
+	if role == "parent" {
+		child = exec.Command(args[0], "-test.run=^TestGitRunnerTimeoutFixture$", "--", "timing-process-group", fifo, gate, "grandchild", "fixture")
+		child.Env = proc.SafeChildEnv()
+		if err := child.Start(); err != nil {
+			os.Exit(2)
+		}
+	}
+	pgid, err := syscall.Getpgid(os.Getpid())
+	if err != nil {
+		os.Exit(3)
+	}
+	output, err := os.OpenFile(fifo, os.O_WRONLY, 0)
+	if err != nil {
+		os.Exit(4)
+	}
+	if _, err := fmt.Fprintf(output, "%s %d %d READY\n", role, os.Getpid(), pgid); err != nil {
+		os.Exit(5)
+	}
+	_ = output.Close()
+	input, err := os.Open(gate)
+	if err != nil {
+		os.Exit(6)
+	}
+	_, _ = input.Read(make([]byte, 1))
+	_ = input.Close()
+	if child != nil {
+		_ = child.Process.Kill()
+		_ = child.Wait()
+	}
+	os.Exit(0)
+}
+
+type gitTimingIdentity struct {
+	role      string
+	pid, pgid int
+}
+
+func parseGitTimingIdentity(line string) (gitTimingIdentity, error) {
+	fields := strings.Fields(line)
+	if !strings.HasSuffix(line, "\n") || len(fields) != 4 || fields[3] != "READY" || (fields[0] != "parent" && fields[0] != "grandchild") {
+		return gitTimingIdentity{}, fmt.Errorf("invalid READY record=%q", line)
+	}
+	pid, e1 := strconv.Atoi(fields[1])
+	pgid, e2 := strconv.Atoi(fields[2])
+	if e1 != nil || e2 != nil || pid <= 1 || pgid <= 1 {
+		return gitTimingIdentity{}, fmt.Errorf("invalid process identity=%q", line)
+	}
+	return gitTimingIdentity{fields[0], pid, pgid}, nil
+}
+
+func TestGitRunnerTimeoutKillsProcessGroup(t *testing.T) {
+	t.Run("reject invalid identities", func(t *testing.T) {
+		for _, line := range []string{"", "parent 123 123", "parent 123 123 READY", "parent x 123 READY\n", "parent 1 123 READY\n", "grandchild 124 0 READY\n", "other 123 123 READY\n", "parent 123 123 WAIT\n"} {
+			if _, err := parseGitTimingIdentity(line); err == nil {
+				t.Fatalf("accepted %q", line)
+			}
+		}
+	})
+
+	dir := t.TempDir()
+	fifo, gate := filepath.Join(dir, "ready"), filepath.Join(dir, "release")
+	held := holdGitTimingFIFO(t, fifo)
+	release := holdGitTimingFIFO(t, gate)
+	input, err := os.Open(fifo)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	binary, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := filepath.Join(dir, "slow-git")
+	script := "#!/bin/sh\nexec '" + binary + "' '-test.run=^TestGitRunnerTimeoutFixture$' -- timing-process-group '" + fifo + "' '" + gate + "' parent fixture\n"
+	if err := os.WriteFile(fake, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	records := make(chan string, 2)
+	readDone := make(chan struct{})
+	go func() {
+		defer close(readDone)
+		reader := bufio.NewReader(input)
+		for i := 0; i < 2; i++ {
+			line, err := reader.ReadString('\n')
+			if err != nil {
+				records <- "read error: " + err.Error()
+				return
+			}
+			records <- line
+		}
+	}()
+	ctx, cancel := context.WithCancel(context.Background())
+	result := make(chan error, 1)
+	exited := make(chan struct{})
+	r := newGitRunnerWithBinary(t, fake, dir, "", "")
+	go func() {
+		defer close(exited)
+		_, err := r.run(ctx, proc.GitEnvLocal, time.Hour, false, "status")
+		result <- err
+	}()
+	pids := map[string]int{}
+	var group, killGroup int
+	defer func() {
+		cancel()
+		// Only the validated fixture group may be signalled.
+		if killGroup > 1 {
+			_ = syscall.Kill(-killGroup, syscall.SIGKILL)
+		}
+		_ = release.Close()
+		awaitGitTiming(t, exited, "runner cleanup")
+		_ = held.Close()
+		awaitGitTiming(t, readDone, "READY reader cleanup")
+		_ = input.Close()
+	}()
+	for i := 0; i < 2; i++ {
+		line := awaitGitTiming(t, records, "child/grandchild READY")
+		identity, err := parseGitTimingIdentity(line)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pgid := identity.pgid
+		if group != 0 && group != pgid {
+			t.Fatalf("group differs: %q", line)
+		}
+		group = pgid
+		if _, duplicate := pids[identity.role]; duplicate {
+			t.Fatalf("duplicate role: %q", line)
+		}
+		pids[identity.role] = identity.pid
+	}
+	if group <= 1 || group == syscall.Getpgrp() || group != pids["parent"] || pids["grandchild"] == group {
+		t.Fatalf("identities=%v pgid=%d", pids, group)
+	}
+	killGroup = group
+	watcher, err := proc.WatchExitWithoutReaping(pids["grandchild"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer watcher.Close()
+	watchCtx, stopWatch := context.WithTimeout(context.Background(), gitTimingWatchdog)
+	defer stopWatch()
+	cancel() // registration happened while both processes were alive
+	if err := awaitGitTiming(t, result, "direct child Wait"); !errors.Is(err, context.Canceled) {
+		t.Errorf("runner error=%v, want context.Canceled", err)
+	}
+	if err := watcher.Wait(watchCtx); err != nil {
+		t.Errorf("grandchild exit was not observed: %v", err)
+	} else {
+		// The grandchild exited and the runner has reaped its direct child.
+		killGroup = 0
 	}
 }
 

@@ -211,21 +211,46 @@ func TestRecoveryAttemptAppliesResumeRecoveryTimeout(t *testing.T) {
 	id := recoveryTestTaskID(t)
 	session := recoveryTestSession(t)
 	launcher := &resumeLauncherFake{}
+	var before time.Time
 	launcherWithDeadline := resumeLauncherFunc(func(ctx context.Context, _ ResumeLaunchParams) error {
+		arrived := time.Now()
 		deadline, ok := ctx.Deadline()
 		if !ok {
 			t.Fatal("resume context has no deadline")
 		}
-		remaining := time.Until(deadline)
-		if remaining > resumeRecoveryTimeout || remaining < resumeRecoveryTimeout-time.Second {
-			t.Fatalf("resume timeout remaining = %s", remaining)
+		if deadline.Before(before.Add(resumeRecoveryTimeout)) || deadline.After(arrived.Add(resumeRecoveryTimeout)) {
+			t.Fatalf("deadline=%v, want [%v,%v]", deadline, before.Add(resumeRecoveryTimeout), arrived.Add(resumeRecoveryTimeout))
 		}
 		launcher.calls++
 		return nil
 	})
-	result, err := (&RecoveryAttempt{TaskID: id, SessionRef: session, CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: t.TempDir(), WorkingDir: recoveryWorkingDir(t)}).Attempt(context.Background(), launcherWithDeadline, &resumeReaderFake{present: true})
+	attempt := &RecoveryAttempt{TaskID: id, SessionRef: session, CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: t.TempDir(), WorkingDir: recoveryWorkingDir(t)}
+	before = time.Now()
+	result, err := attempt.Attempt(context.Background(), launcherWithDeadline, &resumeReaderFake{present: true})
 	if err != nil || !result.Succeeded || launcher.calls != 1 {
 		t.Fatalf("result = (%+v, %v), calls = %d", result, err, launcher.calls)
+	}
+}
+
+func TestRecoveryAttemptAppliesResumeRecoveryTimeoutPreservesParent(t *testing.T) {
+	parentDeadline := time.Now().Add(100 * time.Second)
+	ctx, cancel := context.WithDeadline(context.Background(), parentDeadline)
+	defer cancel()
+	calls := 0
+	launcher := resumeLauncherFunc(func(child context.Context, _ ResumeLaunchParams) error {
+		calls++
+		deadline, ok := child.Deadline()
+		if !ok || !deadline.Equal(parentDeadline) {
+			t.Fatalf("deadline=%v, present=%v, want parent %v", deadline, ok, parentDeadline)
+		}
+		return nil
+	})
+	result, err := (&RecoveryAttempt{TaskID: recoveryTestTaskID(t), SessionRef: recoveryTestSession(t), CodexBinaryPath: "/usr/local/bin/codex", TaskPlacementRoot: t.TempDir(), WorkingDir: recoveryWorkingDir(t)}).Attempt(ctx, launcher, &resumeReaderFake{present: true})
+	if err != nil || !result.Succeeded || calls != 1 {
+		t.Fatalf("result=(%+v,%v), calls=%d", result, err, calls)
+	}
+	if ctx.Err() != nil {
+		t.Fatalf("parent context ended: %v", ctx.Err())
 	}
 }
 

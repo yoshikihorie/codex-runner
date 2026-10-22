@@ -11,7 +11,6 @@ import (
 	"reflect"
 	"strings"
 	"testing"
-	"time"
 )
 
 func TestValidatePushArgv_SCN18_ExactShape(t *testing.T) {
@@ -462,28 +461,32 @@ func TestGitRunner_SCN13_IsolatedPushEnvironment(t *testing.T) {
 
 func TestGitRunner_SCN33_PushTimeoutInjection(t *testing.T) {
 	dir := t.TempDir()
-	fake := filepath.Join(dir, "git-slow")
-	if err := os.WriteFile(fake, []byte("#!/bin/sh\nsleep 1\n"), 0700); err != nil {
-		t.Fatal(err)
-	}
+	fake := hangingGitTimingBinary(t, dir)
 	r := &GitRunner{git: fake, dir: dir, stateDir: t.TempDir()}
 	r.SetParentEnv([]string{"PATH=/usr/bin:/bin", "HOME=" + t.TempDir()})
-	r.SetPushTimeout(20 * time.Millisecond)
-	err := r.Push(context.Background(), "origin", "topic", stringOf('b', 40))
+	r.SetPushTimeout(gitTimingTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), gitTimingWatchdog)
+	defer cancel()
+	err := r.Push(ctx, "origin", "topic", stringOf('b', 40))
+	if ctx.Err() != nil {
+		t.Fatalf("watchdog ended: %v", ctx.Err())
+	}
 	if !errors.Is(err, ErrGitTimeout) || PushErrorReason(err) != "push_failed" {
 		t.Fatalf("timeout classified as %q: %v", PushErrorReason(err), err)
 	}
 }
 func TestGitRunner_SCN33_LsRemoteUsesPushTimeout(t *testing.T) {
 	dir := t.TempDir()
-	fake := filepath.Join(dir, "git-slow")
-	if err := os.WriteFile(fake, []byte("#!/bin/sh\nsleep 1\n"), 0700); err != nil {
-		t.Fatal(err)
-	}
+	fake := hangingGitTimingBinary(t, dir)
 	r := &GitRunner{git: fake, dir: dir, stateDir: t.TempDir()}
 	r.SetParentEnv([]string{"PATH=/usr/bin:/bin", "HOME=" + t.TempDir()})
-	r.SetPushTimeout(20 * time.Millisecond)
-	_, err := r.LsRemote(context.Background(), "origin", "refs/heads/topic")
+	r.SetPushTimeout(gitTimingTimeout)
+	ctx, cancel := context.WithTimeout(context.Background(), gitTimingWatchdog)
+	defer cancel()
+	_, err := r.LsRemote(ctx, "origin", "refs/heads/topic")
+	if ctx.Err() != nil {
+		t.Fatalf("watchdog ended: %v", ctx.Err())
+	}
 	if !errors.Is(err, ErrGitTimeout) {
 		t.Fatalf("ls-remote timeout: %v", err)
 	}

@@ -15,6 +15,7 @@ import (
 	"reflect"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1508,27 +1509,56 @@ func TestInstallDefaultLoggerRestoresPreviousLogger(t *testing.T) {
 }
 
 func TestStartCodexVersionProbeDoesNotBlockCaller(t *testing.T) {
-	previousResolver := resolveCodexVersion
-	defer func() { resolveCodexVersion = previousResolver }()
-	started := make(chan struct{})
-	release := make(chan struct{})
+	previous := resolveCodexVersion
+	started, release, returned := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	logged := make(chan struct{})
+	var once sync.Once
 	resolveCodexVersion = func(context.Context, string) (*string, error) {
 		close(started)
 		<-release
 		return nil, nil
 	}
+	logger := slog.New(slog.NewTextHandler(probeCompletionWriter{logged}, nil))
+	go func() { startCodexVersionProbe(context.Background(), "codex", logger); close(returned) }()
+	defer func() {
+		once.Do(func() { close(release) })
+		awaitTimingTest(t, returned, "probe caller cleanup")
+		awaitTimingTest(t, logged, "probe logging completion")
+		resolveCodexVersion = previous
+	}()
+	awaitTimingTest(t, returned, "caller return before resolver release")
+	awaitTimingTest(t, started, "resolver start before release")
+	once.Do(func() { close(release) })
+}
 
-	start := time.Now()
-	startCodexVersionProbe(context.Background(), "codex", slog.Default())
-	if elapsed := time.Since(start); elapsed > time.Second {
-		t.Fatalf("startCodexVersionProbe blocked for %s", elapsed)
-	}
+type probeCompletionWriter struct{ done chan struct{} }
+
+func (w probeCompletionWriter) Write(p []byte) (int, error) { close(w.done); return len(p), nil }
+
+// A watchdog bounds hangs; it is not an assertion about execution speed.
+func awaitTimingTest[T any](t *testing.T, ch <-chan T, operation string) T {
+	t.Helper()
 	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("version probe did not start asynchronously")
+	case result := <-ch:
+		return result
+	case <-time.After(15 * time.Second):
+		t.Fatalf("watchdog waiting for %s", operation)
+		var zero T
+		return zero
 	}
-	close(release)
+}
+
+func heldTimingFIFO(t *testing.T, path string) *os.File {
+	t.Helper()
+	if err := syscall.Mkfifo(path, 0600); err != nil {
+		t.Fatal(err)
+	}
+	fd, err := os.OpenFile(path, os.O_RDWR|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = fd.Close() })
+	return fd
 }
 
 func TestEnsureManagedPrivateDirCreatesAndSecuresDirectory(t *testing.T) {
@@ -1722,19 +1752,41 @@ func TestAcquireDaemonInstanceLeaseRejectsHeldLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer first.Unlock()
-
-	started := time.Now()
-	if _, err := acquireDaemonInstanceLease(path); err == nil {
-		t.Fatal("acquireDaemonInstanceLease accepted an already held lock")
-	} else if elapsed := time.Since(started); elapsed >= time.Second {
-		t.Fatalf("acquireDaemonInstanceLease blocked for %s", elapsed)
+	type result struct {
+		lease *daemonInstanceLease
+		err   error
+	}
+	acquired := make(chan result, 1)
+	exited := make(chan struct{})
+	go func() {
+		defer close(exited)
+		lease, err := acquireDaemonInstanceLease(path)
+		acquired <- result{lease, err}
+	}()
+	defer func() {
+		_ = first.Unlock()
+		awaitTimingTest(t, exited, "competing lease cleanup")
+		select {
+		case got := <-acquired:
+			if got.lease != nil {
+				_ = got.lease.Unlock()
+			}
+		default:
+		}
+	}()
+	got := awaitTimingTest(t, acquired, "competing lease while first is held")
+	if got.lease != nil {
+		_ = got.lease.Unlock()
+		t.Fatal("held lock accepted")
+	}
+	if !errors.Is(got.err, syscall.EWOULDBLOCK) {
+		t.Fatalf("lock error=%v, want EWOULDBLOCK", got.err)
 	}
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Mode().Perm() != 0o600 {
+	if info.Mode().Perm() != 0600 {
 		t.Fatalf("lock mode=%#o", info.Mode().Perm())
 	}
 }
@@ -1850,22 +1902,31 @@ func TestReconcileTerminationGraceMatchesTimeoutKillGrace(t *testing.T) {
 }
 
 func TestResolveCodexCLIVersionTimesOut(t *testing.T) {
-	binary := filepath.Join(t.TempDir(), "hanging-codex")
-	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec sleep 60\n"), 0o700); err != nil {
+	root := t.TempDir()
+	fifo := filepath.Join(root, "release")
+	heldTimingFIFO(t, fifo)
+	binary := filepath.Join(root, "hanging-codex")
+	if err := os.WriteFile(binary, []byte("#!/bin/sh\nexec /bin/cat < '"+fifo+"'\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
-
+	// The outer context is a cleanup watchdog, independent of the internal timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
 	started := time.Now()
-	version, err := resolveCodexCLIVersion(context.Background(), binary)
+	version, err := resolveCodexCLIVersion(ctx, binary)
+	if ctx.Err() != nil {
+		t.Fatalf("watchdog ended: %v", ctx.Err())
+	}
 	if version != nil {
 		t.Fatalf("version=%q, want nil", *version)
 	}
 	if err == nil {
-		t.Fatal("resolveCodexCLIVersion succeeded for a hanging command")
+		t.Fatal("hanging command succeeded")
 	}
-	if elapsed := time.Since(started); elapsed < codexVersionProbeTimeout || elapsed > codexVersionProbeTimeout+2*time.Second {
-		t.Fatalf("probe elapsed=%s, want approximately %s", elapsed, codexVersionProbeTimeout)
+	if elapsed := time.Since(started); elapsed < codexVersionProbeTimeout {
+		t.Fatalf("probe elapsed=%s, want at least %s", elapsed, codexVersionProbeTimeout)
 	}
+	// Output has returned, so the single direct child has been waited for.
 }
 
 func TestReportMainErrorSuppressesAlreadyReportedError(t *testing.T) {

@@ -926,25 +926,42 @@ func TestRunGitIgnoresAmbientPathAndUsesSafeEnvironment(t *testing.T) {
 }
 
 func TestRunGitReturnsDeadlineExceededWhenCommandTimesOut(t *testing.T) {
-	originalFindGitBinary := findGitBinary
-	originalTimeout := gitCommandTimeout
-	fakeGit := filepath.Join(t.TempDir(), "git")
-	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nexec /bin/sleep 1\n"), 0o700); err != nil {
+	originalBinary, originalTimeout := findGitBinary, gitCommandTimeout
+	root := t.TempDir()
+	fifo := filepath.Join(root, "release")
+	if err := syscall.Mkfifo(fifo, 0600); err != nil {
+		t.Fatal(err)
+	}
+	held, err := os.OpenFile(fifo, os.O_RDWR|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer held.Close()
+	fakeGit := filepath.Join(root, "git")
+	if err := os.WriteFile(fakeGit, []byte("#!/bin/sh\nexec /bin/cat < '"+fifo+"'\n"), 0700); err != nil {
 		t.Fatal(err)
 	}
 	findGitBinary = func() (string, error) { return fakeGit, nil }
 	gitCommandTimeout = 20 * time.Millisecond
-	t.Cleanup(func() {
-		findGitBinary = originalFindGitBinary
-		gitCommandTimeout = originalTimeout
-	})
-	started := time.Now()
-	_, err := runGit(t.TempDir(), "status", "--porcelain")
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("runGit() error=%v, want context.DeadlineExceeded", err)
-	}
-	if elapsed := time.Since(started); elapsed >= time.Second {
-		t.Fatalf("runGit() timed out after %v, want less than one second", elapsed)
+	result := make(chan error, 1)
+	exited := make(chan struct{})
+	defer func() {
+		_ = held.Close() // EOF also releases a child if its internal timeout is broken.
+		select {
+		case <-exited:
+		case <-time.After(15 * time.Second):
+			t.Error("watchdog waiting for Git cleanup")
+		}
+		findGitBinary, gitCommandTimeout = originalBinary, originalTimeout
+	}()
+	go func() { defer close(exited); _, err := runGit(root, "status", "--porcelain"); result <- err }()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("runGit error=%v, want DeadlineExceeded", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("watchdog waiting for Git timeout")
 	}
 }
 

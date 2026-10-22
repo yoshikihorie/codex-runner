@@ -10,7 +10,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -146,27 +146,66 @@ printf 'RESIZED:'; stty size
 	}
 }
 
+// Keep a named frame and the goroutine identity so another reader cannot satisfy
+// the observation. A notification immediately before Read would not prove a wait.
+func ptyTimingBlockedRead(session *PTYSession, identity chan<- string, result chan<- error, exited chan<- struct{}) {
+	defer close(exited)
+	stack := make([]byte, 1024)
+	n := runtime.Stack(stack, false)
+	identity <- strings.Fields(string(stack[:n]))[1]
+	_, err := session.Read(make([]byte, 32))
+	result <- err
+}
+
+func awaitPTYReadWait(t *testing.T, id string) {
+	t.Helper()
+	watchdog := time.NewTimer(ptyCloseWatchdog)
+	defer watchdog.Stop()
+	var last string
+	for {
+		stack := make([]byte, 1<<20)
+		n := runtime.Stack(stack, true)
+		for _, entry := range strings.Split(string(stack[:n]), "\n\n") {
+			if !strings.HasPrefix(entry, "goroutine "+id+" [") {
+				continue
+			}
+			last = entry
+			header := strings.SplitN(entry, "\n", 2)[0]
+			state := strings.SplitN(header, "[", 2)[1]
+			if strings.HasPrefix(state, "IO wait") && strings.Contains(entry, "ptyTimingBlockedRead(") && strings.Contains(entry, "(*PTYSession).Read(") {
+				return
+			}
+		}
+		select {
+		case <-watchdog.C:
+			t.Fatalf("Read did not reach I/O wait: %s", last)
+		default:
+			runtime.Gosched()
+		}
+	}
+}
+
 func TestPTYSessionCloseUnblocksReadAndIsIdempotent(t *testing.T) {
-	session, err := StartPTYSession("/bin/sh", []string{"/bin/sh", "-c", "sleep 10"}, t.TempDir(), BuildSessionEnv(nil), 80, 24)
+	session, err := StartPTYSession("/bin/sh", []string{"/bin/sh", "-c", "printf 'READY\\n'; read gate"}, t.TempDir(), BuildSessionEnv(nil), 80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
+	trackPTYCloseChild(t, session)
+	readPTYCloseMarker(t, session, bufio.NewReader(session), "READY")
+	identity := make(chan string, 1)
 	readResult := make(chan error, 1)
-	go func() { _, err := session.Read(make([]byte, 32)); readResult <- err }()
-	time.Sleep(20 * time.Millisecond)
+	exited := make(chan struct{})
+	go ptyTimingBlockedRead(session, identity, readResult, exited)
+	defer func() { _ = session.Close(); awaitPTYClose(t, exited, "reader cleanup") }()
+	awaitPTYReadWait(t, awaitPTYClose(t, identity, "reader identity"))
 	if err := session.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if err := session.Close(); err != nil {
 		t.Fatalf("second Close: %v", err)
 	}
-	select {
-	case err := <-readResult:
-		if !errors.Is(err, os.ErrClosed) {
-			t.Fatalf("Read after Close: %v", err)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("Read remained blocked after Close")
+	if err := awaitPTYClose(t, readResult, "Read after Close"); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("Read after Close: %v", err)
 	}
 	if err := session.Resize(100, 40); !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("Resize after Close: %v", err)
@@ -174,10 +213,9 @@ func TestPTYSessionCloseUnblocksReadAndIsIdempotent(t *testing.T) {
 	if _, err := session.Write([]byte("x")); !errors.Is(err, os.ErrClosed) {
 		t.Fatalf("Write after Close: %v", err)
 	}
-	_, _ = session.Wait()
 }
 
-// Test-only watchdog; deliberately shorter than the WriteLine delay.
+// Test-only hang watchdog, independent of production delays.
 const ptyCloseWatchdog = 10 * time.Second
 const ptyCloseWriteDelay = time.Hour
 
@@ -457,65 +495,133 @@ func TestPTYSessionChildEnvironmentAndArgv(t *testing.T) {
 }
 
 func TestPTYSessionWriteLineCRArrivesAfterDelayAsSingleByte(t *testing.T) {
-	script := writeShell(t, `stty raw -echo
-before=$(date +%s)
+	for _, callback := range []bool{true, false} {
+		name := "without callback"
+		if callback {
+			name = "with callback"
+		}
+		t.Run(name, func(t *testing.T) {
+			script := writeShell(t, `stty raw -echo
 printf 'READY\n'
-dd bs=1 count=4 >/dev/null 2>&1
+text=$(dd bs=1 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n')
+printf 'BODY:%s\n' "$text"
+if [ "$1" = callback ]; then
+ read gate < "$2"
+ stty min 0 time 0
+ early=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
+ printf 'BEFORE:%s\n' "$early"
+ stty min 1 time 0
+ printf 'GATED\n'
+fi
 enter=$(dd bs=1 count=1 2>/dev/null | od -An -tx1 | tr -d ' \n')
-after=$(date +%s)
-printf 'TIMES:%s:%s:%s\n' "$before" "$after" "$enter"
-printf 'DONE\n'
-sleep 1`)
-	session, err := StartPTYSession("/bin/sh", []string{"/bin/sh", script}, t.TempDir(), BuildSessionEnv(nil), 80, 24)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer session.Close()
-	_ = readPTYUntil(t, session, "READY")
-	writeErr := make(chan error, 1)
-	go func() { writeErr <- session.WriteLine(context.Background(), "test", 2200*time.Millisecond, nil) }()
-	output := readPTYUntil(t, session, "DONE")
-	if err := <-writeErr; err != nil {
-		t.Fatal(err)
-	}
-	line := strings.SplitN(output[strings.LastIndex(output, "TIMES:"):], "\n", 2)[0]
-	parts := strings.Split(strings.TrimSpace(strings.TrimPrefix(line, "TIMES:")), ":")
-	if len(parts) != 3 {
-		t.Fatalf("invalid timestamp output %q", line)
-	}
-	last, err1 := strconv.ParseInt(parts[0], 10, 64)
-	cr, err2 := strconv.ParseInt(parts[1], 10, 64)
-	if err1 != nil || err2 != nil {
-		t.Fatalf("invalid timestamps %q", line)
-	}
-	if cr-last < 2 {
-		t.Fatalf("CR arrived too early: %d seconds", cr-last)
-	}
-	if parts[2] != "0d" {
-		t.Fatalf("received byte=%s, want CR (0d)", parts[2])
+printf 'ENTER:%s\n' "$enter"
+dd bs=1 count=1 >/dev/null 2>&1
+`)
+			var check *os.File
+			argv := []string{"/bin/sh", script}
+			if callback {
+				gatePath := filepath.Join(t.TempDir(), "check-before-enter")
+				if err := syscall.Mkfifo(gatePath, 0600); err != nil {
+					t.Fatal(err)
+				}
+				var err error
+				check, err = os.OpenFile(gatePath, os.O_RDWR|syscall.O_NONBLOCK, 0)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer check.Close()
+				argv = append(argv, "callback", gatePath)
+			}
+			session, err := StartPTYSession("/bin/sh", argv, t.TempDir(), BuildSessionEnv(nil), 80, 24)
+			if err != nil {
+				t.Fatal(err)
+			}
+			childDone := trackPTYCloseChild(t, session)
+			reader := bufio.NewReader(session)
+			readPTYCloseMarker(t, session, reader, "READY")
+			const delay = 50 * time.Millisecond
+			ctx, cancel := context.WithCancel(context.Background())
+			permit := make(chan struct{})
+			var release sync.Once
+			arrived := make(chan time.Duration, 1)
+			writeErr := make(chan error, 1)
+			exited := make(chan struct{})
+			started := make(chan time.Time, 1)
+			go func() {
+				defer close(exited)
+				start := time.Now()
+				started <- start
+				var beforeEnter func() bool
+				if callback {
+					beforeEnter = func() bool {
+						arrived <- time.Since(start)
+						select {
+						case <-permit:
+							return true
+						case <-ctx.Done():
+							return false
+						}
+					}
+				}
+				writeErr <- session.WriteLine(ctx, "test", delay, beforeEnter)
+			}()
+			defer func() {
+				cancel()
+				release.Do(func() { close(permit) })
+				_ = session.Close()
+				awaitPTYClose(t, exited, "WriteLine cleanup")
+			}()
+			start := awaitPTYClose(t, started, "WriteLine start")
+			readPTYCloseMarker(t, session, reader, "BODY:74657374")
+			if callback {
+				if elapsed := awaitPTYClose(t, arrived, "beforeEnter"); elapsed < delay {
+					t.Fatalf("beforeEnter after %s, want at least %s", elapsed, delay)
+				}
+				// Ask the child to inspect its input while beforeEnter remains gated.
+				if _, err := io.WriteString(check, "inspect\n"); err != nil {
+					t.Fatal(err)
+				}
+				readPTYCloseMarker(t, session, reader, "BEFORE:")
+				readPTYCloseMarker(t, session, reader, "GATED")
+				release.Do(func() { close(permit) })
+			}
+			readPTYCloseMarker(t, session, reader, "ENTER:0d")
+			if elapsed := time.Since(start); elapsed < delay {
+				t.Fatalf("CR after %s, want at least %s", elapsed, delay)
+			}
+			if err := awaitPTYClose(t, writeErr, "WriteLine completion"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := session.Write([]byte("!")); err != nil {
+				t.Fatal(err)
+			}
+			awaitPTYClose(t, childDone, "explicit release and Wait")
+		})
 	}
 }
 
 func TestPTYSessionChildOwnsProcessGroupAndControllingTerminal(t *testing.T) {
-	script := writeShell(t, `stty -echo
-: </dev/tty && printf 'TTY-OK\n'
-sleep 2`)
+	script := writeShell(t, "stty -echo\n: </dev/tty && printf 'TTY-OK\\n'\nread gate\n")
 	session, err := StartPTYSession("/bin/sh", []string{"/bin/sh", script}, t.TempDir(), BuildSessionEnv(nil), 80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer session.Close()
-	_ = readPTYUntil(t, session, "TTY-OK")
+	done := trackPTYCloseChild(t, session)
+	readPTYCloseMarker(t, session, bufio.NewReader(session), "TTY-OK")
 	pid := session.Pid()
 	pgid, err := syscall.Getpgid(pid)
 	if err != nil || pgid != pid {
-		t.Fatalf("child pid=%d pgid=%d err=%v", pid, pgid, err)
+		t.Fatalf("pid=%d pgid=%d err=%v", pid, pgid, err)
 	}
-	var tpgid int32
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, session.master.Fd(), syscall.TIOCGPGRP, uintptr(unsafe.Pointer(&tpgid)))
-	if errno != 0 || int(tpgid) != pgid {
-		t.Fatalf("foreground pgrp=%d want=%d errno=%v", tpgid, pgid, errno)
+	var foreground int32
+	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, session.master.Fd(), syscall.TIOCGPGRP, uintptr(unsafe.Pointer(&foreground)))
+	if errno != 0 || int(foreground) != pgid {
+		t.Fatalf("foreground=%d want=%d errno=%v", foreground, pgid, errno)
 	}
+	if _, err := session.Write([]byte("release\n")); err != nil {
+		t.Fatal(err)
+	}
+	awaitPTYClose(t, done, "released controlling-terminal child")
 }
 
 func TestPTYSessionCloseOperations(t *testing.T) {

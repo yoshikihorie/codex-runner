@@ -1,8 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"path/filepath"
@@ -85,7 +89,59 @@ func TestSupervise_SCNSup0517And0548And0557(t *testing.T) {
 	}
 }
 
+// A record must have three newline-terminated fields. A clean EOF before the
+// first field differs from a truncated record and from an underlying I/O error.
+func readStartupNotifyRecord(reader *bufio.Reader) ([3]string, error) {
+	var record [3]string
+	for i := range record {
+		line, err := reader.ReadString('\n')
+		if err != nil {
+			if errors.Is(err, io.EOF) && (i > 0 || line != "") {
+				err = io.ErrUnexpectedEOF
+			}
+			return record, err
+		}
+		record[i] = strings.TrimSuffix(line, "\n")
+	}
+	return record, nil
+}
+
+func validateStartupNotifyRecord(record [3]string) error {
+	if record != [3]string{"2", "supervisor_started", "-"} {
+		return fmt.Errorf("startup arguments=%q", record)
+	}
+	return nil
+}
+
+type startupNotifyReadError struct{}
+
+func (startupNotifyReadError) Read([]byte) (int, error) { return 0, io.ErrClosedPipe }
+
 func TestSuperviseStartupNotifyCommandReceivesTwoArguments(t *testing.T) {
+	t.Run("record parser", func(t *testing.T) {
+		for _, tc := range []struct {
+			name, input string
+			want        error
+		}{
+			{"early EOF", "", io.EOF}, {"missing field", "2\nsupervisor_started\n", io.ErrUnexpectedEOF},
+			{"unterminated field", "2\nsupervisor_started\n-", io.ErrUnexpectedEOF},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				_, err := readStartupNotifyRecord(bufio.NewReader(strings.NewReader(tc.input)))
+				if !errors.Is(err, tc.want) {
+					t.Fatalf("error=%v, want %v", err, tc.want)
+				}
+			})
+		}
+		if _, err := readStartupNotifyRecord(bufio.NewReader(startupNotifyReadError{})); !errors.Is(err, io.ErrClosedPipe) {
+			t.Fatalf("read error=%v", err)
+		}
+		for _, record := range [][3]string{{"1", "supervisor_started", "-"}, {"2", "other", "-"}, {"2", "supervisor_started", "session"}} {
+			if err := validateStartupNotifyRecord(record); err == nil {
+				t.Fatalf("accepted %q", record)
+			}
+		}
+	})
 	home, err := os.MkdirTemp("/tmp", "snotify-")
 	if err != nil {
 		t.Fatal(err)
@@ -97,44 +153,58 @@ func TestSuperviseStartupNotifyCommandReceivesTwoArguments(t *testing.T) {
 		t.Fatal(err)
 	}
 	output := filepath.Join(home, "args")
+	held := heldTimingFIFO(t, output)
+	reader, err := os.Open(output)
+	if err != nil {
+		t.Fatal(err)
+	}
 	command := filepath.Join(home, "notify")
-	if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf '%s\\n' \"$#\" \"$1\" \"$2\" >> \""+output+"\"\n"), 0700); err != nil {
+	if err := os.WriteFile(command, []byte("#!/bin/sh\nprintf '%s\\n' \"$#\" \"$1\" \"$2\" > '"+output+"'\n"), 0700); err != nil {
+		_ = held.Close()
+		_ = reader.Close()
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(configPath, []byte("notify_command = \""+command+"\"\n"), 0600); err != nil {
+		_ = held.Close()
+		_ = reader.Close()
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	done := make(chan int, 1)
+	first := make(chan error, 1)
+	drained := make(chan error, 1)
 	go func() {
-		done <- runEntrypoint(ctx, []string{"supervise"}, strings.NewReader(""), &bytes.Buffer{}, &bytes.Buffer{})
+		input := bufio.NewReader(reader)
+		record, err := readStartupNotifyRecord(input)
+		if err == nil {
+			err = validateStartupNotifyRecord(record)
+		}
+		first <- err
+		_, err = io.Copy(io.Discard, input)
+		drained <- err
 	}()
-	deadline := time.After(5 * time.Second)
-	for {
-		if data, err := os.ReadFile(output); err == nil {
-			lines := strings.Split(strings.TrimSpace(string(data)), "\n")
-			if len(lines) < 3 || lines[0] != "2" || lines[1] != "supervisor_started" || lines[2] != "-" {
-				t.Fatalf("args=%q", data)
-			}
-			break
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	var code int
+	go func() {
+		defer close(done)
+		code = runEntrypoint(ctx, []string{"supervise"}, strings.NewReader(""), io.Discard, io.Discard)
+	}()
+	defer func() {
+		cancel()
+		// Keep both the drainer and the holding descriptor alive until all notifications finish.
+		awaitTimingTest(t, done, "supervisor shutdown with notification drain")
+		_ = held.Close()
+		if err := awaitTimingTest(t, drained, "notification reader cleanup"); err != nil {
+			t.Errorf("drain: %v", err)
 		}
-		select {
-		case code := <-done:
-			t.Fatalf("startup code=%d", code)
-		case <-deadline:
-			t.Fatal("notification not invoked")
-		case <-time.After(10 * time.Millisecond):
-		}
+		_ = reader.Close()
+	}()
+	if err := awaitTimingTest(t, first, "first complete notification"); err != nil {
+		t.Fatal(err)
 	}
 	cancel()
-	select {
-	case code := <-done:
-		if code != 0 {
-			t.Fatalf("shutdown code=%d", code)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("shutdown timeout")
+	awaitTimingTest(t, done, "supervisor shutdown")
+	if code != 0 {
+		t.Fatalf("shutdown code=%d", code)
 	}
 }
 

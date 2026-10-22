@@ -89,7 +89,9 @@ func TestVerifyRunnerRejectsChangedBinary(t *testing.T) {
 
 func TestVerifyRunnerSuccessFailureAndContextTimeout(t *testing.T) {
 	bin := t.TempDir() + "/verify"
-	content := []byte("#!/bin/sh\nif [ \"$1\" = slow ]; then /bin/sleep 5; exit 0; fi\nif [ -n \"$GH_TOKEN\" ] || [ -n \"$SSH_AUTH_SOCK\" ] || [ -n \"$AWS_ACCESS_KEY_ID\" ]; then exit 77; fi\nexit 0\n")
+	fifo := filepath.Join(filepath.Dir(bin), "release")
+	holdGitTimingFIFO(t, fifo)
+	content := []byte("#!/bin/sh\nif [ \"$1\" = slow ]; then exec /bin/cat < '" + fifo + "'; fi\nif [ -n \"$GH_TOKEN\" ] || [ -n \"$SSH_AUTH_SOCK\" ] || [ -n \"$AWS_ACCESS_KEY_ID\" ]; then exit 77; fi\nexit 0\n")
 	if err := os.WriteFile(bin, content, 0700); err != nil {
 		t.Fatal(err)
 	}
@@ -119,7 +121,7 @@ func TestVerifyRunnerSuccessFailureAndContextTimeout(t *testing.T) {
 	if code, err := r.Run(context.Background(), []string{bin}, hash, t.TempDir()); err != nil || code != 0 {
 		t.Fatalf("unexpected environment leak %d: %v", code, err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), gitTimingTimeout)
 	defer cancel()
 	if _, err := r.Run(ctx, []string{bin, "slow"}, hash, t.TempDir()); err != ErrVerifyTimeout {
 		t.Fatalf("want verify timeout, got %v", err)
