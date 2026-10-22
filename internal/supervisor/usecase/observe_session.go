@@ -87,7 +87,15 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 	Read([]byte) (int, error)
 	Wait() (int, error)
 	Close() error
-}, vt *supervisor.VirtualTerminal) error {
+}, vt *supervisor.VirtualTerminal) (runErr error) {
+	var exitEventErr error
+	// Report a confirmed-event failure after the normal exit cleanup, including
+	// when a later operation also fails. The durable result remains confirmed.
+	defer func() {
+		if exitEventErr != nil {
+			runErr = errors.Join(runErr, exitEventErr)
+		}
+	}()
 	if pty == nil || vt == nil || u.Sessions == nil {
 		return errors.New("observer dependencies are required")
 	}
@@ -377,9 +385,9 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 		stoppedByControl := u.Stop != nil && u.Stop.IsStopped(initial.SessionID)
 		wasStopped := current.State == supervisor.SessionStopped
 		var fromState supervisor.SupervisorSessionState
-		var confirmedExit *supervisor.PendingSend
+		var exitSave *exitCommit
 		var exitPending *supervisor.PendingSend
-		err = UpdateSession(u.Sessions, initial.SessionID, func(s *supervisor.ManagedSession) error {
+		updateObserved := func(s *supervisor.ManagedSession, tx *exitCommit) error {
 			fromState = s.State
 			if result.PermissionMode == detect.PermissionUnsafe && s.AutoContinueDisabledReason == "" {
 				s.AutoContinueDisabledReason = supervisor.AutoContinueDisabledPermissionModeUnsafe
@@ -390,16 +398,8 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 					pending := *s.SendGate.Pending
 					exitPending = &pending
 				}
-				if s.SendGate.Pending != nil && s.SendGate.Pending.Kind == supervisor.SendKindHandoffExit && u.SendInput != nil && !u.SendInput.CRWrittenAt(initial.SessionID, s.SendGate.Pending.SendID).IsZero() && exitedAt.After(u.SendInput.CRWrittenAt(initial.SessionID, s.SendGate.Pending.SendID)) {
-					pending := *s.SendGate.Pending
-					confirmedExit = &pending
-					confirmedAt := now().UTC()
-					s.SendGate.Pending = nil
-					s.SendGate.EverSent = true
-					s.SendGate.LastSendConfirmed = true
-					s.SendGate.LastConfirmedAt = &confirmedAt
-					s.SendGate.UnconfirmedDiscarded = false
-					s.LastSend = &supervisor.LastSendRecord{SendID: pending.SendID, Kind: pending.Kind, IssuedAt: pending.IssuedAt, Confirmed: true}
+				if exitPending != nil && exitPending.Kind == supervisor.SendKindHandoffExit && u.SendInput != nil {
+					u.SendInput.observeExit(s, *exitPending, handoffPTYOwner(pty), tx)
 				}
 				// Xe remains active while stopped; no exited child may retain a PID.
 				s.ChildPID = 0
@@ -436,12 +436,17 @@ func (u ObserveSessionUseCase) Run(ctx context.Context, initial supervisor.Manag
 				nextState = s.State
 			}
 			return nil
-		})
+		}
+		if u.SendInput != nil {
+			exitSave, err = u.SendInput.updateExitSession(u.Sessions, initial.SessionID, updateObserved)
+		} else {
+			err = UpdateSession(u.Sessions, initial.SessionID, func(s *supervisor.ManagedSession) error { return updateObserved(s, &exitCommit{}) })
+		}
 		if err != nil {
 			return err
 		}
-		if confirmedExit != nil {
-			u.recordEvent(initial.SessionID, supervisor.EventKindSendConfirmed, store.Event{SendID: confirmedExit.SendID, SendKind: confirmedExit.Kind})
+		if exitSave != nil && exitSave.event != nil && u.RecordStructured != nil {
+			exitEventErr = u.RecordStructured(*exitSave.event)
 		}
 		if u.SendInput != nil {
 			if exited {

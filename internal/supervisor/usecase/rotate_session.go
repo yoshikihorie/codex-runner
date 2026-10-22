@@ -575,7 +575,7 @@ func (u *RotateSessionUseCase) sendExit(ctx context.Context, s supervisor.Manage
 	result, err := u.Send.Execute(ctx, SendInput{SessionID: s.SessionID, Kind: supervisor.SendKindHandoffExit, Origin: supervisor.SendOriginHandoff, ConfirmTimeout: supervisor.SupervisorExitGrace})
 	if err != nil || !result.Confirmed {
 		if !u.alive(s) {
-			return false, u.deadDuringSend(s, supervisor.RotateSendExit, result.SendID)
+			return false, errors.Join(err, u.deadDuringSend(s, supervisor.RotateSendExit, result.SendID))
 		}
 		if u.stopped(s.SessionID) {
 			return false, u.stop(s.SessionID)
@@ -820,7 +820,9 @@ func (u *RotateSessionUseCase) childAbsent(s supervisor.ManagedSession) error {
 }
 
 func (u *RotateSessionUseCase) deadDuringSend(s supervisor.ManagedSession, step supervisor.SupervisorRotateStep, sendID string) error {
+	var crSucceeded bool
 	if err := UpdateSession(u.Sessions, s.SessionID, func(v *supervisor.ManagedSession) error {
+		crSucceeded = sendID != "" && v.LastSend != nil && v.LastSend.SendID == sendID && v.LastSend.Kind == supervisor.SendKindHandoffExit
 		v.SendGate.Pending = nil
 		v.ChildPID = 0
 		v.ChildStartedAt = nil
@@ -829,9 +831,7 @@ func (u *RotateSessionUseCase) deadDuringSend(s supervisor.ManagedSession, step 
 		return err
 	}
 	if step == supervisor.RotateSendExit {
-		if gate, ok := u.Send.(interface {
-			CRWritten(supervisor.SessionID, string) bool
-		}); ok && sendID != "" && gate.CRWritten(s.SessionID, sendID) {
+		if crSucceeded {
 			return u.advance(s.SessionID, step, supervisor.RotateRestart)
 		}
 		return u.fail(s.SessionID, step, supervisor.RotateFailChildAbsent)

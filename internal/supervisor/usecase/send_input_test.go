@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -227,6 +228,11 @@ func (p *sendTestPTY) WriteLine(_ context.Context, text string, delay time.Durat
 	}
 	return p.writeError
 }
+
+// The same fake PTY can be observed when a test needs a normal exit path.
+func (p *sendTestPTY) Read([]byte) (int, error) { return 0, io.EOF }
+func (p *sendTestPTY) Wait() (int, error)       { return 0, nil }
+func (p *sendTestPTY) Close() error             { return nil }
 
 type sendTestScreen struct{ shot ScreenSnapshot }
 
@@ -560,10 +566,24 @@ func TestSendConfirmationQueueResetAndSessionCleanup(t *testing.T) {
 		t.Fatal("confirmation queue retained stale messages")
 	}
 	u.markCR(id, "new")
+	owner := &sendTestPTY{}
+	active := &handoffExitSend{pending: supervisor.PendingSend{SendID: "new"}, owner: owner, marked: true, write: exitWritingCR}
+	u.exitSends = map[supervisor.SessionID]*handoffExitSend{id: active}
 	_ = u.sessionLock(id)
 	u.EndSession(id)
-	if len(u.confirm) != 0 || len(u.locks) != 0 || len(u.crWritten) != 0 {
+	if len(u.confirm) != 0 || len(u.locks) != 0 || len(u.crWritten) != 0 || len(u.crAt) != 0 {
 		t.Fatalf("maps not cleaned: %+v", u)
+	}
+	if u.exitSends[id] != active {
+		t.Fatal("EndSession removed active exit")
+	}
+	u.collectExit(id, &handoffExitSend{pending: active.pending, owner: owner})
+	if u.exitSends[id] != active {
+		t.Fatal("old collection removed active exit")
+	}
+	u.collectExit(id, active)
+	if len(u.exitSends) != 0 {
+		t.Fatal("exit record leaked after collection")
 	}
 }
 
@@ -1155,23 +1175,22 @@ func TestSCNsup0224HandoffExitRequiresProcessExit(t *testing.T) {
 }
 
 func TestFix3HandoffExitRequiresExitAfterCR(t *testing.T) {
-	for _, after := range []bool{false, true} {
-		t.Run(fmt.Sprint(after), func(t *testing.T) {
-			id, _ := supervisor.NewSessionID("alpha-1")
-			s := &sendTestStore{session: supervisor.ManagedSession{SessionID: id, State: supervisor.SessionIdle, SendGate: supervisor.SendGateRecord{NextSeq: 1}}}
-			screen := &sendTestScreen{shot: blankScreen()}
-			pty := &sendTestPTY{onWrite: func() { echoScreen(screen, "/exit") }}
-			u := &SendInputUseCase{Sessions: s, Screens: screen, PTY: pty, IsStopped: func(supervisor.SessionID) bool { return false }, StopState: NewStopState(t.TempDir()), ConfirmTimeout: time.Millisecond}
-			pty.afterEnter = func() {
-				at := time.Now().Add(-time.Second)
-				if after {
-					at = time.Now().Add(time.Second)
+	for _, sameOwner := range []bool{false, true} {
+		t.Run(fmt.Sprint(sameOwner), func(t *testing.T) {
+			f := newSCN45(t)
+			f.pty.afterEnter = func() {
+				if !sameOwner {
+					f.send.mu.Lock()
+					f.send.exitSends[f.initial.SessionID].owner = newObserveSendPTY()
+					f.send.mu.Unlock()
 				}
-				u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", ProcessExited: true, ExitedAt: at})
+				if err := f.exit(); err != nil {
+					t.Fatal(err)
+				}
 			}
-			got, _ := u.Execute(context.Background(), SendInput{SessionID: id, Kind: supervisor.SendKindHandoffExit})
-			if got.Confirmed != after {
-				t.Fatalf("confirmed=%v after=%v", got.Confirmed, after)
+			result, _ := f.send.Execute(context.Background(), SendInput{SessionID: f.initial.SessionID, Kind: supervisor.SendKindHandoffExit, Origin: supervisor.SendOriginHandoff, ConfirmTimeout: time.Millisecond})
+			if result.Confirmed != sameOwner {
+				t.Fatalf("confirmed=%v sameOwner=%v", result.Confirmed, sameOwner)
 			}
 		})
 	}
@@ -1496,7 +1515,10 @@ func TestSendInputE1DelayedEcho(t *testing.T) {
 				}
 				pty.afterEnter = func() {
 					if kind == supervisor.SendKindHandoffExit {
-						u.NotifyConfirmation(SendConfirmation{SessionID: id, SendID: "alpha-1-s1", ProcessExited: true, ExitedAt: time.Now().Add(time.Second)})
+						observer := ObserveSessionUseCase{Sessions: sessions, SendInput: u, Detect: DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateExited}}}}
+						if err := observer.Run(context.Background(), sessions.session, pty, supervisor.NewVirtualTerminal(80, 24)); err != nil {
+							t.Fatal(err)
+						}
 						return
 					}
 					shot := blankScreen()

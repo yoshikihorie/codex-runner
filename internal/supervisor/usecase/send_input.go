@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"time"
@@ -136,6 +137,7 @@ type SendInputUseCase struct {
 	crWritten            map[supervisor.SessionID]string
 	crAt                 map[supervisor.SessionID]time.Time
 	ended                map[supervisor.SessionID]bool
+	exitSends            map[supervisor.SessionID]*handoffExitSend
 }
 
 func (u *SendInputUseCase) sessionLock(id supervisor.SessionID) *sync.Mutex {
@@ -373,6 +375,8 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 	prev := s.SendGate.LastSendConfirmed
 	prevEver := s.SendGate.EverSent
 	var pending supervisor.PendingSend
+	var exitSend *handoffExitSend
+	defer func() { u.collectExit(in.SessionID, exitSend) }()
 	ch := u.resetConfirmation(in.SessionID)
 	defer u.releaseConfirmation(in.SessionID, ch)
 	err = UpdateSession(u.Sessions, in.SessionID, func(v *supervisor.ManagedSession) error {
@@ -389,6 +393,15 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 		pending = supervisor.PendingSend{SendID: fmt.Sprintf("%s-s%d", in.SessionID, seq), Kind: in.Kind, IssuedAt: u.now()}
 		v.SendGate.NextSeq = seq + 1
 		v.SendGate.Pending = &pending
+		if in.Kind == supervisor.SendKindHandoffExit {
+			exitSend = &handoffExitSend{pending: pending, in: in, owner: handoffPTYOwner(pty)}
+			u.mu.Lock()
+			if u.exitSends == nil {
+				u.exitSends = make(map[supervisor.SessionID]*handoffExitSend)
+			}
+			u.exitSends[in.SessionID] = exitSend
+			u.mu.Unlock()
+		}
 		if in.Kind == supervisor.SendKindHandoffEnd && in.Origin == supervisor.SendOriginHandoff && v.Rotation != nil {
 			issued := pending.IssuedAt
 			v.Rotation.EndIssuedAt = &issued
@@ -430,11 +443,15 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 		if !u.waitForEnter(ctx, in, message, pending.SendID, ch) {
 			return false
 		}
+		if exitSend != nil && !u.beginExitCR(in.SessionID, exitSend) {
+			return false
+		}
 		beforeAllowed = true
 		return true
 	}
 	err = pty.WriteLine(ctx, message, supervisor.SupervisorSendEnterDelay, before)
 	if err != nil {
+		u.endExitCR(in.SessionID, exitSend, false)
 		if in.Kind == supervisor.SendKindOperatorInput && u.OperationalLog != nil {
 			kind := supervisor.EventKindSendAborted
 			if beforeAllowed {
@@ -453,8 +470,15 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 		return result, errors.Join(err, u.abortBeforeCR(in, pending, prevEver, prev))
 	}
 	// WriteLine returns only after the separate CR write completes.
+	u.endExitCR(in.SessionID, exitSend, true)
 	u.markCR(in.SessionID, pending.SendID)
 	crAt = u.CRWrittenAt(in.SessionID, pending.SendID)
+	if exitSend != nil {
+		resolved, resolveErr := u.resolveExit(in, pending, exitSend.owner, false)
+		if resolveErr != nil || resolved.Confirmed {
+			return resolved, resolveErr
+		}
+	}
 	timeout := in.ConfirmTimeout
 	if timeout <= 0 && in.Kind == supervisor.SendKindHandoffExit && in.Origin == supervisor.SendOriginHandoff {
 		timeout = supervisor.SupervisorExitGrace
@@ -478,21 +502,11 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 				}
 				if c.ProcessExited {
 					if in.Kind == supervisor.SendKindHandoffExit {
-						if !c.ExitedAt.After(crAt) {
-							continue
+						resolved, resolveErr := u.resolveExit(in, pending, exitSend.owner, false)
+						if resolveErr != nil || resolved.Confirmed {
+							return resolved, resolveErr
 						}
-						// The observer confirms handoff_exit in the same write as the exit transition.
-						current, err := u.Sessions.Load(in.SessionID)
-						if err != nil {
-							return result, err
-						}
-						if current.SendGate.Pending == nil && current.LastSend != nil && current.LastSend.SendID == pending.SendID && current.LastSend.Confirmed {
-							return SendResult{SendID: pending.SendID, Confirmed: true}, nil
-						}
-						if !u.CRWritten(in.SessionID, pending.SendID) {
-							continue
-						}
-						return u.confirmSend(in, pending)
+						continue
 					}
 					current, err := u.Sessions.Load(in.SessionID)
 					if err != nil {
@@ -544,8 +558,14 @@ func (u *SendInputUseCase) Execute(ctx context.Context, in SendInput) (SendResul
 			}
 
 		case <-timer.C:
+			if exitSend != nil {
+				return u.expireExit(in, pending, exitSend.owner, errors.New("SUP_SEND_NOT_CONFIRMED"))
+			}
 			return result, errors.Join(errors.New("SUP_SEND_NOT_CONFIRMED"), u.unconfirmed(in, pending), u.logOperatorSendOutcome(in, pending, supervisor.EventKindSendUnconfirmed))
 		case <-ctx.Done():
+			if exitSend != nil {
+				return u.expireExit(in, pending, exitSend.owner, ctx.Err())
+			}
 			return result, errors.Join(ctx.Err(), u.unconfirmed(in, pending), u.logOperatorSendOutcome(in, pending, supervisor.EventKindSendUnconfirmed))
 		}
 	}
@@ -606,6 +626,10 @@ func (u *SendInputUseCase) blockBeforeText(in SendInput, p supervisor.PendingSen
 }
 
 func (u *SendInputUseCase) unconfirmed(in SendInput, p supervisor.PendingSend) error {
+	if in.Kind == supervisor.SendKindHandoffExit {
+		_, err := u.resolveExit(in, p, u.exitOwner(in.SessionID, p.SendID), true)
+		return err
+	}
 	id, origin := in.SessionID, in.Origin
 	if err := UpdateSession(u.Sessions, id, func(v *supervisor.ManagedSession) error {
 		if origin != supervisor.SendOriginHandoff && v.State != supervisor.SessionStopped {
@@ -625,18 +649,13 @@ func (u *SendInputUseCase) unconfirmed(in SendInput, p supervisor.PendingSend) e
 	return nil
 }
 func (u *SendInputUseCase) confirmSend(in SendInput, p supervisor.PendingSend) (SendResult, error) {
+	if in.Kind == supervisor.SendKindHandoffExit {
+		return u.resolveExit(in, p, u.exitOwner(in.SessionID, p.SendID), false)
+	}
 	id := in.SessionID
 	now := u.now()
 	err := UpdateSession(u.Sessions, id, func(v *supervisor.ManagedSession) error {
-		v.SendGate.Pending = nil
-		v.SendGate.EverSent = true
-		v.SendGate.LastSendConfirmed = true
-		v.SendGate.LastConfirmedAt = &now
-		v.SendGate.UnconfirmedDiscarded = false
-		if p.Kind == supervisor.SendKindRemoteControl {
-			v.RemoteControlConfirmed = true
-		}
-		v.LastSend = &supervisor.LastSendRecord{SendID: p.SendID, Kind: p.Kind, IssuedAt: p.IssuedAt, Confirmed: true}
+		applySendConfirmation(v, p, now)
 		return nil
 	})
 	if err != nil {
@@ -803,4 +822,231 @@ func hasSelectionMenu(rows []string) bool {
 		}
 	}
 	return false
+}
+
+// handoffExitSend is transient. EndSession intentionally leaves it for the sender
+// to collect. The owner is the managed PTY itself, never a screen timestamp.
+type exitWriteState uint8
+
+const (
+	exitBeforeCR exitWriteState = iota
+	exitWritingCR
+	exitCRSucceeded
+	exitCRFailed
+)
+
+type exitResultState uint8
+
+const (
+	exitUndecided exitResultState = iota
+	exitConfirmed
+	exitUnconfirmed
+)
+
+type handoffExitSend struct {
+	pending       supervisor.PendingSend
+	in            SendInput
+	owner         any
+	marked        bool
+	write         exitWriteState
+	exited        bool
+	exitAfterMark bool
+	result        exitResultState
+	saving        *exitCommit
+}
+type exitCommit struct {
+	record    *handoffExitSend
+	done      chan struct{}
+	result    exitResultState
+	confirmed bool
+	event     *store.Event
+}
+
+var errExitSavePending = errors.New("handoff exit result save pending")
+
+func handoffPTYOwner(pty any) any {
+	if observed, ok := pty.(observedPTY); ok {
+		pty = observed.ManagedPTY
+	}
+	// Managed PTYs are pointers. Refuse ownerless/value-only stand-ins rather than
+	// accidentally treating equal values as the same child generation.
+	if pty == nil || reflect.ValueOf(pty).Kind() != reflect.Ptr || reflect.ValueOf(pty).IsNil() {
+		return nil
+	}
+	return pty
+}
+func (u *SendInputUseCase) collectExit(id supervisor.SessionID, r *handoffExitSend) {
+	if r == nil {
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.exitSends[id] == r && u.exitSends[id].owner == r.owner {
+		delete(u.exitSends, id)
+	}
+}
+func (u *SendInputUseCase) beginExitCR(id supervisor.SessionID, r *handoffExitSend) bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.exitSends[id] != r || r.owner == nil || r.exited || r.write != exitBeforeCR {
+		return false
+	}
+	r.marked = true
+	r.write = exitWritingCR
+	return true
+}
+func (u *SendInputUseCase) endExitCR(id supervisor.SessionID, r *handoffExitSend, success bool) {
+	if r == nil {
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.exitSends[id] != r || !r.marked {
+		return
+	}
+	r.write = exitCRFailed
+	if success {
+		r.write = exitCRSucceeded
+	}
+}
+
+// updateExitSession keeps store-lock -> u.mu ordering. A reservation is not a
+// published result. A concurrent updater first waits for the session write, then
+// retries after its owner has completed bookkeeping outside the store lock.
+func (u *SendInputUseCase) updateExitSession(sessions SessionRecordStore, id supervisor.SessionID, update func(*supervisor.ManagedSession, *exitCommit) error) (*exitCommit, error) {
+	for {
+		tx := &exitCommit{}
+		var waiting <-chan struct{}
+		err := UpdateSession(sessions, id, func(v *supervisor.ManagedSession) error {
+			u.mu.Lock()
+			if r := u.exitSends[id]; r != nil && r.saving != nil {
+				waiting = r.saving.done
+			}
+			u.mu.Unlock()
+			if waiting != nil {
+				return errExitSavePending
+			}
+			return update(v, tx)
+		})
+		if errors.Is(err, errExitSavePending) && waiting != nil {
+			<-waiting
+			continue
+		}
+		if tx.record != nil {
+			u.mu.Lock()
+			if err == nil {
+				tx.record.result = tx.result
+			}
+			tx.record.saving = nil
+			u.mu.Unlock()
+			close(tx.done)
+		}
+		if err != nil {
+			tx.confirmed = false
+			tx.event = nil
+		}
+		return tx, err
+	}
+}
+
+// decideExit runs only inside a session update. The caller supplies a PTY owner
+// and send ID on both registration and retrieval; notifications alone are hints.
+func (u *SendInputUseCase) decideExit(v *supervisor.ManagedSession, p supervisor.PendingSend, owner any, expired bool, tx *exitCommit) {
+	at := u.now()
+	if v.LastSend != nil && v.LastSend.SendID == p.SendID && v.LastSend.Kind == p.Kind && v.LastSend.Confirmed {
+		tx.confirmed = true
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	r := u.exitSends[v.SessionID]
+	if r == nil || owner == nil || r.owner != owner || r.pending.SendID != p.SendID {
+		return
+	}
+	if r.result != exitUndecided {
+		return
+	}
+	if r.marked && r.write == exitCRSucceeded {
+		// LastSend's presence for this exact ID/kind is the durable CR-success proof.
+		v.LastSend = &supervisor.LastSendRecord{SendID: p.SendID, Kind: p.Kind, IssuedAt: p.IssuedAt, Confirmed: false}
+	}
+	confirmed := !expired && r.marked && r.write == exitCRSucceeded && r.exited && r.exitAfterMark
+	if !confirmed && !expired {
+		return
+	}
+	tx.record = r
+	tx.done = make(chan struct{})
+	tx.result = exitUnconfirmed
+	kind, code := supervisor.EventKindSendUnconfirmed, "SUP_SEND_NOT_CONFIRMED"
+	if confirmed {
+		tx.result = exitConfirmed
+		tx.confirmed = true
+		kind, code = supervisor.EventKindSendConfirmed, ""
+		applySendConfirmation(v, p, at)
+	} else if r.in.Origin != supervisor.SendOriginHandoff && v.State != supervisor.SessionStopped {
+		v.State = supervisor.SessionStopped
+		v.StopReason = supervisor.StopSendNotConfirmed
+	}
+	event := sendEvent(kind, r.in, p, code)
+	tx.event = &event
+	r.saving = tx
+}
+func (u *SendInputUseCase) observeExit(v *supervisor.ManagedSession, p supervisor.PendingSend, owner any, tx *exitCommit) {
+	u.mu.Lock()
+	r := u.exitSends[v.SessionID]
+	if r == nil || owner == nil || r.owner != owner || r.pending.SendID != p.SendID {
+		u.mu.Unlock()
+		return
+	}
+	if !r.exited {
+		r.exited = true
+		r.exitAfterMark = r.marked
+	}
+	u.mu.Unlock()
+	u.decideExit(v, p, owner, false, tx)
+}
+func (u *SendInputUseCase) resolveExit(in SendInput, p supervisor.PendingSend, owner any, expired bool) (SendResult, error) {
+	tx, err := u.updateExitSession(u.Sessions, in.SessionID, func(v *supervisor.ManagedSession, tx *exitCommit) error {
+		u.decideExit(v, p, owner, expired, tx)
+		return nil
+	})
+	result := SendResult{SendID: p.SendID, Confirmed: tx.confirmed}
+	if err != nil {
+		return result, err
+	}
+	if tx.event != nil {
+		err = u.record(*tx.event)
+		if !tx.confirmed && in.Origin != supervisor.SendOriginHandoff && u.Notify != nil {
+			u.Notify(supervisor.EventKindSendUnconfirmed, in.SessionID.String())
+		}
+	}
+	return result, err
+}
+func (u *SendInputUseCase) expireExit(in SendInput, p supervisor.PendingSend, owner any, cause error) (SendResult, error) {
+	result, err := u.resolveExit(in, p, owner, true)
+	if result.Confirmed {
+		return result, err
+	}
+	return result, errors.Join(cause, err)
+}
+
+func applySendConfirmation(v *supervisor.ManagedSession, p supervisor.PendingSend, at time.Time) {
+	v.SendGate.Pending = nil
+	v.SendGate.EverSent = true
+	v.SendGate.LastSendConfirmed = true
+	v.SendGate.LastConfirmedAt = &at
+	v.SendGate.UnconfirmedDiscarded = false
+	if p.Kind == supervisor.SendKindRemoteControl {
+		v.RemoteControlConfirmed = true
+	}
+	v.LastSend = &supervisor.LastSendRecord{SendID: p.SendID, Kind: p.Kind, IssuedAt: p.IssuedAt, Confirmed: true}
+}
+
+func (u *SendInputUseCase) exitOwner(id supervisor.SessionID, sendID string) any {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if r := u.exitSends[id]; r != nil && r.pending.SendID == sendID {
+		return r.owner
+	}
+	return nil
 }
