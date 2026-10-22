@@ -1286,3 +1286,40 @@ func TestRotateSession_MissingChildLivenessFailsClosed(t *testing.T) {
 		t.Fatalf("started without child liveness: err=%v session=%+v", err, s.session)
 	}
 }
+
+func TestSCNsup0245DeathUsesExactPersistedSend(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		record *supervisor.LastSendRecord
+		want   bool
+	}{
+		{"confirmed", &supervisor.LastSendRecord{SendID: "current", Kind: supervisor.SendKindHandoffExit, Confirmed: true}, true},
+		{"unconfirmed", &supervisor.LastSendRecord{SendID: "current", Kind: supervisor.SendKindHandoffExit}, true},
+		{"old_id", &supervisor.LastSendRecord{SendID: "old", Kind: supervisor.SendKindHandoffExit, Confirmed: true}, false},
+		{"wrong_kind", &supervisor.LastSendRecord{SendID: "current", Kind: supervisor.SendKindHandoffEnd, Confirmed: true}, false},
+		{"no_proof", nil, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, u, now, _ := rotationFixture()
+			s.session.State = supervisor.SessionRotating
+			s.session.Rotation = &supervisor.RotationRecord{Step: supervisor.RotateSendExit, StepStartedAt: now}
+			stale := s.session
+			s.session.LastSend = tc.record
+			pending := supervisor.PendingSend{SendID: "current", Kind: supervisor.SendKindHandoffExit}
+			s.session.SendGate.Pending = &pending
+			if err := u.deadDuringSend(stale, supervisor.RotateSendExit, "current"); err != nil {
+				t.Fatal(err)
+			}
+			if tc.want {
+				if s.session.Rotation.Step != supervisor.RotateRestart {
+					t.Fatalf("not recovered: %+v", s.session)
+				}
+			} else if s.session.Rotation.FailReason != supervisor.RotateFailChildAbsent || s.session.State != supervisor.SessionStopped {
+				t.Fatalf("invalid proof accepted: %+v", s.session)
+			}
+			if s.session.SendGate.Pending != nil || s.session.ChildPID != 0 {
+				t.Fatal("pending/child not cleared")
+			}
+		})
+	}
+}

@@ -3,13 +3,16 @@ package usecase
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
+	"github.com/yoshikihorie/codex-runner/internal/proc"
 	"github.com/yoshikihorie/codex-runner/internal/supervisor"
 	"github.com/yoshikihorie/codex-runner/internal/supervisor/detect"
 	"github.com/yoshikihorie/codex-runner/internal/supervisor/store"
@@ -342,12 +345,16 @@ func TestSCNsup0222SCNsup0235ObserveExitWithPending(t *testing.T) {
 				t.Fatal(err)
 			}
 			send := &SendInputUseCase{}
+			pty := &exitedPTY{code: 0}
 			if tc.crWritten {
 				send.markCR(s.SessionID, pending.SendID)
+				if tc.kind == supervisor.SendKindHandoffExit {
+					send.exitSends = map[supervisor.SessionID]*handoffExitSend{s.SessionID: {pending: pending, in: SendInput{SessionID: s.SessionID, Kind: pending.Kind}, owner: pty, marked: true, write: exitCRSucceeded}}
+				}
 			}
 			confirmations := send.confirmationChannel(s.SessionID)
 			u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateExited}}}, Sessions: sessions, SendInput: send, RecordStructured: observeSendRecord(events)}
-			if err := u.Run(context.Background(), s, exitedPTY{code: 0}, supervisor.NewVirtualTerminal(80, 24)); err != nil {
+			if err := u.Run(context.Background(), s, pty, supervisor.NewVirtualTerminal(80, 24)); err != nil {
 				t.Fatal(err)
 			}
 			select {
@@ -435,4 +442,756 @@ func TestObserveC1ObservationAdvancesOnlyOnOutput(t *testing.T) {
 	if !third.ChangedAt.After(second.ChangedAt) {
 		t.Fatal("changed output did not advance ChangedAt")
 	}
+}
+
+// scn45PTY drives the real sender and observer with the same PTY identity.
+// Hooks run outside all store locks; channels, not sleeps, order concurrent work.
+type scn45PTY struct {
+	*observeSendPTY
+	screens     *ObservedScreenStore
+	id          supervisor.SessionID
+	afterEnter  func()
+	beforeEnter func()
+	writeErr    error
+}
+
+func (p *scn45PTY) WriteLine(_ context.Context, text string, _ time.Duration, before func() bool) error {
+	p.screens.SetSnapshot(p.id, ScreenSnapshot{Rows: []string{"❯\u00a0" + text}, State: detect.StateIdle})
+	if p.beforeEnter != nil {
+		p.beforeEnter()
+	}
+	if !before() {
+		return proc.ErrBeforeEnter
+	}
+	if p.afterEnter != nil {
+		p.afterEnter()
+	}
+	return p.writeErr
+}
+
+type scn45Sender struct {
+	send    *SendInputUseCase
+	timeout time.Duration
+	after   func(SendResult, error)
+}
+
+func (s scn45Sender) Execute(ctx context.Context, in SendInput) (SendResult, error) {
+	in.ConfirmTimeout = s.timeout
+	r, err := s.send.Execute(ctx, in)
+	if s.after != nil {
+		s.after(r, err)
+	}
+	return r, err
+}
+
+type scn45Fixture struct {
+	t        *testing.T
+	initial  supervisor.ManagedSession
+	sessions *store.SessionStore
+	events   *store.EventStore
+	send     *SendInputUseCase
+	pty      *scn45PTY
+	rotate   *RotateSessionUseCase
+	observer ObserveSessionUseCase
+}
+
+func newSCN45(t *testing.T) *scn45Fixture {
+	t.Helper()
+	initial, sessions, events := observeSendFixture(t, supervisor.SessionRotating)
+	initial.ClaudeSessionID = "00000000-0000-0000-0000-000000000001"
+	initial.Rotation = &supervisor.RotationRecord{Step: supervisor.RotateSendExit, StepStartedAt: &initial.StateSince}
+	if err := sessions.Save(initial); err != nil {
+		t.Fatal(err)
+	}
+	screens := &ObservedScreenStore{}
+	screens.SetSnapshot(initial.SessionID, blankScreen())
+	pty := &scn45PTY{observeSendPTY: newObserveSendPTY(), screens: screens, id: initial.SessionID}
+	send := &SendInputUseCase{Sessions: sessions, Screens: screens, PTY: pty, StopState: NewStopState(t.TempDir()), IsStopped: func(supervisor.SessionID) bool { return false }, RecordStructured: observeSendRecord(events)}
+	f := &scn45Fixture{t: t, initial: initial, sessions: sessions, events: events, send: send, pty: pty}
+	f.observer = ObserveSessionUseCase{Sessions: sessions, SendInput: send, Detect: DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateExited}}}, RecordStructured: observeSendRecord(events)}
+	f.rotate = &RotateSessionUseCase{Sessions: sessions, Send: scn45Sender{send: send, timeout: 5 * time.Millisecond}, ResumeReady: func(supervisor.SessionID, time.Time) bool { return true }, IsStopped: func(supervisor.SessionID) bool { return false }, ChildAlive: func(id supervisor.SessionID) bool { s, err := sessions.Load(id); return err == nil && s.ChildPID != 0 }, RecordStructured: observeSendRecord(events)}
+	return f
+}
+func (f *scn45Fixture) current() supervisor.ManagedSession {
+	f.t.Helper()
+	s, err := f.sessions.Load(f.initial.SessionID)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	return s
+}
+func (f *scn45Fixture) exit() error {
+	f.pty.exits <- 0
+	return f.observer.Run(context.Background(), f.initial, f.pty, supervisor.NewVirtualTerminal(80, 24))
+}
+func (f *scn45Fixture) counts(confirmed, unconfirmed int) {
+	f.t.Helper()
+	all, _, err := f.events.ReadAll()
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	c, u := 0, 0
+	for _, e := range all {
+		if e.Kind == supervisor.EventKindSendConfirmed {
+			c++
+		}
+		if e.Kind == supervisor.EventKindSendUnconfirmed {
+			u++
+		}
+	}
+	if c != confirmed || u != unconfirmed {
+		f.t.Fatalf("confirmed=%d unconfirmed=%d want=%d/%d events=%+v", c, u, confirmed, unconfirmed, all)
+	}
+}
+func (f *scn45Fixture) stage5() {
+	f.t.Helper()
+	s := f.current()
+	if s.Rotation.Step != supervisor.RotateRestart || s.SendGate.Pending != nil {
+		f.t.Fatalf("did not reach stage5: %+v", s)
+	}
+}
+func TestSCNsup0245ReturnWindow(t *testing.T) {
+	f := newSCN45(t)
+	f.pty.afterEnter = func() {
+		if err := f.exit(); err != nil {
+			t.Fatal(err)
+		}
+		s := f.current()
+		if s.LastSend != nil && s.LastSend.Confirmed || s.SendGate.Pending == nil {
+			t.Fatalf("confirmed before CR success: %+v", s)
+		}
+	}
+	if _, err := f.rotate.sendExit(context.Background(), f.initial); err != nil {
+		t.Fatal(err)
+	}
+	f.stage5()
+	f.counts(1, 0)
+}
+func TestSCNsup0245ClockIndependent(t *testing.T) {
+	for _, offset := range []time.Duration{0, -time.Hour} {
+		t.Run(offset.String(), func(t *testing.T) {
+			f := newSCN45(t)
+			at := time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
+			f.send.Now = func() time.Time { return at }
+			f.observer.Now = func() time.Time { return at.Add(offset) }
+			f.pty.afterEnter = func() {
+				if err := f.exit(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := f.rotate.sendExit(context.Background(), f.initial); err != nil {
+				t.Fatal(err)
+			}
+			f.stage5()
+			f.counts(1, 0)
+		})
+	}
+}
+func TestSCNsup0245CleanupBeforeCollect(t *testing.T) {
+	f := newSCN45(t)
+	f.pty.afterEnter = func() {
+		if err := f.exit(); err != nil {
+			t.Fatal(err)
+		}
+		f.send.EndSession(f.initial.SessionID)
+		f.send.mu.Lock()
+		r := f.send.exitSends[f.initial.SessionID]
+		retained := r != nil && r.marked && r.write == exitWritingCR
+		f.send.mu.Unlock()
+		if !retained {
+			t.Fatal("cleanup lost in-flight CR")
+		}
+	}
+	if _, err := f.rotate.sendExit(context.Background(), f.initial); err != nil {
+		t.Fatal(err)
+	}
+	f.stage5()
+	f.counts(1, 0)
+	if len(f.send.exitSends) != 0 {
+		t.Fatal("record not collected")
+	}
+}
+func TestSCNsup0245CRWriteFailure(t *testing.T) {
+	f := newSCN45(t)
+	f.pty.writeErr = errors.New("CR write failed")
+	retained := false
+	f.send.RecordStructured = func(e store.Event) error {
+		if e.Kind == supervisor.EventKindSendUnconfirmed {
+			f.send.mu.Lock()
+			r := f.send.exitSends[f.initial.SessionID]
+			retained = r != nil && r.marked && r.write == exitCRFailed
+			f.send.mu.Unlock()
+		}
+		return observeSendRecord(f.events)(e)
+	}
+	f.pty.afterEnter = func() {
+		if err := f.exit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.rotate.sendExit(context.Background(), f.initial); !errors.Is(err, f.pty.writeErr) {
+		t.Fatalf("write failure lost: %v", err)
+	}
+	s := f.current()
+	if s.Rotation.Step != supervisor.RotateSendExit || s.Rotation.FailReason != supervisor.RotateFailChildAbsent || s.State != supervisor.SessionStopped || s.LastSend != nil {
+		t.Fatalf("CR failure treated as success: %+v", s)
+	}
+	f.counts(0, 1)
+	if !retained || len(f.send.exitSends) != 0 {
+		t.Fatal("failed CR not retained until collection")
+	}
+}
+func TestSCNsup0245UnconfirmedThenChildDeath(t *testing.T) {
+	f := newSCN45(t)
+	var sendID string
+	f.rotate.Send = scn45Sender{send: f.send, timeout: time.Millisecond, after: func(result SendResult, err error) {
+		if err == nil || result.Confirmed {
+			t.Fatalf("result=%+v err=%v", result, err)
+		}
+		sendID = result.SendID
+		if len(f.send.exitSends) != 0 {
+			t.Fatal("result not collected before death")
+		}
+		f.counts(0, 1)
+		if err := f.exit(); err != nil {
+			t.Fatal(err)
+		}
+	}}
+	_, err := f.rotate.sendExit(context.Background(), f.initial)
+	if err == nil {
+		t.Fatal("send timeout was not reported")
+	}
+	f.stage5()
+	f.counts(0, 1)
+	if s := f.current(); s.LastSend == nil || s.LastSend.SendID != sendID || s.LastSend.Confirmed {
+		t.Fatalf("unconfirmed result changed: %+v", s.LastSend)
+	}
+}
+
+func TestSCNsup0245ConfirmedBeforeDeadline(t *testing.T) {
+	for _, cancelled := range []bool{false, true} {
+		t.Run(fmt.Sprint(cancelled), func(t *testing.T) {
+			f := newSCN45(t)
+			// Signal CR-success persistence without delivering an exit notification.
+			crSaved := make(chan struct{})
+			f.send.Sessions = &scn45SaveSignal{SessionRecordStore: f.sessions, saved: crSaved}
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			done := make(chan struct {
+				r SendResult
+				e error
+			}, 1)
+			go func() {
+				r, e := f.send.Execute(ctx, SendInput{SessionID: f.initial.SessionID, Kind: supervisor.SendKindHandoffExit, Origin: supervisor.SendOriginHandoff, ConfirmTimeout: 200 * time.Millisecond})
+				done <- struct {
+					r SendResult
+					e error
+				}{r, e}
+			}()
+			select {
+			case <-crSaved:
+			case <-time.After(time.Second):
+				t.Fatal("CR success not persisted")
+			}
+			saved := make(chan struct{})
+			release := make(chan struct{})
+			f.observer.RecordStructured = func(e store.Event) error {
+				if e.Kind == supervisor.EventKindSendConfirmed {
+					close(saved)
+					<-release
+				}
+				return observeSendRecord(f.events)(e)
+			}
+			observed := make(chan error, 1)
+			go func() { observed <- f.exit() }()
+			scn45Receive(t, saved)
+			f.send.EndSession(f.initial.SessionID)
+			f.send.mu.Lock()
+			retained := f.send.exitSends[f.initial.SessionID] != nil
+			f.send.mu.Unlock()
+			if !retained {
+				t.Fatal("cleanup removed saved result before collection")
+			}
+			if cancelled {
+				cancel()
+			}
+			got := scn45Receive(t, done)
+			close(release)
+			if err := scn45Receive(t, observed); err != nil {
+				t.Fatal(err)
+			}
+			if got.e != nil || !got.r.Confirmed {
+				t.Fatalf("saved success lost: %+v err=%v", got.r, got.e)
+			}
+			f.counts(1, 0)
+		})
+	}
+}
+
+// This wrapper intentionally uses UpdateSession's shared-lock fallback.
+type scn45SaveSignal struct {
+	SessionRecordStore
+	saved chan struct{}
+	once  sync.Once
+}
+
+func (s *scn45SaveSignal) Save(v supervisor.ManagedSession) error {
+	err := s.SessionRecordStore.Save(v)
+	if err == nil && v.LastSend != nil && v.LastSend.Kind == supervisor.SendKindHandoffExit {
+		s.once.Do(func() { close(s.saved) })
+	}
+	return err
+}
+
+type scn45CopyBarrier struct {
+	SessionRecordStore
+	armed  bool
+	copied func()
+}
+
+func (s *scn45CopyBarrier) Load(id supervisor.SessionID) (supervisor.ManagedSession, error) {
+	v, err := s.SessionRecordStore.Load(id)
+	if err == nil && s.armed {
+		s.armed = false
+		s.copied()
+	}
+	return v, err
+}
+func TestSCNsup0245ExitBetweenFinalCopyAndMark(t *testing.T) {
+	f := newSCN45(t)
+	copied := false
+	entered := false
+	barrier := &scn45CopyBarrier{SessionRecordStore: f.sessions}
+	barrier.copied = func() {
+		copied = true
+		if err := f.exit(); err != nil {
+			t.Fatal(err)
+		}
+		f.send.mu.Lock()
+		r := f.send.exitSends[f.initial.SessionID]
+		beforeMark := r != nil && r.exited && !r.marked
+		f.send.mu.Unlock()
+		if !beforeMark {
+			t.Fatal("exit not registered before mark")
+		}
+	}
+	f.send.Sessions = barrier
+	f.pty.beforeEnter = func() { barrier.armed = true }
+	f.pty.afterEnter = func() { entered = true }
+	result, err := f.send.Execute(context.Background(), SendInput{SessionID: f.initial.SessionID, Kind: supervisor.SendKindHandoffExit, Origin: supervisor.SendOriginHandoff})
+	if !copied || entered || !errors.Is(err, proc.ErrBeforeEnter) || result.Confirmed || f.current().LastSend != nil {
+		t.Fatalf("copied=%v entered=%v result=%+v err=%v", copied, entered, result, err)
+	}
+	f.counts(0, 0)
+}
+
+type scn45BlockedSave struct {
+	SessionRecordStore
+	entered chan struct{}
+	release chan struct{}
+	fail    error
+	once    sync.Once
+}
+
+func (s *scn45BlockedSave) Save(v supervisor.ManagedSession) error {
+	if v.LastSend != nil && v.LastSend.Confirmed {
+		s.once.Do(func() { close(s.entered) })
+		<-s.release
+		if s.fail != nil {
+			return s.fail
+		}
+	}
+	return s.SessionRecordStore.Save(v)
+}
+
+type scn45UpdateProbe struct {
+	SessionRecordStore
+	ctx       context.Context
+	attempted chan struct{}
+	watch     atomic.Bool
+	once      sync.Once
+}
+
+func (s *scn45UpdateProbe) UpdateSession(id supervisor.SessionID, update func(*supervisor.ManagedSession) error) error {
+	if s.watch.Load() || s.ctx.Err() != nil {
+		s.once.Do(func() { close(s.attempted) })
+	}
+	return UpdateSessionWith(sessionLocker, id, func() (supervisor.ManagedSession, error) { return s.Load(id) }, s.Save, update)
+}
+func TestSCNsup0245DeadlineDuringSave(t *testing.T) {
+	for _, fail := range []bool{false, true} {
+		for _, cancelled := range []bool{false, true} {
+			t.Run(fmt.Sprintf("fail=%v/cancel=%v", fail, cancelled), func(t *testing.T) {
+				f := newSCN45(t)
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				save := &scn45BlockedSave{SessionRecordStore: f.sessions, entered: make(chan struct{}), release: make(chan struct{})}
+				writeErr := errors.New("confirmation save failed")
+				if fail {
+					save.fail = writeErr
+				}
+				crSaved := make(chan struct{})
+				signal := &scn45SaveSignal{SessionRecordStore: save, saved: crSaved}
+				probe := &scn45UpdateProbe{SessionRecordStore: signal, ctx: ctx, attempted: make(chan struct{})}
+				f.send.Sessions = probe
+				f.observer.Sessions = signal
+				done := make(chan struct {
+					r SendResult
+					e error
+				}, 1)
+				go func() {
+					r, e := f.send.Execute(ctx, SendInput{SessionID: f.initial.SessionID, Kind: supervisor.SendKindHandoffExit, Origin: supervisor.SendOriginHandoff, ConfirmTimeout: 200 * time.Millisecond})
+					done <- struct {
+						r SendResult
+						e error
+					}{r, e}
+				}()
+				scn45Receive(t, crSaved)
+				observed := make(chan error, 1)
+				go func() { observed <- f.exit() }()
+				scn45Receive(t, save.entered)
+				if s := f.current(); s.LastSend == nil || s.LastSend.Confirmed {
+					t.Fatal("reservation published before save")
+				}
+				probe.watch.Store(true)
+				if cancelled {
+					cancel()
+				}
+				scn45Receive(t, probe.attempted)
+				select {
+				case result := <-done:
+					t.Fatalf("returned before save completion: %+v", result)
+				default:
+				}
+				close(save.release)
+				observeErr := scn45Receive(t, observed)
+				result := scn45Receive(t, done)
+				if fail {
+					if !errors.Is(observeErr, writeErr) || result.r.Confirmed || result.e == nil || cancelled && !errors.Is(result.e, context.Canceled) {
+						t.Fatalf("observer=%v sender=%+v/%v", observeErr, result.r, result.e)
+					}
+					f.counts(0, 1)
+				} else {
+					if observeErr != nil || result.e != nil || !result.r.Confirmed {
+						t.Fatalf("observer=%v sender=%+v/%v", observeErr, result.r, result.e)
+					}
+					f.counts(1, 0)
+				}
+			})
+		}
+	}
+}
+func TestSCNsup0245EventFailureKeepsSavedSuccess(t *testing.T) {
+	f := newSCN45(t)
+	eventErr := errors.New("confirmed event failed")
+	attempts := 0
+	f.send.RecordStructured = func(e store.Event) error {
+		if e.Kind == supervisor.EventKindSendConfirmed {
+			attempts++
+			return eventErr
+		}
+		return observeSendRecord(f.events)(e)
+	}
+	f.pty.afterEnter = func() {
+		if err := f.exit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.rotate.sendExit(context.Background(), f.initial); !errors.Is(err, eventErr) {
+		t.Fatalf("event error lost: %v", err)
+	}
+	f.stage5()
+	f.counts(0, 0)
+	p := supervisor.PendingSend{SendID: f.current().LastSend.SendID, Kind: supervisor.SendKindHandoffExit}
+	result, err := f.send.confirmSend(SendInput{SessionID: f.initial.SessionID, Kind: p.Kind, Origin: supervisor.SendOriginHandoff}, p)
+	if err != nil || !result.Confirmed || attempts != 1 {
+		t.Fatalf("result=%+v err=%v attempts=%d", result, err, attempts)
+	}
+	if err := f.send.unconfirmed(SendInput{SessionID: f.initial.SessionID, Kind: p.Kind}, p); err != nil {
+		t.Fatal(err)
+	}
+	f.counts(0, 0)
+}
+func TestSCNsup0245DuplicateAndLateObservation(t *testing.T) {
+	f := newSCN45(t)
+	f.pty.afterEnter = func() {
+		for i := 0; i < 2; i++ {
+			if err := f.exit(); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	result, err := f.send.Execute(context.Background(), SendInput{SessionID: f.initial.SessionID, Kind: supervisor.SendKindHandoffExit, Origin: supervisor.SendOriginHandoff})
+	if err != nil || !result.Confirmed {
+		t.Fatalf("result=%+v err=%v", result, err)
+	}
+	for i := 0; i < 2; i++ {
+		f.send.NotifyConfirmation(SendConfirmation{SessionID: f.initial.SessionID, SendID: result.SendID, ProcessExited: true})
+		p := supervisor.PendingSend{SendID: result.SendID, Kind: supervisor.SendKindHandoffExit}
+		_, err := f.send.updateExitSession(f.sessions, f.initial.SessionID, func(v *supervisor.ManagedSession, tx *exitCommit) error {
+			f.send.observeExit(v, p, f.pty, tx)
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if len(f.send.exitSends) != 0 || len(f.send.confirm) != 0 {
+		t.Fatal("late observation recreated transient records")
+	}
+	f.counts(1, 0)
+}
+
+func (p *scn45PTY) Pid() int                  { return 123 }
+func (p *scn45PTY) Kill(syscall.Signal) error { return nil }
+func TestSCNsup0245EarlyExitPathsDoNotRegister(t *testing.T) {
+	for _, path := range []string{"shutdown", "stopping", "old_pty", "old_send_id"} {
+		t.Run(path, func(t *testing.T) {
+			f := newSCN45(t)
+			registry := &PTYRegistry{}
+			registry.Register(f.initial.SessionID, f.pty)
+			registry.RegisterManaged(f.initial.SessionID, f.pty)
+			f.send.PTYs = registry
+			f.pty.afterEnter = func() {
+				switch path {
+				case "shutdown":
+					registry.BeginShutdown()
+				case "stopping":
+					registry.MarkStopping(f.initial.SessionID)
+				case "old_pty":
+					registry.RegisterManaged(f.initial.SessionID, &fakeManagedPTY{})
+				case "old_send_id":
+					if err := UpdateSession(f.sessions, f.initial.SessionID, func(v *supervisor.ManagedSession) error {
+						p := *v.SendGate.Pending
+						p.SendID = v.SessionID.String() + "-s1"
+						v.SendGate.Pending = &p
+						return nil
+					}); err != nil {
+						t.Fatal(err)
+					}
+				}
+				f.pty.exits <- 0
+				if err := f.observer.Run(context.Background(), f.initial, observedPTY{ManagedPTY: f.pty, Reader: f.pty}, supervisor.NewVirtualTerminal(80, 24)); err != nil {
+					t.Fatal(err)
+				}
+				f.send.mu.Lock()
+				r := f.send.exitSends[f.initial.SessionID]
+				registered := r != nil && r.exited
+				f.send.mu.Unlock()
+				if registered {
+					t.Fatal("excluded exit was registered")
+				}
+			}
+			result, err := f.send.Execute(context.Background(), SendInput{SessionID: f.initial.SessionID, Kind: supervisor.SendKindHandoffExit, Origin: supervisor.SendOriginHandoff, ConfirmTimeout: time.Millisecond})
+			if err == nil || result.Confirmed {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+			f.counts(0, 1)
+		})
+	}
+}
+func TestSCNsup0245OtherSessionProgressesDuringCR(t *testing.T) {
+	f := newSCN45(t)
+	other := f.initial
+	other.SessionID = supervisor.SessionID("other-45")
+	if err := f.sessions.Save(other); err != nil {
+		t.Fatal(err)
+	}
+	f.pty.screens.SetSnapshot(other.SessionID, blankScreen())
+	second := &scn45PTY{observeSendPTY: newObserveSendPTY(), screens: f.pty.screens, id: other.SessionID}
+	registry := &PTYRegistry{}
+	registry.Register(f.initial.SessionID, f.pty)
+	registry.Register(other.SessionID, second)
+	f.send.PTYs = registry
+	entered, release := make(chan struct{}), make(chan struct{})
+	f.pty.afterEnter = func() { close(entered); <-release }
+	firstDone := make(chan struct {
+		r SendResult
+		e error
+	}, 1)
+	go func() {
+		r, e := f.send.Execute(context.Background(), SendInput{SessionID: f.initial.SessionID, Kind: supervisor.SendKindHandoffExit, Origin: supervisor.SendOriginHandoff})
+		firstDone <- struct {
+			r SendResult
+			e error
+		}{r, e}
+	}()
+	scn45Receive(t, entered)
+	duplicate, err := f.send.Execute(context.Background(), SendInput{SessionID: f.initial.SessionID, Kind: supervisor.SendKindHandoffExit, Origin: supervisor.SendOriginHandoff})
+	if err != nil || duplicate.Blocked != supervisor.SendBlockedPending {
+		t.Fatalf("duplicate=%+v err=%v", duplicate, err)
+	}
+	second.afterEnter = func() {
+		second.exits <- 0
+		if err := f.observer.Run(context.Background(), other, second, supervisor.NewVirtualTerminal(80, 24)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	secondDone := make(chan struct {
+		r SendResult
+		e error
+	}, 1)
+	go func() {
+		r, e := f.send.Execute(context.Background(), SendInput{SessionID: other.SessionID, Kind: supervisor.SendKindHandoffExit, Origin: supervisor.SendOriginHandoff})
+		secondDone <- struct {
+			r SendResult
+			e error
+		}{r, e}
+	}()
+	got := scn45Receive(t, secondDone)
+	if got.e != nil || !got.r.Confirmed {
+		t.Fatalf("second session blocked: %+v/%v", got.r, got.e)
+	}
+	if err := f.exit(); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	first := scn45Receive(t, firstDone)
+	if first.e != nil || !first.r.Confirmed {
+		t.Fatalf("first=%+v/%v", first.r, first.e)
+	}
+	f.counts(2, 0)
+}
+func scn45Receive[T any](t *testing.T, ch <-chan T) T {
+	t.Helper()
+	select {
+	case value := <-ch:
+		return value
+	case <-time.After(3 * time.Second):
+		t.Fatal("SCN45 barrier was not reached")
+		var zero T
+		return zero
+	}
+}
+
+// A failed durable success write must never be used for stage-4 compensation.
+type scn45RejectProof struct {
+	SessionRecordStore
+	err error
+}
+
+func (s scn45RejectProof) Save(v supervisor.ManagedSession) error {
+	if v.LastSend != nil && v.LastSend.Kind == supervisor.SendKindHandoffExit {
+		return s.err
+	}
+	return s.SessionRecordStore.Save(v)
+}
+func TestSCNsup0245SuccessProofSaveFailure(t *testing.T) {
+	f := newSCN45(t)
+	saveErr := errors.New("CR proof save failed")
+	f.send.Sessions = scn45RejectProof{SessionRecordStore: f.sessions, err: saveErr}
+	f.pty.afterEnter = func() {
+		if err := f.exit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := f.rotate.sendExit(context.Background(), f.initial); !errors.Is(err, saveErr) {
+		t.Fatalf("save error lost: %v", err)
+	}
+	s := f.current()
+	if s.LastSend != nil || s.Rotation.FailReason != supervisor.RotateFailChildAbsent || s.Rotation.Step != supervisor.RotateSendExit {
+		t.Fatalf("failed proof used: %+v", s)
+	}
+	f.counts(0, 0)
+	if len(f.send.exitSends) != 0 {
+		t.Fatal("save failure leaked active record")
+	}
+}
+func TestSCNsup0245PastSuccessCannotRescueCurrentFailure(t *testing.T) {
+	f := newSCN45(t)
+	old := &supervisor.LastSendRecord{SendID: f.initial.SessionID.String() + "-s1", Kind: supervisor.SendKindHandoffExit, IssuedAt: f.initial.StateSince, Confirmed: true}
+	if err := UpdateSession(f.sessions, f.initial.SessionID, func(v *supervisor.ManagedSession) error { v.LastSend = old; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	f.pty.writeErr = errors.New("current CR failed")
+	f.pty.afterEnter = func() {
+		if err := f.exit(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_, err := f.rotate.sendExit(context.Background(), f.initial)
+	if !errors.Is(err, f.pty.writeErr) {
+		t.Fatalf("failure not reported: %v", err)
+	}
+	if s := f.current(); s.Rotation.FailReason != supervisor.RotateFailChildAbsent || s.LastSend.SendID != old.SendID {
+		t.Fatalf("old success used for current send: %+v", s)
+	}
+	f.counts(0, 1)
+}
+
+func TestSCNsup0245ClockAfterSuccessfulReturn(t *testing.T) {
+	for _, offset := range []time.Duration{0, -time.Hour} {
+		t.Run(offset.String(), func(t *testing.T) {
+			f := newSCN45(t)
+			at := time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
+			f.send.Now = func() time.Time { return at }
+			f.observer.Now = func() time.Time { return at.Add(offset) }
+			crSaved := make(chan struct{})
+			f.send.Sessions = &scn45SaveSignal{SessionRecordStore: f.sessions, saved: crSaved}
+			f.rotate.Send = scn45Sender{send: f.send, timeout: time.Second}
+			done := make(chan error, 1)
+			go func() { _, err := f.rotate.sendExit(context.Background(), f.initial); done <- err }()
+			scn45Receive(t, crSaved)
+			// Success has returned from WriteLine and the unconfirmed CR proof is durable.
+			if s := f.current(); s.LastSend == nil || s.LastSend.Confirmed || s.SendGate.Pending == nil {
+				t.Fatalf("bad pre-exit proof: %+v", s)
+			}
+			if err := f.exit(); err != nil {
+				t.Fatal(err)
+			}
+			if err := scn45Receive(t, done); err != nil {
+				t.Fatal(err)
+			}
+			f.stage5()
+			f.counts(1, 0)
+		})
+	}
+}
+
+func TestSCNsup0245ObserverEventFailureStillCleansUp(t *testing.T) {
+	f := newSCN45(t)
+	eventErr := errors.New("observer confirmed event failed")
+	crSaved := make(chan struct{})
+	f.send.Sessions = &scn45SaveSignal{SessionRecordStore: f.sessions, saved: crSaved}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct {
+		r SendResult
+		e error
+	}, 1)
+	go func() {
+		r, e := f.send.Execute(ctx, SendInput{SessionID: f.initial.SessionID, Kind: supervisor.SendKindHandoffExit, Origin: supervisor.SendOriginHandoff, ConfirmTimeout: time.Second})
+		done <- struct {
+			r SendResult
+			e error
+		}{r, e}
+	}()
+	scn45Receive(t, crSaved)
+	attempts := 0
+	f.observer.RecordStructured = func(e store.Event) error {
+		if e.Kind == supervisor.EventKindSendConfirmed {
+			attempts++
+			return eventErr
+		}
+		return observeSendRecord(f.events)(e)
+	}
+	if err := f.exit(); !errors.Is(err, eventErr) {
+		t.Fatalf("observer error lost: %v", err)
+	}
+	cancel()
+	got := scn45Receive(t, done)
+	if got.e != nil || !got.r.Confirmed || attempts != 1 {
+		t.Fatalf("sender=%+v/%v attempts=%d", got.r, got.e, attempts)
+	}
+	f.send.mu.Lock()
+	cleaned := len(f.send.confirm) == 0 && len(f.send.crWritten) == 0 && len(f.send.crAt) == 0 && len(f.send.locks) == 0 && len(f.send.exitSends) == 0
+	f.send.mu.Unlock()
+	if !cleaned {
+		t.Fatal("event failure skipped exit cleanup")
+	}
+	if err := f.rotate.deadDuringSend(f.initial, supervisor.RotateSendExit, got.r.SendID); err != nil {
+		t.Fatal(err)
+	}
+	f.stage5()
+	f.counts(0, 0)
 }
