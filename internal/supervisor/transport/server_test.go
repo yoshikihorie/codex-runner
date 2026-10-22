@@ -99,11 +99,25 @@ func TestServer_SCNSup0570_SendInputParams(t *testing.T) {
 	}
 }
 
+// Keep the call and all fake-state inspection on the test goroutine. Context expiry
+// is a watchdog failure even if Dispatch translates it into an expected error code.
+func callOperatorWithWatchdog(t *testing.T, d *Dispatch, request Request) Response {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), transportTimingWatchdog)
+	defer cancel()
+	response := d.Handle(ctx, request, os.Getpid())
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("operator watchdog context ended: %v", err)
+	}
+	return response
+}
+
 func TestServer_SCNSup0569_BodyBoundaryAndInvalidUTF8(t *testing.T) {
 	d, pty, events, _ := operatorServerFixture(t)
+	d.OperatorInput.Send.ConfirmTimeout = operatorSuccessConfirmTimeout
 	invalid := append([]byte(`{"session_id":"alpha-1","text":"`), 0xff)
 	invalid = append(invalid, []byte(`"}`)...)
-	r := d.Handle(context.Background(), Request{SupervisorProtocolVersion: SupervisorProtocolVersion, Verb: "send-input", Params: invalid}, os.Getpid())
+	r := callOperatorWithWatchdog(t, d, Request{SupervisorProtocolVersion: SupervisorProtocolVersion, Verb: "send-input", Params: invalid})
 	if r.Error == nil || r.Error.Code != "SUP_REQUEST_MALFORMED" || len(r.Error.Details) != 0 || pty.writes != 0 {
 		t.Fatalf("invalid UTF-8 response=%+v writes=%d", r, pty.writes)
 	}
@@ -117,7 +131,7 @@ func TestServer_SCNSup0569_BodyBoundaryAndInvalidUTF8(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r = d.Handle(context.Background(), Request{SupervisorProtocolVersion: SupervisorProtocolVersion, Verb: "send-input", Params: params}, os.Getpid())
+	r = callOperatorWithWatchdog(t, d, Request{SupervisorProtocolVersion: SupervisorProtocolVersion, Verb: "send-input", Params: params})
 	if !r.OK || pty.writes != 1 || pty.text != text {
 		t.Fatalf("boundary response=%+v writes=%d", r, pty.writes)
 	}
@@ -184,8 +198,9 @@ func TestServer_SCNSup0577_OtherUIDRejectedBeforeRead(t *testing.T) {
 
 func TestServer_SCNSup0578_OperatorBodyNeverPersisted(t *testing.T) {
 	d, pty, events, root := operatorServerFixture(t)
+	d.OperatorInput.Send.ConfirmTimeout = operatorSuccessConfirmTimeout
 	const body = "固有の日本語😀 test"
-	r := d.Handle(context.Background(), Request{SupervisorProtocolVersion: SupervisorProtocolVersion, Verb: "send-input", Params: json.RawMessage(`{"session_id":"alpha-1","text":"` + body + `"}`)}, os.Getpid())
+	r := callOperatorWithWatchdog(t, d, Request{SupervisorProtocolVersion: SupervisorProtocolVersion, Verb: "send-input", Params: json.RawMessage(`{"session_id":"alpha-1","text":"` + body + `"}`)})
 	if !r.OK || pty.text != body || strings.Contains(string(r.Result), body) {
 		t.Fatalf("response=%+v text matched=%v", r, pty.text == body)
 	}
@@ -196,7 +211,7 @@ func TestServer_SCNSup0578_OperatorBodyNeverPersisted(t *testing.T) {
 	hash := sha256.Sum256([]byte(body))
 	markers := []string{body, hex.EncodeToString(hash[:])}
 	for _, verb := range []string{"status", "events"} {
-		response := d.Handle(context.Background(), Request{SupervisorProtocolVersion: SupervisorProtocolVersion, Verb: verb}, os.Getpid())
+		response := callOperatorWithWatchdog(t, d, Request{SupervisorProtocolVersion: SupervisorProtocolVersion, Verb: verb})
 		encoded, err := json.Marshal(response)
 		if err != nil || !response.OK {
 			t.Fatalf("verb=%s response=%+v err=%v", verb, response, err)
@@ -212,7 +227,7 @@ func TestServer_SCNSup0578_OperatorBodyNeverPersisted(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	invalid := d.Handle(context.Background(), Request{SupervisorProtocolVersion: SupervisorProtocolVersion, Verb: "send-input", Params: params}, os.Getpid())
+	invalid := callOperatorWithWatchdog(t, d, Request{SupervisorProtocolVersion: SupervisorProtocolVersion, Verb: "send-input", Params: params})
 	if invalid.Error == nil || invalid.Error.Code != "SUP_REQUEST_MALFORMED" || len(invalid.Error.Details) != 0 {
 		t.Fatalf("invalid response=%+v", invalid)
 	}
@@ -261,7 +276,7 @@ func TestServer_SCNSup0579_ConfirmationFailureResponse(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			d, pty, events, _ := operatorServerFixture(t)
 			pty.abort, pty.unconfirmed = tc.abort, !tc.abort
-			r := d.Handle(context.Background(), Request{SupervisorProtocolVersion: SupervisorProtocolVersion, Verb: "send-input", Params: json.RawMessage(`{"session_id":"alpha-1","text":"hello"}`)}, os.Getpid())
+			r := callOperatorWithWatchdog(t, d, Request{SupervisorProtocolVersion: SupervisorProtocolVersion, Verb: "send-input", Params: json.RawMessage(`{"session_id":"alpha-1","text":"hello"}`)})
 			all, _, err := events.ReadAll()
 			if err != nil || r.Error == nil || r.Error.Code != tc.code || len(r.Error.Details) != 2 || r.Error.Details["send_id"] != "alpha-1-s1" || pty.writes != 1 || len(all) != 2 {
 				t.Fatalf("response=%+v events=%+v err=%v", r, all, err)

@@ -3,9 +3,11 @@
 package proc
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -175,28 +177,124 @@ func TestPTYSessionCloseUnblocksReadAndIsIdempotent(t *testing.T) {
 	_, _ = session.Wait()
 }
 
+// Test-only watchdog; deliberately shorter than the WriteLine delay.
+const ptyCloseWatchdog = 10 * time.Second
+const ptyCloseWriteDelay = time.Hour
+
+func awaitPTYClose[T any](t *testing.T, ch <-chan T, operation string) T {
+	t.Helper()
+	select {
+	case result := <-ch:
+		return result
+	case <-time.After(ptyCloseWatchdog):
+		t.Fatalf("watchdog waiting for %s", operation)
+		var zero T
+		return zero
+	}
+}
+
+// Read synchronously on the test goroutine, bounded by the PTY poller deadline.
+func readPTYCloseMarker(t *testing.T, session *PTYSession, reader *bufio.Reader, marker string) {
+	t.Helper()
+	if err := session.master.SetReadDeadline(time.Now().Add(ptyCloseWatchdog)); err != nil {
+		t.Fatal(err)
+	}
+	line, err := reader.ReadString('\n')
+	if err != nil || strings.TrimSpace(line) != marker {
+		t.Fatalf("watchdog/PTY marker %q: line=%q err=%v", marker, line, err)
+	}
+}
+
+func trackPTYCloseChild(t *testing.T, session *PTYSession) <-chan struct{} {
+	t.Helper()
+	done := make(chan struct{})
+	go func() { _, _ = session.Wait(); close(done) }()
+	t.Cleanup(func() {
+		select {
+		case <-done:
+			// Do not signal a PID after its child has already been reaped.
+		default:
+			_ = session.Kill(syscall.SIGKILL)
+		}
+		_ = session.Close()
+		awaitPTYClose(t, done, "child cleanup")
+	})
+	return done
+}
+
 func TestPTYSessionCloseLeavesHUPTrappingChildForExplicitKill(t *testing.T) {
-	session, err := StartPTYSession("/bin/sh", []string{"/bin/sh", "-c", "trap '' HUP; sleep 5"}, t.TempDir(), BuildSessionEnv(nil), 80, 24)
+	// A FIFO provides a response path independent of the closed terminal.
+	replyPath := filepath.Join(t.TempDir(), "alive")
+	if err := syscall.Mkfifo(replyPath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reply, err := os.OpenFile(replyPath, os.O_RDWR|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := session.Close(); err != nil {
+	defer reply.Close()
+	script := writeShell(t, `trap '' HUP
+trap 'printf ALIVE > "$1"' USR1
+printf 'READY\n'
+while :; do sleep 1 & wait $!; done
+`)
+	session, err := StartPTYSession("/bin/sh", []string{"/bin/sh", script, replyPath}, t.TempDir(), BuildSessionEnv(nil), 80, 24)
+	if err != nil {
 		t.Fatal(err)
 	}
-	time.Sleep(250 * time.Millisecond)
-	select {
-	case <-session.processDone:
-		t.Fatal("Close terminated HUP-ignoring child")
-	default:
+	done := trackPTYCloseChild(t, session)
+	readPTYCloseMarker(t, session, bufio.NewReader(session), "READY")
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- session.Close() }()
+	if err := awaitPTYClose(t, closeDone, "Close"); err != nil {
+		t.Fatal(err)
+	}
+
+	// Only the shell receives USR1; its trap runs while the background sleep is waited on.
+	if err := syscall.Kill(session.Pid(), syscall.SIGUSR1); err != nil {
+		t.Fatal(err)
+	}
+	// Darwin FIFOs do not support os.File deadlines. Select bounds this independent read.
+	fd := int(reply.Fd())
+	var readable syscall.FdSet
+	const fdSetWordBits = 32
+	if fd >= len(readable.Bits)*fdSetWordBits {
+		t.Fatal("FIFO descriptor exceeds select capacity")
+	}
+	deadline := time.Now().Add(ptyCloseWatchdog)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatal("watchdog waiting for independent child reply")
+		}
+		readable = syscall.FdSet{}
+		readable.Bits[fd/fdSetWordBits] |= 1 << uint(fd%fdSetWordBits)
+		timeout := syscall.NsecToTimeval(remaining.Nanoseconds())
+		err := syscall.Select(fd+1, &readable, nil, nil, &timeout)
+		if errors.Is(err, syscall.EINTR) {
+			continue
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if readable.Bits[fd/fdSetWordBits]&(1<<uint(fd%fdSetWordBits)) == 0 {
+			t.Fatal("watchdog waiting for independent child reply")
+		}
+		break
+	}
+	response := make([]byte, len("ALIVE"))
+	if _, err := io.ReadFull(reply, response); err != nil {
+		t.Fatalf("watchdog waiting for independent child reply: %v", err)
+	}
+	if string(response) != "ALIVE" {
+		t.Fatalf("child reply=%q", response)
 	}
 	if err := session.Kill(syscall.SIGKILL); err != nil {
-		if errors.Is(err, syscall.EPERM) {
-			t.Skip("sandbox does not permit signaling child process groups")
-		}
 		t.Fatal(err)
 	}
-	if _, err := session.Wait(); err != nil {
-		t.Fatal(err)
+	awaitPTYClose(t, done, "explicit kill and Wait")
+	if code, err := session.Wait(); code != -1 || err != nil {
+		t.Fatalf("Wait=(%d,%v), want killed child", code, err)
 	}
 }
 
@@ -466,29 +564,41 @@ func TestPTYSessionSetReadDeadlineAndWriteLineCallbackCanReenter(t *testing.T) {
 }
 
 func TestPTYSessionCloseDoesNotWaitForWriteLineDelay(t *testing.T) {
-	session, err := StartPTYSession("/bin/sh", []string{"/bin/sh", "-c", "sleep 10"}, t.TempDir(), BuildSessionEnv(nil), 80, 24)
+	script := writeShell(t, `stty -echo -icanon min 1 time 0
+printf 'READY\n'
+dd bs=1 count=1 >/dev/null 2>&1
+printf 'BODY\n'
+while :; do sleep 1 & wait $!; done
+`)
+	session, err := StartPTYSession("/bin/sh", []string{"/bin/sh", script}, t.TempDir(), BuildSessionEnv(nil), 80, 24)
 	if err != nil {
 		t.Fatal(err)
 	}
+	childDone := trackPTYCloseChild(t, session)
+	reader := bufio.NewReader(session)
+	readPTYCloseMarker(t, session, reader, "READY")
+	ctx, cancel := context.WithCancel(context.Background())
 	writeDone := make(chan error, 1)
-	go func() { writeDone <- session.WriteLine(context.Background(), "x", 2*time.Second, nil) }()
-	time.Sleep(100 * time.Millisecond)
-	start := time.Now()
-	if err := session.Close(); err != nil {
+	writeExited := make(chan struct{})
+	go func() { defer close(writeExited); writeDone <- session.WriteLine(ctx, "x", ptyCloseWriteDelay, nil) }()
+	defer func() { cancel(); _ = session.Close(); awaitPTYClose(t, writeExited, "writer cleanup") }()
+	readPTYCloseMarker(t, session, reader, "BODY")
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- session.Close() }()
+	if err := awaitPTYClose(t, closeDone, "Close during WriteLine delay"); err != nil {
 		t.Fatal(err)
 	}
-	if elapsed := time.Since(start); elapsed > 100*time.Millisecond {
-		t.Fatalf("Close waited %s for WriteLine", elapsed)
+	if err := awaitPTYClose(t, writeDone, "WriteLine after Close"); !errors.Is(err, os.ErrClosed) {
+		t.Fatalf("WriteLine=%v, want os.ErrClosed", err)
 	}
-	select {
-	case err := <-writeDone:
-		if err == nil {
-			t.Fatal("WriteLine unexpectedly succeeded after Close")
-		}
-	case <-time.After(300 * time.Millisecond):
-		t.Fatal("WriteLine remained blocked after Close")
+	if err := ctx.Err(); err != nil {
+		t.Fatalf("WriteLine context ended: %v", err)
 	}
-	_, _ = session.Wait()
+	awaitPTYClose(t, writeExited, "writer completion")
+	awaitPTYClose(t, childDone, "child Wait after Close")
+	if _, err := session.Wait(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func TestPTYSessionCanceledWriteLineSendsNoBytesAtZeroDelay(t *testing.T) {

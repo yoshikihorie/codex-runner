@@ -854,42 +854,53 @@ func TestSCNsup01017StartUsesInstanceLock(t *testing.T) {
 func TestSCNsup01012UndeterminedNotifiesOncePerInterval(t *testing.T) {
 	id, _ := supervisor.NewSessionID("demo-1")
 	s := supervisor.ManagedSession{SessionID: id, ProjectID: "demo", CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionWorking, StateSince: time.Now(), StopScope: supervisor.StopScopeNone, SendGate: supervisor.SendGateRecord{NextSeq: 1}, RestartTimes: []time.Time{}}
-	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-	defer cancel()
 	notices := 0
-	u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: &constantDetector{result: detect.DetectResult{State: detect.StateUndetermined}}}, Sessions: &regressionSessionStore{session: s}, Stop: NewStopState(t.TempDir()), Interval: time.Millisecond, UndeterminedNotifyAfter: 3 * time.Millisecond, Notify: func(k supervisor.SupervisorEventKind, _ string) {
-		if k == supervisor.EventKindUndeterminedLong {
-			notices++
-		}
-	}}
-	_ = u.Run(ctx, s, &waitingPTY{closed: make(chan struct{})}, supervisor.NewVirtualTerminal(80, 24))
-	if notices != 1 {
-		t.Fatalf("undetermined notifications=%d; want one for the undetermined interval", notices)
+	steps := []timingBatchObservation{
+		{0, detect.DetectResult{State: detect.StateUndetermined}, 0},
+		{undeterminedNotifyInterval - time.Nanosecond, detect.DetectResult{State: detect.StateUndetermined}, 0},
+		{undeterminedNotifyInterval, detect.DetectResult{State: detect.StateUndetermined}, 1},
+		{2 * undeterminedNotifyInterval, detect.DetectResult{State: detect.StateUndetermined}, 1},
 	}
+	timingBatchObserve(t, s, steps, func(u *ObserveSessionUseCase) {
+		u.Stop = NewStopState(t.TempDir())
+		u.Notify = func(k supervisor.SupervisorEventKind, _ string) {
+			if k == supervisor.EventKindUndeterminedLong {
+				notices++
+			}
+		}
+	}, func(want int) {
+		if notices != want {
+			t.Fatalf("undetermined notifications=%d; want %d", notices, want)
+		}
+	})
 }
 
 func TestSCNsup01012UndeterminedNotifiesAgainAfterNewInterval(t *testing.T) {
 	id, _ := supervisor.NewSessionID("demo-1")
 	s := supervisor.ManagedSession{SessionID: id, ProjectID: "demo", CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionWorking, StateSince: time.Now(), StopScope: supervisor.StopScopeNone, SendGate: supervisor.SendGateRecord{NextSeq: 1}, RestartTimes: []time.Time{}}
-	ctx, cancel := context.WithTimeout(context.Background(), 70*time.Millisecond)
-	defer cancel()
-	calls, notices := 0, 0
-	detector := detectorFunc(func() detect.DetectResult {
-		calls++
-		if calls >= 10 && calls <= 14 {
-			return detect.DetectResult{State: detect.StateWorking}
-		}
-		return detect.DetectResult{State: detect.StateUndetermined}
-	})
-	u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: detector}, Sessions: &regressionSessionStore{session: s}, Interval: time.Millisecond, UndeterminedNotifyAfter: 4 * time.Millisecond, Notify: func(k supervisor.SupervisorEventKind, _ string) {
-		if k == supervisor.EventKindUndeterminedLong {
-			notices++
-		}
-	}}
-	_ = u.Run(ctx, s, &waitingPTY{closed: make(chan struct{})}, supervisor.NewVirtualTerminal(80, 24))
-	if notices != 2 {
-		t.Fatalf("undetermined notifications=%d; want one notification in each of two intervals", notices)
+	notices := 0
+	steps := []timingBatchObservation{
+		{0, detect.DetectResult{State: detect.StateUndetermined}, 0},
+		{undeterminedNotifyInterval - time.Nanosecond, detect.DetectResult{State: detect.StateUndetermined}, 0},
+		{undeterminedNotifyInterval, detect.DetectResult{State: detect.StateUndetermined}, 1},
+		{2 * undeterminedNotifyInterval, detect.DetectResult{State: detect.StateUndetermined}, 1},
+		{3 * undeterminedNotifyInterval, detect.DetectResult{State: detect.StateWorking}, 1},
+		{4 * undeterminedNotifyInterval, detect.DetectResult{State: detect.StateUndetermined}, 1},
+		{5*undeterminedNotifyInterval - time.Nanosecond, detect.DetectResult{State: detect.StateUndetermined}, 1},
+		{5 * undeterminedNotifyInterval, detect.DetectResult{State: detect.StateUndetermined}, 2},
+		{6 * undeterminedNotifyInterval, detect.DetectResult{State: detect.StateUndetermined}, 2},
 	}
+	timingBatchObserve(t, s, steps, func(u *ObserveSessionUseCase) {
+		u.Notify = func(k supervisor.SupervisorEventKind, _ string) {
+			if k == supervisor.EventKindUndeterminedLong {
+				notices++
+			}
+		}
+	}, func(want int) {
+		if notices != want {
+			t.Fatalf("undetermined notifications=%d; want %d", notices, want)
+		}
+	})
 }
 
 type detectorFunc func() detect.DetectResult
@@ -901,29 +912,25 @@ func (f detectorFunc) Detect(context.Context, detect.DetectInput) (detect.Detect
 func TestSCNsup01033IllegalTransitionIsLoggedOncePerStatePair(t *testing.T) {
 	id, _ := supervisor.NewSessionID("demo-1")
 	s := supervisor.ManagedSession{SessionID: id, ProjectID: "demo", CLI: supervisor.CLIClaude, Generation: 1, State: supervisor.SessionStarting, StateSince: time.Now(), StopScope: supervisor.StopScopeNone, SendGate: supervisor.SendGateRecord{NextSeq: 1}, RestartTimes: []time.Time{}}
-	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
-	defer cancel()
 	count := 0
-	var calls int
-	detector := detectorFunc(func() detect.DetectResult {
-		calls++
-		if calls == 1 {
-			return detect.DetectResult{State: detect.StateWorking, ProcessingIndicator: true}
-		}
-		return detect.DetectResult{State: detect.StateAwaitingRecommendation}
-	})
-	u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: detector}, Sessions: &regressionSessionStore{session: s}, Interval: time.Millisecond, RecordStructured: func(event testEvent) error {
-		k := event.Kind
-		if k == supervisor.EventKindIllegalTransition {
-			count++
-		}
-
-		return nil
-	}}
-	_ = u.Run(ctx, s, &waitingPTY{closed: make(chan struct{})}, supervisor.NewVirtualTerminal(80, 24))
-	if count != 1 {
-		t.Fatalf("illegal transition event count=%d; want 1", count)
+	steps := []timingBatchObservation{
+		{0, detect.DetectResult{State: detect.StateWorking, ProcessingIndicator: true}, 0},
+		{time.Second, detect.DetectResult{State: detect.StateAwaitingRecommendation}, 1},
+		{2 * time.Second, detect.DetectResult{State: detect.StateAwaitingRecommendation}, 1},
+		{3 * time.Second, detect.DetectResult{State: detect.StateAwaitingRecommendation}, 1},
 	}
+	timingBatchObserve(t, s, steps, func(u *ObserveSessionUseCase) {
+		u.RecordStructured = func(event testEvent) error {
+			if event.Kind == supervisor.EventKindIllegalTransition {
+				count++
+			}
+			return nil
+		}
+	}, func(want int) {
+		if count != want {
+			t.Fatalf("illegal transition event count=%d; want %d", count, want)
+		}
+	})
 }
 
 func TestRealSessionStoreAdapterDoesNotDeadlock(t *testing.T) {
@@ -1267,4 +1274,87 @@ func TestReconcileRealStoreOrphanEventAndResumeGuard(t *testing.T) {
 	if err := rows[0].Apply(supervisor.EventResume, ctx, time.Now()); err == nil || !strings.Contains(err.Error(), "SUP_ORPHAN_CHILD_ALIVE") {
 		t.Fatalf("orphan resume error=%v", err)
 	}
+}
+
+// The next Detect call is a barrier for completion of all effects of the previous
+// observation. The clock advances inside Detect, then stays fixed for that step.
+type timingBatchObservation struct {
+	after  time.Duration
+	result detect.DetectResult
+	want   int
+}
+
+type timingBatchDetector struct {
+	started chan struct{}
+	steps   chan timingBatchObservation
+	mu      sync.Mutex
+	now     time.Time
+	base    time.Time
+	last    detect.DetectResult
+}
+
+func (d *timingBatchDetector) Now() time.Time {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.now
+}
+
+func (d *timingBatchDetector) Detect(ctx context.Context, _ detect.DetectInput) (detect.DetectResult, error) {
+	select {
+	case d.started <- struct{}{}:
+	case <-ctx.Done():
+		return d.last, nil
+	}
+	select {
+	case step := <-d.steps:
+		d.mu.Lock()
+		d.now = d.base.Add(step.after)
+		d.mu.Unlock()
+		d.last = step.result
+	case <-ctx.Done():
+		// Run may call Detect again after cancellation. Keep time and result
+		// stable so this cannot create another interval or state pair.
+	}
+	return d.last, nil
+}
+
+func timingBatchObserve(t *testing.T, initial supervisor.ManagedSession, steps []timingBatchObservation, configure func(*ObserveSessionUseCase), check func(int)) {
+	t.Helper()
+	watchdog := timingBatchContext(t)
+	ctx, cancel := context.WithCancelCause(watchdog)
+	cause := errors.New("all requested observations completed")
+	d := &timingBatchDetector{started: make(chan struct{}), steps: make(chan timingBatchObservation), base: initial.StateSince, now: initial.StateSince}
+	u := ObserveSessionUseCase{Detect: DetectSessionStateUseCase{Detector: d, Now: d.Now}, Now: d.Now, Sessions: &regressionSessionStore{session: initial}, Interval: time.Millisecond}
+	configure(&u)
+	done := make(chan error, 1)
+	go func() {
+		done <- u.Run(ctx, initial, &waitingPTY{closed: make(chan struct{})}, supervisor.NewVirtualTerminal(80, 24))
+	}()
+	joined := false
+	defer func() {
+		cancel(cause) // Release a blocked Detect even if an intermediate assertion fails.
+		if !joined {
+			timingBatchAwait(t, done)
+		}
+	}()
+	timingBatchAwait(t, d.started)
+	for _, step := range steps {
+		select {
+		case d.steps <- step:
+		case <-watchdog.Done():
+			t.Fatal("watchdog: detector did not accept step")
+		}
+		timingBatchAwait(t, d.started)
+		check(step.want)
+	}
+	timingBatchHealthy(t, watchdog)
+	cancel(cause)
+	err := timingBatchAwait(t, done)
+	joined = true
+	timingBatchHealthy(t, watchdog)
+	if !errors.Is(err, context.Canceled) || !errors.Is(context.Cause(ctx), cause) {
+		t.Fatalf("observer cancellation: err=%v cause=%v", err, context.Cause(ctx))
+	}
+	// Read final counters only after Run has stopped, including any extra Detect.
+	check(steps[len(steps)-1].want)
 }
